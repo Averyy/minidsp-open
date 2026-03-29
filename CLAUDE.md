@@ -1,0 +1,79 @@
+# minidsp-open
+
+Fork of minidsp-rs. Headless MiniDSP controller — HTTP API, CLI, and MCP server. Runs on Linux/macOS/Windows AND ESP32-S3 from one Rust codebase. No UI.
+
+## Project State
+
+Planning/research complete. Not yet coding. All protocol details, device definitions, and address tables extracted and verified.
+
+## Key Files
+
+| File | What |
+|------|------|
+| `minidsp-open.md` | Master planning doc — architecture, protocol, roadmap, effort estimate |
+| `devices.md` | Complete device registry — all hw_ids, DSP IDs, sources, USB PIDs, capabilities |
+| `address-tables.md` | Every DSP register address for all 7 structures (verified against minidsp-rs + Device Console XML) |
+| `MiniDSP Device Console.app/` | Extracted official app — source of truth for device definitions and addresses |
+| `app-extracted/` | Decompiled Device Console JS (minified) — protocol details, command formats |
+
+## Goal: Fix Everything Wrong With minidsp-rs
+
+minidsp-rs is an upstream protocol reference (one maintainer, 10 stale dependabot PRs, 9 unresolved device requests). We fix all of it:
+
+| minidsp-rs issue | Problem | Our fix |
+|-----------------|---------|---------|
+| #765 | Device unreachable after standby/wake | Auto-reconnect with health checks, exponential backoff |
+| #511 | Daemon doesn't find device after boot | Retry USB enumeration, don't fail on first attempt |
+| #144 | Stale device after USB unplug | Proper hotplug lifecycle, clean up and notify clients |
+| #662 | Can't run multiple devices on one host | Per-device connection isolation, no global lock |
+| #699 | Simultaneous connections corrupt state | Command queue with arbitration, return "busy" |
+| #570 | Level streaming blocks preset changes | Interleave commands properly |
+| #557 | Delay hard limit too low for some devices | Per-device limits from device definition |
+| #663 | No standby/power control | 12V trigger via ESP32 GPIO |
+| #566 | Flex Eight not supported | Full definition with addresses from Device Console XML |
+| #698 | Flex HT not supported | Full definition with addresses from Device Console XML |
+| #657 | SHD Power not supported | Add hw_id 21 + 5-source mapping (trivial) |
+| #764 | CDSP 8x12DL not supported | Pending device owner probe |
+| #701 | HTx new firmware breaks existing | DSP 115 definition with input PEQ addresses |
+
+Also: MiniDSP's WI-DG WiFi module is $75 for a MediaTek SoC running OpenWrt that just bridges TCP↔USB HID. Our ESP32-S3 target does the same thing (and more — full HTTP API, MCP server, 12V trigger) on a $10 dev board.
+
+Plus features minidsp-rs never had: config read-back, measurement mode, preset import/export, display control, DRE, per-source volume offsets, modification tokens, ESP32 target, MCP server.
+
+## Critical Rules
+
+- **XML is source of truth for addresses.** DSP_default_parameters.xml `idx` attributes are the actual DSP register addresses. Verified 100% match against minidsp-rs for all existing devices.
+- **Drop-in replacement for minidsp-rs.** Every existing minidsp-rs API endpoint, TCP protocol, and UDP discovery packet must work identically. Existing clients (Home Assistant, ezBEQ, mobile apps, CLI scripts) must work without changes. We only add, never remove or break.
+- **No UI.** This is an API/CLI/MCP server. Users interact via HTTP, CLI commands, or MCP clients.
+- **All devices from day one.** Don't subset — the per-device code is just address tables, not logic. Ship every device MiniDSP sells.
+- **Dual target: Linux + ESP32-S3.** Use `cfg(target_os = "espidf")` for platform splits. Protocol crate is shared, transport and HTTP server are platform-specific.
+- **Linux: tokio + axum.** ESP32: embassy + picoserve. Handler logic shared, server wiring `cfg`-gated.
+- **USB HID on ESP32** has no safe Rust wrappers. Use `esp-idf-sys` unsafe FFI to the C USB host API.
+- **MIT license.** 100% our code, not a fork. Credit minidsp-rs in README as protocol reference and inspiration.
+
+## Tech Stack
+
+- **Language:** Rust
+- **Not a fork.** Clean-room implementation. Protocol knowledge from minidsp-rs (credited) + Device Console XML extraction
+- **Linux:** tokio + axum + hidapi
+- **ESP32-S3:** embassy + picoserve + esp-idf-sys FFI for USB host
+- **JSON:** serde_json (Linux), serde-json-core (ESP32, no_std)
+- **Protocol crate:** Pure Rust, no platform deps, compiles everywhere
+
+## Protocol Quick Reference
+
+- USB HID: VID `0x2752`, 65-byte reports (report ID 0x00 + 64 bytes, 0xFF padded)
+- TCP: port 5333, length-prefixed frames with checksum
+- UDP discovery: port 3999, broadcast every 1s
+- HTTP API: port 5380 (Linux daemon), configurable on ESP32
+- Frame: `[length] [payload] [checksum]` — length is self-inclusive, checksum = sum(all bytes) & 0xFF
+- Dialect: old devices use 2-byte addr + fixed-point, new devices use 3-byte addr + float32
+- Flash memory at page 0xFF (preset, volume, mute, source, tokens, display, DRE, serial)
+
+## Device Console Reference
+
+Downloaded from:
+- macOS: `https://phpstack-793508-3229840.cloudwaysapps.com/deviceconsole/latest-macmx`
+- Windows: `https://phpstack-793508-3229840.cloudwaysapps.com/deviceconsole/latest-win`
+
+Address tables extracted from: `Contents/Resources/device_support_package/DSP_Structures/{dsp_id}/DSP_default_parameters.xml`
