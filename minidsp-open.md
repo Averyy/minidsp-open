@@ -12,7 +12,7 @@ minidsp-open adds:
 - Config read-back (save/restore full device state)
 - Connection resilience (auto-reconnect, exponential backoff)
 - 12V trigger / power control via ESP32 GPIO
-- MCP server for AI assistant integration
+- `llms.txt` at webapp root for AI/LLM discoverability (MCP server skipped — zero demand, maybe later)
 - Fixes for every actionable open issue
 
 ## Architecture
@@ -177,6 +177,8 @@ Offset  Len  Field
 | 2 | Failed to load preset from flash |
 
 ### Flash memory map (page 0xFF)
+
+Cross-verified against: Device Console JS, minidsp-rs source, and miniDSP Controller Android app (apk-extracted).
 
 | Address | Size | Purpose |
 |---------|------|---------|
@@ -375,6 +377,41 @@ Beyond what minidsp-rs supports, we add from day one:
 | IRLZ34N MOSFET + diode (12V trigger) | ~$0.50 |
 | **Total** | **~$14** |
 
+## AVS Forum Coverage Audit
+
+Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ posts), Flex HTx thread (400+ posts), and general MiniDSP thread (5,700+ posts). Every unique issue mapped to our plan:
+
+| # | Issue | Frequency | Our fix | Status |
+|---|-------|-----------|---------|--------|
+| 1 | Device unreachable after standby/wake (#765) | COMMON | Auto-reconnect, health checks, exponential backoff | Planned |
+| 2 | Boot race — daemon starts before USB ready (#511) | VERY COMMON | Retry USB enumeration, don't fail on first attempt | Planned |
+| 3 | Concurrent access crashes minidsp-rs (#699) | COMMON | Command queue with arbitration, return "busy" | Planned |
+| 4 | ARM .deb broken on Bookworm (glibc mismatch) | COMMON | We ship native static binaries for all platforms | Solved |
+| 5 | Multi-device setup extremely difficult (#662) | COMMON | Per-device connection isolation, no global lock | Planned |
+| 6 | HTx firmware update breaks minidsp-rs (#701) | MODERATE | DSP 115 definition, auto-detect hw_id, `--force-kind` escape hatch | Planned |
+| 7 | Cannot read config back from device | VERY COMMON | Full config read-back via cmd 0x14 (`ReadFloats`) | Planned |
+| 8 | HID error on newer platforms (RPi5, newer kernels) | MODERATE | Test hidapi on RPi5 + newer kernels during dev | **NEW — needs testing** |
+| 9 | Version upgrade breaks config / bind defaults | COMMON | Design config format from scratch, sane defaults (bind 0.0.0.0) | Planned |
+| 10 | Windows config file location undocumented | MODERATE | Unified config across platforms, XDG/well-known paths | Planned |
+| 11 | Device Console discovery broken via minidsp-rs | COMMON | Proper UDP advertise implementation matching Device Console expectations | Planned |
+| 12 | Intermittent communication timeouts | MODERATE | Connection health checks, retry with backoff | Planned |
+| 13 | 10x10 filter routing overwrites user output EQ | MODERATE | BEQ loads to input PEQ first, overflows to XO biquads, never output PEQ | **NEW — add to design** |
+| 14 | WI-DG is flaky and overpriced ($75) | UNIVERSAL | ESP32-S3 target ($10) does everything WI-DG does and more | Planned |
+| 15 | Levels display broken on non-2x4HD devices | MODERATE | All device types tested with correct level meter addresses from day one | Planned |
+| 16 | Service autostart unreliable across platforms | MODERATE | Ship ready-made systemd units, launchd plists, Windows service config | **NEW — add to deliverables** |
+| 17 | Server/CLI mode conflict (can't run both) | COMMON | Single daemon architecture, CLI commands talk to daemon over socket | Planned |
+| 18 | Flex Eight not supported (#566) | MODERATE | Full definition from Device Console XML | Planned |
+| 19 | Flex HT/HTx incomplete support (#698) | COMMON | Full definition including DSP 115 (new FW with input PEQ) | Planned |
+| 20 | Stale WebSocket state requires browser refresh | MODERATE | Robust WebSocket lifecycle, heartbeat, reconnect | **NEW — add to API design** |
+| 21 | Device Console + minidsp-rs coexistence pain | COMMON | Proper TCP bridge, reliable UDP advertise | Planned |
+| 22 | Preset change briefly mutes audio | LOW | Firmware behavior, not fixable in software | Won't fix |
+| 23 | Python dependency hell installing ezBEQ on RPi | VERY COMMON | ESP32 eliminates the RPi entirely; desktop is a single static binary | Solved |
+| 24 | No per-channel output control via API | MODERATE | Full per-channel API (gain, delay, mute, PEQ) from day one | Planned |
+| 25 | No confirmation that BEQ filter was applied | MODERATE | Config read-back verifies actual device state after write | Planned |
+| 26 | minidsp-rs development appears stalled | BACKGROUND | That's why we exist | Solved |
+
+**4 new items added from this audit:** #8 (HID on newer platforms), #13 (10x10 filter routing), #16 (service management files), #20 (WebSocket lifecycle).
+
 ## Open Questions
 
 1. ~~VBUS power from MiniDSP?~~ **ANSWERED: No.** USB port is sense-only. Two cables required. Not negotiable.
@@ -383,6 +420,8 @@ Beyond what minidsp-rs supports, we add from day one:
 4. **OTA update security** — ESP32 OTA should require authentication. Signed firmware images.
 5. **Multiple clients** — start with single client (WI-DG compat), expand to multi-client with command queue.
 6. **embassy + esp-idf interop** — picoserve needs embassy, but USB Host HID needs esp-idf-sys FFI. Can run embassy executor alongside esp-idf-hal on separate pthreads (proven pattern by ivmarkov). Need to verify this works cleanly for our use case.
+7. **hidapi on RPi5 + newer kernels** — minidsp-rs users report `hid_error is not implemented yet` on newer platforms. Need to test our hidapi usage on RPi5 + Bookworm arm64 early.
+8. **ezBEQ entry ID format** — ezBEQ uses ephemeral `{version}_{index}` IDs (change every catalogue refresh) AND stable SHA-256 `digest` IDs. Our biquad index needs to support both lookup methods. The v3 API's `find()` tries ID first, falls back to digest.
 
 ## MiniDSP Device Console (extracted)
 
@@ -390,9 +429,9 @@ Download URLs (undocumented, found via app auto-updater):
 - macOS (Apple Silicon): `https://phpstack-793508-3229840.cloudwaysapps.com/deviceconsole/latest-macmx`
 - Windows: `https://phpstack-793508-3229840.cloudwaysapps.com/deviceconsole/latest-win`
 
-Full device registry with all extracted data: **see `devices.md`**
+Full device registry with all extracted data: **see `ref-devices.md`**
 
-Extracted app bundle is at `~/code/temp/minidsp-open/MiniDSP Device Console.app/`.
+Extracted app bundle is at `app/MiniDSP Device Console.app/`.
 
 ### Device Support Package
 Location: `Contents/Resources/device_support_package/`
@@ -437,6 +476,108 @@ To get addresses for new devices, two approaches:
 1. **Dump from hardware**: Connect device, use minidsp-rs `debug dump-float 0 255` to read all DSP float registers. Map known values to symbols.
 2. **Reverse the address computation**: The Device Console JS (in app.asar, minified) contains the logic that maps structure layouts to addresses. Could be deobfuscated.
 3. **Compare with existing**: DSP 110 (Flex Eight) likely shares address patterns with DSP 100 (2x4 HD / Flex) since both are 96kHz SHARC. DSP 115 shares with 113 (HTx) with added input PEQ block.
+
+## Additional minidsp-rs Issues to Address
+
+From comprehensive GitHub issue review (34 open, 10 dependabot PRs, last release 2024-10-27):
+
+| Issue | What | Priority | Effort |
+|-------|------|----------|--------|
+| #762 | TCP server doesn't start on Windows 11 | Medium | Easy |
+| #703 | "No devices found" when actually permission denied | Medium | Trivial |
+| #666 | Legacy USB VID 0x04D8 not scanned (miniSHARC, nanoDIGI, old 2x4) | High | Easy |
+| #625 | Negative PEQ coefficients parsed as CLI flags | Low | Trivial |
+| #571 | No CORS headers for REST API | Medium | Trivial |
+| #569 | nanoAVR HDA (hw_id 8) partially broken | Low | 1 day |
+| #245 | PWR-ICE125/250 — deferred, see `FUTURE-pwr-ice.md` | — | Transport (70-byte frames) included; full support needs user packet captures |
+| #229 | MiniDSP 2x4 non-HD (legacy dialect, VID 0x04D8) | Medium | 2 days |
+
+Also: ship OpenAPI docs at `/docs` endpoint (current minidsp-rs docs page is empty). Ship `llms.txt` at webapp root for AI/LLM discoverability of the API.
+
+## Release Artifacts
+
+Must ship pre-built binaries for every platform minidsp-rs users are on:
+
+| Artifact | Target | Notes |
+|----------|--------|-------|
+| `.deb` (armhf) | RPi 32-bit Bullseye/Bookworm | Critical — most ezBEQ setups are RPi |
+| `.deb` (arm64) | RPi 64-bit Bookworm | Growing share of RPi users |
+| `.deb` (amd64) | x86_64 Linux | NAS, server, desktop |
+| `.tar.gz` (aarch64-apple-darwin) | macOS Apple Silicon | |
+| `.tar.gz` (x86_64-apple-darwin) | macOS Intel | |
+| `.exe` / `.msi` (x86_64-windows) | Windows | |
+| `.bin` (ESP32-S3) | ESP32 firmware | Flash via esptool or web flasher |
+
+Each `.deb` includes:
+- Static binary (no runtime deps)
+- udev rules at `/etc/udev/rules.d/70-minidsp.rules`
+- systemd unit at `/lib/systemd/system/minidsp.service` (with `After=dev-bus-usb.target` — no sleep hack)
+- Default config at `/etc/minidsp/config.toml`
+
+GitHub Actions CI builds all artifacts on every tagged release.
+
+## Home Assistant Integration
+
+Existing landscape is fragmented:
+- `trevorwarwick/minidspshd` (SHD-only via Volumio API)
+- `xuio/minidsp-rs-hass` (all devices via WebSocket, 2 stars, brand new)
+- No auto-discovery, no MQTT, no config read-back
+
+Our advantages:
+- **ESP32 with mDNS** = HA auto-discovers MiniDSP devices with zero config
+- **Config read-back** = full device state queryable (volume, preset, source, per-channel gain/delay/PEQ)
+- **Optional MQTT** (phase 2) = direct HA integration without custom component, MQTT discovery for zero-config
+- **WebSocket streaming** = real-time level meters + state changes (compat with existing xuio integration)
+- **Drop-in minidsp-rs API** = existing `minidsp-rs-hass` integration works immediately
+
+## Config Backup & Restore
+
+Full device state is ~2.1 KB per preset (~528 floats × 4 bytes). All 4 presets = ~8.4 KB. Trivially small.
+
+Enabled by config read-back (cmd 0x14, `ReadFloats`):
+- `GET /devices/{id}/config` — full state as JSON
+- `POST /devices/{id}/config` — restore from JSON
+- `GET /devices/{id}/config/export` — Device Console XML format (for interop)
+- `POST /devices/{id}/config/import` — import from Device Console XML
+
+Use cases:
+- **Backup before BEQ load** — save state, load BEQ, restore after movie
+- **Preset cloning** — read preset 1, write to preset 2
+- **Migration** — read from old device, write to new device
+- **Version control** — save configs as JSON files in git
+- **Measurement mode** — save state, flatten all EQ, measure, restore
+
+Modification tokens (EEPROM 0xFFC8, 4 × u32 per preset) detect if another client changed the device since last read. Use for cache invalidation and multi-client coordination.
+
+## Resolved Technical Questions
+
+### picoserve WebSocket: YES
+picoserve v0.18.0 fully supports WebSocket behind the `ws` feature flag. Provides `WebSocketUpgrade` extractor, `SocketRx`/`SocketTx` for async frame I/O, ping/pong, protocol negotiation. Suitable for both ezBEQ API compat and live level streaming.
+
+### Embassy + esp-idf interop: WORKS with caveats
+`embassy-executor` with `arch-std` feature works alongside `esp-idf-svc`. Key: remove `critical-section` from embassy features to avoid conflicts. Known timer driver bugs (esp-idf-svc#619, #630) caused by FreeRTOS priority inversion — fixed by using `embassy-executor` (not `async-executor`) or latest `edge-executor`.
+
+### hidapi on RPi5: NO BLOCKERS
+No Pi 5-specific hidapi issues with standard HID devices. Kernel 6.12.x had a hid-core regression (fixed in 6.12.75). Main issue is permissions — ship udev rules:
+```
+KERNEL=="hidraw*", ATTRS{idVendor}=="2752", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="2752", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+```
+
+### ESP32-S3 USB Host HID: No safe wrapper, FFI required
+No safe Rust wrapper exists. Use `esp-idf-sys` FFI to the ESP-IDF HID Host class driver (`usb_host_hid` component). ~200-300 lines of unsafe glue. Well-tested C API underneath.
+
+### ezBEQ entry ID format: Dual lookup needed
+- Ephemeral: `{git_hash}_{index}` — changes every catalogue refresh
+- Stable: SHA-256 digest of `json.dumps({title, filters, mv, season, episode})`
+- v3 API tries ID first, falls back to digest
+- Our biquad index must support both
+
+### ezBEQ license: MIT (both ezbeq and beqcatalogue)
+Full permission to redistribute UI build artifacts and reprocess catalogue data, including commercially. Must include MIT copyright notice.
+
+### ezBEQ UI build: No separate release artifact
+UI static files are bundled inside the Python wheel on PyPI (in `ezbeq/ui/`). Our GitHub Action must either extract from the wheel or build from source (`cd ui && yarn install && yarn build`).
 
 ## License
 

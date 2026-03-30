@@ -1,7 +1,41 @@
 # minidsp-open: Device Registry
 
 All data extracted from MiniDSP Device Console v2.10.6 (2026-03-29).
-Source: `MiniDSP Device Console.app/Contents/Resources/device_support_package/`
+Sources:
+- `app/MiniDSP Device Console.app/Contents/Resources/device_support_package/` (primary — SHARC devices)
+- `app/apk-extracted/assets/www/js/controllers.js` (miniDSP Controller Android app — confirms source maps, adds legacy devices)
+- minidsp-rs source code (legacy device definitions)
+
+## Dirac-Capable DSP Versions
+
+From miniDSP Controller app: `[61, 94, 95, 101, 105, 111, 113]`
+
+| dsp_version | Device |
+|-------------|--------|
+| 61 | Legacy (unknown, pre-HD) |
+| 94 | Legacy (unknown, pre-HD) |
+| 95 | Legacy (unknown, pre-HD) |
+| 101 | DDRC-24 |
+| 105 | SHD / SHD Studio / SHD Power |
+| 111 | Flex Eight DL |
+| 113 | Flex HT / Flex HTx (old FW, Dirac variant) |
+
+Note: DSP 115 (Flex HT/HTx new FW with input PEQ) is NOT in the Dirac list — it replaces Dirac with input PEQ.
+
+## Legacy Devices (Not in Device Console)
+
+From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-point, 2-byte addresses):
+
+| hw_id | Device | Sources | Notes |
+|-------|--------|---------|-------|
+| 1 | 4x10 HD | SPDIF, TOSLINK, AES-EBU (or "Not Installed" if AN-FP module) | |
+| 2 | miniDSP 2x4 (non-HD) / NanoDigi 2x8 | TOSLINK, SPDIF | Legacy VID 0x04D8 |
+| 3 | PWR-ICE125/250 | LAN-only, see `FUTURE-pwr-ice.md` | dsp_version=51 |
+| 4 | 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | |
+| 5 | 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | |
+| 7 | nanoAVR (variant) | Has HDMI source switching | |
+| 8 | nanoAVR HDA | Has HDMI source switching | minidsp-rs #569, partially broken |
+| 11 | NanoDigi 2x8 (variant) | TOSLINK, SPDIF | |
 
 ## Devices
 

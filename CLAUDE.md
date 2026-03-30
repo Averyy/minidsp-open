@@ -1,6 +1,6 @@
 # minidsp-open
 
-Fork of minidsp-rs. Headless MiniDSP controller — HTTP API, CLI, and MCP server. Runs on Linux/macOS/Windows AND ESP32-S3 from one Rust codebase. No UI.
+Fork of minidsp-rs. Headless MiniDSP controller — HTTP API and CLI. Runs on Linux/macOS/Windows AND ESP32-S3 from one Rust codebase.
 
 ## Project State
 
@@ -11,10 +11,13 @@ Planning/research complete. Not yet coding. All protocol details, device definit
 | File | What |
 |------|------|
 | `minidsp-open.md` | Master planning doc — architecture, protocol, roadmap, effort estimate |
-| `devices.md` | Complete device registry — all hw_ids, DSP IDs, sources, USB PIDs, capabilities |
-| `address-tables.md` | Every DSP register address for all 7 structures (verified against minidsp-rs + Device Console XML) |
-| `MiniDSP Device Console.app/` | Extracted official app — source of truth for device definitions and addresses |
-| `app-extracted/` | Decompiled Device Console JS (minified) — protocol details, command formats |
+| `ref-devices.md` | Complete device registry — all hw_ids, DSP IDs, sources, USB PIDs, capabilities |
+| `ref-address-tables.md` | Every DSP register address for all 7 structures (verified against minidsp-rs + Device Console XML) |
+| `ref-ezbeq.md` | ezBEQ integration plan — protocol, API compat, ESP32 strategy, catalogue pipeline |
+| `app/MiniDSP Device Console.app/` | Extracted official app — source of truth for device definitions and addresses |
+| `app/app-extracted/` | Decompiled Device Console JS (minified) — protocol details, command formats |
+| `app/apk-extracted/` | Decompiled miniDSP Controller Android app — hw_id source maps, flash addresses, legacy devices |
+| `FUTURE-pwr-ice.md` | PWR-ICE125/250 deferred support — protocol details, what we need from users |
 
 ## Goal: Fix Everything Wrong With minidsp-rs
 
@@ -36,19 +39,20 @@ minidsp-rs is an upstream protocol reference (one maintainer, 10 stale dependabo
 | #764 | CDSP 8x12DL not supported | Pending device owner probe |
 | #701 | HTx new firmware breaks existing | DSP 115 definition with input PEQ addresses |
 
-Also: MiniDSP's WI-DG WiFi module is $75 for a MediaTek SoC running OpenWrt that just bridges TCP↔USB HID. Our ESP32-S3 target does the same thing (and more — full HTTP API, MCP server, 12V trigger) on a $10 dev board.
+Also: MiniDSP's WI-DG WiFi module is $75 for a MediaTek SoC running OpenWrt that just bridges TCP↔USB HID. Our ESP32-S3 target does the same thing (and more — full HTTP API, ezBEQ UI, 12V trigger) on a $10 dev board.
 
-Plus features minidsp-rs never had: config read-back, measurement mode, preset import/export, display control, DRE, per-source volume offsets, modification tokens, ESP32 target, MCP server.
+Plus features minidsp-rs never had: config read-back, measurement mode, preset import/export, display control, DRE, per-source volume offsets, modification tokens, ESP32 target, ezBEQ integration, `llms.txt` for AI discoverability.
 
 ## Critical Rules
 
 - **XML is source of truth for addresses.** DSP_default_parameters.xml `idx` attributes are the actual DSP register addresses. Verified 100% match against minidsp-rs for all existing devices.
 - **Drop-in replacement for minidsp-rs.** Every existing minidsp-rs API endpoint, TCP protocol, and UDP discovery packet must work identically. Existing clients (Home Assistant, ezBEQ, mobile apps, CLI scripts) must work without changes. We only add, never remove or break.
-- **No UI.** This is an API/CLI/MCP server. Users interact via HTTP, CLI commands, or MCP clients.
+- **No UI on desktop.** Desktop target is API/CLI only. ESP32 serves ezBEQ's unmodified React UI from flash (auto-updated). Ship `llms.txt` at webapp root for AI/LLM discoverability.
 - **All devices from day one.** Don't subset — the per-device code is just address tables, not logic. Ship every device MiniDSP sells.
 - **Dual target: Linux + ESP32-S3.** Use `cfg(target_os = "espidf")` for platform splits. Protocol crate is shared, transport and HTTP server are platform-specific.
 - **Linux: tokio + axum.** ESP32: embassy + picoserve. Handler logic shared, server wiring `cfg`-gated.
 - **USB HID on ESP32** has no safe Rust wrappers. Use `esp-idf-sys` unsafe FFI to the C USB host API.
+- **No MCP server.** Skipped — zero demand. HTTP API + CLI already usable by LLMs. Ship `llms.txt` instead. Maybe add later as `--mcp` flag if requested.
 - **MIT license.** 100% our code, not a fork. Credit minidsp-rs in README as protocol reference and inspiration.
 
 ## Tech Stack

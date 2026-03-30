@@ -3,7 +3,7 @@
 All addresses extracted from MiniDSP Device Console v2.10.6 `DSP_default_parameters.xml` files.
 Each address is a u16 index into DSP memory (4 bytes per index, float32 LE for new dialect devices).
 
-Source: `MiniDSP Device Console.app/Contents/Resources/device_support_package/DSP_Structures/{dsp_id}/DSP_default_parameters.xml`
+Source: `app/MiniDSP Device Console.app/Contents/Resources/device_support_package/DSP_Structures/{dsp_id}/DSP_default_parameters.xml`
 
 Cross-verified against minidsp-rs address tables for DSP 100 (2x4 HD) — all addresses match exactly.
 

@@ -1,2 +1,3 @@
-MiniDSP Device Console.app/
-app-extracted/
+app/
+.DS_Store
+.playwright-mcp/
