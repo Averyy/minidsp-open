@@ -13,7 +13,7 @@ Three separate repos, one calibration workflow. The end goal is a single app whe
 ### 2. open-sub-optimizer
 **What:** Multi-subwoofer optimizer. Electron + React + TypeScript.
 **Role:** Stage 1 of calibration. Measures each sub individually at multiple seats, runs a JADE/EPSDE optimizer to compute optimal delay, gain, polarity, and PEQ per sub, then pushes the config to MiniDSP hardware. Replaces the REW + MSO + MiniDSP Plugin three-app shuffle.
-**Repo:** `~/code/temp/open-sub-optimizer`
+**Repo:** `~/code/open-sub-optimizer`
 
 ### 3. dirac-sparr
 **What:** Automated Dirac Live calibration client. Electron + React + TypeScript.
