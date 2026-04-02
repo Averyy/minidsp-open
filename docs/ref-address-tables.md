@@ -79,7 +79,7 @@ Input PEQ (10 bands × 5 coeffs):
 | Xover LPF | 4337 | 4440 | 4543 | 4646 | 4749 | 4852 | 4955 | 5058 |
 | Xover HPF | 4357 | 4460 | 4563 | 4666 | 4769 | 4872 | 4975 | 5078 |
 
-## DSP 111 — Flex Eight DL (2 in / 8 out, 48kHz, Dirac)
+## DSP 111 — Flex Eight DL (2 in / 8 out, 96kHz, Dirac)
 
 Params: addr=0, size=3568. Dirac: addr=3568, size=5124, 2 channels, 1088 FIR taps.
 

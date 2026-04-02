@@ -8,10 +8,11 @@ We need a dual-target architecture (Linux + ESP32) from day one, and we have com
 
 minidsp-open adds:
 - ESP32-S3 target (WiFi MiniDSP controller, no computer needed)
-- All missing device definitions (Flex Eight, Flex HT, SHD Power, CDSP 8x12DL)
+- All missing device definitions (Flex Eight, Flex HT, SHD Power) + all legacy devices
 - Config read-back (save/restore full device state)
 - Connection resilience (auto-reconnect, exponential backoff)
-- 12V trigger / power control via ESP32 GPIO
+- ezBEQ on ESP32 (phase 2 — after core is verified)
+- 12V trigger / power control via ESP32 GPIO (future — see `docs/FUTURE-12v-trigger.md`)
 - `llms.txt` at webapp root for AI/LLM discoverability (MCP server skipped — zero demand, maybe later)
 - Fixes for every actionable open issue
 
@@ -65,16 +66,9 @@ axum on ESP32 was proven but too heavy (~30-40KB per connection, OOMs at 5 concu
 ### Power
 ESP32 is USB host, MiniDSP is USB device. **Two cables required** (power + data), same as the WI-DG. The MiniDSP USB port does NOT provide VBUS — it's sense-only (XMOS XU216 uses a voltage divider to detect host presence). The ESP32 must provide its own power AND drive VBUS high on the host cable so the MiniDSP enables its USB interface. Single-cable is not possible.
 
-### 12V Trigger (optional hardware add-on)
-- ESP32 GPIO → IRLZ34N MOSFET → switches MiniDSP DC power
-- API: `POST /trigger/on`, `POST /trigger/off`, `GET /trigger/status`
-- ESP32 stays powered independently — always reachable on WiFi even when MiniDSP is off
-- Optional trigger INPUT: detect receiver power state → auto-power MiniDSP
-- Hardware cost: ~$0.50 (MOSFET + flyback diode)
-- Solves minidsp-rs #663 permanently
+### 12V Trigger + Custom PCB
 
-### Custom PCB (future)
-ESP32-S3-WROOM module, USB-A male plug, LDO, MOSFET for trigger. USB stick form factor. BOM ~$5-8.
+Separate project, after v1. See `docs/FUTURE-12v-trigger.md`.
 
 ## Protocol Reference
 
@@ -226,11 +220,11 @@ One `if/else`, not per-device logic.
 | 1 | other | 4x10 HD | 96 kHz |
 | 2 | 54 | nanoDIGI 2x8 | 96 kHz |
 | 2 | 22 | 2x4 (non-HD) | 96 kHz |
-| **30** | **110/111** | **Flex Eight** (missing) | **96 kHz?** | 2 in (digital only) / 8 out. Sources: Toslink(0)/SPDIF(1)/USB(2)/BT(3). No analog. USB PID 0x0012 (non-DL) / 0x004A (DL). Need config.xml from Device Console. |
-| **31** | **113** | **Flex HT** (missing) | **48 kHz** | 2 in (digital only) / 8 out. Sources: Toslink/SPDIF/USB/HDMI (no analog, shifts IDs vs HTx). Shares DSP structure with HTx. USB PID 0x004B. |
-| **21** | **105** | **SHD Power** (missing) | **96 kHz** | 2 in / 4 out. Sources: Toslink(0)/SPDIF(1)/AES(2)/USB(3)/LAN(4). Same DSP as SHD, just add hw_id + 5-source map. USB PID 0x0045. **Ready to add.** |
-| **32** | **115** | **HTx new firmware** (breaks existing) | **48 kHz** | Same I/O as HTx but adds input PEQ, shifts DSP addresses. Need config.xml from new Device Console. |
-| **??** | **??** | **CDSP 8x12DL** (missing) | **48 kHz** | 8 in / 12 out. Zero data — need probe from device owner. USB PID 0x0047. |
+| **30** | **110/111** | **Flex Eight / Flex Eight DL** | **96 kHz** | 2 in / 8 out. Sources: 1:Toslink, 2:SPDIF, 3:USB, 4:Bluetooth (no analog, idx starts at 1). Address tables complete. |
+| **31** | **113/115** | **Flex HT** | **48 kHz** | 8 in / 8 out. Sources: 1:Toslink, 2:SPDIF, 3:USB, 4:HDMI (no analog). Shares DSP with HTx. Address tables complete. |
+| **21** | **105** | **SHD Power** | **96 kHz** | 2 in / 4 out. Sources: 0:Toslink, 1:SPDIF, 2:AES, 3:USB, 4:LAN. Same DSP as SHD, different source map. |
+| **32** | **115** | **HTx new firmware** | **48 kHz** | Same I/O as HTx but adds input PEQ. Address tables complete (DSP 115). |
+| **??** | **??** | **CDSP 8x12DL** (deferred) | **48 kHz** | 8 in / 12 out. Zero data — need probe from device owner. |
 
 ### Master status (EEPROM 0xFFD8, 9 bytes)
 | Offset | Field |
@@ -273,9 +267,9 @@ Match minidsp-rs endpoints + additions:
 | POST | `/devices/:id/preset/:preset` | Set config preset |
 | **POST** | **`/devices/:id/measurement-mode`** | **Enter measurement mode: save state, set flat/bypass (NEW)** |
 | **POST** | **`/devices/:id/measurement-mode/restore`** | **Exit measurement mode: restore saved state (NEW)** |
-| **POST** | **`/trigger/on`** | **12V trigger on — ESP32 only (NEW)** |
-| **POST** | **`/trigger/off`** | **12V trigger off — ESP32 only (NEW)** |
-| **GET** | **`/trigger/status`** | **12V trigger state — ESP32 only (NEW)** |
+| POST | `/trigger/on` | TODO: 12V trigger on — ESP32 only |
+| POST | `/trigger/off` | TODO: 12V trigger off — ESP32 only |
+| GET | `/trigger/status` | TODO: 12V trigger state — ESP32 only |
 | **GET** | **`/devices/:id/display`** | **Read display settings (brightness, idle timeout) (NEW)** |
 | **POST** | **`/devices/:id/display`** | **Set display brightness/idle (NEW)** |
 | **GET** | **`/devices/:id/dre`** | **Read DRE status (NEW)** |
@@ -286,7 +280,14 @@ Match minidsp-rs endpoints + additions:
 | **POST** | **`/devices/:id/volume-offsets`** | **Set per-source volume offsets (NEW)** |
 | **POST** | **`/devices/:id/preset/import`** | **Import Device Console preset XML file (NEW)** |
 | **GET** | **`/devices/:id/preset/export`** | **Export current preset as Device Console XML (NEW)** |
+| **GET** | **`/debug/log`** | **Ring buffer log snapshot — ESP32 (NEW)** |
+| **GET** | **`/debug/info`** | **JSON system diagnostics: heap, WiFi, USB state, uptime (NEW)** |
+| **POST** | **`/debug/level`** | **Change runtime log level (NEW)** |
+| **GET** | **`/debug/events`** | **SSE live log stream — phase 2 (NEW)** |
+| **GET** | **`/api/system/status`** | **Data partition state, last sync time — ESP32 (NEW)** |
+| **POST** | **`/api/system/reprovision`** | **Reset WiFi, enter SoftAP provisioning — ESP32 (NEW)** |
 | GET | `/openapi.json` | OpenAPI schema |
+| GET | `/llms.txt` | LLM-readable API description |
 | ANY | `/devices/:id/ws` | WebSocket: raw binary frame bridge |
 
 ## Fixes Over minidsp-rs
@@ -300,7 +301,7 @@ Match minidsp-rs endpoints + additions:
 | #699 | Simultaneous connections corrupt state | Command queue with arbitration, return "busy" not silent corruption |
 | #570 | Level streaming blocks preset changes | Interleave commands — pause level reads for state-changing writes |
 | #557 | Delay hard limit too low | Per-device limits from device definition, not global constant |
-| #663 | No standby/power control | 12V trigger via ESP32 GPIO |
+| #663 | No standby/power control | 12V trigger via ESP32 GPIO (deferred — separate project after v1) |
 | #566, #698, #657, #764 | Missing device definitions | All devices included at launch |
 
 ## Device Behavior Notes
@@ -312,40 +313,73 @@ Match minidsp-rs endpoints + additions:
 
 ## ESP32-S3 Constraints
 
-- 512KB SRAM (~300KB available after WiFi/FreeRTOS), optional 8MB PSRAM
+- 512KB SRAM (~150-200KB free heap after WiFi/FreeRTOS), optional 8MB PSRAM
 - WiFi stack: ~60-100KB heap
 - embassy + picoserve: minimal overhead, ~2-4KB per connection (user-controlled buffers)
 - Realistic capacity: 4-8 concurrent connections with headroom for application state
 - USB Host HID: no safe Rust wrappers. Use `esp-idf-sys` unsafe FFI to C API.
 - Device tables: ~15-20KB in flash (.rodata), near-zero heap (all `&'static const`)
 - JSON: serde-json-core (no_std, no alloc) — streams directly to socket via picoserve
-- WiFi provisioning: ESP-IDF built-in captive portal, SSID/password saved to NVS
+- WiFi provisioning: SoftAP + captive portal, SSID/password saved to NVS
+- WiFi reconnection: app-level exponential backoff (ESP-IDF does NOT auto-reconnect)
+- Data partition: LittleFS (wear leveling + power-loss safety), ~5 MB for UI + catalogue
+- Diagnostics: 4KB ring buffer + `/debug/log` + `/debug/info` endpoints (~4.2KB persistent RAM)
+- Command queue: `heapless::Deque` (16 capacity), `embassy_sync` primitives
+- mDNS: `EspMdns` from `esp-idf-svc` (singleton, own FreeRTOS task)
 
 ## Effort Estimate
 
+### Phase 1: Desktop + ESP32 core (ship first, verify it works)
+
 | Component | Time |
 |-----------|------|
-| Fork + repo setup, CI for both targets | 1 day |
-| ESP32 USB Host HID transport (esp-idf-sys FFI) | 3 days |
+| Repo setup, Cargo workspace, CI for both targets | 1 day |
+| Protocol crate: frame encoding, commands, dialect (old + new) | 3 days |
+| SHARC device definitions (7 DSP structures from Device Console XML) | 2 days |
+| Legacy device definitions (6 devices from SigmaStudio config.xml) | 1.5 days |
+| Two-stage device identification + capability tiers | 1 day |
+| Command queue (priority, batch, level pause, preset gating) | 3 days |
 | Config read-back (ReadFloats at device addresses) | 2 days |
 | Measurement mode (save/restore state, flat/bypass) | 2 days |
-| Missing device definitions (Flex Eight, Flex HT, SHD Power, CDSP 8x12DL) | 2 days |
+| Partial write recovery (bypass-first ordering, reconnect retry) | 1 day |
 | Connection resilience (reconnect, backoff, hotplug lifecycle) | 3 days |
-| Multi-client / command arbitration | 2 days |
-| Per-device delay limits | 1 day |
-| ESP32 WiFi provisioning + NVS config | 1 day |
-| ESP32 12V trigger GPIO | 1 day |
-| UDP discovery (shared) | 1 day |
-| TCP bridge server (shared, port 5333) | 1 day |
-| HTTP API server (ESP32 wiring) | 2 days |
-| Measurement mode + config read-back endpoints | 1 day |
-| Testing: minidsp-rs CLI, Device Console, mobile apps | 2 days |
+| Biquad stability validation (warn by default) | 0.5 day |
+| Per-device delay limits | 0.5 day |
+| UDP discovery (shared) + mDNS (`_minidsp._tcp`) | 1.5 days |
+| TCP bridge server (decoded + queued, port 5333) | 1.5 days |
+| HTTP API server (axum wiring) | 2 days |
+| CLI (drop-in minidsp-rs compat, all commands) | 2 days |
+| ESP32 USB Host HID transport (esp-idf-sys FFI) | 3 days |
+| HTTP API server (picoserve wiring, ESP32) | 2 days |
+| ESP32 WiFi provisioning (SoftAP + captive portal) | 1.5 days |
+| ESP32 diagnostics (ring buffer, /debug endpoints) | 1 day |
+| Testing: minidsp-rs CLI compat, Device Console | 2 days |
 | Testing: ESP32 target end-to-end | 2 days |
-| **Total** | **~4 weeks** |
+| **Phase 1 total** | **~36 days sequential, ~7 weeks solo** |
+
+### Phase 2: ezBEQ on ESP32 (after core is verified)
+
+| Component | Time |
+|-----------|------|
+| GitHub Action: catalogue index pipeline (~80 lines Python) | 1 day |
+| ESP32 boot sequence + data partition + auto-update from GitHub Pages | 2 days |
+| ezBEQ backend API (entry ID lookup, biquad write, WebSocket catalogue) | 3 days |
+| Serve ezBEQ React UI from flash | 1 day |
+| Testing: ezBEQ end-to-end on ESP32 | 2 days |
+| **Phase 2 total** | **~9 days sequential, ~2 weeks solo** |
+
+### Separate projects (after v1)
+
+| Component | Time |
+|-----------|------|
+| 12V trigger GPIO + API endpoints | 0.5 day |
+| MQTT discovery + HA entities | 2 days |
+| SSE live log streaming | 1 day |
+| Syslog UDP | 0.5 day |
 
 ## v1 Features From Device Console Extraction
 
-Beyond what minidsp-rs supports, we add from day one:
+Beyond what minidsp-rs supports, we add from day one. Note: preset import/export (2d), per-source volume offsets (1d), and template/offline device (2d) are not yet in the Phase 1 estimate above — add ~5 days if all three ship in phase 1.
 
 | Feature | Commands | Effort |
 |---------|----------|--------|
@@ -361,10 +395,16 @@ Beyond what minidsp-rs supports, we add from day one:
 
 ## Future Additions
 
-- **MCP server** — `/mcp` JSON-RPC/SSE endpoint. Exposes tools: `set_gain`, `set_delay`, `write_peq`, `get_status`, `set_preset`, `read_levels`, `trigger_on`, `trigger_off`, `set_display`, `set_dre`. Design internal API as clean function calls so MCP calls same functions as HTTP handlers.
-- **OTA firmware updates** — ESP32 supports OTA over WiFi natively. Add `/update` endpoint.
-- **Custom PCB** — USB stick form factor with integrated MOSFET for trigger.
-- **Home Assistant integration** — the HTTP API is already HA-friendly. Could add MQTT discovery.
+**After v1 (separate projects):**
+- **12V trigger** — ESP32 GPIO + MOSFET for power control. API endpoints, optional trigger input for receiver power state detection. Solves minidsp-rs #663. Needs hardware validation first.
+- **MQTT discovery + state** — publish HA auto-discovery configs to `homeassistant/{type}/minidsp_{serial}/{entity}/config`. Ongoing state/control via MQTT topics. Complementary to mDNS.
+- **SSE live log streaming** — `GET /debug/events` on ESP32 via picoserve `EventStream`.
+- **Syslog UDP** — optional remote logging for ESP32, configured via API. RFC 5424 format.
+
+**Someday / maybe:**
+- **MCP server** — `/mcp` JSON-RPC/SSE endpoint. Design internal API as clean function calls so MCP calls same functions as HTTP handlers. Zero demand from target audience.
+- **OTA firmware updates** — ESP32 supports OTA over WiFi natively. Add `/update` endpoint. Signed firmware images.
+- **Custom PCB** — USB stick form factor with integrated MOSFET for trigger. BOM ~$5-8.
 - **WiSA speaker management** — full scan/associate/assign/volume protocol (0xF0 subcommands). Low priority, niche audience.
 
 ## Bill of Materials (ESP32 prototype)
@@ -396,7 +436,7 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 | 11 | Device Console discovery broken via minidsp-rs | COMMON | Proper UDP advertise implementation matching Device Console expectations | Planned |
 | 12 | Intermittent communication timeouts | MODERATE | Connection health checks, retry with backoff | Planned |
 | 13 | 10x10 filter routing overwrites user output EQ | MODERATE | BEQ loads to input PEQ first, overflows to XO biquads, never output PEQ | **NEW — add to design** |
-| 14 | WI-DG is flaky and overpriced ($75) | UNIVERSAL | ESP32-S3 target ($10) does everything WI-DG does and more | Planned |
+| 14 | WI-DG is flaky and overpriced ($75) | UNIVERSAL | ESP32-S3 target ($10) replaces WI-DG | Planned |
 | 15 | Levels display broken on non-2x4HD devices | MODERATE | All device types tested with correct level meter addresses from day one | Planned |
 | 16 | Service autostart unreliable across platforms | MODERATE | Ship ready-made systemd units, launchd plists, Windows service config | **NEW — add to deliverables** |
 | 17 | Server/CLI mode conflict (can't run both) | COMMON | Single daemon architecture, CLI commands talk to daemon over socket | Planned |
@@ -417,11 +457,18 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 1. ~~VBUS power from MiniDSP?~~ **ANSWERED: No.** USB port is sense-only. Two cables required. Not negotiable.
 2. ~~axum vs picoserve on ESP32~~ **ANSWERED: picoserve + embassy.** axum works but OOMs at 5 connections (~30-40KB each). picoserve uses zero heap with user-controlled buffers. Linux keeps axum, ESP32 uses picoserve. Handler logic shared.
 3. ~~Missing device config.xml files~~ **RESOLVED.** Device Console app extracted (see below). All DSP structure layouts, default parameters, source mappings, and firmware files obtained. SHD Power trivial (same DSP 105, add hw_id 21 + 5-source map). Flex Eight (DSP 110/111), Flex HT/HTx new FW (DSP 115) all have full structure layouts. Address tables to be computed from layouts or dumped via `debug dump-float`. Only CDSP 8x12DL still needs a device owner.
-4. **OTA update security** — ESP32 OTA should require authentication. Signed firmware images.
-5. **Multiple clients** — start with single client (WI-DG compat), expand to multi-client with command queue.
-6. **embassy + esp-idf interop** — picoserve needs embassy, but USB Host HID needs esp-idf-sys FFI. Can run embassy executor alongside esp-idf-hal on separate pthreads (proven pattern by ivmarkov). Need to verify this works cleanly for our use case.
-7. **hidapi on RPi5 + newer kernels** — minidsp-rs users report `hid_error is not implemented yet` on newer platforms. Need to test our hidapi usage on RPi5 + Bookworm arm64 early.
-8. **ezBEQ entry ID format** — ezBEQ uses ephemeral `{version}_{index}` IDs (change every catalogue refresh) AND stable SHA-256 `digest` IDs. Our biquad index needs to support both lookup methods. The v3 API's `find()` tries ID first, falls back to digest.
+4. ~~OTA update security~~ — ESP32 OTA should require authentication. Signed firmware images.
+5. ~~Multiple clients~~ **RESOLVED.** Single executor task with priority queue. See Command Queue Architecture section.
+6. ~~embassy + esp-idf interop~~ **RESOLVED.** `embassy-executor` with `arch-std` works alongside `esp-idf-svc`. See Resolved Technical Questions.
+7. ~~hidapi on RPi5 + newer kernels~~ **RESOLVED.** No blockers. See Resolved Technical Questions.
+8. ~~ezBEQ entry ID format~~ **RESOLVED.** Dual lookup: ephemeral `{git_hash}_{index}` + stable SHA-256 digest. v3 API tries ID first, falls back to digest.
+9. ~~Legacy device address tables~~ **RESOLVED.** SigmaStudio config.xml exports available for all devices. See `docs/ref-legacy-devices.md`.
+10. ~~Command pacing / multi-client~~ **RESOLVED.** See Command Queue Architecture section.
+11. ~~ESP32 boot without internet~~ **RESOLVED.** See ESP32 Boot Sequence section.
+12. ~~WiFi provisioning~~ **RESOLVED.** SoftAP + captive portal. See ESP32 Boot Sequence section.
+13. ~~mDNS service type~~ **RESOLVED.** `_minidsp._tcp` on port 5380. See Network Discovery section.
+14. ~~Biquad validation~~ **RESOLVED.** Warn by default, opt-in reject. See Biquad Stability Validation section.
+15. ~~ESP32 logging~~ **RESOLVED.** Ring buffer + HTTP endpoint. See ESP32 Diagnostics section.
 
 ## MiniDSP Device Console (extracted)
 
@@ -429,7 +476,7 @@ Download URLs (undocumented, found via app auto-updater):
 - macOS (Apple Silicon): `https://phpstack-793508-3229840.cloudwaysapps.com/deviceconsole/latest-macmx`
 - Windows: `https://phpstack-793508-3229840.cloudwaysapps.com/deviceconsole/latest-win`
 
-Full device registry with all extracted data: **see `ref-devices.md`**
+Full device registry with all extracted data: **see `docs/ref-devices.md`**
 
 Extracted app bundle is at `app/MiniDSP Device Console.app/`.
 
@@ -489,7 +536,7 @@ From comprehensive GitHub issue review (34 open, 10 dependabot PRs, last release
 | #625 | Negative PEQ coefficients parsed as CLI flags | Low | Trivial |
 | #571 | No CORS headers for REST API | Medium | Trivial |
 | #569 | nanoAVR HDA (hw_id 8) partially broken | Low | 1 day |
-| #245 | PWR-ICE125/250 — deferred, see `FUTURE-pwr-ice.md` | — | Transport (70-byte frames) included; full support needs user packet captures |
+| #245 | PWR-ICE125/250 — deferred, see `docs/FUTURE-pwr-ice.md` | — | Transport (70-byte frames) included; full support needs user packet captures |
 | #229 | MiniDSP 2x4 non-HD (legacy dialect, VID 0x04D8) | Medium | 2 days |
 
 Also: ship OpenAPI docs at `/docs` endpoint (current minidsp-rs docs page is empty). Ship `llms.txt` at webapp root for AI/LLM discoverability of the API.
@@ -519,16 +566,16 @@ GitHub Actions CI builds all artifacts on every tagged release.
 ## Home Assistant Integration
 
 Existing landscape is fragmented:
-- `trevorwarwick/minidspshd` (SHD-only via Volumio API)
-- `xuio/minidsp-rs-hass` (all devices via WebSocket, 2 stars, brand new)
-- No auto-discovery, no MQTT, no config read-back
+- `trevorwarwick/minidspshd` (8 stars, SHD-only via `_Volumio._tcp` zeroconf → Volumio HTTP API port 3000)
+- `xuio/minidsp-rs-hass` (2 stars, all devices via WebSocket at `ws://host:5380`, no auto-discovery)
+- None use UDP 3999 discovery or mDNS for DSP control
 
 Our advantages:
-- **ESP32 with mDNS** = HA auto-discovers MiniDSP devices with zero config
+- **Drop-in minidsp-rs API** = existing `minidsp-rs-hass` WebSocket integration works immediately, zero changes
+- **mDNS hostname** = reachable by name (`minidsp-plum.local`) instead of IP. `_minidsp._tcp` service advertised for future HA zeroconf integration (no HA component exists yet — not auto-discovery today)
 - **Config read-back** = full device state queryable (volume, preset, source, per-channel gain/delay/PEQ)
-- **Optional MQTT** (phase 2) = direct HA integration without custom component, MQTT discovery for zero-config
+- **MQTT discovery** (future) = native HA entities without custom component
 - **WebSocket streaming** = real-time level meters + state changes (compat with existing xuio integration)
-- **Drop-in minidsp-rs API** = existing `minidsp-rs-hass` integration works immediately
 
 ## Config Backup & Restore
 
@@ -582,3 +629,348 @@ UI static files are bundled inside the Python wheel on PyPI (in `ezbeq/ui/`). Ou
 ## License
 
 MIT. 100% our code, not a fork. Credit minidsp-rs in README as protocol reference and inspiration.
+
+## Legacy Device Support
+
+**All legacy devices included at launch.** Full details in `docs/ref-legacy-devices.md`.
+
+### Address table sourcing (clean-room)
+
+- **SHARC devices (hw_id 10-32):** Address tables extracted from Device Console XML (`DSP_default_parameters.xml`). Already complete in `docs/ref-address-tables.md`.
+- **Legacy ADAU1445 devices (hw_id 1-8):** Address tables extracted from SigmaStudio config.xml exports — these are MiniDSP device data files, not minidsp-rs code. We write our own extraction code and device definitions.
+- We do NOT copy minidsp-rs's generated Rust files or their codegen pipeline. Same principle as SHARC devices: use the manufacturer's source data, write all code ourselves.
+
+### Device inventory at launch
+
+**Full support (13 devices):**
+
+| Category | Devices |
+|----------|---------|
+| SHARC / New dialect | 2x4 HD, DDRC-24, Flex, Flex DL, SHD, SHD Studio, SHD Power, Flex Eight, Flex Eight DL, Flex HT, Flex HTx (both DSP 113 + 115) |
+| Legacy / Old dialect | 4x10 HD, 10x10 HD, NanoDigi 2x8 |
+| Legacy / New dialect (SHARC despite age) | miniSHARC 4x8, DDRC-88BM, C-DSP 8x12 v2 |
+
+**Basic support only (3 devices):** miniDSP 2x4 non-HD, nanoAVR, nanoAVR HDA — volume/mute/preset/source only, no PEQ. No config.xml exists for nanoAVR/HDA.
+
+**Deferred:** PWR-ICE (see `docs/FUTURE-pwr-ice.md`), CDSP 8x12DL (need device owner probe).
+
+### Effort: ~1.5 days
+
+| Task | Time |
+|------|------|
+| Config.xml parser (shared, simple XML) | 2 hours |
+| Dialect layer (5.23 fixed-point codec + 2-byte addr) | 2-3 hours |
+| 6 legacy device definitions (extract from config.xml) | 3-6 hours |
+| Wire up 2x4 non-HD from existing symbols | 1-2 hours |
+| nanoAVR/HDA basic support stubs | 30 min |
+| Probe entries for all hw_ids | 30 min |
+
+## Command Queue Architecture
+
+Single executor task owns the transport. All commands from all clients go through a priority queue. Full details in `docs/ref-command-pacing.md`.
+
+### USB HID timing (measured)
+
+- Round-trip: ~3ms per simple command
+- Practical sustained throughput: ~150-250 commands/second
+- Preset switch: 4-5 seconds device-side processing after ACK
+- Protocol is strictly synchronous: one command in flight, one response. No command tagging.
+
+### Priority levels
+
+| Priority | Category | Examples | On busy |
+|----------|----------|----------|---------|
+| 0 (LOW) | Telemetry | Level meters, compressor meters | Skip this cycle (`try_enqueue`) |
+| 1 (NORMAL) | Status reads | get_master_status, TCP bridge commands | Queue and wait (10s timeout) |
+| 2 (HIGH) | Config writes | PEQ, gain, delay, volume, source | Queue as batch, response after all complete |
+| 3 (CRITICAL) | State transitions | Preset switch, FIR load, measurement mode | Must complete, blocks all else |
+
+### Key behaviors
+
+- **Batch operations** (ezBEQ's 40-command PEQ load) execute contiguously — not interleaved with level reads
+- **Level polling pauses** during batch operations, resumes after completion
+- **Post-preset-switch gating:** Queue enters DeviceBusy state, polls device status every 500ms until preset confirms changed, before allowing further commands
+- **TCP bridge decoded and queued:** Device Console commands go through the same queue as everything else. Unrecognized command bytes pass through as raw frames at NORMAL priority — never reject a valid frame. This preserves compatibility with any Device Console version.
+- **Per-device queues:** Each physical device gets its own queue and executor task. No global lock.
+- **ESP32 adaptation:** `heapless::Deque` (16 capacity), `embassy_sync` primitives, 500ms level interval
+
+### Why not minidsp-rs's approach
+
+minidsp-rs uses a Mutex on the transport write + Hub broadcast. This causes:
+- Level polling holds SharedService Mutex, starving all other commands (#570)
+- TCP bridge does raw frame forwarding with zero serialization (#699)
+- No "busy" response to callers — commands silently queue or fail
+- No pause mechanism for level polling during batch operations
+- Preset switch doesn't gate subsequent commands
+
+## Partial Write Recovery
+
+WriteBiquad (cmd 0x30) always saves to flash immediately (0x80 flag hardcoded). No RAM-only mode for biquads. No transaction mechanism. Each PEQ write is instantly active on the audio path AND persisted.
+
+### Strategy: Bypass-first write ordering + idempotent retry
+
+**During batch PEQ writes (ezBEQ filter load, API batch, etc.):**
+
+1. Bypass all target PEQ bands first (`bypass on` for each)
+2. Write all biquad coefficients
+3. Un-bypass the written bands (`bypass off` for each)
+
+If interrupted after step 1 but before step 3: bands are silent (bypassed) rather than in a mixed old/new state. Sonically safe.
+
+**On reconnect after interrupted batch:**
+- Pending batch is saved in connection state
+- On auto-reconnect, re-send the entire batch from the beginning
+- Biquad writes are idempotent — rewriting an already-written band is harmless
+
+**Optional verification after batch completion:**
+- Read back written registers via `ReadFloats` (cmd 0x14)
+- Compare against intended values
+- If mismatch, log warning and retry once
+
+**What we do NOT implement:**
+- No read-before-write rollback (adds latency, can't rollback if disconnected anyway)
+- No RAM-only pseudo-commit (protocol doesn't support it for biquads)
+- No journaling (overkill — device survives power loss fine)
+
+**CLI compatibility note:** When running `minidsp -f <file>`, commands execute exactly as given in the file (preserving ezBEQ's exact ordering). The bypass-first ordering is only used for our batch API endpoints, not for sequential CLI commands. This preserves drop-in compatibility.
+
+## Device Identification: Two-Stage Matching
+
+minidsp-rs uses a single `match (hw_id, dsp_version)` that falls to Generic on unknown combinations, losing all PEQ/crossover/metering capability. We split into two stages.
+
+### Stage 1: Match dsp_version → DSP address table
+
+```
+dsp_version 100 → DSP_100 (2x4 HD / Flex)
+dsp_version 101 → DSP_101 (DDRC-24 / Flex DL)
+dsp_version 105 → DSP_105 (SHD / SHD Studio / SHD Power)
+dsp_version 110 → DSP_110 (Flex Eight)
+dsp_version 111 → DSP_111 (Flex Eight DL)
+dsp_version 113 → DSP_113 (Flex HT/HTx old FW)
+dsp_version 115 → DSP_115 (Flex HT/HTx new FW)
+(legacy dsp_versions for old-dialect devices)
+unknown       → None (Tier 1 only)
+```
+
+### Stage 2: Match hw_id → device profile (source names, features)
+
+```
+(hw_id 10, dsp 100) → 2x4 HD profile
+(hw_id 10, dsp 101) → DDRC-24 profile
+(hw_id 30, dsp 110) → Flex Eight profile
+...
+unknown             → None (generic source names)
+```
+
+### Capability tiers
+
+| Tier | Requirements | What works |
+|------|-------------|-----------|
+| Universal | Always | Volume, mute, preset, source by index, hardware info, flash read/write |
+| DspKnown | Known dsp_version | + Full PEQ/crossover/delay/compressor/FIR/metering, config read-back |
+| Full | Known hw_id | + Source names, display control, DRE, Dirac, per-source volume offsets |
+
+A new hw_id that reuses an existing DSP structure (e.g., hypothetical Flex Eight-N with DSP 110) automatically gets Tier 2 — full PEQ/crossover/delay/metering — even though we don't know its source names. minidsp-rs would drop it to Generic and lose everything.
+
+### CLI flags (backward compatible)
+
+- `--force-kind {type}` — backward compat alias, maps to both DSP structure and device profile (same behavior as minidsp-rs)
+- `--force-device {name}` — override device profile only (new)
+- `--force-dsp {id}` — override DSP structure only, keep auto-detected hw_id for source mapping (new, safer)
+
+### Unknown device communication
+
+CLI output for unknown device:
+```
+Connected to unknown device (hw_id=35, dsp_version=110, serial=901500)
+DSP structure recognized: Flex Eight (2 in / 8 out)
+Source names unavailable — use 'minidsp source 1' (numeric index)
+Full DSP control available (PEQ, crossover, delay, FIR, metering)
+Report this device: https://github.com/.../issues/new?template=new-device
+```
+
+API response includes capability tier and degraded_reason. No telemetry — clear error message with GitHub issue template link.
+
+## Biquad Stability Validation
+
+Unstable biquad coefficients (poles outside unit circle) cause DSP oscillation → loud noise → potential speaker damage. Neither the ADAU1445 nor ADSP-21489 validate coefficients on hardware. CamillaDSP validates and rejects; minidsp-rs does not.
+
+### The check (trivial)
+
+```rust
+fn is_stable(a1: f32, a2: f32) -> bool {
+    a1.is_finite() && a2.is_finite()
+        && a2.abs() < 1.0
+        && a1.abs() < 1.0 + a2
+}
+```
+
+Two comparisons per biquad. Nanoseconds on any platform.
+
+### Behavior (warn by default, opt-in reject)
+
+**Drop-in compatibility rule: we only add, never break.** minidsp-rs accepts any coefficients. Rejecting by default would break existing scripts. Instead:
+
+| Path | Default behavior | Opt-in strict mode |
+|------|-----------------|-------------------|
+| CLI `peq set` | Warn to stderr, write anyway | `--strict` rejects with error |
+| HTTP API | Warn in response JSON, write anyway | `?strict=true` returns 400 |
+| ezBEQ batch | Warn in log, write anyway | Strict mode per-request |
+| Config import (preset restore) | Warn in log, write anyway | N/A (came from device) |
+| TCP proxy (Device Console) | No validation | N/A (transparent proxy) |
+
+Warning message in plain English: explains the risk, suggests checking sample rate mismatch (most common cause of bad coefficients from REW), shows the offending coefficients.
+
+## Network Discovery
+
+Run all three mechanisms simultaneously. No conflicts.
+
+### UDP broadcast (port 3999) — required for Device Console
+
+Exact packet format from minidsp-rs protocol. Magic bytes `0x80 0x00 0x05 0xA0`, MAC, IP, hw_id, dsp_version, serial, hostname. Broadcast every 1 second. Required for Device Console and MiniDSP mobile app compatibility.
+
+### mDNS — hostname resolution + service advertisement
+
+Primarily useful for `.local` hostname resolution so users can reach ESP32 by name instead of IP. Service advertisement (`_minidsp._tcp`) is cheap infrastructure for a future HA integration but does NOT provide HA auto-discovery today — no HA component exists that listens for it. The existing `minidsp-rs-hass` integration works with our API out of the box via manually configured WebSocket.
+
+**Service type:** `_minidsp._tcp` on port 5380
+
+**Hostname:** `minidsp-{word}.local` — human-friendly, deterministic from serial number
+
+Default hostname is derived by hashing the device serial number (EEPROM 0xFFFE) into a ~50-word list of short (3-5 letter), unambiguous, easy-to-type words. Examples:
+```
+minidsp-plum.local
+minidsp-oak.local
+minidsp-reef.local
+```
+
+User-settable via NVS — the SoftAP provisioning page includes a "Device name" field. Users with multiple devices can set meaningful names:
+```
+minidsp-sub.local       (subwoofer DSP)
+minidsp-main.local      (main speakers)
+```
+
+Or clear the suffix for single-device setups: just `minidsp.local`.
+
+Word list: ~50 words, ~250 bytes in flash. Short, distinct, no homophones, no profanity, no confusable spellings. For the near-zero chance of collision on the same network, mDNS conflict resolution (RFC 6762 Section 9) auto-appends `-2`.
+
+**Instance name:** `MiniDSP 2x4 HD` (friendly name, visible in network browsers)
+
+**TXT records:**
+```
+txtvers=1  hwid=10  dsp=100  model=2x4HD  serial=AB64
+fw=1.85  api=5380  tcp=5333  ezbeq=1
+```
+
+**Secondary service:** `_http._tcp` on port 5380 with `path=/` and `vendor=minidsp` for generic service browsers.
+
+### Implementation
+
+- **ESP32:** `EspMdns` from `esp-idf-svc` (~10 lines, singleton, runs own FreeRTOS task)
+- **Linux:** `mdns-sd` crate (pure Rust, tokio-compatible, no avahi dependency)
+- Both also run UDP 3999 broadcast for Device Console compat
+
+### Home Assistant (future)
+
+No HA custom component at launch. The existing `minidsp-rs-hass` WebSocket integration works with our drop-in API immediately.
+
+Future HA integration could use `_minidsp._tcp` zeroconf for auto-discovery. MQTT discovery (phase 2) would provide native HA entities without a custom component. Neither is needed for launch — the existing ecosystem works as-is.
+
+## ESP32 Boot Sequence
+
+Full details in `docs/ref-esp32-boot.md`.
+
+### Boot flow
+
+```
+POWER ON
+  → Init NVS + hardware + USB HID host (blocking, fast)
+  → Check NVS for WiFi creds
+    → No creds: SoftAP provisioning (see below)
+  → Connect WiFi (30s window, exponential backoff: 1s base, 2x, 60s cap)
+    → Timeout: start HTTP API anyway if data exists, keep retrying
+  → Got IP: start HTTP API + mDNS immediately (serve whatever is in flash)
+  → Fetch manifest.json in background (3s timeout)
+    → Up to date: done
+    → Changed: download files (15s timeout each, non-blocking for API)
+    → Failed: log warning, serve stale data
+  → READY
+```
+
+**Key principle: the MiniDSP is always controllable.** USB HID works regardless of WiFi. minidsp-rs API works the moment WiFi is up. Only ezBEQ catalogue browsing degrades.
+
+### Data partition states
+
+| State | minidsp-rs API | ezBEQ UI | ezBEQ catalogue |
+|-------|---------------|----------|-----------------|
+| EMPTY (first boot) | Fully functional | 503 "Downloading..." | Empty list |
+| STALE (update check failed) | Fully functional | Works normally | Old data |
+| CURRENT (matches manifest) | Fully functional | Works normally | Current data |
+
+Expose via `GET /api/system/status` → `{"data_state": "stale", "last_sync": "...", "last_check_error": "timeout"}`.
+
+### WiFi provisioning: SoftAP + captive portal
+
+Matching WLED/Tasmota/ESPHome pattern. No app install required.
+
+1. Device starts SoftAP: SSID `minidsp-setup` (open network)
+2. DNS redirect triggers captive portal on phone/laptop
+3. Web page: scan available networks, pick one, enter password, optionally set device name (for mDNS hostname)
+4. Save to NVS, switch to STA mode, connect
+5. Success: restart into normal mode. Failure: re-enter SoftAP with error message.
+
+Re-provisioning: after N consecutive AUTH_FAIL (code 202) disconnects, automatically re-enter provisioning. Or `POST /api/system/reprovision`.
+
+Consider `esp-wifi-provisioning` crate (v0.1.0, March 2026) as starting point.
+
+### WiFi reconnection
+
+ESP-IDF does NOT auto-reconnect. Our application handles it:
+
+- Exponential backoff: 1s base, 2x multiplier, 60s cap, 20 retries before 5-minute pause
+- Distinguish reason codes: AUTH_FAIL (202) = wrong password → limited retries, then re-provision. BEACON_TIMEOUT (200) = AP went away → retry aggressively. NO_AP_FOUND (201) → retry with backoff.
+- On disconnect: close all WebSocket/TCP connections, stop HTTP listener
+- On reconnect + got-IP: restart HTTP server, re-bind listeners. Clients must reconnect.
+
+### Flash wear
+
+Data partition: LittleFS (wear leveling + power-loss safety + directory support).
+
+- NOR flash: 100,000 erase cycles per sector minimum
+- 5 MB partition = 1,280 sectors with wear leveling
+- Catalogue updates ~2x/week → 62 erases/sector/year → **1,600+ years flash life**
+- Version check before write: boots with no update cause **zero flash erases**
+
+## ESP32 Diagnostics
+
+Full details in `docs/ref-esp32-logging.md`.
+
+### Phase 1 (ship with v0.1)
+
+**Custom `log::Log` implementation** that writes to both:
+- UART (via EspIdfLogger delegation — always on)
+- 4KB ring buffer in RAM (~40-80 log lines at INFO level)
+
+**Endpoints:**
+- `GET /debug/log` — snapshot of ring buffer as plain text (ESP-IDF format: `I (12345) usb: connected`)
+- `GET /debug/info` — JSON system diagnostics: `{firmware, uptime_secs, heap_free, heap_min_free, wifi: {connected, ssid, rssi, ip}, usb: {connected, device, hw_id, serial, reconnects, last_cmd_ms}, log_level, log_buffer_used}`
+- `POST /debug/level` — change runtime log level within compiled range
+
+### Phase 2
+
+- `GET /debug/events` — SSE live log streaming (picoserve has native `EventStream` support)
+- Syslog UDP (optional, configured via API)
+
+### Key decisions
+
+- `log` crate (not `tracing` — too heavy for ESP32)
+- Plain text format (not JSON lines — 2-4x smaller, matches UART output)
+- Compile-time `max_level_info` in release builds (strips DEBUG/TRACE calls)
+- **Keep diagnostic infrastructure in release builds** — the whole point is diagnosing deployed devices
+- Total persistent RAM cost: ~4.2KB
+
+### Desktop target
+
+- `tracing` + `tracing-subscriber`, log to stderr, `RUST_LOG` env var
+- Same `/debug/log` and `/debug/info` endpoints for consistency
+- Optional `--log-file` flag
