@@ -14,7 +14,8 @@ Planning/research complete. Not yet coding. All protocol details, device definit
 
 | File | What |
 |------|------|
-| `minidsp-open.md` | Master planning doc — architecture, protocol, roadmap, effort estimate |
+| `PROJECT.md` | Scope of work — architecture, protocol reference, device tables, goals, effort estimates |
+| `PROGRESS.md` | Checklist of all tasks by phase — tick off as we go |
 | `docs/ref-devices.md` | Complete device registry — all hw_ids, DSP IDs, sources, USB PIDs, capabilities |
 | `docs/ref-address-tables.md` | Every DSP register address for all 7 SHARC structures (verified against minidsp-rs + Device Console XML) |
 | `docs/ref-legacy-devices.md` | Legacy ADAU1445 device analysis — address tables, dialect, config.xml source data |
@@ -25,6 +26,7 @@ Planning/research complete. Not yet coding. All protocol details, device definit
 | `app/MiniDSP Device Console.app/` | Extracted official app — source of truth for device definitions and addresses |
 | `app/app-extracted/` | Decompiled Device Console JS (minified) — protocol details, command formats |
 | `app/apk-extracted/` | Decompiled miniDSP Controller Android app — hw_id source maps, flash addresses, legacy devices |
+| `docs/shared-understanding.md` | How this project fits with open-sub-optimizer and dirac-sparr |
 | `docs/FUTURE-12v-trigger.md` | 12V trigger — GPIO power control, hardware design, API, separate project after v1 |
 | `docs/FUTURE-pwr-ice.md` | PWR-ICE125/250 deferred support — protocol details, what we need from users |
 

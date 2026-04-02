@@ -90,4 +90,4 @@ ESP32-S3-WROOM module, USB-A male plug, LDO, MOSFET for trigger. USB stick form 
 ## Related
 
 - minidsp-rs #663: "Feature request: standby/power control"
-- minidsp-open.md: Device Behavior Notes (no standby control via USB/TCP)
+- PROJECT.md: Device Behavior Notes (no standby control via USB/TCP)
