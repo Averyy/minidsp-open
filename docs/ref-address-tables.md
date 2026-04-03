@@ -108,9 +108,9 @@ Mixer:      [36..43]    Comp:      [44..51]    Output: [52..59]
 | Xover LPF | 124 | 228 | 332 | 436 | 540 | 644 | 748 | 852 |
 | Xover HPF | 144 | 248 | 352 | 456 | 560 | 664 | 768 | 872 |
 
-## DSP 115 — Flex HT/HTx new FW (8 in / 8 out, 48kHz, bass mgmt + Dirac + input PEQ)
+## DSP 115 — Flex HT/HTx new FW (8 in / 8 out, 48kHz, bass mgmt + input PEQ)
 
-Params: addr=0, size=8224. Dirac: addr=8224, size=3332, 8 channels, 640 FIR taps.
+Params: addr=0, size=8224. Dirac block in XML layout: addr=8224, size=3332, 8 channels, 640 FIR taps — but inactive per firmware (DSP 115 not in Dirac-capable list; firmware replaced Dirac with input PEQ).
 
 ### Bass Management BPF Crossover
 ```
@@ -185,7 +185,7 @@ DSP 113 (old firmware) is identical to 115 EXCEPT:
 - No input PEQ (addresses 1656-2055 don't exist)
 - Output channels use internal numbers 1-8 (not 9-16)
 - Params size: 6624 (not 8224)
-- Dirac base: 6624 (not 8224)
+- Dirac block base: 6624 (not 8224) — DSP 113 IS Dirac-capable (in Android app list), DSP 115 is NOT (Dirac block present in XML layout but inactive in firmware)
 - Everything from addr 0 to 823 is identical between 113 and 115
 
 ## Notes

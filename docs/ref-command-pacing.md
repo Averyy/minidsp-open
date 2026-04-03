@@ -2,6 +2,18 @@
 
 Research findings for minidsp-open command queue architecture.
 
+## Concurrency Rules
+
+All paths to the device go through a single-executor command queue. No code touches USB/TCP writes directly.
+
+| Interface | Connection limit | Priority | Arbitration |
+|-----------|-----------------|----------|-------------|
+| **TCP bridge (port 5333)** | 1 connection (WI-DG compat) | NORMAL | Second connection rejected. Commands decoded and queued. |
+| **HTTP API (port 5380)** | Unlimited | HIGH for writes, NORMAL for reads | Queue depth limit (64) → 503 if full. |
+| **WebSocket levels** | Unlimited (subscribe to broadcast) | LOW | One shared poll task, droppable. Paused during batch ops. |
+| **CLI** | N/A (talks to HTTP API) | Same as HTTP | CLI never touches USB directly. |
+| **Device Console** | Via TCP bridge (counts as the 1 TCP client) | NORMAL | Coexists with HTTP clients through the queue. |
+
 ## 1. USB HID Round-Trip Time
 
 ### Theoretical Limits

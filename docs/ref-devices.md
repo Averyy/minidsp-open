@@ -18,9 +18,11 @@ From miniDSP Controller app: `[61, 94, 95, 101, 105, 111, 113]`
 | 101 | DDRC-24 |
 | 105 | SHD / SHD Studio / SHD Power |
 | 111 | Flex Eight DL |
-| 113 | Flex HT / Flex HTx (old FW, Dirac variant) |
+| 113 | Flex HT / Flex HTx (old FW) |
 
-Note: DSP 115 (Flex HT/HTx new FW with input PEQ) is NOT in the Dirac list — it replaces Dirac with input PEQ.
+Note: DSP 115 (Flex HT/HTx new FW with input PEQ) is NOT in the Dirac list — the firmware replaced Dirac with input PEQ. The Device Console XML still contains Dirac address blocks for DSP 115 (layout artifact from the shared structure), but the firmware does not activate them.
+
+Dirac capability here means the firmware has the code path and valid DSP addresses. Whether Dirac is actually active depends on product licensing — not all products shipping with a Dirac-capable DSP version have Dirac enabled.
 
 ## Legacy Devices (Not in Device Console)
 
@@ -142,7 +144,7 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | FIR | No | No |
 | Compressor | Yes | Yes |
 | Crossover | Yes (includes bass management HPF/LPF) | Yes |
-| Dirac | No | No |
+| Dirac | Yes (firmware capable) | No (replaced by input PEQ) |
 | Presets | 4 | 4 |
 | USB VID/PID | 0x2752/0x004B | Same |
 | USB audio name (macOS) | miniDSP Flex HT | Same |
@@ -173,7 +175,7 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | FIR | No | No |
 | Compressor | Yes | Yes |
 | Crossover | Yes (includes bass management) | Yes |
-| Dirac | No | No |
+| Dirac | Yes (firmware capable) | No (replaced by input PEQ) |
 | Presets | 4 | 4 |
 | USB VID/PID | 0x2752/0x004B | Same |
 | USB audio name (macOS) | miniDSP Flex HTx | Same |
@@ -291,8 +293,8 @@ hw_id 21 (SHD Power):     0:Toslink, 1:SPDIF,   2:AES-EBU, 3:USB, 4:LAN   ← 5 
 | 105 | SHD, SHD Studio, SHD Power | 96kHz | 2/4 | No | No | Dirac-only, no input PEQ |
 | 110 | Flex Eight | 96kHz | 2/8 | Yes (10) | Yes (4096 taps) | 8 outputs |
 | 111 | Flex Eight DL | 96kHz | 2/8 | Yes (10) | Yes | Dirac variant of 110 |
-| 113 | Flex HT*, Flex HTx* | 48kHz | 8/8 | **No** | No | Old firmware, no input PEQ |
-| 115 | Flex HT, Flex HTx | 48kHz | 8/8 | **Yes (10)** | No | New firmware, adds input PEQ + bass management |
+| 113 | Flex HT*, Flex HTx* | 48kHz | 8/8 | **No** | No | Old firmware, Dirac capable, no input PEQ |
+| 115 | Flex HT, Flex HTx | 48kHz | 8/8 | **Yes (10)** | No | New firmware, adds input PEQ + bass management, no Dirac |
 
 ## What's Needed to Generate Address Tables
 

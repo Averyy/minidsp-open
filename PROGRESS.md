@@ -23,7 +23,7 @@
 - [ ] SHARC DSP 105 (SHD / SHD Studio / SHD Power) — + Dirac block
 - [ ] SHARC DSP 110 (Flex Eight) — 2 in / 8 out, FIR on input, no Dirac
 - [ ] SHARC DSP 111 (Flex Eight DL) — + Dirac block
-- [ ] SHARC DSP 113 (Flex HT/HTx old FW) — 8 in / 8 out, bass management
+- [ ] SHARC DSP 113 (Flex HT/HTx old FW) — 8 in / 8 out, bass management, Dirac capable
 - [ ] SHARC DSP 115 (Flex HT/HTx new FW) — + input PEQ
 - [ ] Legacy config.xml parser (SigmaStudio format)
 - [ ] Legacy 4x10 HD (old dialect)
@@ -91,8 +91,6 @@
 - [ ] `GET/POST /devices/:id/dre`
 - [ ] `POST /devices/:id/preset/copy`
 - [ ] `GET /devices/:id/tokens`
-- [ ] `GET/POST /devices/:id/volume-offsets`
-- [ ] `POST /devices/:id/preset/import` + `GET .../export`
 - [ ] `GET /openapi.json`
 - [ ] `GET /llms.txt`
 - [ ] `ANY /devices/:id/ws` — WebSocket binary frame bridge
@@ -105,7 +103,6 @@
 - [ ] Daemon mode (`minidsp server`)
 - [ ] All per-channel commands: gain, delay, mute, peq, crossover, fir, compressor
 - [ ] Global commands: volume, source, preset, dirac, dre, display
-- [ ] Config import/export
 - [ ] Negative coefficient parsing fix (minidsp-rs #625)
 
 ## Phase 1j: ESP32 — USB Host HID

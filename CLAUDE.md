@@ -6,15 +6,15 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 Planning/research complete. Not yet coding. All protocol details, device definitions, and address tables extracted and verified.
 
-**Phase 1:** Desktop CLI/API + ESP32 core (WiFi, USB HID, same API). ~4.5 weeks.
-**Phase 2:** ezBEQ on ESP32 (catalogue pipeline, UI serving, entry ID lookup). ~2 weeks. Built after phase 1 is verified working.
+**Phase 1:** Desktop CLI/API + ESP32 core (WiFi, USB HID, same API).
+**Phase 2:** ezBEQ on ESP32 (catalogue pipeline, UI serving, entry ID lookup). Built after phase 1 is verified working.
 **Separate projects (after v1):** 12V trigger, MQTT, SSE log streaming, syslog.
 
 ## Key Files
 
 | File | What |
 |------|------|
-| `PROJECT.md` | Scope of work — architecture, protocol reference, device tables, goals, effort estimates |
+| `PROJECT.md` | Scope of work — architecture, protocol reference, device tables, goals |
 | `PROGRESS.md` | Checklist of all tasks by phase — tick off as we go |
 | `docs/ref-devices.md` | Complete device registry — all hw_ids, DSP IDs, sources, USB PIDs, capabilities |
 | `docs/ref-address-tables.md` | Every DSP register address for all 7 SHARC structures (verified against minidsp-rs + Device Console XML) |
@@ -52,7 +52,7 @@ minidsp-rs is an upstream protocol reference (one maintainer, 10 stale dependabo
 
 Also: MiniDSP's WI-DG WiFi module is $75 for a MediaTek SoC running OpenWrt that just bridges TCP↔USB HID. Our ESP32-S3 target does the same thing (and more — full HTTP API, plus ezBEQ UI in phase 2) on a $10 dev board.
 
-Plus features minidsp-rs never had: config read-back, measurement mode, preset import/export, display control, DRE, per-source volume offsets, modification tokens, ESP32 target, ezBEQ integration, `llms.txt` for AI discoverability.
+Plus features minidsp-rs never had: config read-back, measurement mode, display control, DRE, modification tokens, ESP32 target, ezBEQ integration, `llms.txt` for AI discoverability. Preset import/export, per-source volume offsets deferred to post-v1.
 
 ## Critical Rules
 
@@ -61,7 +61,7 @@ Plus features minidsp-rs never had: config read-back, measurement mode, preset i
 - **No UI on desktop.** Desktop target is API/CLI only. ESP32 serves ezBEQ's unmodified React UI from flash (auto-updated). Ship `llms.txt` at webapp root for AI/LLM discoverability.
 - **All devices from day one.** Full PEQ support for 13 devices (7 SHARC + 6 legacy). Basic support (volume/mute/preset) for 3 more (2x4 non-HD, nanoAVR, nanoAVR HDA). See `docs/ref-legacy-devices.md`.
 - **Dual target: Linux + ESP32-S3.** Use `cfg(target_os = "espidf")` for platform splits. Protocol crate is shared, transport and HTTP server are platform-specific.
-- **Linux: tokio + axum.** ESP32: embassy + picoserve. Handler logic shared, server wiring `cfg`-gated.
+- **Linux: tokio + axum.** ESP32: embassy-executor on ESP-IDF (`arch-std`) + picoserve. Business logic shared, HTTP handler wiring is platform-specific.
 - **USB HID on ESP32** has no safe Rust wrappers. Use `esp-idf-sys` unsafe FFI to the C USB host API.
 - **No MCP server.** Skipped — zero demand. HTTP API + CLI already usable by LLMs. Ship `llms.txt` instead. Maybe add later as `--mcp` flag if requested.
 - **Clean-room implementation.** All code written from scratch. Protocol knowledge referenced from minidsp-rs (credited). Source data from manufacturer (Device Console XML, SigmaStudio config.xml). We do NOT copy minidsp-rs generated code or their codegen pipeline.
@@ -72,9 +72,9 @@ Plus features minidsp-rs never had: config read-back, measurement mode, preset i
 - **Language:** Rust
 - **Not a fork.** Clean-room implementation. Protocol knowledge from minidsp-rs (credited) + Device Console XML extraction
 - **Linux:** tokio + axum + hidapi
-- **ESP32-S3:** embassy + picoserve + esp-idf-sys FFI for USB host
-- **JSON:** serde_json (Linux), serde-json-core (ESP32, no_std)
-- **Protocol crate:** Pure Rust, no platform deps, compiles everywhere
+- **ESP32-S3:** std-on-ESP-IDF. embassy-executor (`arch-std`) + picoserve + esp-idf-svc + esp-idf-sys FFI for USB host
+- **JSON:** serde_json (Linux), serde-json-core (ESP32, chosen for heap efficiency)
+- **Protocol crate:** Pure Rust, no_std, no platform deps, compiles everywhere
 
 ## Protocol Quick Reference
 

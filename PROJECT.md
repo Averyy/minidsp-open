@@ -30,9 +30,8 @@ minidsp-open/
     transport/hid.rs         ← cfg: hidapi (Linux) / esp-idf-sys FFI (ESP32)
     transport/tcp.rs         ← Shared (tokio, works on both platforms)
   daemon/                ← HTTP API + TCP server + discovery
-    http/handlers.rs         ← SHARED: pure functions, device-agnostic
-    http/server_axum.rs      ← Linux: axum wiring
-    http/server_espidf.rs    ← ESP32: embedded-svc or picoserve wiring
+    http/server_axum.rs      ← Linux: axum handlers (thin wrappers calling minidsp/ business logic)
+    http/server_espidf.rs    ← ESP32: picoserve handlers (thin wrappers calling same business logic)
     tcp/mod.rs               ← Shared TCP bridge server (port 5333)
     discovery/mod.rs         ← Shared UDP discovery (port 3999)
   app-esp32/             ← ESP32 binary: WiFi provisioning, NVS config, GPIO trigger, OTA
@@ -46,14 +45,17 @@ Platform splits use `cfg(target_os = "espidf")`. Proven pattern in esp-rs ecosys
 | Component | Linux | ESP32-S3 |
 |-----------|-------|----------|
 | USB HID transport | hidapi (libusb) | ESP-IDF `usb_host_hid` via unsafe FFI (~100 lines) |
-| Async runtime | tokio (full, multi-thread) | embassy (no_std, interrupt-driven, lighter than tokio) |
-| HTTP server | axum | picoserve (no_std, zero heap alloc, axum-like API) |
-| JSON | serde_json | serde-json-core (no_std, no alloc, fixed buffer) |
+| Async runtime | tokio (full, multi-thread) | embassy-executor on ESP-IDF (`arch-std`, runs as FreeRTOS task) |
+| HTTP server | axum | picoserve (zero heap alloc, axum-like API) |
+| JSON | serde_json | serde-json-core (fixed buffer, no alloc) |
 | Config storage | filesystem | NVS (ESP32 flash) |
+| WiFi / mDNS / NVS | N/A | esp-idf-svc (std, wraps ESP-IDF C APIs) |
 | 12V trigger | N/A | GPIO + MOSFET |
 | WiFi provisioning | N/A | ESP-IDF captive portal |
 
-axum on ESP32 was proven but too heavy (~30-40KB per connection, OOMs at 5 concurrent). picoserve + embassy uses zero heap allocation with user-controlled per-connection buffers (~2-4KB each). Device tables are all `&'static` / `const` — they live in flash (.rodata), not heap. ~15-20KB flash across all devices, near-zero RAM impact.
+**ESP32 is std-on-ESP-IDF, not no_std.** embassy-executor runs as a FreeRTOS task via `arch-std`. esp-idf-svc (std) provides WiFi, mDNS, and NVS. picoserve and serde-json-core are no_std-*compatible* libraries chosen for heap efficiency — not because the target is no_std. The protocol crate is the only true no_std crate (pure Rust, no platform deps).
+
+axum on ESP32 was proven but too heavy (~30-40KB per connection, OOMs at 5 concurrent). picoserve uses zero heap allocation with user-controlled per-connection buffers (~2-4KB each). Device tables are all `&'static` / `const` — they live in flash (.rodata), not heap. ~15-20KB flash across all devices, near-zero RAM impact.
 
 ## Hardware (ESP32 target)
 
@@ -92,7 +94,7 @@ Byte N+1:   checksum = sum(all preceding bytes) & 0xFF
 - Client-side framing: `buf[0]` is self-inclusive length, no checksum on responses
 - Zero bytes between frames = padding, skip them
 - Fixed-packet-size mode: if first chunk >= 64 bytes, split into 64-byte chunks (WI-DG compat)
-- Single client at a time for WI-DG compatibility; support multiple clients as improvement
+- TCP bridge: single connection (WI-DG compatibility, second connection rejected). HTTP API: concurrent, all serialized through command queue. Device Console (via TCP) + HTTP clients coexist safely — the command queue arbitrates all paths to the device.
 
 ### UDP discovery (port 3999)
 Broadcast every 1 second:
@@ -276,10 +278,6 @@ Match minidsp-rs endpoints + additions:
 | **POST** | **`/devices/:id/dre`** | **Set DRE on/off (NEW)** |
 | **POST** | **`/devices/:id/preset/copy`** | **Copy current preset to another slot (NEW)** |
 | **GET** | **`/devices/:id/tokens`** | **Read modification tokens for all presets (NEW)** |
-| **GET** | **`/devices/:id/volume-offsets`** | **Read per-source volume offsets (NEW)** |
-| **POST** | **`/devices/:id/volume-offsets`** | **Set per-source volume offsets (NEW)** |
-| **POST** | **`/devices/:id/preset/import`** | **Import Device Console preset XML file (NEW)** |
-| **GET** | **`/devices/:id/preset/export`** | **Export current preset as Device Console XML (NEW)** |
 | **GET** | **`/debug/log`** | **Ring buffer log snapshot — ESP32 (NEW)** |
 | **GET** | **`/debug/info`** | **JSON system diagnostics: heap, WiFi, USB state, uptime (NEW)** |
 | **POST** | **`/debug/level`** | **Change runtime log level (NEW)** |
@@ -315,11 +313,11 @@ Match minidsp-rs endpoints + additions:
 
 - 512KB SRAM (~150-200KB free heap after WiFi/FreeRTOS), optional 8MB PSRAM
 - WiFi stack: ~60-100KB heap
-- embassy + picoserve: minimal overhead, ~2-4KB per connection (user-controlled buffers)
+- picoserve: minimal overhead, ~2-4KB per connection (user-controlled buffers)
 - Realistic capacity: 4-8 concurrent connections with headroom for application state
 - USB Host HID: no safe Rust wrappers. Use `esp-idf-sys` unsafe FFI to C API.
 - Device tables: ~15-20KB in flash (.rodata), near-zero heap (all `&'static const`)
-- JSON: serde-json-core (no_std, no alloc) — streams directly to socket via picoserve
+- JSON: serde-json-core (fixed buffer, no alloc) — streams directly to socket via picoserve
 - WiFi provisioning: SoftAP + captive portal, SSID/password saved to NVS
 - WiFi reconnection: app-level exponential backoff (ESP-IDF does NOT auto-reconnect)
 - Data partition: LittleFS (wear leveling + power-loss safety), ~5 MB for UI + catalogue
@@ -327,71 +325,31 @@ Match minidsp-rs endpoints + additions:
 - Command queue: `heapless::Deque` (16 capacity), `embassy_sync` primitives
 - mDNS: `EspMdns` from `esp-idf-svc` (singleton, own FreeRTOS task)
 
-## Effort Estimate
+## Phase Overview
 
-### Phase 1: Desktop + ESP32 core (ship first, verify it works)
+See `PROGRESS.md` for the full task checklist. High-level phasing:
 
-| Component | Time |
-|-----------|------|
-| Repo setup, Cargo workspace, CI for both targets | 1 day |
-| Protocol crate: frame encoding, commands, dialect (old + new) | 3 days |
-| SHARC device definitions (7 DSP structures from Device Console XML) | 2 days |
-| Legacy device definitions (6 devices from SigmaStudio config.xml) | 1.5 days |
-| Two-stage device identification + capability tiers | 1 day |
-| Command queue (priority, batch, level pause, preset gating) | 3 days |
-| Config read-back (ReadFloats at device addresses) | 2 days |
-| Measurement mode (save/restore state, flat/bypass) | 2 days |
-| Partial write recovery (bypass-first ordering, reconnect retry) | 1 day |
-| Connection resilience (reconnect, backoff, hotplug lifecycle) | 3 days |
-| Biquad stability validation (warn by default) | 0.5 day |
-| Per-device delay limits | 0.5 day |
-| UDP discovery (shared) + mDNS (`_minidsp._tcp`) | 1.5 days |
-| TCP bridge server (decoded + queued, port 5333) | 1.5 days |
-| HTTP API server (axum wiring) | 2 days |
-| CLI (drop-in minidsp-rs compat, all commands) | 2 days |
-| ESP32 USB Host HID transport (esp-idf-sys FFI) | 3 days |
-| HTTP API server (picoserve wiring, ESP32) | 2 days |
-| ESP32 WiFi provisioning (SoftAP + captive portal) | 1.5 days |
-| ESP32 diagnostics (ring buffer, /debug endpoints) | 1 day |
-| Testing: minidsp-rs CLI compat, Device Console | 2 days |
-| Testing: ESP32 target end-to-end | 2 days |
-| **Phase 1 total** | **~36 days sequential, ~7 weeks solo** |
+**Phase 1 — Desktop + ESP32 core (ship first, verify it works):**
+Protocol crate, all device definitions (7 SHARC + 6 legacy), command queue, config read-back, measurement mode, connection resilience, USB/TCP transports, HTTP API (axum + picoserve), CLI, ESP32 USB host HID, WiFi provisioning, diagnostics, testing.
 
-### Phase 2: ezBEQ on ESP32 (after core is verified)
+**Phase 2 — ezBEQ on ESP32 (after core is verified):**
+Catalogue index pipeline, data partition + auto-update, ezBEQ backend API, serve React UI from flash.
 
-| Component | Time |
-|-----------|------|
-| GitHub Action: catalogue index pipeline (~80 lines Python) | 1 day |
-| ESP32 boot sequence + data partition + auto-update from GitHub Pages | 2 days |
-| ezBEQ backend API (entry ID lookup, biquad write, WebSocket catalogue) | 3 days |
-| Serve ezBEQ React UI from flash | 1 day |
-| Testing: ezBEQ end-to-end on ESP32 | 2 days |
-| **Phase 2 total** | **~9 days sequential, ~2 weeks solo** |
-
-### Separate projects (after v1)
-
-| Component | Time |
-|-----------|------|
-| 12V trigger GPIO + API endpoints | 0.5 day |
-| MQTT discovery + HA entities | 2 days |
-| SSE live log streaming | 1 day |
-| Syslog UDP | 0.5 day |
+**Separate projects (after v1):**
+12V trigger, MQTT discovery + HA entities, SSE live log streaming, syslog UDP.
 
 ## v1 Features From Device Console Extraction
 
-Beyond what minidsp-rs supports, we add from day one. Note: preset import/export (2d), per-source volume offsets (1d), and template/offline device (2d) are not yet in the Phase 1 estimate above — add ~5 days if all three ship in phase 1.
+Beyond what minidsp-rs supports, we add from day one:
 
-| Feature | Commands | Effort |
-|---------|----------|--------|
-| **Preset import/export** (Device Console XML format) | Read/write preset files, parse filter/FIR/label data | 2 days |
-| **Modification tokens** | ReadFlash(0xFF, 0xC8+idx×4, 4) / WriteFlash same | Trivial |
-| **Display brightness** | 0x1A (contrast, current) | Trivial |
-| **Display idle timeout** | 0x1B (seconds) | Trivial |
-| **DRE control** | 0x1E (on/off), ReadFlash(0xFF, 0xED, 1) | Trivial |
-| **Preset copy** | 0x27 (async/sync) | Trivial |
-| **Per-source volume offsets** | ReadFlash/WriteFlash(0xFE, 0x00, N) | 1 day |
-| **Error code reporting** | Parse PicVersion response bytes 6-7 | Trivial |
-| **Template/offline device** | In-memory device simulation for preset editing | 2 days |
+| Feature | Commands |
+|---------|----------|
+| **Modification tokens** | ReadFlash(0xFF, 0xC8+idx×4, 4) / WriteFlash same |
+| **Display brightness** | 0x1A (contrast, current) |
+| **Display idle timeout** | 0x1B (seconds) |
+| **DRE control** | 0x1E (on/off), ReadFlash(0xFF, 0xED, 1) |
+| **Preset copy** | 0x27 (async/sync) |
+| **Error code reporting** | Parse PicVersion response bytes 6-7 |
 
 ## Future Additions
 
@@ -402,6 +360,9 @@ Beyond what minidsp-rs supports, we add from day one. Note: preset import/export
 - **Syslog UDP** — optional remote logging for ESP32, configured via API. RFC 5424 format.
 
 **Someday / maybe:**
+- **Preset import/export** — Device Console XML format. Read/write preset files, parse filter/FIR/label data.
+- **Per-source volume offsets** — ReadFlash/WriteFlash(0xFE, 0x00, N).
+- **Template/offline device** — In-memory device simulation for preset editing without hardware.
 - **MCP server** — `/mcp` JSON-RPC/SSE endpoint. Design internal API as clean function calls so MCP calls same functions as HTTP handlers. Zero demand from target audience.
 - **OTA firmware updates** — ESP32 supports OTA over WiFi natively. Add `/update` endpoint. Signed firmware images.
 - **Custom PCB** — USB stick form factor with integrated MOSFET for trigger. BOM ~$5-8.
@@ -438,7 +399,7 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 | 13 | 10x10 filter routing overwrites user output EQ | MODERATE | BEQ loads to input PEQ first, overflows to XO biquads, never output PEQ | **NEW — add to design** |
 | 14 | WI-DG is flaky and overpriced ($75) | UNIVERSAL | ESP32-S3 target ($10) replaces WI-DG | Planned |
 | 15 | Levels display broken on non-2x4HD devices | MODERATE | All device types tested with correct level meter addresses from day one | Planned |
-| 16 | Service autostart unreliable across platforms | MODERATE | Ship ready-made systemd units, launchd plists, Windows service config | **NEW — add to deliverables** |
+| 16 | Service autostart unreliable across platforms | MODERATE | Ship systemd unit in .deb; launchd and Windows service deferred | **NEW — add to deliverables** |
 | 17 | Server/CLI mode conflict (can't run both) | COMMON | Single daemon architecture, CLI commands talk to daemon over socket | Planned |
 | 18 | Flex Eight not supported (#566) | MODERATE | Full definition from Device Console XML | Planned |
 | 19 | Flex HT/HTx incomplete support (#698) | COMMON | Full definition including DSP 115 (new FW with input PEQ) | Planned |
@@ -459,7 +420,7 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 3. ~~Missing device config.xml files~~ **RESOLVED.** Device Console app extracted (see below). All DSP structure layouts, default parameters, source mappings, and firmware files obtained. SHD Power trivial (same DSP 105, add hw_id 21 + 5-source map). Flex Eight (DSP 110/111), Flex HT/HTx new FW (DSP 115) all have full structure layouts. Address tables to be computed from layouts or dumped via `debug dump-float`. Only CDSP 8x12DL still needs a device owner.
 4. ~~OTA update security~~ — ESP32 OTA should require authentication. Signed firmware images.
 5. ~~Multiple clients~~ **RESOLVED.** Single executor task with priority queue. See Command Queue Architecture section.
-6. ~~embassy + esp-idf interop~~ **RESOLVED.** `embassy-executor` with `arch-std` works alongside `esp-idf-svc`. See Resolved Technical Questions.
+6. ~~embassy + esp-idf interop~~ **RESOLVED.** ESP32 target is std-on-ESP-IDF. `embassy-executor` with `arch-std` runs as a FreeRTOS task alongside `esp-idf-svc`. picoserve and serde-json-core are no_std-compatible but run in a std environment.
 7. ~~hidapi on RPi5 + newer kernels~~ **RESOLVED.** No blockers. See Resolved Technical Questions.
 8. ~~ezBEQ entry ID format~~ **RESOLVED.** Dual lookup: ephemeral `{git_hash}_{index}` + stable SHA-256 digest. v3 API tries ID first, falls back to digest.
 9. ~~Legacy device address tables~~ **RESOLVED.** SigmaStudio config.xml exports available for all devices. See `docs/ref-legacy-devices.md`.
