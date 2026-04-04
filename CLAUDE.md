@@ -17,6 +17,7 @@ Planning/research complete. Not yet coding. All protocol details, device definit
 | `PROJECT.md` | Scope of work — architecture, protocol reference, device tables, goals |
 | `PROGRESS.md` | Checklist of all tasks by phase — tick off as we go |
 | `docs/ref-devices.md` | Complete device registry — all hw_ids, DSP IDs, sources, USB PIDs, capabilities |
+| `docs/ref-compatibility.md` | Canonical external compatibility contract — CLI, HTTP, WebSocket, TCP bridge, UDP discovery |
 | `docs/ref-address-tables.md` | Every DSP register address for all 7 SHARC structures (verified against minidsp-rs + Device Console XML) |
 | `docs/ref-legacy-devices.md` | Legacy ADAU1445 device analysis — address tables, dialect, config.xml source data |
 | `docs/ref-ezbeq.md` | ezBEQ integration plan — protocol, API compat, ESP32 strategy, catalogue pipeline |
@@ -57,7 +58,7 @@ Plus features minidsp-rs never had: config read-back, measurement mode, display 
 ## Critical Rules
 
 - **XML is source of truth for addresses.** SHARC: Device Console `DSP_default_parameters.xml`. Legacy ADAU1445: SigmaStudio `config.xml` exports. Both are manufacturer device data, not minidsp-rs code.
-- **Drop-in replacement for minidsp-rs.** Every existing minidsp-rs API endpoint, TCP protocol, UDP discovery packet, and CLI flag must work identically. Existing clients (Home Assistant, ezBEQ, mobile apps, CLI scripts) must work without changes. We only add, never remove or break. This includes: accepting `--force-kind`, not rejecting previously-accepted input (biquad coefficients), and passing through unknown TCP bridge commands.
+- **Drop-in replacement for minidsp-rs.** The canonical compatibility contract is `docs/ref-compatibility.md`. Existing clients (Home Assistant, ezBEQ, mobile apps, CLI scripts) must work without changes. We only add, never remove or break. This includes: accepting `--force-kind`, not rejecting previously-accepted input (biquad coefficients), and passing through unknown TCP bridge commands.
 - **No UI on desktop.** Desktop target is API/CLI only. ESP32 serves ezBEQ's unmodified React UI from flash (auto-updated). Ship `llms.txt` at webapp root for AI/LLM discoverability.
 - **All devices from day one.** Full PEQ support for 13 devices (7 SHARC + 6 legacy). Basic support (volume/mute/preset) for 3 more (2x4 non-HD, nanoAVR, nanoAVR HDA). See `docs/ref-legacy-devices.md`.
 - **Dual target: Linux + ESP32-S3.** Use `cfg(target_os = "espidf")` for platform splits. Protocol crate is shared, transport and HTTP server are platform-specific.

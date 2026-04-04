@@ -5,6 +5,7 @@
 - [ ] CI: GitHub Actions for Linux (x86_64, armhf, arm64), macOS (x86_64, aarch64), Windows
 - [ ] CI: ESP32 cross-compile
 - [ ] License, README, CLAUDE.md finalized
+- [ ] `docs/ref-compatibility.md` finalized as canonical external contract
 
 ## Phase 1a: Protocol Crate (pure Rust, no platform deps)
 - [ ] Frame encoding: length-prefixed, checksum, 0xFF padding
@@ -75,7 +76,9 @@
 - [ ] TCP bridge server (port 5333, length-prefixed frames)
 - [ ] TCP bridge: decode and queue through command queue
 - [ ] TCP bridge: pass through unrecognized commands as raw frames
-- [ ] TCP bridge: WI-DG compat (64-byte chunking, zero-byte padding)
+- [ ] TCP bridge: WI-DG compat (64-byte chunking, non-zero padding handling)
+- [ ] TCP bridge: PWR-ICE compat (70-byte fixed frames)
+- [ ] Unix socket `/tmp/minidsp.sock` (permissions 0o766, same HTTP API as TCP listener)
 
 ## Phase 1h: HTTP API (Desktop — axum)
 - [ ] `GET /devices` — list detected devices
@@ -83,9 +86,9 @@
 - [ ] `POST /devices/:id` — set master status
 - [ ] `POST /devices/:id/config` — full config write
 - [ ] `GET /devices/:id/config` — full config read-back
-- [ ] `POST /devices/:id/volume/up`, `down`, `toggle_mute`
-- [ ] `POST /devices/:id/source/:source`
-- [ ] `POST /devices/:id/preset/:preset`
+- [ ] `POST /devices/:id/volume/:direction` — compatibility route for `up`, `down`, `toggle_mute`
+- [ ] `POST /devices/:id/source/:source` — compatibility route
+- [ ] `POST /devices/:id/preset/:preset` — compatibility route
 - [ ] `POST /devices/:id/measurement-mode` + `/restore`
 - [ ] `GET/POST /devices/:id/display`
 - [ ] `GET/POST /devices/:id/dre`
@@ -93,17 +96,19 @@
 - [ ] `GET /devices/:id/tokens`
 - [ ] `GET /openapi.json`
 - [ ] `GET /llms.txt`
-- [ ] `ANY /devices/:id/ws` — WebSocket binary frame bridge
-- [ ] WebSocket level streaming (250ms poll)
+- [ ] Compatibility state/levels WebSocket on `/devices/:id` with `poll=true` / `levels=true` per `docs/ref-compatibility.md`
+- [ ] Raw frame bridge on `/devices/:id/ws`
 - [ ] CORS headers
 
 ## Phase 1i: CLI
 - [ ] Drop-in minidsp-rs command compatibility
 - [ ] `--force-kind`, `--force-device`, `--force-dsp` flags
 - [ ] Daemon mode (`minidsp server`)
+- [ ] CLI auto-discovery order: Unix socket → USB (per `docs/ref-compatibility.md`)
 - [ ] All per-channel commands: gain, delay, mute, peq, crossover, fir, compressor
 - [ ] Global commands: volume, source, preset, dirac, dre, display
 - [ ] Negative coefficient parsing fix (minidsp-rs #625)
+- [ ] Accept minidsp-rs config TOML format (per `docs/ref-compatibility.md`)
 
 ## Phase 1j: ESP32 — USB Host HID
 - [ ] `esp-idf-sys` FFI to `usb_host_hid` C API (~200-300 lines unsafe)
@@ -135,12 +140,26 @@
 
 ## Phase 1n: Release & Testing
 - [ ] Test: minidsp-rs CLI compatibility (all commands produce same behavior)
+- [ ] Test: `minidsp -o jsonline` output remains parseable by existing consumers
+- [ ] Test: `minidsp probe` output preserves upstream line format
+- [ ] Test: `minidsp -f <file>` preserves file order exactly
+- [ ] Test: `--force-kind` compatibility behavior
+- [ ] Test: convenience compatibility routes (`/volume/:direction`, `/source/:source`, `/preset/:preset`)
+- [ ] Test: compatibility state/levels WebSocket on `/devices/:id`
+- [ ] Test: raw frame bridge on `/devices/:id/ws`
 - [ ] Test: Device Console coexistence (TCP bridge + UDP discovery)
 - [ ] Test: ezBEQ client compatibility (PEQ batch load)
-- [ ] Test: WebSocket level streaming
 - [ ] Test: multi-device
 - [ ] Test: reconnect after USB unplug/replug
 - [ ] Test: ESP32 end-to-end (WiFi → USB HID → MiniDSP)
+- [ ] Device-family matrix: 2x4 HD / Flex / DDRC-24 / Flex DL
+- [ ] Device-family matrix: SHD / SHD Studio / SHD Power
+- [ ] Device-family matrix: Flex Eight / Flex Eight DL
+- [ ] Device-family matrix: Flex HT / Flex HTx on DSP 113
+- [ ] Device-family matrix: Flex HT / Flex HTx on DSP 115
+- [ ] Device-family matrix: old-dialect legacy devices (4x10 HD, 10x10 HD, NanoDigi 2x8)
+- [ ] Device-family matrix: legacy new-dialect devices (miniSHARC 4x8, DDRC-88BM, C-DSP 8x12 v2)
+- [ ] For each device-family matrix row: probe, status read, preset switch, source switch, gain/mute, PEQ write, compatibility WS, reconnect
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
 - [ ] ESP32 .bin firmware

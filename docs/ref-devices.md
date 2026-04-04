@@ -33,11 +33,13 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | 1 | 4x10 HD | SPDIF, TOSLINK, AES-EBU (or "Not Installed" if AN-FP module) | |
 | 2 | miniDSP 2x4 (non-HD) / NanoDigi 2x8 | TOSLINK, SPDIF | Legacy VID 0x04D8 |
 | 3 | PWR-ICE125/250 | LAN-only, see `FUTURE-pwr-ice.md` | dsp_version=51 |
-| 4 | 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | |
+| 4 | miniSHARC 4x8 / 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | APK groups hw_id 4 with 1 and 5 for sources; minidsp-rs maps `(4, _) -> MSharc4x8`. Likely shared hw_id. |
 | 5 | 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | |
-| 7 | nanoAVR (variant) | Has HDMI source switching | |
-| 8 | nanoAVR HDA | Has HDMI source switching | minidsp-rs #569, partially broken |
-| 11 | NanoDigi 2x8 (variant) | TOSLINK, SPDIF | |
+| 6 | DDRC-88BM | TOSLINK, SPDIF | dsp_version=95, new dialect (SHARC). Not in APK or Device Console. minidsp-rs maps `(6, 95) -> DDRC88BM`. |
+| 7 | nanoAVR (variant) | Has HDMI source switching (cmd 0x49) | |
+| 8 | nanoAVR HDA | Has HDMI source switching (cmd 0x49) | minidsp-rs #569, partially broken |
+| 18 | SHD Studio (variant) | TOSLINK, SPDIF, AES-EBU, USB, LAN | APK groups with hw_id 17. Not in Device Console. Likely older or regional SHD Studio SKU. |
+| 11 | C-DSP 8x12 v2 | TOSLINK, SPDIF | dsp_version=97, new dialect (SHARC despite legacy hw_id). minidsp-rs maps `(11, 97) -> C8x12v2`. APK groups with hw_id 2 for sources. |
 
 ## Devices
 
@@ -48,7 +50,7 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | Name | 2x4 HD | DDRC-24 |
 | DSP chip | ADI SHARC (ADSP21489) | Same |
 | Controller | XMOS XU216 | Same |
-| Sample rate | 96,000 Hz | 96,000 Hz |
+| Sample rate | 96,000 Hz | 48,000 Hz (Dirac requires lower rate) |
 | Inputs | 2 | 2 |
 | Outputs | 4 | 4 |
 | Input PEQ | 10 per channel | 10 per channel |
@@ -61,9 +63,10 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | USB VID/PID | 0x2752/0x0011 | 0x2752/0x0044 |
 | USB audio name (macOS) | miniDSP 2x4HD | DDRC-24 |
 | Dialect | New (3-byte addr, float32) | New |
-| XMOS FW | v1.59 min, v1.85 latest | Same |
-| DSP FW | v2.1 | v1.15 |
+| XMOS FW | v1.50 min, v1.85 latest | Same |
+| DSP FW | v2.0 | v2.0 |
 | Sources | 0:Analog, 1:Toslink, 2:USB | Same |
+| REW supported | Yes | Yes |
 | minidsp-rs status | Supported | Supported |
 
 ---
@@ -88,8 +91,9 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | USB VID/PID | 0x2752/0x0011 | 0x2752/0x0044 |
 | USB audio name (macOS) | miniDSP Flex | miniDSP Flex DL |
 | Dialect | New | New |
-| XMOS FW | v1.59 min, v1.85 latest | Same |
-| Sources | 0:Analog, 1:Toslink, 2:USB, 3:Bluetooth | Same |
+| XMOS FW | v1.76 min, v1.85 latest | Same |
+| DSP FW | v2.0 | v2.0 |
+| Sources | 0:Analog, 1:Toslink, 2:SPDIF, 3:USB, 4:Bluetooth | Same |
 | Has Bluetooth module | Yes | Yes |
 | Has display | Yes (OLED) | Yes |
 | REW supported | Yes | Yes |
@@ -104,12 +108,12 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | Name | Flex Eight | Flex Eight (DL) |
 | DSP chip | ADI SHARC | Same |
 | Controller | XMOS | Same |
-| Sample rate | 96,000 Hz | 96,000 Hz |
+| Sample rate | 96,000 Hz | 48,000 Hz (Dirac requires lower rate) |
 | Inputs | 2 | 2 |
 | Outputs | 8 | 8 |
 | Input PEQ | 10 per channel | 10 per channel |
 | Output PEQ | 10 per channel | 10 per channel |
-| FIR | Yes (4096 max taps, 2048 per channel) | Yes |
+| FIR | Yes (4096 max taps, 2048 per channel) | No (Dirac replaces FIR) |
 | Compressor | Yes (per output) | Yes |
 | Crossover | Yes (LPF8 + HPF8 per output) | Yes |
 | Dirac | No | Yes |
@@ -185,7 +189,7 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | Sources | 0:Analog, 1:Toslink, 2:SPDIF, 3:USB, 4:HDMI | Same |
 | Note | Has analog input (unlike Flex HT). | Input PEQ added in new FW — breaks minidsp-rs #701. |
 | Has display | Yes | Yes |
-| Has DRE option | Yes | Yes |
+| Has DRE option | **No** (not in Device Console XML — only Flex Eight and Flex HT have DRE) | **No** |
 | REW supported | Yes | Yes |
 | minidsp-rs status | Supported (DSP 113 only) — **DSP 115 BROKEN** |
 
@@ -210,7 +214,12 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | Presets | 4 |
 | USB VID/PID | 0x2752/0x0045 |
 | Dialect | New |
-| Sources | 0:Toslink, 1:SPDIF, 2:AES-EBU, 3:RCA, 4:XLR, 5:USB, 6:LAN |
+| XMOS FW | v1.76 min, v1.85 latest |
+| DSP FW | v1.15 |
+| Sources | 0:Toslink, 1:SPDIF, 2:AES-EBU, 3:Analog Single-End, 4:Analog Balanced, 5:USB, 6:LAN |
+| Source name note | XML uses "Analog Single-End" (idx 3) and "Analog Balanced" (idx 4). APK and minidsp-rs use "RCA" and "XLR". Both refer to the same physical connectors. |
+| Has display | Yes (DIM_CTRL: idle 3-120s, brightness 1-8) |
+| REW supported | Yes |
 | minidsp-rs status | Supported |
 
 ---
@@ -221,9 +230,14 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 |-------|-------|
 | Name | SHD Studio |
 | DSP ID | 105 (same as SHD) |
-| Everything | Same as SHD except no built-in amplification |
-| Sources | Same as SHD (7 sources) |
+| Everything | Same as SHD except: no built-in amplification, no analog inputs |
+| Sources | **0:Toslink, 1:SPDIF, 2:AES-EBU, 3:USB, 4:LAN** (5 sources — no analog inputs unlike SHD) |
 | USB VID/PID | 0x2752/0x0045 |
+| XMOS FW | v1.76 min, v1.85 latest |
+| DSP FW | v1.15 |
+| Has display | Yes (same DIM_CTRL as SHD) |
+| REW supported | Yes |
+| hw_id 18 note | APK groups `hw_id == 17 \|\| hw_id == 18` with same sources. hw_id 18 is not in Device Console — likely older or regional variant. |
 | minidsp-rs status | Supported (shares SHD definition) |
 
 ---
@@ -247,8 +261,10 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | USB VID/PID | 0x2752/0x0045 |
 | Dialect | New |
 | XMOS FW | v1.76 min, v1.85 latest |
+| DSP FW | v1.15 |
 | Sources | **0:Toslink, 1:SPDIF, 2:AES-EBU, 3:USB, 4:LAN** |
 | Note | Same DSP as SHD but **5 sources, not 7** (no RCA, no XLR — has built-in amp, no analog preamp inputs). |
+| Has display | Yes (same DIM_CTRL as SHD) |
 | REW supported | Yes |
 | minidsp-rs status | **MISSING** — add hw_id 21 to SHD match + add 5-source mapping. **Trivial fix.** |
 
@@ -274,43 +290,39 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 ## Source Mappings (idx → name, per hw_id)
 
 ```
-hw_id 10 (2x4 HD):       0:Analog,  1:Toslink, 2:USB
-hw_id 27 (Flex):          0:Analog,  1:Toslink, 2:USB,     3:Bluetooth
-hw_id 30 (Flex Eight):    1:Toslink, 2:SPDIF,   3:USB,     4:Bluetooth     ← NO analog, starts at 1
-hw_id 31 (Flex HT):       1:Toslink, 2:SPDIF,   3:USB,     4:HDMI          ← NO analog, starts at 1
-hw_id 32 (Flex HTx):      0:Analog,  1:Toslink, 2:SPDIF,   3:USB, 4:HDMI
-hw_id 14 (SHD):           0:Toslink, 1:SPDIF,   2:AES-EBU, 3:RCA, 4:XLR, 5:USB, 6:LAN
-hw_id 17 (SHD Studio):    (same as SHD)
-hw_id 21 (SHD Power):     0:Toslink, 1:SPDIF,   2:AES-EBU, 3:USB, 4:LAN   ← 5 sources (no RCA/XLR)
+hw_id 10 (2x4 HD):       0:Analog,  1:Toslink, 2:USB                                                   [no voloffsets]
+hw_id 27 (Flex):          0:Analog,  1:Toslink, 2:SPDIF,   3:USB, 4:Bluetooth                           [voloffsets]
+hw_id 30 (Flex Eight):    1:Toslink, 2:SPDIF,   3:USB,     4:Bluetooth     ← NO analog, starts at 1     [voloffsets]
+hw_id 31 (Flex HT):       1:Toslink, 2:SPDIF,   3:USB,     4:HDMI          ← NO analog, starts at 1     [voloffsets]
+hw_id 32 (Flex HTx):      0:Analog,  1:Toslink, 2:SPDIF,   3:USB, 4:HDMI                                [voloffsets]
+hw_id 14 (SHD):           0:Toslink, 1:SPDIF,   2:AES-EBU, 3:Analog S-E, 4:Analog Bal, 5:USB, 6:LAN    [voloffsets]
+hw_id 17 (SHD Studio):    0:Toslink, 1:SPDIF,   2:AES-EBU, 3:USB, 4:LAN   ← 5 sources (no analog)      [voloffsets]
+hw_id 21 (SHD Power):     0:Toslink, 1:SPDIF,   2:AES-EBU, 3:USB, 4:LAN   ← 5 sources (no analog)      [voloffsets]
 ```
+
+Note: `voloffsets` = Device Console XML `voloffsets="true"` on `<AUDIO_IN_SOURCES>`. hw_id 10 (2x4 HD) is the only SHARC device without per-source volume offsets. SHD source names: XML uses "Analog Single-End"/"Analog Balanced"; APK and minidsp-rs use "RCA"/"XLR".
 
 ## DSP Structure Summary
 
 | DSP ID | Used by | Freq | In/Out | Input PEQ | FIR | Key difference |
 |--------|---------|------|--------|-----------|-----|----------------|
 | 100 | 2x4 HD, Flex | 96kHz | 2/4 | Yes (10) | Yes (4096 taps) | Base structure |
-| 101 | DDRC-24, Flex DL | 96kHz | 2/4 | Yes (10) | No | Dirac variant of 100 |
+| 101 | DDRC-24, Flex DL | 48kHz | 2/4 | Yes (10) | No | Dirac variant of 100 |
 | 105 | SHD, SHD Studio, SHD Power | 96kHz | 2/4 | No | No | Dirac-only, no input PEQ |
 | 110 | Flex Eight | 96kHz | 2/8 | Yes (10) | Yes (4096 taps) | 8 outputs |
-| 111 | Flex Eight DL | 96kHz | 2/8 | Yes (10) | Yes | Dirac variant of 110 |
+| 111 | Flex Eight DL | 48kHz | 2/8 | Yes (10) | No | Dirac variant of 110 |
 | 113 | Flex HT*, Flex HTx* | 48kHz | 8/8 | **No** | No | Old firmware, Dirac capable, no input PEQ |
 | 115 | Flex HT, Flex HTx | 48kHz | 8/8 | **Yes (10)** | No | New firmware, adds input PEQ + bass management, no Dirac |
 
-## What's Needed to Generate Address Tables
+## Address Table Status
 
-The DSP_structure_layout.xml files define the signal chain (which modules, connections). The actual DSP register addresses are computed from these layouts. Two paths to get addresses:
+Canonical source:
+- `docs/ref-address-tables.md` — SHARC address tables
+- `docs/ref-legacy-devices.md` — legacy address sourcing and deferred devices
 
-1. **Dump from hardware** — connect device, run `minidsp probe` then `debug dump-float 0 255`. Map known parameter values to symbols. Best for unknown devices.
-2. **Port the address computation** — the Device Console JS (`app.asar/build/src/templateDspDevice.js`, minified) computes addresses from structure layouts. Deobfuscate and port to our codegen.
-3. **Reuse existing** — for devices sharing DSP structures with already-supported ones (SHD Power = SHD = DSP 105), the address table is identical. Only source mapping differs.
+This file is the device registry only: hw_ids, dsp_versions, source maps, USB VID/PID, and capability notes.
 
-### Ready to add immediately (no hardware needed):
-- **SHD Power** (hw_id 21) — same address table as SHD (DSP 105), just add hw_id + source mapping
-
-### Need address dump from hardware OR deobfuscated address computation:
-- **Flex Eight** (hw_id 30, DSP 110/111) — new structure, 8 outputs
-- **Flex HT** (hw_id 31, DSP 113/115) — partially known from HTx, source mapping differs
-- **Flex HTx new FW** (hw_id 32, DSP 115) — new structure with input PEQ
-
-### Need device owner to probe:
-- **CDSP 8x12DL** — zero data available
+Current status:
+- SHARC address tables needed for launch are already documented in `docs/ref-address-tables.md`
+- SHD Power reuses DSP 105 with a different source map
+- CDSP 8x12DL remains deferred pending a device owner probe

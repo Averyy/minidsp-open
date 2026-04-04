@@ -90,14 +90,14 @@ Byte N+1:   checksum = sum(all preceding bytes) & 0xFF
 ```
 
 ### TCP server (port 5333)
-- Server-side framing: read `buf[0] + 1` bytes (length byte counts payload+checksum after itself)
+- Server-side framing: read `buf[0] + 1` bytes total (`buf[0]` is self-inclusive length covering length byte + payload; the extra +1 is the checksum appended after)
 - Client-side framing: `buf[0]` is self-inclusive length, no checksum on responses
 - Zero bytes between frames = padding, skip them
 - Fixed-packet-size mode: if first chunk >= 64 bytes, split into 64-byte chunks (WI-DG compat)
 - TCP bridge: single connection (WI-DG compatibility, second connection rejected). HTTP API: concurrent, all serialized through command queue. Device Console (via TCP) + HTTP clients coexist safely — the command queue arbitrates all paths to the device.
 
 ### UDP discovery (port 3999)
-Broadcast every 1 second:
+Broadcast every 1 second. Note: Device Console listens on multicast group `224.0.0.250:3999`, while minidsp-rs broadcasts to `255.255.255.255:3999`. We should send both (broadcast + multicast) for maximum compatibility.
 ```
 Offset  Len  Field
 0       4    Magic: 0x80 0x00 0x05 0xA0
@@ -136,13 +136,14 @@ Offset  Len  Field
 | 0x3B | ReloadDspParam | (none) — reload DSP params from flash |
 | 0x3F | DiracBypass | value:u8 (0=enabled, 1=bypassed) |
 | 0x42 | SetVolume | value:u8 (gain = -0.5 × value) |
+| 0x49 | SetHdmiSource | source:u8 | nanoAVR (hw_id 7/8) HDMI input switching — separate from SetSource (0x34) |
 
 **New commands (NOT in minidsp-rs):**
 | Byte | Command | Payload | Notes |
 |------|---------|---------|-------|
 | 0x1A | SetDisplayBrightness | contrast_level % 0x80, current_level | Flex/HT/HTx OLED |
 | 0x1B | SetDisplayIdleTime | timeout_secs % 256 | Flex/HT/HTx OLED |
-| 0x1E | SetDRE | 0x00, value:u8 (0x01=on, 0x00=off) | Flex HT/HTx only |
+| 0x1E | SetDRE | 0x00, value:u8 (0x01=on, 0x00=off) | Flex Eight and Flex HT only (NOT Flex HTx — no `HAS_DRE_OPTION` in Device Console XML) |
 | 0x27 | CopyPreset | (none)=async, 0x00=sync | Copy current preset to another slot |
 | 0x45 | DiracDelayGain | 0xA1, channel_bitmask | Read Dirac filter delay/gain |
 | 0x54 | LogControl | 0x01=on, 0x00=off | Enable device-side logging |
@@ -185,8 +186,8 @@ Cross-verified against: Device Console JS, minidsp-rs source, and miniDSP Contro
 | 0xFF:0xDA | 1 | Master volume (encoded: dB = -0.5 × value) |
 | 0xFF:0xDB | 1 | Master mute (1=muted, 0=unmuted) |
 | 0xFF:0xE0 | 1 | Dirac bypass / Master FIR bypass |
-| 0xFF:0xE8 | 5 | Display settings (idle_secs, brightness, pad, pad, contrast_current) |
-| 0xFF:0xEA | 32 | Selectable audio sources (1 byte per source, up to 32) |
+| 0xFF:0xE8 | 2 | Display settings (byte 0: idle_secs, byte 1: brightness) — APK reads only 0xE8. Device Console may read more via SetDisplayBrightness (0x1A) which uses contrast_level and current_level as separate command params, not flash reads. |
+| 0xFF:0xEA | varies | Selectable audio sources (1 byte per source, device-dependent count) |
 | 0xFF:0xED | 1 | DRE on/off state |
 | 0xFF:0xFE | 2 | Serial number (u16 BE, actual = 900000 + value) |
 | 0xFE:0x00 | N | Per-source volume offsets (1 byte per source, signed, half-dB steps) |
@@ -206,27 +207,14 @@ Each audio input can have an independent volume offset. Read: `ReadFlash(0xFE, 0
 
 One `if/else`, not per-device logic.
 
-### Device ID table
-| hw_id | dsp_version | Device | Sample rate |
-|-------|-------------|--------|-------------|
-| 10 | 100 | 2x4 HD | 96 kHz |
-| 10 | 101 | DDRC-24 | 96 kHz |
-| 27 | 100 | Flex | 96 kHz |
-| 27 | 101 | Flex DL | 48 kHz |
-| 14 | any | SHD | 96 kHz |
-| 32 | 113 | Flex HTX | 48 kHz |
-| 11 | 97 | C-DSP 8x12 v2 | N/A |
-| 6 | 95 | DDRC-88BM | 48 kHz |
-| 4 | any | miniSHARC 4x8 | 96 kHz |
-| 1 | 51 | 10x10 HD | 96 kHz |
-| 1 | other | 4x10 HD | 96 kHz |
-| 2 | 54 | nanoDIGI 2x8 | 96 kHz |
-| 2 | 22 | 2x4 (non-HD) | 96 kHz |
-| **30** | **110/111** | **Flex Eight / Flex Eight DL** | **96 kHz** | 2 in / 8 out. Sources: 1:Toslink, 2:SPDIF, 3:USB, 4:Bluetooth (no analog, idx starts at 1). Address tables complete. |
-| **31** | **113/115** | **Flex HT** | **48 kHz** | 8 in / 8 out. Sources: 1:Toslink, 2:SPDIF, 3:USB, 4:HDMI (no analog). Shares DSP with HTx. Address tables complete. |
-| **21** | **105** | **SHD Power** | **96 kHz** | 2 in / 4 out. Sources: 0:Toslink, 1:SPDIF, 2:AES, 3:USB, 4:LAN. Same DSP as SHD, different source map. |
-| **32** | **115** | **HTx new firmware** | **48 kHz** | Same I/O as HTx but adds input PEQ. Address tables complete (DSP 115). |
-| **??** | **??** | **CDSP 8x12DL** (deferred) | **48 kHz** | 8 in / 12 out. Zero data — need probe from device owner. |
+### Device registry
+
+Canonical source:
+- `docs/ref-devices.md` — full hw_id / dsp_version registry, source maps, USB VID/PID, capabilities
+- `docs/ref-address-tables.md` — canonical SHARC address tables
+- `docs/ref-legacy-devices.md` — canonical legacy inventory and probe mapping
+
+Do not maintain device tables in this file. `PROJECT.md` is the architecture/scope doc; the `docs/ref-*` files are the source of truth for device identification and address data.
 
 ### Master status (EEPROM 0xFFD8, 9 bytes)
 | Offset | Field |
@@ -258,7 +246,7 @@ Match minidsp-rs endpoints + additions:
 |--------|------|-------------|
 | GET | `/devices` | List all detected devices |
 | GET | `/devices/:id` | Master status (preset, source, volume, mute, dirac) |
-| GET | `/devices/:id?levels` | WebSocket: live input/output dB levels (250ms poll) |
+| GET | `/devices/:id` + WS upgrade | Compatibility WebSocket for live state + levels (`poll=true`, `levels=true`) |
 | POST | `/devices/:id` | Set master status (preset, source, volume, mute) |
 | POST | `/devices/:id/config` | Full config write (PEQ, crossover, gain, delay, polarity, compressor, FIR) |
 | **GET** | **`/devices/:id/config`** | **Full config read-back (NEW)** |
@@ -286,7 +274,12 @@ Match minidsp-rs endpoints + additions:
 | **POST** | **`/api/system/reprovision`** | **Reset WiFi, enter SoftAP provisioning — ESP32 (NEW)** |
 | GET | `/openapi.json` | OpenAPI schema |
 | GET | `/llms.txt` | LLM-readable API description |
-| ANY | `/devices/:id/ws` | WebSocket: raw binary frame bridge |
+| ANY | `/devices/:id/ws` | Raw frame bridge compatibility endpoint |
+
+Canonical compatibility reference:
+- `docs/ref-compatibility.md` — canonical CLI / HTTP / WebSocket / TCP / UDP compatibility contract
+- `docs/ref-ezbeq.md` — ezBEQ-specific integration details and phase 2 strategy
+- `docs/ref-command-pacing.md` — queueing/arbitration behavior for HTTP/TCP/WebSocket paths
 
 ## Fixes Over minidsp-rs
 
@@ -413,77 +406,24 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 
 **4 new items added from this audit:** #8 (HID on newer platforms), #13 (10x10 filter routing), #16 (service management files), #20 (WebSocket lifecycle).
 
-## Open Questions
+## Research Status
 
-1. ~~VBUS power from MiniDSP?~~ **ANSWERED: No.** USB port is sense-only. Two cables required. Not negotiable.
-2. ~~axum vs picoserve on ESP32~~ **ANSWERED: picoserve + embassy.** axum works but OOMs at 5 connections (~30-40KB each). picoserve uses zero heap with user-controlled buffers. Linux keeps axum, ESP32 uses picoserve. Handler logic shared.
-3. ~~Missing device config.xml files~~ **RESOLVED.** Device Console app extracted (see below). All DSP structure layouts, default parameters, source mappings, and firmware files obtained. SHD Power trivial (same DSP 105, add hw_id 21 + 5-source map). Flex Eight (DSP 110/111), Flex HT/HTx new FW (DSP 115) all have full structure layouts. Address tables to be computed from layouts or dumped via `debug dump-float`. Only CDSP 8x12DL still needs a device owner.
-4. ~~OTA update security~~ — ESP32 OTA should require authentication. Signed firmware images.
-5. ~~Multiple clients~~ **RESOLVED.** Single executor task with priority queue. See Command Queue Architecture section.
-6. ~~embassy + esp-idf interop~~ **RESOLVED.** ESP32 target is std-on-ESP-IDF. `embassy-executor` with `arch-std` runs as a FreeRTOS task alongside `esp-idf-svc`. picoserve and serde-json-core are no_std-compatible but run in a std environment.
-7. ~~hidapi on RPi5 + newer kernels~~ **RESOLVED.** No blockers. See Resolved Technical Questions.
-8. ~~ezBEQ entry ID format~~ **RESOLVED.** Dual lookup: ephemeral `{git_hash}_{index}` + stable SHA-256 digest. v3 API tries ID first, falls back to digest.
-9. ~~Legacy device address tables~~ **RESOLVED.** SigmaStudio config.xml exports available for all devices. See `docs/ref-legacy-devices.md`.
-10. ~~Command pacing / multi-client~~ **RESOLVED.** See Command Queue Architecture section.
-11. ~~ESP32 boot without internet~~ **RESOLVED.** See ESP32 Boot Sequence section.
-12. ~~WiFi provisioning~~ **RESOLVED.** SoftAP + captive portal. See ESP32 Boot Sequence section.
-13. ~~mDNS service type~~ **RESOLVED.** `_minidsp._tcp` on port 5380. See Network Discovery section.
-14. ~~Biquad validation~~ **RESOLVED.** Warn by default, opt-in reject. See Biquad Stability Validation section.
-15. ~~ESP32 logging~~ **RESOLVED.** Ring buffer + HTTP endpoint. See ESP32 Diagnostics section.
+Planning/research is complete enough to begin implementation. Canonical reference docs:
+- `docs/ref-devices.md` — device registry and extracted app data
+- `docs/ref-compatibility.md` — canonical external compatibility contract
+- `docs/ref-address-tables.md` — SHARC address tables
+- `docs/ref-legacy-devices.md` — legacy address sourcing and probe mapping
+- `docs/ref-command-pacing.md` — queueing and arbitration model
+- `docs/ref-esp32-boot.md` — boot/provisioning/reconnect behavior
+- `docs/ref-esp32-logging.md` — diagnostics/logging design
+- `docs/ref-ezbeq.md` — ezBEQ compatibility and phase 2 strategy
 
-## MiniDSP Device Console (extracted)
+Extracted assets referenced by those docs live in:
+- `app/MiniDSP Device Console.app/`
+- `app/app-extracted/`
+- `app/apk-extracted/`
 
-Download URLs (undocumented, found via app auto-updater):
-- macOS (Apple Silicon): `https://phpstack-793508-3229840.cloudwaysapps.com/deviceconsole/latest-macmx`
-- Windows: `https://phpstack-793508-3229840.cloudwaysapps.com/deviceconsole/latest-win`
-
-Full device registry with all extracted data: **see `docs/ref-devices.md`**
-
-Extracted app bundle is at `app/MiniDSP Device Console.app/`.
-
-### Device Support Package
-Location: `Contents/Resources/device_support_package/`
-
-```
-info.xml                    ← Master device registry (hw_id → DSP structures, USB VID/PID)
-HW/{hw_id}/info.xml         ← Per-device: source mappings, firmware versions, XMOS info
-DSP_Structures/{dsp_id}/
-  DSP_structure_layout.xml  ← Signal chain topology (modules, connections, channel count)
-  DSP_default_parameters.xml ← Parameter ranges, default values, labels
-  info.xml                  ← DSP firmware info, conversion paths
-```
-
-### Confirmed device data from extracted XMLs:
-
-| hw_id | dsp_id | Name | Freq | In/Out | Sources (idx → name) |
-|-------|--------|------|------|--------|---------------------|
-| 10 | 100 | 2x4 HD | 96kHz | 2/4 | 0:Analog, 1:Toslink, 2:USB |
-| 10 | 101 | DDRC-24 | — | 2/4 | (same) |
-| 14 | 105 | SHD | — | 2/4 | 0:Toslink, 1:SPDIF, 2:AES, 3:RCA, 4:XLR, 5:USB, 6:LAN |
-| 17 | 105 | SHD Studio | — | 2/4 | (same as SHD) |
-| **21** | **105** | **SHD Power** | — | 2/4 | **0:Toslink, 1:SPDIF, 2:AES-EBU, 3:USB, 4:LAN** (5 sources, not 7) |
-| 27 | 100 | Flex | 96kHz | 2/4 | 0:Analog, 1:Toslink, 2:USB, 3:Bluetooth |
-| 27 | 101 | Flex DL | — | 2/4 | (same) |
-| **30** | **110** | **Flex Eight** | **96kHz** | **2/8** | **1:Toslink, 2:SPDIF, 3:USB, 4:Bluetooth** (no analog, idx starts at 1) |
-| **30** | **111** | **Flex Eight DL** | — | 2/8 | (same) |
-| **31** | **113** | **Flex HT** (old FW) | 48kHz | 8/8 | **1:Toslink, 2:SPDIF, 3:USB, 4:HDMI** (no analog) |
-| **31** | **115** | **Flex HT** (new FW) | 48kHz | 8/8 | (same, adds input PEQ) |
-| **32** | **113** | **Flex HTx** (old FW) | 48kHz | 8/8 | 0:Analog, 1:Toslink, 2:SPDIF, 3:USB, 4:HDMI |
-| **32** | **115** | **Flex HTx** (new FW) | 48kHz | 8/8 | (same, adds input PEQ) |
-
-Key findings:
-- DSP 115 (new firmware) adds `GROUP_INPUT` with PEQ10 to Flex HT/HTx — this is what breaks minidsp-rs issue #701
-- DSP 110 (Flex Eight) has FIR support (max 4096 taps, 2048 per channel) + input PEQ + 8 outputs with full compressor/crossover
-- Flex HT (hw_id 31) and Flex HTx (hw_id 32) share DSP structures (113 and 115) but differ in source mapping (HT has no analog)
-- SHD/SHD Studio/SHD Power all share DSP 105 but have different source mappings
-
-### Address Table Generation
-The Device Console XMLs define signal chain topology (DSP_structure_layout.xml) and parameter ranges (DSP_default_parameters.xml), but NOT explicit numeric DSP register addresses. The addresses are computed at runtime by the Device Console from the structure layout + firmware binary.
-
-To get addresses for new devices, two approaches:
-1. **Dump from hardware**: Connect device, use minidsp-rs `debug dump-float 0 255` to read all DSP float registers. Map known values to symbols.
-2. **Reverse the address computation**: The Device Console JS (in app.asar, minified) contains the logic that maps structure layouts to addresses. Could be deobfuscated.
-3. **Compare with existing**: DSP 110 (Flex Eight) likely shares address patterns with DSP 100 (2x4 HD / Flex) since both are 96kHz SHARC. DSP 115 shares with 113 (HTx) with added input PEQ block.
+Do not restate detailed extracted tables or reverse-engineering status in this file. Update the `docs/ref-*` files instead.
 
 ## Additional minidsp-rs Issues to Address
 
@@ -500,7 +440,7 @@ From comprehensive GitHub issue review (34 open, 10 dependabot PRs, last release
 | #245 | PWR-ICE125/250 — deferred, see `docs/FUTURE-pwr-ice.md` | — | Transport (70-byte frames) included; full support needs user packet captures |
 | #229 | MiniDSP 2x4 non-HD (legacy dialect, VID 0x04D8) | Medium | 2 days |
 
-Also: ship OpenAPI docs at `/docs` endpoint (current minidsp-rs docs page is empty). Ship `llms.txt` at webapp root for AI/LLM discoverability of the API.
+Also: minidsp-rs serves ReDoc at `/api` and OpenAPI schema at `/openapi.json`. We serve the same plus `llms.txt` at webapp root for AI/LLM discoverability.
 
 ## Release Artifacts
 
@@ -523,6 +463,8 @@ Each `.deb` includes:
 - Default config at `/etc/minidsp/config.toml`
 
 GitHub Actions CI builds all artifacts on every tagged release.
+
+Compatibility contract for all public daemon/CLI/network surfaces lives in `docs/ref-compatibility.md`. Do not redefine endpoint semantics in this file.
 
 ## Home Assistant Integration
 
@@ -593,29 +535,17 @@ MIT. 100% our code, not a fork. Credit minidsp-rs in README as protocol referenc
 
 ## Legacy Device Support
 
-**All legacy devices included at launch.** Full details in `docs/ref-legacy-devices.md`.
+Canonical source:
+- `docs/ref-legacy-devices.md`
 
-### Address table sourcing (clean-room)
+That file owns:
+- launch inventory
+- clean-room source-data notes
+- probe mapping
+- deferred legacy devices
+- rough effort estimates
 
-- **SHARC devices (hw_id 10-32):** Address tables extracted from Device Console XML (`DSP_default_parameters.xml`). Already complete in `docs/ref-address-tables.md`.
-- **Legacy ADAU1445 devices (hw_id 1-8):** Address tables extracted from SigmaStudio config.xml exports — these are MiniDSP device data files, not minidsp-rs code. We write our own extraction code and device definitions.
-- We do NOT copy minidsp-rs's generated Rust files or their codegen pipeline. Same principle as SHARC devices: use the manufacturer's source data, write all code ourselves.
-
-### Device inventory at launch
-
-**Full support (13 devices):**
-
-| Category | Devices |
-|----------|---------|
-| SHARC / New dialect | 2x4 HD, DDRC-24, Flex, Flex DL, SHD, SHD Studio, SHD Power, Flex Eight, Flex Eight DL, Flex HT, Flex HTx (both DSP 113 + 115) |
-| Legacy / Old dialect | 4x10 HD, 10x10 HD, NanoDigi 2x8 |
-| Legacy / New dialect (SHARC despite age) | miniSHARC 4x8, DDRC-88BM, C-DSP 8x12 v2 |
-
-**Basic support only (3 devices):** miniDSP 2x4 non-HD, nanoAVR, nanoAVR HDA — volume/mute/preset/source only, no PEQ. No config.xml exists for nanoAVR/HDA.
-
-**Deferred:** PWR-ICE (see `docs/FUTURE-pwr-ice.md`), CDSP 8x12DL (need device owner probe).
-
-### Effort: ~1.5 days
+Do not duplicate the legacy inventory in `PROJECT.md`.
 
 | Task | Time |
 |------|------|
@@ -628,41 +558,18 @@ MIT. 100% our code, not a fork. Credit minidsp-rs in README as protocol referenc
 
 ## Command Queue Architecture
 
-Single executor task owns the transport. All commands from all clients go through a priority queue. Full details in `docs/ref-command-pacing.md`.
+Canonical source:
+- `docs/ref-command-pacing.md`
 
-### USB HID timing (measured)
+This file owns:
+- measured USB timing
+- queue priorities
+- arbitration across HTTP/TCP/WebSocket/CLI paths
+- batch semantics
+- level polling behavior
+- rationale vs minidsp-rs
 
-- Round-trip: ~3ms per simple command
-- Practical sustained throughput: ~150-250 commands/second
-- Preset switch: 4-5 seconds device-side processing after ACK
-- Protocol is strictly synchronous: one command in flight, one response. No command tagging.
-
-### Priority levels
-
-| Priority | Category | Examples | On busy |
-|----------|----------|----------|---------|
-| 0 (LOW) | Telemetry | Level meters, compressor meters | Skip this cycle (`try_enqueue`) |
-| 1 (NORMAL) | Status reads | get_master_status, TCP bridge commands | Queue and wait (10s timeout) |
-| 2 (HIGH) | Config writes | PEQ, gain, delay, volume, source | Queue as batch, response after all complete |
-| 3 (CRITICAL) | State transitions | Preset switch, FIR load, measurement mode | Must complete, blocks all else |
-
-### Key behaviors
-
-- **Batch operations** (ezBEQ's 40-command PEQ load) execute contiguously — not interleaved with level reads
-- **Level polling pauses** during batch operations, resumes after completion
-- **Post-preset-switch gating:** Queue enters DeviceBusy state, polls device status every 500ms until preset confirms changed, before allowing further commands
-- **TCP bridge decoded and queued:** Device Console commands go through the same queue as everything else. Unrecognized command bytes pass through as raw frames at NORMAL priority — never reject a valid frame. This preserves compatibility with any Device Console version.
-- **Per-device queues:** Each physical device gets its own queue and executor task. No global lock.
-- **ESP32 adaptation:** `heapless::Deque` (16 capacity), `embassy_sync` primitives, 500ms level interval
-
-### Why not minidsp-rs's approach
-
-minidsp-rs uses a Mutex on the transport write + Hub broadcast. This causes:
-- Level polling holds SharedService Mutex, starving all other commands (#570)
-- TCP bridge does raw frame forwarding with zero serialization (#699)
-- No "busy" response to callers — commands silently queue or fail
-- No pause mechanism for level polling during batch operations
-- Preset switch doesn't gate subsequent commands
+Keep only the high-level requirement here: single executor per physical device, with all command paths serialized through the queue.
 
 ## Partial Write Recovery
 
@@ -839,99 +746,29 @@ Future HA integration could use `_minidsp._tcp` zeroconf for auto-discovery. MQT
 
 ## ESP32 Boot Sequence
 
-Full details in `docs/ref-esp32-boot.md`.
+Canonical source:
+- `docs/ref-esp32-boot.md`
 
-### Boot flow
+This file owns:
+- boot flow
+- provisioning UX
+- WiFi reconnect/backoff policy
+- data partition state machine
+- graceful degradation rules
+- flash-wear analysis
 
-```
-POWER ON
-  → Init NVS + hardware + USB HID host (blocking, fast)
-  → Check NVS for WiFi creds
-    → No creds: SoftAP provisioning (see below)
-  → Connect WiFi (30s window, exponential backoff: 1s base, 2x, 60s cap)
-    → Timeout: start HTTP API anyway if data exists, keep retrying
-  → Got IP: start HTTP API + mDNS immediately (serve whatever is in flash)
-  → Fetch manifest.json in background (3s timeout)
-    → Up to date: done
-    → Changed: download files (15s timeout each, non-blocking for API)
-    → Failed: log warning, serve stale data
-  → READY
-```
-
-**Key principle: the MiniDSP is always controllable.** USB HID works regardless of WiFi. minidsp-rs API works the moment WiFi is up. Only ezBEQ catalogue browsing degrades.
-
-### Data partition states
-
-| State | minidsp-rs API | ezBEQ UI | ezBEQ catalogue |
-|-------|---------------|----------|-----------------|
-| EMPTY (first boot) | Fully functional | 503 "Downloading..." | Empty list |
-| STALE (update check failed) | Fully functional | Works normally | Old data |
-| CURRENT (matches manifest) | Fully functional | Works normally | Current data |
-
-Expose via `GET /api/system/status` → `{"data_state": "stale", "last_sync": "...", "last_check_error": "timeout"}`.
-
-### WiFi provisioning: SoftAP + captive portal
-
-Matching WLED/Tasmota/ESPHome pattern. No app install required.
-
-1. Device starts SoftAP: SSID `minidsp-setup` (open network)
-2. DNS redirect triggers captive portal on phone/laptop
-3. Web page: scan available networks, pick one, enter password, optionally set device name (for mDNS hostname)
-4. Save to NVS, switch to STA mode, connect
-5. Success: restart into normal mode. Failure: re-enter SoftAP with error message.
-
-Re-provisioning: after N consecutive AUTH_FAIL (code 202) disconnects, automatically re-enter provisioning. Or `POST /api/system/reprovision`.
-
-Consider `esp-wifi-provisioning` crate (v0.1.0, March 2026) as starting point.
-
-### WiFi reconnection
-
-ESP-IDF does NOT auto-reconnect. Our application handles it:
-
-- Exponential backoff: 1s base, 2x multiplier, 60s cap, 20 retries before 5-minute pause
-- Distinguish reason codes: AUTH_FAIL (202) = wrong password → limited retries, then re-provision. BEACON_TIMEOUT (200) = AP went away → retry aggressively. NO_AP_FOUND (201) → retry with backoff.
-- On disconnect: close all WebSocket/TCP connections, stop HTTP listener
-- On reconnect + got-IP: restart HTTP server, re-bind listeners. Clients must reconnect.
-
-### Flash wear
-
-Data partition: LittleFS (wear leveling + power-loss safety + directory support).
-
-- NOR flash: 100,000 erase cycles per sector minimum
-- 5 MB partition = 1,280 sectors with wear leveling
-- Catalogue updates ~2x/week → 62 erases/sector/year → **1,600+ years flash life**
-- Version check before write: boots with no update cause **zero flash erases**
+Keep only the project-level principle here: the MiniDSP remains controllable even when catalogue/UI data is stale or unavailable.
 
 ## ESP32 Diagnostics
 
-Full details in `docs/ref-esp32-logging.md`.
+Canonical source:
+- `docs/ref-esp32-logging.md`
 
-### Phase 1 (ship with v0.1)
+This file owns:
+- logging architecture
+- ring buffer sizing
+- `/debug/*` endpoints
+- SSE/syslog phasing
+- desktop/ESP32 logging split
 
-**Custom `log::Log` implementation** that writes to both:
-- UART (via EspIdfLogger delegation — always on)
-- 4KB ring buffer in RAM (~40-80 log lines at INFO level)
-
-**Endpoints:**
-- `GET /debug/log` — snapshot of ring buffer as plain text (ESP-IDF format: `I (12345) usb: connected`)
-- `GET /debug/info` — JSON system diagnostics: `{firmware, uptime_secs, heap_free, heap_min_free, wifi: {connected, ssid, rssi, ip}, usb: {connected, device, hw_id, serial, reconnects, last_cmd_ms}, log_level, log_buffer_used}`
-- `POST /debug/level` — change runtime log level within compiled range
-
-### Phase 2
-
-- `GET /debug/events` — SSE live log streaming (picoserve has native `EventStream` support)
-- Syslog UDP (optional, configured via API)
-
-### Key decisions
-
-- `log` crate (not `tracing` — too heavy for ESP32)
-- Plain text format (not JSON lines — 2-4x smaller, matches UART output)
-- Compile-time `max_level_info` in release builds (strips DEBUG/TRACE calls)
-- **Keep diagnostic infrastructure in release builds** — the whole point is diagnosing deployed devices
-- Total persistent RAM cost: ~4.2KB
-
-### Desktop target
-
-- `tracing` + `tracing-subscriber`, log to stderr, `RUST_LOG` env var
-- Same `/debug/log` and `/debug/info` endpoints for consistency
-- Optional `--log-file` flag
+Keep only the project-level requirement here: ship diagnostic infrastructure in release builds.

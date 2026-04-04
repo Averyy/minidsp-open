@@ -77,7 +77,7 @@ Parses JSON output for: master volume, mute, source, active preset, input/output
 
 ### Live monitoring
 
-Connects to minidsp-rs WebSocket at `ws://{ip}:5380/devices/{id}/ws` for real-time level data and state change notifications.
+Connects to minidsp-rs compatibility WebSocket at `ws://{wsIp}/devices/{wsDeviceId}?levels=true&poll=true` for real-time level data and state change notifications. The `wsIp` config value includes the port (default `127.0.0.1:5380`), and `wsDeviceId` specifies the device index. Uses Autobahn Twisted WebSocket client with reconnecting factory.
 
 ## ezBEQ's Tech Stack
 
@@ -126,6 +126,11 @@ The `routes` array with `name: input` and `slots: [0..9]` tells ezBEQ to write B
 
 ## What minidsp-open Must Support for ezBEQ Compatibility
 
+Canonical source of truth for the public compatibility contract:
+- `docs/ref-compatibility.md`
+
+This file focuses on ezBEQ-specific usage patterns and ESP32 strategy. Do not treat it as the canonical definition of CLI/HTTP/WebSocket/TCP/UDP compatibility semantics.
+
 ### CLI compatibility (drop-in binary replacement)
 
 ezBEQ shells out to `minidsp`. Our binary must accept the same commands:
@@ -153,24 +158,36 @@ ezBEQ shells out to `minidsp`. Our binary must accept the same commands:
 
 ### HTTP API compatibility (daemon mode)
 
+Canonical endpoint definitions live in `docs/ref-compatibility.md`. Summary for ezBEQ:
+
 When running as `minidsp server`, must serve:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/devices/{id}` | GET | Device status (JSON) |
-| `/devices/{id}/config/{n}` | POST | Switch preset |
-| `/devices/{id}/gain` | POST | Set master gain |
-| `/devices/{id}/mute` | POST | Set master mute |
-| `/devices/{id}/source` | POST | Set input source |
-| `/devices/{id}/input/{ch}/peq/{n}` | POST | Set PEQ coefficients |
-| `/devices/{id}/input/{ch}/peq/{n}/bypass` | POST | Set PEQ bypass |
-| `/devices/{id}/ws` | WebSocket | Live state + level stream |
+| `/devices/{id}` | POST | Set master status |
+| `/devices/{id}/config` | POST | Structured config updates |
+| `/devices/{id}/volume/{direction}` | POST | Compatibility volume/mute convenience route |
+| `/devices/{id}/source/{source}` | POST | Compatibility source route |
+| `/devices/{id}/preset/{preset}` | POST | Compatibility preset route |
+| `/devices/{id}` | WebSocket | Compatibility WebSocket for live state + level stream (`poll=true`, `levels=true`) |
 
 Plus UDP discovery on port 3999 and TCP bridge on port 5333.
 
 ### Auto-detection
 
 minidsp-rs requires `device_type` in config. We auto-detect from `hw_id` in the device's master status response. Every hw_id is mapped in our device registry. The `--force-kind` flag exists only as an escape hatch.
+
+### ezBEQ implementation details for Phase 2
+
+Verified against ezBEQ source (2026-04-03). Not needed for Phase 1 compatibility, but critical for Phase 2 ESP32 ezBEQ:
+
+- **`device_type` config key:** Maps to built-in descriptors: `24HD`, `DDRC24`, `DDRC88`, `HTx`, `4x10`, `10x10`, `SHD`, `8x12CDSP`. Default is `Minidsp24HD`. SHD and DDRC24 share the same PEQ layout internally.
+- **Slot switching:** ezBEQ prepends `config {n}` to batch files when the target slot differs from the active one. `slotChangeDelay` config option adds a delay after slot change for Flex devices.
+- **`sw_channels`:** Config key that overrides which output channels receive BEQ filters (used for DDRC88/HTx).
+- **ezBEQ REST API surface:** Beyond filter load/clear, the frontend calls: `/api/1/devices/{name}/config/{slot}/active`, `/api/1/devices/{name}/mute`, `/api/1/devices/{name}/gain`, `/api/1/devices/{name}/levels`, `/api/2/devices` (all devices with refresh), `/api/3/devices/{name}` (PATCH with MV adjust), `/api/1/search`, `/api/1/catalogue/{id}/details`, `/api/1/authors`, `/api/1/audiotypes`, `/api/1/years`, `/api/1/contenttypes`, `/api/1/version`. All must be implemented on ESP32 for the React UI.
+- **ezBEQ WebSocket protocol:** Server sends JSON `{"message": "DeviceState"|"Catalogue"|"CatalogueEntries"|"Levels"|"Error", "data": ...}`. Client sends `"load catalogue"` and `"subscribe levels {device_name}"`. Catalogue entries are sent in chunks.
+- **`ignoreRetcode`:** Config flag that suppresses exit code checking from minidsp CLI.
 
 ## ESP32 Strategy: Replace the Entire Stack
 
@@ -340,7 +357,7 @@ Two API surfaces that share the same device control core:
 
 **minidsp-rs compatible API** (for desktop ezBEQ, Home Assistant, etc.):
 - HTTP endpoints on port 5380
-- WebSocket at `/devices/{id}/ws`
+- WebSocket on `/devices/{id}` with compatibility query params
 - TCP bridge on port 5333
 - UDP discovery on port 3999
 

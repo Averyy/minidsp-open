@@ -274,10 +274,12 @@ First boot with WiFi but empty data partition:
 | API | EMPTY | STALE | CURRENT |
 |-----|-------|-------|---------|
 | `GET /devices/{id}` | Yes | Yes | Yes |
-| `POST /devices/{id}/config/{n}` | Yes | Yes | Yes |
-| `POST /devices/{id}/gain` | Yes | Yes | Yes |
-| `POST /devices/{id}/mute` | Yes | Yes | Yes |
-| WebSocket `/devices/{id}/ws` | Yes | Yes | Yes |
+| `POST /devices/{id}` | Yes | Yes | Yes |
+| `POST /devices/{id}/config` | Yes | Yes | Yes |
+| `POST /devices/{id}/volume/{direction}` | Yes | Yes | Yes |
+| `POST /devices/{id}/source/{source}` | Yes | Yes | Yes |
+| `POST /devices/{id}/preset/{preset}` | Yes | Yes | Yes |
+| WebSocket `/devices/{id}` (`poll=true`, `levels=true`) | Yes | Yes | Yes |
 | TCP bridge (5333) | Yes | Yes | Yes |
 | UDP discovery (3999) | Yes | Yes | Yes |
 | ezBEQ catalogue WebSocket | Empty list | Old data | Current data |
