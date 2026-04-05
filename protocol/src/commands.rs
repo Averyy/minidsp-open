@@ -1,0 +1,431 @@
+//! Command builders and response parsing for the MiniDSP HID protocol.
+//!
+//! Each command is a byte sequence that gets wrapped in a frame (see [`crate::packet`]).
+//! The first byte identifies the command type.
+
+use crate::dialect::{self, Dialect};
+
+// -- Command opcodes --
+
+pub const CMD_RESET: u8 = 0x03;
+pub const CMD_WRITE_FLASH: u8 = 0x04;
+pub const CMD_READ_FLASH: u8 = 0x05;
+pub const CMD_WRITE_DSP: u8 = 0x13;
+pub const CMD_READ_FLOATS: u8 = 0x14;
+pub const CMD_SET_MUTE: u8 = 0x17;
+pub const CMD_BYPASS_FILTER: u8 = 0x19;
+pub const CMD_SET_DISPLAY_BRIGHTNESS: u8 = 0x1A;
+pub const CMD_SET_DISPLAY_IDLE_TIME: u8 = 0x1B;
+pub const CMD_SET_DRE: u8 = 0x1E;
+pub const CMD_SET_CONFIG: u8 = 0x25;
+pub const CMD_COPY_PRESET: u8 = 0x27;
+pub const CMD_WRITE_BIQUAD: u8 = 0x30;
+pub const CMD_READ_HARDWARE_ID: u8 = 0x31;
+pub const CMD_SET_SOURCE: u8 = 0x34;
+pub const CMD_FIR_LOAD_START: u8 = 0x39;
+pub const CMD_FIR_LOAD_DATA: u8 = 0x3A;
+pub const CMD_RELOAD_DSP_PARAM: u8 = 0x3B;
+pub const CMD_DIRAC_BYPASS: u8 = 0x3F;
+pub const CMD_SET_VOLUME: u8 = 0x42;
+pub const CMD_DIRAC_DELAY_GAIN: u8 = 0x45;
+pub const CMD_SET_HDMI_SOURCE: u8 = 0x49;
+pub const CMD_LOG_CONTROL: u8 = 0x54;
+
+// -- Response types --
+
+pub const RESP_ERROR: u8 = 0x00;
+pub const RESP_OK: u8 = 0x01;
+pub const RESP_EVENT: u8 = 0x02;
+pub const RESP_RESET_COMPLETE: u8 = 0xAA;
+pub const RESP_PRESET_COMPLETE: u8 = 0xAB;
+pub const RESP_OVERFLOW: u8 = 0xFF;
+
+/// Parsed hardware identity from ReadHardwareId response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareId {
+    pub fw_major: u8,
+    pub fw_minor: u8,
+    pub hw_id: u8,
+}
+
+/// Parsed response from the device.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Response {
+    /// Command acknowledged.
+    Ack,
+    /// Error response.
+    Error(Vec<u8>),
+    /// Hardware ID response.
+    HardwareId(HardwareId),
+    /// Float values read from DSP memory.
+    Floats(Vec<f32>),
+    /// Raw response bytes (for passthrough in TCP bridge without re-encoding).
+    Raw(Vec<u8>),
+    /// Flash data read.
+    FlashData(Vec<u8>),
+    /// Reset complete (0xAA).
+    ResetComplete,
+    /// Preset change complete (0xAB).
+    PresetComplete,
+    /// Buffer overflow / fatal (0xFF).
+    Overflow,
+    /// FIR load start response (max coefficient count).
+    FirLoadInfo { max_coeffs: u16 },
+    /// Unknown response (raw bytes).
+    Unknown(Vec<u8>),
+}
+
+// -- Command builders --
+// Each returns the payload bytes to be wrapped in a frame.
+
+/// Build a ReadHardwareId command.
+pub fn read_hardware_id() -> Vec<u8> {
+    vec![CMD_READ_HARDWARE_ID]
+}
+
+/// Build a SetVolume command. `value` is the raw byte sent to the device.
+/// Gain in dB = -0.5 × value. So value=0 → 0dB, value=20 → -10dB, value=255 → -127.5dB.
+pub fn set_volume(value: u8) -> Vec<u8> {
+    vec![CMD_SET_VOLUME, value]
+}
+
+/// Build a SetMute command.
+pub fn set_mute(muted: bool) -> Vec<u8> {
+    vec![CMD_SET_MUTE, if muted { 0x01 } else { 0x00 }]
+}
+
+/// Build a SetConfig (preset switch) command.
+pub fn set_config(preset: u8, reset: u8) -> Vec<u8> {
+    vec![CMD_SET_CONFIG, preset, reset]
+}
+
+/// Build a SetSource command.
+pub fn set_source(source: u8) -> Vec<u8> {
+    vec![CMD_SET_SOURCE, source]
+}
+
+/// Build a DiracBypass command. 0 = Dirac enabled, 1 = bypassed.
+pub fn dirac_bypass(bypass: bool) -> Vec<u8> {
+    vec![CMD_DIRAC_BYPASS, if bypass { 0x01 } else { 0x00 }]
+}
+
+/// Build a Reset command.
+pub fn reset() -> Vec<u8> {
+    vec![CMD_RESET]
+}
+
+/// Build a ReadFlash command.
+pub fn read_flash(addr_hi: u8, addr_lo: u8, count: u8) -> Vec<u8> {
+    vec![CMD_READ_FLASH, addr_hi, addr_lo, count]
+}
+
+/// Build a WriteFlash command.
+pub fn write_flash(addr_hi: u8, addr_lo: u8, data: &[u8]) -> Vec<u8> {
+    let mut cmd = vec![CMD_WRITE_FLASH, addr_hi, addr_lo];
+    cmd.extend_from_slice(data);
+    cmd
+}
+
+/// Build a WriteDSP command.
+///
+/// `save`: true = 0x80 (persist to flash), false = 0xA0 (RAM only).
+pub fn write_dsp(addr: u16, value: f32, save: bool, dialect: &Dialect) -> Vec<u8> {
+    let mut cmd = vec![CMD_WRITE_DSP];
+    cmd.push(if save { 0x80 } else { 0xA0 });
+    cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+    cmd.extend_from_slice(&dialect::encode_value(value, dialect));
+    cmd
+}
+
+/// Build a ReadFloats command. Reads `count` float values starting at `addr`.
+/// Maximum count is 14 per request.
+pub fn read_floats(addr: u16, count: u8, dialect: &Dialect) -> Vec<u8> {
+    let mut cmd = vec![CMD_READ_FLOATS];
+    let addr_bytes = dialect::encode_addr(addr, false, dialect);
+    cmd.extend_from_slice(&addr_bytes);
+    cmd.push(count.min(14));
+    cmd
+}
+
+/// Build a WriteBiquad command. Writes 5 biquad coefficients at the given address.
+pub fn write_biquad(addr: u16, coeffs: &[f32; 5], dialect: &Dialect) -> Vec<u8> {
+    let mut cmd = vec![CMD_WRITE_BIQUAD, 0x80];
+    cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+    cmd.extend_from_slice(&[0x00, 0x00]); // padding
+    for &c in coeffs {
+        cmd.extend_from_slice(&dialect::encode_value(c, dialect));
+    }
+    cmd
+}
+
+/// Build a BypassFilter command.
+pub fn bypass_filter(addr: u16, bypass: bool, dialect: &Dialect) -> Vec<u8> {
+    let mut cmd = vec![CMD_BYPASS_FILTER];
+    cmd.push(if bypass { 0x80 } else { 0x00 });
+    cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+    cmd
+}
+
+/// Build a SetDisplayBrightness command. level: 1-8.
+pub fn set_display_brightness(level: u8) -> Vec<u8> {
+    vec![CMD_SET_DISPLAY_BRIGHTNESS, level]
+}
+
+/// Build a SetDisplayIdleTime command. timeout in seconds.
+pub fn set_display_idle_time(timeout_secs: u8) -> Vec<u8> {
+    vec![CMD_SET_DISPLAY_IDLE_TIME, timeout_secs]
+}
+
+/// Build a SetDRE command. enabled: true = on, false = off.
+pub fn set_dre(enabled: bool) -> Vec<u8> {
+    vec![CMD_SET_DRE, 0x00, if enabled { 0x01 } else { 0x00 }]
+}
+
+/// Build a CopyPreset command. sync: true = synchronous (0x00), false = async.
+pub fn copy_preset(sync: bool) -> Vec<u8> {
+    if sync {
+        vec![CMD_COPY_PRESET, 0x00]
+    } else {
+        vec![CMD_COPY_PRESET]
+    }
+}
+
+/// Build a FirLoadStart command. Returns max coefficient count.
+pub fn fir_load_start(index: u8) -> Vec<u8> {
+    vec![CMD_FIR_LOAD_START, index]
+}
+
+/// Build a FirLoadData command. Up to 15 float32 coefficients per packet.
+pub fn fir_load_data(index: u8, coeffs: &[f32]) -> Vec<u8> {
+    let mut cmd = vec![CMD_FIR_LOAD_DATA, index];
+    for &c in &coeffs[..coeffs.len().min(15)] {
+        cmd.extend_from_slice(&c.to_le_bytes());
+    }
+    cmd
+}
+
+/// Build a ReloadDspParam command.
+pub fn reload_dsp_param() -> Vec<u8> {
+    vec![CMD_RELOAD_DSP_PARAM]
+}
+
+/// Build a DiracDelayGain read command.
+pub fn dirac_delay_gain(channel_bitmask: u8) -> Vec<u8> {
+    vec![CMD_DIRAC_DELAY_GAIN, 0xA1, channel_bitmask]
+}
+
+/// Build a LogControl command.
+pub fn log_control(enable: bool) -> Vec<u8> {
+    vec![CMD_LOG_CONTROL, if enable { 0x01 } else { 0x00 }]
+}
+
+/// Build a SetHdmiSource command (nanoAVR only).
+pub fn set_hdmi_source(source: u8) -> Vec<u8> {
+    vec![CMD_SET_HDMI_SOURCE, source]
+}
+
+// -- Response parsing --
+
+/// Parse a response payload (already decoded from frame).
+pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
+    if data.is_empty() {
+        return Response::Error(vec![]);
+    }
+
+    match data[0] {
+        RESP_OVERFLOW => Response::Overflow,
+        RESP_RESET_COMPLETE => Response::ResetComplete,
+        RESP_PRESET_COMPLETE => Response::PresetComplete,
+        RESP_ERROR => Response::Error(data[1..].to_vec()),
+
+        CMD_READ_HARDWARE_ID => {
+            if data.len() >= 4 {
+                Response::HardwareId(HardwareId {
+                    fw_major: data[1],
+                    fw_minor: data[2],
+                    hw_id: data[3],
+                })
+            } else {
+                Response::Unknown(data.to_vec())
+            }
+        }
+
+        CMD_READ_FLOATS => {
+            parse_floats_response(data, dialect)
+        }
+
+        CMD_READ_FLASH => {
+            Response::FlashData(data[1..].to_vec())
+        }
+
+        CMD_FIR_LOAD_START => {
+            if data.len() >= 3 {
+                let max_coeffs = u16::from_le_bytes([data[1], data[2]]);
+                Response::FirLoadInfo { max_coeffs }
+            } else {
+                Response::Unknown(data.to_vec())
+            }
+        }
+
+        // Ack-like responses for various commands
+        CMD_WRITE_DSP
+        | CMD_WRITE_BIQUAD
+        | CMD_SET_VOLUME
+        | CMD_SET_MUTE
+        | CMD_SET_SOURCE
+        | CMD_SET_CONFIG
+        | CMD_BYPASS_FILTER
+        | CMD_DIRAC_BYPASS
+        | CMD_SET_DISPLAY_BRIGHTNESS
+        | CMD_SET_DISPLAY_IDLE_TIME
+        | CMD_SET_DRE
+        | CMD_COPY_PRESET
+        | CMD_FIR_LOAD_DATA
+        | CMD_RELOAD_DSP_PARAM
+        | CMD_LOG_CONTROL
+        | CMD_SET_HDMI_SOURCE
+        | RESP_OK => Response::Ack,
+
+        _ => Response::Unknown(data.to_vec()),
+    }
+}
+
+/// Parse a ReadFloats response into float values.
+fn parse_floats_response(data: &[u8], dialect: &Dialect) -> Response {
+    // Response: [0x14, addr bytes..., float data...]
+    let addr_size = match dialect.addr_len {
+        crate::dialect::AddrLen::Two => 2,
+        crate::dialect::AddrLen::Three => 3,
+    };
+    let header_size = 1 + addr_size; // cmd byte + addr
+    if data.len() <= header_size {
+        return Response::Floats(vec![]);
+    }
+    let float_data = &data[header_size..];
+    let mut floats = Vec::new();
+    for chunk in float_data.chunks(4) {
+        if chunk.len() == 4 {
+            let bytes: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            floats.push(dialect::decode_value(&bytes, dialect));
+        }
+    }
+    Response::Floats(floats)
+}
+
+/// Check if a command opcode expects a specific response type.
+pub fn matches_response(cmd_opcode: u8, resp_opcode: u8) -> bool {
+    if resp_opcode == RESP_ERROR || resp_opcode == RESP_OVERFLOW {
+        return true; // errors match everything
+    }
+    match cmd_opcode {
+        CMD_READ_HARDWARE_ID => resp_opcode == CMD_READ_HARDWARE_ID,
+        CMD_READ_FLOATS => resp_opcode == CMD_READ_FLOATS,
+        CMD_READ_FLASH => resp_opcode == CMD_READ_FLASH,
+        CMD_SET_CONFIG => resp_opcode == CMD_SET_CONFIG || resp_opcode == RESP_PRESET_COMPLETE,
+        CMD_RESET => resp_opcode == RESP_RESET_COMPLETE,
+        CMD_FIR_LOAD_START => resp_opcode == CMD_FIR_LOAD_START,
+        _ => {
+            // Most write commands just return an ack with their own opcode
+            resp_opcode == cmd_opcode || resp_opcode == RESP_OK
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialect::Dialect;
+
+    #[test]
+    fn read_hardware_id_cmd() {
+        let cmd = read_hardware_id();
+        assert_eq!(cmd, vec![0x31]);
+    }
+
+    #[test]
+    fn set_volume_cmd() {
+        let cmd = set_volume(20); // -10dB
+        assert_eq!(cmd, vec![0x42, 20]);
+    }
+
+    #[test]
+    fn set_mute_cmd() {
+        assert_eq!(set_mute(true), vec![0x17, 0x01]);
+        assert_eq!(set_mute(false), vec![0x17, 0x00]);
+    }
+
+    #[test]
+    fn set_config_cmd() {
+        let cmd = set_config(2, 0);
+        assert_eq!(cmd, vec![0x25, 0x02, 0x00]);
+    }
+
+    #[test]
+    fn write_dsp_new_dialect() {
+        let cmd = write_dsp(0x0042, 1.0, true, &Dialect::NEW);
+        assert_eq!(cmd[0], CMD_WRITE_DSP);
+        assert_eq!(cmd[1], 0x80); // save flag
+        assert_eq!(cmd[2], 0x80); // addr hi with write bit
+        assert_eq!(cmd[3], 0x42); // addr lo
+        assert_eq!(cmd[4], 0x00); // addr third byte
+        let value_bytes = &cmd[5..9];
+        assert_eq!(value_bytes, &1.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn write_biquad_cmd() {
+        let coeffs = [1.0, 0.0, 0.0, 0.0, 0.0]; // bypass biquad
+        let cmd = write_biquad(0x0100, &coeffs, &Dialect::NEW);
+        assert_eq!(cmd[0], CMD_WRITE_BIQUAD);
+        assert_eq!(cmd[1], 0x80);
+        // After addr (3 bytes) + padding (2 bytes) = 5 coeffs × 4 bytes = 20 bytes
+        assert_eq!(cmd.len(), 1 + 1 + 3 + 2 + 20);
+    }
+
+    #[test]
+    fn read_floats_cmd() {
+        let cmd = read_floats(0x0030, 4, &Dialect::NEW);
+        assert_eq!(cmd[0], CMD_READ_FLOATS);
+        // addr: 3 bytes (no write bit)
+        assert_eq!(cmd[1], 0x00);
+        assert_eq!(cmd[2], 0x30);
+        assert_eq!(cmd[3], 0x00);
+        assert_eq!(cmd[4], 4); // count
+    }
+
+    #[test]
+    fn parse_hw_id_response() {
+        let data = [0x31, 1, 85, 10]; // fw 1.85, hw_id 10
+        let resp = parse_response(&data, &Dialect::NEW);
+        assert_eq!(
+            resp,
+            Response::HardwareId(HardwareId {
+                fw_major: 1,
+                fw_minor: 85,
+                hw_id: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_floats_response_new() {
+        let mut data = vec![CMD_READ_FLOATS, 0x00, 0x30, 0x00]; // addr
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        data.extend_from_slice(&(-3.5f32).to_le_bytes());
+        let resp = parse_response(&data, &Dialect::NEW);
+        match resp {
+            Response::Floats(values) => {
+                assert_eq!(values.len(), 2);
+                assert!((values[0] - 1.0).abs() < 0.0001);
+                assert!((values[1] - (-3.5)).abs() < 0.0001);
+            }
+            _ => panic!("expected Floats response"),
+        }
+    }
+
+    #[test]
+    fn parse_preset_complete() {
+        let resp = parse_response(&[RESP_PRESET_COMPLETE], &Dialect::NEW);
+        assert_eq!(resp, Response::PresetComplete);
+    }
+}

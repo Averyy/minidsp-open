@@ -1,0 +1,341 @@
+//! High-level MiniDSP client — wraps transport + command queue + device profile.
+
+use crate::transport::{Transport, TransportError};
+use crate::queue::{CommandQueue, Priority};
+use minidsp_protocol::commands::{self, HardwareId, Response};
+use minidsp_protocol::device::DeviceProfile;
+use minidsp_protocol::device::probe;
+use minidsp_protocol::eeprom;
+use minidsp_protocol::status::{MasterStatusView, StatusSummary, DeviceInfo, DeviceVersion};
+use std::sync::Arc;
+
+/// Error type for client operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("device busy")]
+    Busy,
+    #[error("timeout")]
+    Timeout,
+    #[error("unsupported operation for this device")]
+    Unsupported,
+}
+
+/// Connected MiniDSP device client.
+pub struct MiniDspClient {
+    queue: Arc<CommandQueue>,
+    profile: DeviceProfile,
+    hw_id: HardwareId,
+    dsp_version: u8,
+    serial: u32,
+}
+
+impl MiniDspClient {
+    /// Connect to a device via transport, probe its identity, and return a client.
+    pub async fn connect(transport: Box<dyn Transport>) -> Result<Self, ClientError> {
+        let queue = Arc::new(CommandQueue::new(transport));
+
+        // Step 1: Read hardware ID
+        let hw_resp = queue
+            .execute(commands::read_hardware_id(), Priority::Critical)
+            .await?;
+        let hw_id = match hw_resp {
+            Response::HardwareId(id) => id,
+            _ => return Err(ClientError::Protocol("unexpected response to ReadHardwareId".into())),
+        };
+
+        // Step 2: Read DSP version from EEPROM
+        let flash_resp = queue
+            .execute(
+                commands::read_flash(eeprom::DSP_VERSION_ADDR.0, eeprom::DSP_VERSION_ADDR.1, 1),
+                Priority::Critical,
+            )
+            .await?;
+        let dsp_version = match flash_resp {
+            Response::FlashData(data) => eeprom::parse_dsp_version(&data).unwrap_or(0),
+            _ => 0,
+        };
+
+        // Step 3: Read serial number
+        let serial_resp = queue
+            .execute(
+                commands::read_flash(eeprom::SERIAL_ADDR.0, eeprom::SERIAL_ADDR.1, 2),
+                Priority::Critical,
+            )
+            .await?;
+        let serial = match serial_resp {
+            Response::FlashData(data) => eeprom::parse_serial(&data).unwrap_or(0),
+            _ => 0,
+        };
+
+        // Step 4: Identify device profile
+        let profile = probe::identify(hw_id.hw_id, dsp_version);
+
+        // Step 5: Set dialect on queue so responses are parsed correctly
+        queue.set_dialect(profile.dialect).await;
+
+        Ok(Self {
+            queue,
+            profile,
+            hw_id,
+            dsp_version,
+            serial,
+        })
+    }
+
+    pub fn profile(&self) -> &DeviceProfile {
+        &self.profile
+    }
+
+    pub fn hw_id(&self) -> &HardwareId {
+        &self.hw_id
+    }
+
+    pub fn serial(&self) -> u32 {
+        self.serial
+    }
+
+    pub fn dsp_version(&self) -> u8 {
+        self.dsp_version
+    }
+
+    /// Get device info for the /devices list endpoint.
+    pub fn device_info(&self, url: &str) -> DeviceInfo {
+        DeviceInfo {
+            url: url.to_string(),
+            version: DeviceVersion {
+                hw_id: self.hw_id.hw_id,
+                fw_major: self.hw_id.fw_major,
+                fw_minor: self.hw_id.fw_minor,
+                dsp_version: self.dsp_version,
+                serial: self.serial,
+            },
+            product_name: probe::product_name(self.hw_id.hw_id, self.dsp_version).to_string(),
+        }
+    }
+
+    /// Read master status from EEPROM.
+    pub async fn get_master_status(&self) -> Result<eeprom::MasterStatusRaw, ClientError> {
+        let resp = self
+            .queue
+            .execute(
+                commands::read_flash(eeprom::MASTER_STATUS_ADDR.0, eeprom::MASTER_STATUS_ADDR.1, 4),
+                Priority::Normal,
+            )
+            .await?;
+        match resp {
+            Response::FlashData(data) => {
+                eeprom::MasterStatusRaw::from_bytes(&data)
+                    .ok_or_else(|| ClientError::Protocol("failed to parse master status".into()))
+            }
+            _ => Err(ClientError::Protocol("unexpected response".into())),
+        }
+    }
+
+    /// Get full status summary (compatible with minidsp-rs StatusSummary).
+    pub async fn get_status_summary(&self) -> Result<StatusSummary, ClientError> {
+        let master = self.get_master_status().await?;
+        let source_name = self
+            .profile
+            .sources
+            .source_for_index(master.source)
+            .map(|s| s.pascal_case().to_string())
+            .unwrap_or_else(|| format!("Unknown({})", master.source));
+
+        // Read level meters if available
+        let (input_levels, output_levels) = if let Some(table) = self.profile.dsp_table {
+            let input_levels = self.read_meters(&table.meters.input).await?;
+            let output_levels = self.read_meters(&table.meters.output).await?;
+            (input_levels, output_levels)
+        } else {
+            (vec![], vec![])
+        };
+
+        let dirac = if self.profile.has_dirac {
+            Some(false) // TODO: read actual Dirac state
+        } else {
+            None
+        };
+
+        Ok(StatusSummary {
+            master: MasterStatusView {
+                preset: master.preset,
+                source: source_name,
+                volume: master.volume_db(),
+                mute: master.is_muted(),
+                dirac,
+            },
+            input_levels,
+            output_levels,
+        })
+    }
+
+    /// Set volume (raw byte value, gain = -0.5 * value).
+    pub async fn set_volume(&self, value: u8) -> Result<(), ClientError> {
+        self.queue
+            .execute(commands::set_volume(value), Priority::High)
+            .await?;
+        Ok(())
+    }
+
+    /// Set volume in dB.
+    pub async fn set_volume_db(&self, db: f32) -> Result<(), ClientError> {
+        let value = (-2.0 * db).clamp(0.0, 255.0) as u8;
+        self.set_volume(value).await
+    }
+
+    /// Set mute state.
+    pub async fn set_mute(&self, muted: bool) -> Result<(), ClientError> {
+        self.queue
+            .execute(commands::set_mute(muted), Priority::High)
+            .await?;
+        Ok(())
+    }
+
+    /// Switch preset (0-3).
+    pub async fn set_config(&self, preset: u8) -> Result<(), ClientError> {
+        if preset >= self.profile.presets {
+            return Err(ClientError::Protocol(format!(
+                "preset {} out of range (max {})", preset, self.profile.presets - 1
+            )));
+        }
+        self.queue
+            .execute(commands::set_config(preset, 0), Priority::Critical)
+            .await?;
+        Ok(())
+    }
+
+    /// Set source by index.
+    pub async fn set_source(&self, source: u8) -> Result<(), ClientError> {
+        self.queue
+            .execute(commands::set_source(source), Priority::High)
+            .await?;
+        Ok(())
+    }
+
+    /// Set Dirac bypass state.
+    pub async fn set_dirac_bypass(&self, bypass: bool) -> Result<(), ClientError> {
+        if !self.profile.has_dirac {
+            return Err(ClientError::Unsupported);
+        }
+        self.queue
+            .execute(commands::dirac_bypass(bypass), Priority::High)
+            .await?;
+        Ok(())
+    }
+
+    /// Write biquad coefficients to a PEQ band.
+    /// Warns (but does not reject) unstable filters for minidsp-rs compatibility.
+    pub async fn write_biquad(
+        &self,
+        addr: u16,
+        coeffs: &[f32; 5],
+    ) -> Result<(), ClientError> {
+        if !minidsp_protocol::biquad::is_stable(coeffs) {
+            tracing::warn!(
+                "writing potentially unstable biquad at addr {addr}: a1={}, a2={}",
+                coeffs[3], coeffs[4]
+            );
+        }
+        self.queue
+            .execute(
+                commands::write_biquad(addr, coeffs, &self.profile.dialect),
+                Priority::High,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Set PEQ bypass state.
+    pub async fn bypass_filter(&self, addr: u16, bypass: bool) -> Result<(), ClientError> {
+        self.queue
+            .execute(
+                commands::bypass_filter(addr, bypass, &self.profile.dialect),
+                Priority::High,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Write DSP parameter.
+    pub async fn write_dsp(&self, addr: u16, value: f32, save: bool) -> Result<(), ClientError> {
+        self.queue
+            .execute(
+                commands::write_dsp(addr, value, save, &self.profile.dialect),
+                Priority::High,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read float values from DSP memory.
+    pub async fn read_floats(&self, addr: u16, count: u8) -> Result<Vec<f32>, ClientError> {
+        let resp = self
+            .queue
+            .execute(
+                commands::read_floats(addr, count, &self.profile.dialect),
+                Priority::Normal,
+            )
+            .await?;
+        match resp {
+            Response::Floats(values) => Ok(values),
+            _ => Err(ClientError::Protocol("unexpected response to ReadFloats".into())),
+        }
+    }
+
+    /// Send raw command payload. For advanced/raw access.
+    pub async fn raw_command(&self, payload: Vec<u8>, priority: Priority) -> Result<Response, ClientError> {
+        Ok(self.queue.execute(payload, priority).await?)
+    }
+
+    /// Access the command queue directly.
+    pub fn queue(&self) -> &Arc<CommandQueue> {
+        &self.queue
+    }
+
+    // Internal: read meter values from an array of addresses.
+    async fn read_meters(&self, addrs: &[u16]) -> Result<Vec<f32>, ClientError> {
+        if addrs.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut all_values = Vec::with_capacity(addrs.len());
+
+        // Check if addresses are contiguous for bulk read
+        let is_contiguous = addrs.len() <= 14
+            && addrs.windows(2).all(|w| w[1] == w[0] + 1);
+
+        if is_contiguous {
+            let values = self.read_floats(addrs[0], addrs.len() as u8).await?;
+            all_values.extend(values);
+        } else {
+            // Find contiguous runs and read each run in bulk
+            let mut i = 0;
+            while i < addrs.len() {
+                let start = i;
+                while i + 1 < addrs.len() && addrs[i + 1] == addrs[i] + 1 && (i - start + 1) < 14 {
+                    i += 1;
+                }
+                let count = (i - start + 1).min(14);
+                let values = self.read_floats(addrs[start], count as u8).await?;
+                all_values.extend(values);
+                i += 1;
+            }
+        }
+
+        // Convert raw float to dB (20 * log10(abs(value)), clamped)
+        let db_values: Vec<f32> = all_values
+            .iter()
+            .map(|&v| {
+                if v.abs() < 1e-10 {
+                    -140.0
+                } else {
+                    20.0 * v.abs().log10()
+                }
+            })
+            .collect();
+        Ok(db_values)
+    }
+}

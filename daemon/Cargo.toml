@@ -1,0 +1,18 @@
+[package]
+name = "minidsp-daemon"
+description = "MiniDSP daemon — HTTP API, TCP bridge, UDP discovery, WebSocket."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minidsp-protocol = { workspace = true }
+minidsp = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tower-http = { version = "0.6", features = ["cors"] }

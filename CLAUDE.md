@@ -6,10 +6,6 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 Planning/research complete. Not yet coding. All protocol details, device definitions, and address tables extracted and verified.
 
-**Phase 1:** Desktop CLI/API + ESP32 core (WiFi, USB HID, same API).
-**Phase 2:** ezBEQ on ESP32 (catalogue pipeline, UI serving, entry ID lookup). Built after phase 1 is verified working.
-**Separate projects (after v1):** 12V trigger, MQTT, SSE log streaming, syslog.
-
 ## Key Files
 
 | File | What |
@@ -30,30 +26,6 @@ Planning/research complete. Not yet coding. All protocol details, device definit
 | `docs/shared-understanding.md` | How this project fits with open-sub-optimizer and dirac-sparr |
 | `docs/FUTURE-12v-trigger.md` | 12V trigger — GPIO power control, hardware design, API, separate project after v1 |
 | `docs/FUTURE-pwr-ice.md` | PWR-ICE125/250 deferred support — protocol details, what we need from users |
-
-## Goal: Fix Everything Wrong With minidsp-rs
-
-minidsp-rs is an upstream protocol reference (one maintainer, 10 stale dependabot PRs, 9 unresolved device requests). We fix all of it:
-
-| minidsp-rs issue | Problem | Our fix |
-|-----------------|---------|---------|
-| #765 | Device unreachable after standby/wake | Auto-reconnect with health checks, exponential backoff |
-| #511 | Daemon doesn't find device after boot | Retry USB enumeration, don't fail on first attempt |
-| #144 | Stale device after USB unplug | Proper hotplug lifecycle, clean up and notify clients |
-| #662 | Can't run multiple devices on one host | Per-device connection isolation, no global lock |
-| #699 | Simultaneous connections corrupt state | Command queue with arbitration, return "busy" |
-| #570 | Level streaming blocks preset changes | Interleave commands properly |
-| #557 | Delay hard limit too low for some devices | Per-device limits from device definition |
-| #663 | No standby/power control | 12V trigger via ESP32 GPIO (FUTURE — see `docs/FUTURE-12v-trigger.md`) |
-| #566 | Flex Eight not supported | Full definition with addresses from Device Console XML |
-| #698 | Flex HT not supported | Full definition with addresses from Device Console XML |
-| #657 | SHD Power not supported | Add hw_id 21 + 5-source mapping (trivial) |
-| #764 | CDSP 8x12DL not supported | Pending device owner probe |
-| #701 | HTx new firmware breaks existing | DSP 115 definition with input PEQ addresses |
-
-Also: MiniDSP's WI-DG WiFi module is $75 for a MediaTek SoC running OpenWrt that just bridges TCP↔USB HID. Our ESP32-S3 target does the same thing (and more — full HTTP API, plus ezBEQ UI in phase 2) on a $10 dev board.
-
-Plus features minidsp-rs never had: config read-back, measurement mode, display control, DRE, modification tokens, ESP32 target, ezBEQ integration, `llms.txt` for AI discoverability. Preset import/export, per-source volume offsets deferred to post-v1.
 
 ## Critical Rules
 

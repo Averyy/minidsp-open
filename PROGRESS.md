@@ -1,60 +1,60 @@
 # minidsp-open Progress
 
 ## Phase 0: Project Setup
-- [ ] Cargo workspace (protocol, minidsp, daemon, app-desktop, app-esp32)
+- [x] Cargo workspace (protocol, minidsp, daemon, app-desktop, app-esp32)
 - [ ] CI: GitHub Actions for Linux (x86_64, armhf, arm64), macOS (x86_64, aarch64), Windows
 - [ ] CI: ESP32 cross-compile
-- [ ] License, README, CLAUDE.md finalized
-- [ ] `docs/ref-compatibility.md` finalized as canonical external contract
+- [x] License, README, CLAUDE.md finalized
+- [x] `docs/ref-compatibility.md` finalized as canonical external contract
 
 ## Phase 1a: Protocol Crate (pure Rust, no platform deps)
-- [ ] Frame encoding: length-prefixed, checksum, 0xFF padding
-- [ ] HID packet wrapping (65-byte reports, report ID 0x00)
-- [ ] Command builders: WriteDSP, ReadFloats, WriteBiquad, SetVolume, SetMute, SetConfig, SetSource, ReadHardwareId, WriteFlash, ReadFlash
-- [ ] New commands: SetDisplayBrightness, SetDisplayIdleTime, SetDRE, CopyPreset, DiracBypass, DiracDelayGain, FirLoadStart, FirLoadData, ReloadDspParam, LogControl
-- [ ] Response parsing (OK, error codes, preset complete, reset complete)
-- [ ] Dialect layer: old (2-byte addr, 5.23 fixed-point) vs new (3-byte addr, float32)
-- [ ] Biquad stability validation (warn by default)
-- [ ] Master status parsing (EEPROM 0xFFD8)
-- [ ] Flash memory map helpers (preset, volume, mute, source, tokens, display, DRE, serial, volume offsets)
+- [x] Frame encoding: length-prefixed, checksum, 0xFF padding
+- [x] HID packet wrapping (65-byte reports, report ID 0x00)
+- [x] Command builders: WriteDSP, ReadFloats, WriteBiquad, SetVolume, SetMute, SetConfig, SetSource, ReadHardwareId, WriteFlash, ReadFlash
+- [x] New commands: SetDisplayBrightness, SetDisplayIdleTime, SetDRE, CopyPreset, DiracBypass, DiracDelayGain, FirLoadStart, FirLoadData, ReloadDspParam, LogControl
+- [x] Response parsing (OK, error codes, preset complete, reset complete)
+- [x] Dialect layer: old (2-byte addr, 5.23 fixed-point) vs new (3-byte addr, float32)
+- [x] Biquad stability validation (warn by default)
+- [x] Master status parsing (EEPROM 0xFFD8)
+- [x] Flash memory map helpers (preset, volume, mute, source, tokens, display, DRE, serial, volume offsets)
 
 ## Phase 1b: Device Definitions
-- [ ] SHARC DSP 100 (2x4 HD / Flex) — address table, channel layout, PEQ/crossover/delay/compressor/FIR addresses
-- [ ] SHARC DSP 101 (DDRC-24 / Flex DL) — + Dirac block
-- [ ] SHARC DSP 105 (SHD / SHD Studio / SHD Power) — + Dirac block
-- [ ] SHARC DSP 110 (Flex Eight) — 2 in / 8 out, FIR on input, no Dirac
-- [ ] SHARC DSP 111 (Flex Eight DL) — + Dirac block
-- [ ] SHARC DSP 113 (Flex HT/HTx old FW) — 8 in / 8 out, bass management, Dirac capable
-- [ ] SHARC DSP 115 (Flex HT/HTx new FW) — + input PEQ
+- [x] SHARC DSP 100 (2x4 HD / Flex) — address table, channel layout, PEQ/crossover/delay/compressor/FIR addresses
+- [x] SHARC DSP 101 (DDRC-24 / Flex DL) — + Dirac block
+- [x] SHARC DSP 105 (SHD / SHD Studio / SHD Power) — + Dirac block
+- [x] SHARC DSP 110 (Flex Eight) — 2 in / 8 out, FIR on input, no Dirac
+- [x] SHARC DSP 111 (Flex Eight DL) — + Dirac block
+- [x] SHARC DSP 113 (Flex HT/HTx old FW) — 8 in / 8 out, bass management, Dirac capable
+- [x] SHARC DSP 115 (Flex HT/HTx new FW) — + input PEQ
 - [ ] Legacy config.xml parser (SigmaStudio format)
-- [ ] Legacy 4x10 HD (old dialect)
-- [ ] Legacy 10x10 HD (old dialect)
-- [ ] Legacy NanoDigi 2x8 (old dialect)
-- [ ] Legacy miniSHARC 4x8
-- [ ] Legacy DDRC-88BM
-- [ ] Legacy C-DSP 8x12 v2
-- [ ] Basic support stubs: 2x4 non-HD, nanoAVR, nanoAVR HDA (volume/mute/preset only)
-- [ ] Two-stage device identification (dsp_version → address table, hw_id → profile)
-- [ ] Capability tiers (Universal / DspKnown / Full)
-- [ ] Per-device delay limits, sample rates, source mappings
+- [x] Legacy 4x10 HD (old dialect) — probe entry, DspKnown tier
+- [x] Legacy 10x10 HD (old dialect) — probe entry, DspKnown tier
+- [x] Legacy NanoDigi 2x8 (old dialect) — probe entry, DspKnown tier
+- [x] Legacy miniSHARC 4x8 — probe entry, DspKnown tier
+- [x] Legacy DDRC-88BM — probe entry, DspKnown tier
+- [x] Legacy C-DSP 8x12 v2 — probe entry, DspKnown tier
+- [x] Basic support stubs: 2x4 non-HD, nanoAVR, nanoAVR HDA (volume/mute/preset only)
+- [x] Two-stage device identification (dsp_version → address table, hw_id → profile)
+- [x] Capability tiers (Universal / DspKnown / Full)
+- [x] Per-device delay limits, sample rates, source mappings
 
 ## Phase 1c: Transport & Connection
-- [ ] Transport trait
-- [ ] USB HID transport (hidapi, desktop)
-- [ ] TCP transport (tokio, shared)
-- [ ] Connection lifecycle: connect, health check, disconnect
+- [x] Transport trait
+- [x] USB HID transport (hidapi, desktop)
+- [x] TCP transport (tokio, shared)
+- [x] Connection lifecycle: connect, health check, disconnect
 - [ ] Auto-reconnect with exponential backoff (100ms → 10s)
 - [ ] USB hotplug detection + cleanup
 - [ ] Multi-device support (per-device connection isolation)
-- [ ] Legacy USB VID 0x04D8 scanning
+- [x] Legacy USB VID 0x04D8 scanning
 
 ## Phase 1d: Command Queue
-- [ ] Priority queue (LOW/NORMAL/HIGH/CRITICAL)
-- [ ] Batch execution (contiguous, no interleaving with level reads)
-- [ ] Level polling pause during batch operations
-- [ ] Post-preset-switch gating (DeviceBusy state, poll until confirmed)
+- [x] Priority queue (LOW/NORMAL/HIGH/CRITICAL)
+- [x] Batch execution (contiguous, no interleaving with level reads)
+- [x] Level polling pause during batch operations
+- [x] Post-preset-switch gating (DeviceBusy state, poll until confirmed)
 - [ ] Per-device queues (no global lock)
-- [ ] Timeout handling (10s default)
+- [x] Timeout handling (10s default)
 - [ ] "Busy" response for simultaneous connections
 
 ## Phase 1e: Config Read-Back & Measurement Mode
@@ -70,32 +70,32 @@
 - [ ] Optional post-write verification via ReadFloats
 
 ## Phase 1g: Network Services (Desktop)
-- [ ] UDP discovery broadcast (port 3999, 1s interval)
+- [x] UDP discovery broadcast (port 3999, 1s interval)
 - [ ] mDNS service advertisement (`_minidsp._tcp`, `mdns-sd` crate)
 - [ ] mDNS hostname generation from serial number
-- [ ] TCP bridge server (port 5333, length-prefixed frames)
-- [ ] TCP bridge: decode and queue through command queue
-- [ ] TCP bridge: pass through unrecognized commands as raw frames
+- [x] TCP bridge server (port 5333, length-prefixed frames)
+- [x] TCP bridge: decode and queue through command queue
+- [x] TCP bridge: pass through unrecognized commands as raw frames
 - [ ] TCP bridge: WI-DG compat (64-byte chunking, non-zero padding handling)
 - [ ] TCP bridge: PWR-ICE compat (70-byte fixed frames)
 - [ ] Unix socket `/tmp/minidsp.sock` (permissions 0o766, same HTTP API as TCP listener)
 
 ## Phase 1h: HTTP API (Desktop — axum)
-- [ ] `GET /devices` — list detected devices
-- [ ] `GET /devices/:id` — master status
-- [ ] `POST /devices/:id` — set master status
-- [ ] `POST /devices/:id/config` — full config write
+- [x] `GET /devices` — list detected devices
+- [x] `GET /devices/:id` — master status
+- [x] `POST /devices/:id` — set master status
+- [x] `POST /devices/:id/config` — full config write
 - [ ] `GET /devices/:id/config` — full config read-back
-- [ ] `POST /devices/:id/volume/:direction` — compatibility route for `up`, `down`, `toggle_mute`
-- [ ] `POST /devices/:id/source/:source` — compatibility route
-- [ ] `POST /devices/:id/preset/:preset` — compatibility route
+- [x] `POST /devices/:id/volume/:direction` — compatibility route for `up`, `down`, `toggle_mute`
+- [x] `POST /devices/:id/source/:source` — compatibility route
+- [x] `POST /devices/:id/preset/:preset` — compatibility route
 - [ ] `POST /devices/:id/measurement-mode` + `/restore`
 - [ ] `GET/POST /devices/:id/display`
 - [ ] `GET/POST /devices/:id/dre`
 - [ ] `POST /devices/:id/preset/copy`
 - [ ] `GET /devices/:id/tokens`
 - [ ] `GET /openapi.json`
-- [ ] `GET /llms.txt`
+- [x] `GET /llms.txt`
 - [ ] Compatibility state/levels WebSocket on `/devices/:id` with `poll=true` / `levels=true` per `docs/ref-compatibility.md`
 - [ ] Raw frame bridge on `/devices/:id/ws`
 - [ ] CORS headers

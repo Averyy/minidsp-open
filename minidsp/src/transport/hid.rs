@@ -1,0 +1,140 @@
+//! USB HID transport using hidapi.
+
+use super::{Transport, TransportError};
+use minidsp_protocol::device::probe::{USB_VID_MINIDSP, USB_VID_LEGACY, USB_PID_LEGACY};
+use minidsp_protocol::packet;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+
+/// Discovered USB HID device.
+#[derive(Debug, Clone)]
+pub struct HidDeviceInfo {
+    pub path: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub serial_number: Option<String>,
+    pub product_string: Option<String>,
+}
+
+/// Enumerate all connected MiniDSP USB HID devices.
+pub fn enumerate() -> Result<Vec<HidDeviceInfo>, TransportError> {
+    let api = hidapi::HidApi::new().map_err(|e| TransportError::Hid(e.to_string()))?;
+    let mut devices = Vec::new();
+
+    for info in api.device_list() {
+        let vid = info.vendor_id();
+        if vid == USB_VID_MINIDSP || (vid == USB_VID_LEGACY && info.product_id() == USB_PID_LEGACY) {
+            devices.push(HidDeviceInfo {
+                path: info.path().to_string_lossy().into_owned(),
+                vendor_id: vid,
+                product_id: info.product_id(),
+                serial_number: info.serial_number().map(|s| s.to_string()),
+                product_string: info.product_string().map(|s| s.to_string()),
+            });
+        }
+    }
+    Ok(devices)
+}
+
+/// USB HID transport.
+pub struct HidTransport {
+    device: Arc<Mutex<hidapi::HidDevice>>,
+    path: String,
+    vid: u16,
+    pid: u16,
+}
+
+impl HidTransport {
+    /// Open a HID device by path.
+    pub fn open(path: &str) -> Result<Self, TransportError> {
+        let api = hidapi::HidApi::new().map_err(|e| TransportError::Hid(e.to_string()))?;
+        let device = api
+            .open_path(&std::ffi::CString::new(path).unwrap())
+            .map_err(|e| TransportError::Hid(e.to_string()))?;
+        let info = device.get_device_info().map_err(|e| TransportError::Hid(e.to_string()))?;
+        Ok(Self {
+            vid: info.vendor_id(),
+            pid: info.product_id(),
+            device: Arc::new(Mutex::new(device)),
+            path: path.to_string(),
+        })
+    }
+
+    /// Open the first available MiniDSP device.
+    pub fn open_first() -> Result<Self, TransportError> {
+        let devices = enumerate()?;
+        let info = devices.first().ok_or(TransportError::NotFound)?;
+        Self::open(&info.path)
+    }
+}
+
+impl Transport for HidTransport {
+    fn send_frame(&self, payload: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+        let device = self.device.clone();
+        let hid_report = packet::encode_hid(payload);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let dev = device.lock().map_err(|e| TransportError::Hid(e.to_string()))?;
+                let mut retries = 10;
+                loop {
+                    match dev.write(&hid_report) {
+                        Ok(_) => return Ok(()),
+                        Err(e) if retries > 0 => {
+                            retries -= 1;
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                            tracing::warn!("HID write retry ({retries} left): {e}");
+                        }
+                        Err(e) => return Err(TransportError::Hid(e.to_string())),
+                    }
+                }
+            })
+            .await
+            .map_err(|e| TransportError::Io(e.to_string()))?
+        })
+    }
+
+    fn recv_frame(&self, timeout_ms: u64) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+        let device = self.device.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let dev = device.lock().map_err(|e| TransportError::Hid(e.to_string()))?;
+                let mut buf = [0u8; packet::HID_REPORT_SIZE];
+                let timeout = timeout_ms.min(i32::MAX as u64) as i32;
+                let n = dev.read_timeout(&mut buf, timeout)
+                    .map_err(|e| TransportError::Hid(e.to_string()))?;
+                if n == 0 {
+                    return Err(TransportError::Timeout);
+                }
+                // Decode HID report: strip report ID (byte 0), decode frame
+                if n == packet::HID_REPORT_SIZE {
+                    packet::decode_hid(buf[..packet::HID_REPORT_SIZE].try_into().unwrap())
+                        .ok_or_else(|| TransportError::Hid("failed to decode HID frame".into()))
+                } else {
+                    // Partial read — try to decode as frame
+                    packet::decode_frame(&buf[1..n])
+                        .ok_or_else(|| TransportError::Hid("failed to decode HID frame".into()))
+                }
+            })
+            .await
+            .map_err(|e| TransportError::Io(e.to_string()))?
+        })
+    }
+
+    fn is_connected(&self) -> bool {
+        self.device.lock().is_ok()
+    }
+
+    fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn url(&self) -> String {
+        format!(
+            "usb:{}?vid={:04x}&pid={:04x}",
+            urlencoding::encode(&self.path),
+            self.vid,
+            self.pid,
+        )
+    }
+}

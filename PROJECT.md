@@ -16,6 +16,32 @@ minidsp-open adds:
 - `llms.txt` at webapp root for AI/LLM discoverability (MCP server skipped — zero demand, maybe later)
 - Fixes for every actionable open issue
 
+
+## Goal: Fix Everything Wrong With minidsp-rs
+
+minidsp-rs is an upstream protocol reference (one maintainer, 10 stale dependabot PRs, 9 unresolved device requests). We fix all of it:
+
+| minidsp-rs issue | Problem | Our fix |
+|-----------------|---------|---------|
+| #765 | Device unreachable after standby/wake | Auto-reconnect with health checks, exponential backoff |
+| #511 | Daemon doesn't find device after boot | Retry USB enumeration, don't fail on first attempt |
+| #144 | Stale device after USB unplug | Proper hotplug lifecycle, clean up and notify clients |
+| #662 | Can't run multiple devices on one host | Per-device connection isolation, no global lock |
+| #699 | Simultaneous connections corrupt state | Command queue with arbitration, return "busy" |
+| #570 | Level streaming blocks preset changes | Interleave commands properly |
+| #557 | Delay hard limit too low for some devices | Per-device limits from device definition |
+| #663 | No standby/power control | 12V trigger via ESP32 GPIO (FUTURE — see `docs/FUTURE-12v-trigger.md`) |
+| #566 | Flex Eight not supported | Full definition with addresses from Device Console XML |
+| #698 | Flex HT not supported | Full definition with addresses from Device Console XML |
+| #657 | SHD Power not supported | Add hw_id 21 + 5-source mapping (trivial) |
+| #764 | CDSP 8x12DL not supported | Pending device owner probe |
+| #701 | HTx new firmware breaks existing | DSP 115 definition with input PEQ addresses |
+
+Also: MiniDSP's WI-DG WiFi module is $75 for a MediaTek SoC running OpenWrt that just bridges TCP↔USB HID. Our ESP32-S3 target does the same thing (and more — full HTTP API, plus ezBEQ UI in phase 2) on a $10 dev board.
+
+Plus features minidsp-rs never had: config read-back, measurement mode, display control, DRE, modification tokens, ESP32 target, ezBEQ integration, `llms.txt` for AI discoverability. Preset import/export, per-source volume offsets deferred to post-v1.
+
+
 ## Architecture
 
 The existing minidsp-rs codebase is already split into three crates. ~90% of the code is platform-independent.

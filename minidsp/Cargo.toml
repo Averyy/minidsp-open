@@ -1,0 +1,18 @@
+[package]
+name = "minidsp"
+description = "MiniDSP client library — transport, connection, command queue."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minidsp-protocol = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+hidapi = "2"
+urlencoding = "2"
