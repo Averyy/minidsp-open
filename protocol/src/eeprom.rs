@@ -36,15 +36,16 @@ pub struct MasterStatusRaw {
 
 impl MasterStatusRaw {
     /// Parse from 4 bytes read from EEPROM 0xFFD8.
+    /// Byte order: [preset, source, volume, mute] — verified against miniDSP 2x4 HD simulator.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 4 {
             return None;
         }
         Some(Self {
-            volume: data[0],
-            mute: data[1],
-            preset: data[2],
-            source: data[3],
+            preset: data[0],
+            source: data[1],
+            volume: data[2],
+            mute: data[3],
         })
     }
 
@@ -86,13 +87,27 @@ mod tests {
 
     #[test]
     fn master_status_parse() {
-        let data = [20, 0x00, 0x01, 0x02]; // volume=20 (-10dB), unmuted, preset 1, source 2
+        // Byte order at 0xFFD8: [preset, source, volume, mute]
+        // Verified against miniDSP 2x4 HD simulator
+        let data = [0x01, 0x02, 20, 0x00]; // preset 1, source 2, volume=20 (-10dB), unmuted
         let status = MasterStatusRaw::from_bytes(&data).unwrap();
-        assert_eq!(status.volume, 20);
-        assert!(!status.is_muted());
         assert_eq!(status.preset, 1);
         assert_eq!(status.source, 2);
+        assert_eq!(status.volume, 20);
+        assert!(!status.is_muted());
         assert!((status.volume_db() - (-10.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn master_status_simulator_defaults() {
+        // Simulator defaults: preset=0, source=2 (USB), volume=0 (0dB), mute=0
+        let data = [0x00, 0x02, 0x00, 0x00];
+        let status = MasterStatusRaw::from_bytes(&data).unwrap();
+        assert_eq!(status.preset, 0);
+        assert_eq!(status.source, 2);
+        assert_eq!(status.volume, 0);
+        assert!(!status.is_muted());
+        assert!((status.volume_db() - 0.0).abs() < 0.01);
     }
 
     #[test]

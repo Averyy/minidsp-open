@@ -517,6 +517,7 @@ dependencies = [
 name = "minidsp-app"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "minidsp",
  "minidsp-daemon",
@@ -526,6 +527,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
 ]
 
 [[package]]

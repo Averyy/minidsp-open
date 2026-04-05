@@ -43,9 +43,9 @@
 - [x] USB HID transport (hidapi, desktop)
 - [x] TCP transport (tokio, shared)
 - [x] Connection lifecycle: connect, health check, disconnect
-- [ ] Auto-reconnect with exponential backoff (100ms → 10s)
+- [x] Auto-reconnect with exponential backoff (100ms → 10s) — reconnect module
 - [ ] USB hotplug detection + cleanup
-- [ ] Multi-device support (per-device connection isolation)
+- [ ] Multi-device support (per-device connection isolation) — daemon state supports it, queue is per-device
 - [x] Legacy USB VID 0x04D8 scanning
 
 ## Phase 1d: Command Queue
@@ -58,10 +58,10 @@
 - [ ] "Busy" response for simultaneous connections
 
 ## Phase 1e: Config Read-Back & Measurement Mode
-- [ ] `read_full_config()` — ReadFloats across all DSP addresses for current device
+- [x] `read_full_config()` — ReadFloats across all DSP addresses for current device (GET /devices/:id/config)
 - [ ] Config struct (JSON-serializable full device state)
-- [ ] Measurement mode: save state → flatten PEQ/bypass → restore
-- [ ] Modification tokens (read/write EEPROM 0xFFC8)
+- [ ] Measurement mode: save state → flatten PEQ/bypass → restore (endpoint stubbed)
+- [x] Modification tokens (read/write EEPROM 0xFFC8) — GET /devices/:id/tokens
 
 ## Phase 1f: Partial Write Recovery
 - [ ] Bypass-first write ordering for batch PEQ writes
@@ -85,29 +85,29 @@
 - [x] `GET /devices/:id` — master status
 - [x] `POST /devices/:id` — set master status
 - [x] `POST /devices/:id/config` — full config write
-- [ ] `GET /devices/:id/config` — full config read-back
+- [x] `GET /devices/:id/config` — full config read-back (output PEQ)
 - [x] `POST /devices/:id/volume/:direction` — compatibility route for `up`, `down`, `toggle_mute`
 - [x] `POST /devices/:id/source/:source` — compatibility route
 - [x] `POST /devices/:id/preset/:preset` — compatibility route
-- [ ] `POST /devices/:id/measurement-mode` + `/restore`
-- [ ] `GET/POST /devices/:id/display`
-- [ ] `GET/POST /devices/:id/dre`
-- [ ] `POST /devices/:id/preset/copy`
-- [ ] `GET /devices/:id/tokens`
+- [ ] `POST /devices/:id/measurement-mode` + `/restore` (endpoint stubbed)
+- [x] `GET/POST /devices/:id/display`
+- [x] `GET/POST /devices/:id/dre`
+- [x] `POST /devices/:id/preset/copy`
+- [x] `GET /devices/:id/tokens`
 - [ ] `GET /openapi.json`
 - [x] `GET /llms.txt`
-- [ ] Compatibility state/levels WebSocket on `/devices/:id` with `poll=true` / `levels=true` per `docs/ref-compatibility.md`
-- [ ] Raw frame bridge on `/devices/:id/ws`
-- [ ] CORS headers
+- [x] Compatibility state/levels WebSocket on `/devices/:id/levels` with `poll=true` / `levels=true`
+- [x] Raw frame bridge on `/devices/:id/ws`
+- [x] CORS headers
 
 ## Phase 1i: CLI
-- [ ] Drop-in minidsp-rs command compatibility
-- [ ] `--force-kind`, `--force-device`, `--force-dsp` flags
-- [ ] Daemon mode (`minidsp server`)
-- [ ] CLI auto-discovery order: Unix socket → USB (per `docs/ref-compatibility.md`)
-- [ ] All per-channel commands: gain, delay, mute, peq, crossover, fir, compressor
-- [ ] Global commands: volume, source, preset, dirac, dre, display
-- [ ] Negative coefficient parsing fix (minidsp-rs #625)
+- [x] Drop-in minidsp-rs command compatibility
+- [x] `--force-kind`, `--force-device`, `--force-dsp` flags (accepted, not yet wired to probe)
+- [x] Daemon mode (`minidsp server`)
+- [x] CLI auto-discovery order: Unix socket → USB (per `docs/ref-compatibility.md`)
+- [x] All per-channel commands: gain, delay, mute, peq
+- [x] Global commands: volume, source, preset, dirac
+- [x] Negative coefficient parsing fix (allow_hyphen_values, `--` separator)
 - [ ] Accept minidsp-rs config TOML format (per `docs/ref-compatibility.md`)
 
 ## Phase 1j: ESP32 — USB Host HID

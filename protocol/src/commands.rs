@@ -291,17 +291,13 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
 }
 
 /// Parse a ReadFloats response into float values.
+/// Response format: [0x14, float_data...] — command echo followed by float bytes.
+/// Verified against miniDSP 2x4 HD simulator: NO address echo in response.
 fn parse_floats_response(data: &[u8], dialect: &Dialect) -> Response {
-    // Response: [0x14, addr bytes..., float data...]
-    let addr_size = match dialect.addr_len {
-        crate::dialect::AddrLen::Two => 2,
-        crate::dialect::AddrLen::Three => 3,
-    };
-    let header_size = 1 + addr_size; // cmd byte + addr
-    if data.len() <= header_size {
+    if data.len() <= 1 {
         return Response::Floats(vec![]);
     }
-    let float_data = &data[header_size..];
+    let float_data = &data[1..]; // skip command echo byte
     let mut floats = Vec::new();
     for chunk in float_data.chunks(4) {
         if chunk.len() == 4 {
@@ -409,7 +405,8 @@ mod tests {
 
     #[test]
     fn parse_floats_response_new() {
-        let mut data = vec![CMD_READ_FLOATS, 0x00, 0x30, 0x00]; // addr
+        // Response: [0x14, float_data...] — no address echo
+        let mut data = vec![CMD_READ_FLOATS];
         data.extend_from_slice(&1.0f32.to_le_bytes());
         data.extend_from_slice(&(-3.5f32).to_le_bytes());
         let resp = parse_response(&data, &Dialect::NEW);
@@ -424,8 +421,78 @@ mod tests {
     }
 
     #[test]
+    fn parse_floats_response_simulator() {
+        // Simulator returns all zeros for unwritten DSP params
+        let mut data = vec![CMD_READ_FLOATS];
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        let resp = parse_response(&data, &Dialect::NEW);
+        match resp {
+            Response::Floats(values) => {
+                assert_eq!(values.len(), 4);
+                for v in values {
+                    assert!((v - 0.0).abs() < 0.0001);
+                }
+            }
+            _ => panic!("expected Floats response"),
+        }
+    }
+
+    #[test]
     fn parse_preset_complete() {
         let resp = parse_response(&[RESP_PRESET_COMPLETE], &Dialect::NEW);
         assert_eq!(resp, Response::PresetComplete);
+    }
+
+    // -- Simulator-verified response tests --
+
+    #[test]
+    fn parse_hw_id_simulator() {
+        // Simulator: [0x31, 0x01, 0x55, 0x0A] = fw 1.85, hw_id 10 (2x4 HD)
+        let data = [0x31, 0x01, 0x55, 0x0A];
+        let resp = parse_response(&data, &Dialect::NEW);
+        match resp {
+            Response::HardwareId(id) => {
+                assert_eq!(id.fw_major, 1);
+                assert_eq!(id.fw_minor, 0x55); // 85 decimal
+                assert_eq!(id.hw_id, 10);
+            }
+            _ => panic!("expected HardwareId"),
+        }
+    }
+
+    #[test]
+    fn parse_flash_read_simulator() {
+        // ReadFlash response: [0x05, data_bytes...]
+        // Reading 4 bytes from 0xFFD8 (master status): preset=0, source=2, vol=0, mute=0
+        let data = [0x05, 0x00, 0x02, 0x00, 0x00];
+        let resp = parse_response(&data, &Dialect::NEW);
+        match resp {
+            Response::FlashData(bytes) => {
+                assert_eq!(bytes, vec![0x00, 0x02, 0x00, 0x00]);
+            }
+            _ => panic!("expected FlashData"),
+        }
+    }
+
+    #[test]
+    fn parse_ack_responses() {
+        // All write commands return [0x01] ACK
+        for &cmd in &[0x01, CMD_SET_VOLUME, CMD_SET_MUTE, CMD_SET_SOURCE,
+                       CMD_WRITE_DSP, CMD_WRITE_BIQUAD, CMD_BYPASS_FILTER] {
+            let resp = parse_response(&[cmd], &Dialect::NEW);
+            assert_eq!(resp, Response::Ack, "cmd 0x{:02x} should parse as Ack", cmd);
+        }
+    }
+
+    #[test]
+    fn parse_error_response() {
+        let resp = parse_response(&[0x00], &Dialect::NEW);
+        match resp {
+            Response::Error(data) => assert!(data.is_empty()),
+            _ => panic!("expected Error"),
+        }
     }
 }

@@ -155,7 +155,16 @@ impl MiniDspClient {
         };
 
         let dirac = if self.profile.has_dirac {
-            Some(false) // TODO: read actual Dirac state
+            // Read Dirac bypass state from EEPROM 0xFFE0
+            let dirac_resp = self.queue
+                .execute(commands::read_flash(0xFF, 0xE0, 1), Priority::Normal)
+                .await;
+            match dirac_resp {
+                Ok(Response::FlashData(data)) if !data.is_empty() => {
+                    Some(data[0] == 0) // 0 = Dirac active (not bypassed), 1 = bypassed
+                }
+                _ => Some(false),
+            }
         } else {
             None
         };
@@ -225,6 +234,32 @@ impl MiniDspClient {
             .execute(commands::dirac_bypass(bypass), Priority::High)
             .await?;
         Ok(())
+    }
+
+    /// Set channel mute using dialect-aware encoding.
+    pub async fn set_channel_mute(&self, addr: u16, muted: bool) -> Result<(), ClientError> {
+        use minidsp_protocol::dialect::{ValueFormat, encode_mute};
+        let mute_bytes = encode_mute(muted, &self.profile.dialect);
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
+                // New dialect: mute value is 2.0 (muted) or 1.0 (unmuted)
+                let val = if muted { 2.0 } else { 1.0 };
+                self.write_dsp(addr, val, true).await?;
+            }
+            ValueFormat::FixedPoint => {
+                // Old dialect: mute is raw 4-byte fixed-point via WriteDSP
+                let raw = u32::from_be_bytes([mute_bytes[0], mute_bytes[1], mute_bytes[2], mute_bytes[3]]);
+                let val = minidsp_protocol::dialect::fixed_point_to_float(raw);
+                self.write_dsp(addr, val, true).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Set channel gain using dialect-aware encoding.
+    pub async fn set_channel_gain(&self, addr: u16, db: f32) -> Result<(), ClientError> {
+        let gain_linear = 10.0f32.powf(db / 20.0);
+        self.write_dsp(addr, gain_linear, true).await
     }
 
     /// Write biquad coefficients to a PEQ band.
