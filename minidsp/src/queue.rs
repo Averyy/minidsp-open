@@ -44,6 +44,9 @@ enum QueueState {
     DeviceBusy,
 }
 
+/// Maximum queue depth before returning a busy error.
+pub const MAX_QUEUE_DEPTH: usize = 64;
+
 /// Per-device command queue with priority scheduling.
 pub struct CommandQueue {
     transport: Box<dyn Transport>,
@@ -79,7 +82,14 @@ impl CommandQueue {
         *self.dialect.lock().await = dialect;
     }
 
+    /// Returns the total number of queued commands across all priority levels.
+    pub async fn queue_depth(&self) -> usize {
+        let queues = self.queues.lock().await;
+        queues.iter().map(|q| q.len()).sum()
+    }
+
     /// Execute a single command and return the parsed response.
+    /// Returns `TransportError::Busy` if the queue is full.
     pub async fn execute(
         &self,
         payload: Vec<u8>,
@@ -104,6 +114,15 @@ impl CommandQueue {
         payload: Vec<u8>,
         priority: Priority,
     ) -> Result<QueueResponse, TransportError> {
+        // Check queue depth before enqueuing
+        {
+            let queues = self.queues.lock().await;
+            let depth: usize = queues.iter().map(|q| q.len()).sum();
+            if depth >= MAX_QUEUE_DEPTH {
+                return Err(TransportError::Busy);
+            }
+        }
+
         let (tx, rx) = oneshot::channel();
         {
             let mut queues = self.queues.lock().await;

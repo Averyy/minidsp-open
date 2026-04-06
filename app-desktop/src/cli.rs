@@ -7,6 +7,33 @@ use minidsp_protocol::device::probe;
 use minidsp_protocol::source::Source;
 use crate::output;
 
+/// TOML config file structure (minidsp-rs compatible).
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(default)]
+struct DaemonConfig {
+    http_server: Option<HttpServerConfig>,
+    tcp_server: Option<TcpServerConfig>,
+    advertise: Option<AdvertiseConfig>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(default)]
+struct HttpServerConfig {
+    bind_address: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(default)]
+struct TcpServerConfig {
+    bind_address: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(default)]
+struct AdvertiseConfig {
+    hostname: Option<String>,
+}
+
 /// Print device status.
 pub async fn status(client: &MiniDspClient, format: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let summary = client.get_status_summary().await?;
@@ -62,10 +89,29 @@ pub async fn probe(_cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Start the daemon server.
-pub async fn server(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn server(bind: &str, config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use minidsp_daemon::state::DaemonState;
     use minidsp_daemon::http::routes;
     use std::sync::Arc;
+
+    // Load optional TOML config
+    let config = if let Some(path) = config_path {
+        let contents = std::fs::read_to_string(path)?;
+        toml::from_str::<DaemonConfig>(&contents)?
+    } else {
+        DaemonConfig::default()
+    };
+
+    // Override bind address from config if not provided on CLI
+    let http_bind = config.http_server.as_ref()
+        .and_then(|h| h.bind_address.as_deref())
+        .unwrap_or(bind);
+    let tcp_bind = config.tcp_server.as_ref()
+        .and_then(|t| t.bind_address.as_deref())
+        .unwrap_or("0.0.0.0:5333");
+    let hostname = config.advertise.as_ref()
+        .and_then(|a| a.hostname.as_deref())
+        .unwrap_or("minidsp-open");
 
     let state = Arc::new(DaemonState::new());
 
@@ -93,10 +139,11 @@ pub async fn server(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = routes::router(state.clone());
 
-    // Start TCP bridge on port 5333
+    // Start TCP bridge
     let tcp_state = state.clone();
+    let tcp_addr = tcp_bind.to_string();
     tokio::spawn(async move {
-        if let Err(e) = minidsp_daemon::tcp::serve("0.0.0.0:5333", tcp_state).await {
+        if let Err(e) = minidsp_daemon::tcp::serve(&tcp_addr, tcp_state).await {
             tracing::error!("TCP bridge error: {e}");
         }
     });
@@ -108,22 +155,80 @@ pub async fn server(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
         let fw_minor = client.hw_id().fw_minor;
         let serial = client.serial();
         let dsp = client.dsp_version();
+        let disc_hostname = hostname.to_string();
         tokio::spawn(async move {
             if let Err(e) = minidsp_daemon::discovery::broadcast_loop(
                 std::net::Ipv4Addr::new(0, 0, 0, 0),
                 hw_id, fw_major, fw_minor, dsp, serial,
-                "minidsp-open".to_string(),
+                disc_hostname,
             ).await {
                 tracing::error!("UDP discovery error: {e}");
             }
         });
     }
 
-    println!("minidsp-open daemon listening on {bind}");
-    println!("  HTTP API: http://{bind}/devices");
-    println!("  TCP bridge: 0.0.0.0:5333");
+    // Start Unix socket listener at /tmp/minidsp.sock
+    #[cfg(unix)]
+    {
+        let unix_app = app.clone();
+        tokio::spawn(async move {
+            let sock_path = "/tmp/minidsp.sock";
+            // Remove stale socket file
+            let _ = std::fs::remove_file(sock_path);
+            match tokio::net::UnixListener::bind(sock_path) {
+                Ok(unix_listener) => {
+                    // Set socket permissions to 0o766
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        sock_path,
+                        std::fs::Permissions::from_mode(0o766),
+                    );
+                    tracing::info!("Unix socket listening on {sock_path}");
+                    if let Err(e) = axum::serve(
+                        unix_listener,
+                        unix_app.into_make_service(),
+                    ).await {
+                        tracing::error!("Unix socket server error: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to bind Unix socket at {sock_path}: {e}");
+                }
+            }
+        });
+    }
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    // Start mDNS advertisement
+    let _mdns_handle = if let Some(client) = state.get_device(0).await {
+        let port: u16 = http_bind.rsplit(':').next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(5380);
+        let product = probe::product_name(client.hw_id().hw_id, client.dsp_version());
+        match minidsp_daemon::mdns::advertise(
+            port, client.serial(), product,
+            client.hw_id().hw_id, client.dsp_version(),
+        ) {
+            Ok(mdns) => {
+                tracing::info!("mDNS: advertising as minidsp-{}.local", client.serial());
+                Some(mdns)
+            }
+            Err(e) => {
+                tracing::warn!("mDNS advertisement failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    println!("minidsp-open daemon listening on {http_bind}");
+    println!("  HTTP API: http://{http_bind}/devices");
+    println!("  TCP bridge: {tcp_bind}");
+    println!("  mDNS: _minidsp._tcp.local.");
+    #[cfg(unix)]
+    println!("  Unix socket: /tmp/minidsp.sock");
+
+    let listener = tokio::net::TcpListener::bind(http_bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

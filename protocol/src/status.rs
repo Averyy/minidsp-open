@@ -1,5 +1,86 @@
 //! Status types for JSON serialization — compatible with minidsp-rs StatusSummary.
 
+#[cfg(feature = "std")]
+extern crate alloc;
+
+/// Biquad coefficients for a single PEQ band.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct BiquadCoeffs {
+    pub b0: f32,
+    pub b1: f32,
+    pub b2: f32,
+    pub a1: f32,
+    pub a2: f32,
+}
+
+impl BiquadCoeffs {
+    pub fn from_array(c: &[f32; 5]) -> Self {
+        Self { b0: c[0], b1: c[1], b2: c[2], a1: c[3], a2: c[4] }
+    }
+
+    pub fn to_array(&self) -> [f32; 5] {
+        [self.b0, self.b1, self.b2, self.a1, self.a2]
+    }
+}
+
+/// PEQ band state: coefficients + bypass flag.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct PeqBandConfig {
+    pub index: u8,
+    pub coeff: BiquadCoeffs,
+    pub bypass: bool,
+}
+
+/// Compressor settings for an output channel.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct CompressorConfig {
+    pub bypass: bool,
+    pub threshold: f32,
+    pub gain: f32,
+    pub ratio: f32,
+    pub knee: f32,
+    pub attack: f32,
+    pub release: f32,
+}
+
+/// Input channel config.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct InputChannelConfig {
+    pub index: u8,
+    pub gain: Option<f32>,
+    pub mute: Option<bool>,
+    pub peq: Vec<PeqBandConfig>,
+}
+
+/// Output channel config.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct OutputChannelConfig {
+    pub index: u8,
+    pub gain: f32,
+    pub mute: bool,
+    pub delay: f32,
+    pub peq: Vec<PeqBandConfig>,
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
+    pub compressor: Option<CompressorConfig>,
+}
+
+/// Full device config — JSON-serializable representation of all device state.
+///
+/// Used for config readback (GET /devices/{id}/config), measurement mode
+/// save/restore, and config export/import.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeviceConfig {
+    pub master_status: MasterStatusView,
+    pub inputs: Vec<InputChannelConfig>,
+    pub outputs: Vec<OutputChannelConfig>,
+}
+
 /// Master status — the main device state.
 ///
 /// When serialized for GET responses, null fields are omitted (`skip_serializing_if`).
@@ -43,6 +124,7 @@ pub struct StatusSummary {
 
 /// View of master status for GET responses — omits null fields.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
 pub struct MasterStatusView {
     pub preset: u8,
     pub source: String,

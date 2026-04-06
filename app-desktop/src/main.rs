@@ -50,6 +50,31 @@ struct Cli {
     command: Option<Command>,
 }
 
+/// Map a --force-kind string to (hw_id, dsp_version).
+fn resolve_force_kind(kind: &str) -> Option<(u8, u8)> {
+    match kind.to_lowercase().as_str() {
+        "2x4hd" | "2x4-hd" => Some((10, 100)),
+        "ddrc24" | "ddrc-24" => Some((10, 101)),
+        "flex" => Some((27, 100)),
+        "flex-dl" | "flexdl" => Some((27, 101)),
+        "shd" => Some((14, 105)),
+        "shd-studio" | "shdstudio" => Some((17, 105)),
+        "shd-power" | "shdpower" => Some((21, 105)),
+        "flex-eight" | "flexeight" | "flex8" => Some((30, 110)),
+        "flex-eight-dl" | "flexeightdl" | "flex8dl" => Some((30, 111)),
+        "flex-ht" | "flexht" => Some((31, 115)),
+        "flex-htx" | "flexhtx" => Some((32, 115)),
+        "4x10hd" | "4x10-hd" => Some((1, 0)),
+        "10x10hd" | "10x10-hd" => Some((1, 51)),
+        "nanodigi-2x8" | "nanodigi2x8" => Some((2, 54)),
+        "2x4" => Some((2, 22)),
+        "msharc-4x8" | "minisharc" => Some((4, 0)),
+        "ddrc-88bm" | "ddrc88bm" => Some((6, 95)),
+        "cdsp-8x12v2" | "cdsp8x12v2" => Some((11, 97)),
+        _ => None,
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Print device status (default if no command given)
@@ -61,6 +86,9 @@ enum Command {
         /// Bind address
         #[arg(long, default_value = "0.0.0.0:5380")]
         bind: String,
+        /// TOML config file (minidsp-rs compatible)
+        #[arg(long = "config", value_name = "FILE")]
+        config: Option<String>,
     },
     /// Set master volume in dB
     Gain {
@@ -191,12 +219,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Handle server mode
-    if let Some(Command::Server { ref bind }) = cli.command {
-        return cli::server(bind).await;
+    if let Some(Command::Server { ref bind, ref config }) = cli.command {
+        return cli::server(bind, config.as_deref()).await;
     }
 
     // Connect to device
-    let client = connect(&cli).await?;
+    let mut client = connect(&cli).await?;
+
+    // Apply --force-kind override
+    if let Some(ref kind) = cli.force_kind {
+        if let Some((hw_id, dsp_version)) = resolve_force_kind(kind) {
+            let profile = minidsp_protocol::device::probe::identify(hw_id, dsp_version);
+            tracing::info!("forcing device kind to {} (hw_id={}, dsp={})", profile.name, hw_id, dsp_version);
+            client.override_profile(profile).await;
+        } else {
+            return Err(format!("unknown device kind '{kind}'").into());
+        }
+    }
 
     // Execute command
     match cli.command {
@@ -237,19 +276,51 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::error::Error>> {
     // Connection order per ref-compatibility.md:
     // 1. --daemon-sock  2. --tcp  3. --url  4. --daemon-url  5. --usb
-    // 6. Default: try Unix socket, then USB HID
+    // 6. Default: try /tmp/minidsp.sock, then USB HID
 
+    // 1. Explicit daemon socket
+    if let Some(path) = &cli.daemon_sock {
+        let transport = TcpTransport::connect_unix(path).await?;
+        return Ok(MiniDspClient::connect(Box::new(transport)).await?);
+    }
+
+    // 2. Explicit TCP
     if let Some(addr) = &cli.tcp {
         let transport = TcpTransport::connect(addr).await?;
         return Ok(MiniDspClient::connect(Box::new(transport)).await?);
     }
 
+    // 4. Daemon URL (HTTP/WS to remote daemon)
+    if let Some(url) = &cli.daemon_url {
+        // Connect to daemon's TCP endpoint
+        let addr = url.trim_start_matches("http://").trim_start_matches("ws://");
+        let transport = TcpTransport::connect(addr).await?;
+        return Ok(MiniDspClient::connect(Box::new(transport)).await?);
+    }
+
+    // 5. Explicit USB
     if let Some(path) = &cli.usb {
         let transport = HidTransport::open(path)?;
         return Ok(MiniDspClient::connect(Box::new(transport)).await?);
     }
 
-    // Default: try USB HID first (Unix socket TODO)
+    // 6. Default: try Unix socket first, then USB HID
+    #[cfg(unix)]
+    {
+        let sock_path = "/tmp/minidsp.sock";
+        if std::path::Path::new(sock_path).exists() {
+            match TcpTransport::connect_unix(sock_path).await {
+                Ok(transport) => {
+                    return Ok(MiniDspClient::connect(Box::new(transport)).await?);
+                }
+                Err(_) => {
+                    // Socket exists but daemon not responding — fall through to USB
+                    tracing::debug!("Unix socket at {sock_path} not responding, trying USB");
+                }
+            }
+        }
+    }
+
     match HidTransport::open_first() {
         Ok(transport) => Ok(MiniDspClient::connect(Box::new(transport)).await?),
         Err(e) => Err(format!("no MiniDSP device found: {e}").into()),

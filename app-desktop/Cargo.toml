@@ -22,3 +22,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
 urlencoding = "2"
+toml = "0.8"

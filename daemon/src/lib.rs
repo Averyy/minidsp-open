@@ -3,4 +3,5 @@
 pub mod http;
 pub mod tcp;
 pub mod discovery;
+pub mod mdns;
 pub mod state;

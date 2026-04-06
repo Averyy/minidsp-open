@@ -571,22 +571,172 @@ async fn enter_measurement_mode(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let _client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
-    // TODO: save current PEQ state, flatten all PEQ to bypass
-    Err(StatusCode::NOT_IMPLEMENTED)
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    client.enter_measurement_mode().await.map_err(client_error_to_status)?;
+    Ok(Json(serde_json::json!({ "status": "measurement_mode_active" })))
 }
 
 async fn restore_measurement_mode(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let _client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
-    // TODO: restore saved PEQ state
-    Err(StatusCode::NOT_IMPLEMENTED)
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    client.restore_measurement_mode().await.map_err(client_error_to_status)?;
+    Ok(Json(serde_json::json!({ "status": "measurement_mode_restored" })))
+}
+
+/// Map ClientError to HTTP status code, including 503 for busy.
+fn client_error_to_status(e: minidsp::client::ClientError) -> StatusCode {
+    match e {
+        minidsp::client::ClientError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+        minidsp::client::ClientError::Transport(minidsp::transport::TransportError::Busy) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        minidsp::client::ClientError::Unsupported => StatusCode::NOT_IMPLEMENTED,
+        minidsp::client::ClientError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 async fn openapi() -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+    let spec = serde_json::json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "minidsp-open API",
+            "description": "MiniDSP controller HTTP API. Drop-in replacement for minidsp-rs.",
+            "version": "0.1.0",
+            "license": { "name": "MIT" }
+        },
+        "servers": [
+            { "url": "http://localhost:5380", "description": "Default daemon" }
+        ],
+        "paths": {
+            "/devices": {
+                "get": {
+                    "summary": "List connected devices",
+                    "operationId": "listDevices",
+                    "responses": {
+                        "200": {
+                            "description": "Array of connected MiniDSP devices",
+                            "content": { "application/json": { "schema": { "type": "array" } } }
+                        }
+                    }
+                }
+            },
+            "/devices/{id}": {
+                "get": {
+                    "summary": "Get device status (or WebSocket upgrade for streaming)",
+                    "operationId": "getDeviceStatus",
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } },
+                        { "name": "levels", "in": "query", "schema": { "type": "boolean" } },
+                        { "name": "poll", "in": "query", "schema": { "type": "boolean" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Device status summary" },
+                        "101": { "description": "WebSocket upgrade for state/level streaming" },
+                        "404": { "description": "Device not found" }
+                    }
+                },
+                "post": {
+                    "summary": "Set master status (volume, mute, preset, source, dirac)",
+                    "operationId": "setDeviceStatus",
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }
+                    ],
+                    "requestBody": {
+                        "content": { "application/json": { "schema": { "type": "object" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Updated master status" },
+                        "503": { "description": "Device busy (queue full)" }
+                    }
+                }
+            },
+            "/devices/{id}/config": {
+                "get": {
+                    "summary": "Read full device config (PEQ coefficients, gains, delays)",
+                    "operationId": "readConfig",
+                    "responses": { "200": { "description": "Full device config" } }
+                },
+                "post": {
+                    "summary": "Write device config (PEQ, gains)",
+                    "operationId": "writeConfig",
+                    "responses": { "200": { "description": "Config applied" } }
+                }
+            },
+            "/devices/{id}/volume/{direction}": {
+                "post": {
+                    "summary": "Volume up/down/toggle_mute",
+                    "operationId": "volumeDirection",
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } },
+                        { "name": "direction", "in": "path", "required": true, "schema": { "type": "string", "enum": ["up", "down", "toggle_mute"] } }
+                    ],
+                    "responses": { "200": { "description": "Updated status" } }
+                }
+            },
+            "/devices/{id}/source/{source}": {
+                "post": {
+                    "summary": "Set input source",
+                    "operationId": "setSource",
+                    "responses": { "200": { "description": "Updated status" } }
+                }
+            },
+            "/devices/{id}/preset/{preset}": {
+                "post": {
+                    "summary": "Switch preset (0-3)",
+                    "operationId": "setPreset",
+                    "responses": { "200": { "description": "Updated status" } }
+                }
+            },
+            "/devices/{id}/display": {
+                "get": { "summary": "Get display settings", "responses": { "200": { "description": "Display state" } } },
+                "post": { "summary": "Set display brightness/idle time", "responses": { "200": { "description": "Updated" } } }
+            },
+            "/devices/{id}/dre": {
+                "get": { "summary": "Get DRE state", "responses": { "200": { "description": "DRE state" } } },
+                "post": { "summary": "Set DRE enabled/disabled", "responses": { "200": { "description": "Updated" } } }
+            },
+            "/devices/{id}/measurement-mode": {
+                "post": {
+                    "summary": "Enter measurement mode (bypass all PEQ)",
+                    "operationId": "enterMeasurementMode",
+                    "responses": {
+                        "200": { "description": "Measurement mode active, PEQ state saved" },
+                        "501": { "description": "Device does not support PEQ" }
+                    }
+                }
+            },
+            "/devices/{id}/measurement-mode/restore": {
+                "post": {
+                    "summary": "Restore PEQ state from measurement mode",
+                    "operationId": "restoreMeasurementMode",
+                    "responses": { "200": { "description": "PEQ state restored" } }
+                }
+            },
+            "/devices/{id}/tokens": {
+                "get": { "summary": "Read modification tokens", "responses": { "200": { "description": "Token values" } } }
+            },
+            "/devices/{id}/preset/copy": {
+                "post": { "summary": "Copy current preset to flash", "responses": { "200": { "description": "Preset copied" } } }
+            },
+            "/devices/{id}/ws": {
+                "get": {
+                    "summary": "WebSocket raw frame bridge",
+                    "operationId": "wsRawBridge",
+                    "responses": { "101": { "description": "WebSocket upgrade" } }
+                }
+            },
+            "/openapi.json": {
+                "get": { "summary": "This OpenAPI specification", "responses": { "200": { "description": "OpenAPI 3.0 JSON" } } }
+            },
+            "/llms.txt": {
+                "get": { "summary": "LLM discovery file", "responses": { "200": { "description": "Plain text LLM info" } } }
+            }
+        }
+    });
+    (StatusCode::OK, [("content-type", "application/json")], serde_json::to_string_pretty(&spec).unwrap())
 }
 
 async fn llms_txt() -> impl IntoResponse {

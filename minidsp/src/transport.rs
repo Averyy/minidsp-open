@@ -16,6 +16,8 @@ pub enum TransportError {
     Timeout,
     #[error("device not found")]
     NotFound,
+    #[error("device busy (queue full)")]
+    Busy,
 }
 
 /// Async transport trait — abstracts USB HID and TCP connections.

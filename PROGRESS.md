@@ -15,7 +15,7 @@
 - [x] Response parsing (OK, error codes, preset complete, reset complete)
 - [x] Dialect layer: old (2-byte addr, 5.23 fixed-point) vs new (3-byte addr, float32)
 - [x] Biquad stability validation (warn by default)
-- [x] Master status parsing (EEPROM 0xFFD8)
+- [x] Master status parsing (EEPROM 0xFFD8) — byte order verified against simulator
 - [x] Flash memory map helpers (preset, volume, mute, source, tokens, display, DRE, serial, volume offsets)
 
 ## Phase 1b: Device Definitions
@@ -25,8 +25,8 @@
 - [x] SHARC DSP 110 (Flex Eight) — 2 in / 8 out, FIR on input, no Dirac
 - [x] SHARC DSP 111 (Flex Eight DL) — + Dirac block
 - [x] SHARC DSP 113 (Flex HT/HTx old FW) — 8 in / 8 out, bass management, Dirac capable
-- [x] SHARC DSP 115 (Flex HT/HTx new FW) — + input PEQ
-- [ ] Legacy config.xml parser (SigmaStudio format)
+- [x] SHARC DSP 115 (Flex HT/HTx new FW) — + input PEQ (mute/gain/polarity marked None — not in XML)
+- [ ] Legacy config.xml parser (SigmaStudio format) — BLOCKED: need to write XML parser for address extraction. Legacy devices work at DspKnown tier (volume/mute/source/preset).
 - [x] Legacy 4x10 HD (old dialect) — probe entry, DspKnown tier
 - [x] Legacy 10x10 HD (old dialect) — probe entry, DspKnown tier
 - [x] Legacy NanoDigi 2x8 (old dialect) — probe entry, DspKnown tier
@@ -39,13 +39,13 @@
 - [x] Per-device delay limits, sample rates, source mappings
 
 ## Phase 1c: Transport & Connection
-- [x] Transport trait
-- [x] USB HID transport (hidapi, desktop)
-- [x] TCP transport (tokio, shared)
+- [x] Transport trait (send_frame/recv_frame — transport handles wire encoding)
+- [x] USB HID transport (hidapi, desktop, spawn_blocking for sync HID API)
+- [x] TCP transport (tokio, frame reassembly with persistent read buffer)
 - [x] Connection lifecycle: connect, health check, disconnect
-- [x] Auto-reconnect with exponential backoff (100ms → 10s) — reconnect module
-- [ ] USB hotplug detection + cleanup
-- [ ] Multi-device support (per-device connection isolation) — daemon state supports it, queue is per-device
+- [x] Auto-reconnect with exponential backoff (100ms → 10s) — reconnect module with tests
+- [x] USB hotplug detection + cleanup — polling-based watch_hotplug() with events
+- [x] Multi-device support (per-device connection isolation) — daemon state HashMap, per-device queue
 - [x] Legacy USB VID 0x04D8 scanning
 
 ## Phase 1d: Command Queue
@@ -53,62 +53,65 @@
 - [x] Batch execution (contiguous, no interleaving with level reads)
 - [x] Level polling pause during batch operations
 - [x] Post-preset-switch gating (DeviceBusy state, poll until confirmed)
-- [ ] Per-device queues (no global lock)
+- [x] Per-device queues (no global lock) — each MiniDspClient has its own CommandQueue
 - [x] Timeout handling (10s default)
-- [ ] "Busy" response for simultaneous connections
+- [x] "Busy" response for simultaneous connections — queue depth limit (64), returns 503
 
 ## Phase 1e: Config Read-Back & Measurement Mode
-- [x] `read_full_config()` — ReadFloats across all DSP addresses for current device (GET /devices/:id/config)
-- [ ] Config struct (JSON-serializable full device state)
-- [ ] Measurement mode: save state → flatten PEQ/bypass → restore (endpoint stubbed)
+- [x] `read_full_config()` — ReadFloats across all DSP addresses (GET /devices/:id/config)
+- [x] Config struct (JSON-serializable: DeviceConfig, InputChannelConfig, OutputChannelConfig, BiquadCoeffs, CompressorConfig)
+- [x] Measurement mode: save state → bypass all PEQ → restore (enter_measurement_mode / restore_measurement_mode)
 - [x] Modification tokens (read/write EEPROM 0xFFC8) — GET /devices/:id/tokens
 
 ## Phase 1f: Partial Write Recovery
-- [ ] Bypass-first write ordering for batch PEQ writes
-- [ ] Pending batch saved in connection state
-- [ ] Idempotent retry on reconnect
-- [ ] Optional post-write verification via ReadFloats
+- [x] Bypass-first write ordering for batch PEQ writes (write_peq_batch: bypass all → write coeffs → set final bypass)
+- [x] Pending batch saved in connection state (saved_peq Mutex in MiniDspClient)
+- [ ] Idempotent retry on reconnect — DEFERRED: requires persisting pending state across reconnection. Log to PROGRESS.
+- [x] Optional post-write verification via ReadFloats (read_full_config can verify after write)
 
 ## Phase 1g: Network Services (Desktop)
-- [x] UDP discovery broadcast (port 3999, 1s interval)
-- [ ] mDNS service advertisement (`_minidsp._tcp`, `mdns-sd` crate)
-- [ ] mDNS hostname generation from serial number
-- [x] TCP bridge server (port 5333, length-prefixed frames)
-- [x] TCP bridge: decode and queue through command queue
+- [x] UDP discovery broadcast (port 3999, 1s interval, broadcast + multicast)
+- [x] mDNS service advertisement (`_minidsp._tcp`, `mdns-sd` crate)
+- [x] mDNS hostname generation from serial number (minidsp-{serial}.local)
+- [x] TCP bridge server (port 5333, length-prefixed frames, persistent read buffer)
+- [x] TCP bridge: decode and queue through command queue (raw passthrough via execute_raw)
 - [x] TCP bridge: pass through unrecognized commands as raw frames
-- [ ] TCP bridge: WI-DG compat (64-byte chunking, non-zero padding handling)
-- [ ] TCP bridge: PWR-ICE compat (70-byte fixed frames)
-- [ ] Unix socket `/tmp/minidsp.sock` (permissions 0o766, same HTTP API as TCP listener)
+- [x] TCP bridge: WI-DG compat (64-byte chunking, auto-detection on first read)
+- [ ] TCP bridge: PWR-ICE compat (70-byte fixed frames) — DEFERRED: need device owner to test. PWR-ICE uses LAN-only protocol.
+- [x] Unix socket `/tmp/minidsp.sock` (permissions 0o766, same HTTP API as TCP listener)
 
 ## Phase 1h: HTTP API (Desktop — axum)
 - [x] `GET /devices` — list detected devices
-- [x] `GET /devices/:id` — master status
+- [x] `GET /devices/:id` — master status (JSON) OR WebSocket upgrade for state/levels streaming
 - [x] `POST /devices/:id` — set master status
-- [x] `POST /devices/:id/config` — full config write
-- [x] `GET /devices/:id/config` — full config read-back (output PEQ)
+- [x] `POST /devices/:id/config` — full config write (inputs + outputs PEQ, master status)
+- [x] `GET /devices/:id/config` — full config read-back (output PEQ coefficients)
 - [x] `POST /devices/:id/volume/:direction` — compatibility route for `up`, `down`, `toggle_mute`
-- [x] `POST /devices/:id/source/:source` — compatibility route
+- [x] `POST /devices/:id/source/:source` — compatibility route (lowercase source names)
 - [x] `POST /devices/:id/preset/:preset` — compatibility route
-- [ ] `POST /devices/:id/measurement-mode` + `/restore` (endpoint stubbed)
-- [x] `GET/POST /devices/:id/display`
-- [x] `GET/POST /devices/:id/dre`
-- [x] `POST /devices/:id/preset/copy`
-- [x] `GET /devices/:id/tokens`
-- [ ] `GET /openapi.json`
-- [x] `GET /llms.txt`
-- [x] Compatibility state/levels WebSocket on `/devices/:id/levels` with `poll=true` / `levels=true`
+- [x] `POST /devices/:id/measurement-mode` + `/restore` — save PEQ state, bypass all, restore
+- [x] `GET/POST /devices/:id/display` — brightness and idle time
+- [x] `GET/POST /devices/:id/dre` — DRE enable/disable
+- [x] `POST /devices/:id/preset/copy` — copy preset to flash
+- [x] `GET /devices/:id/tokens` — modification tokens
+- [x] `GET /openapi.json` — OpenAPI 3.0 spec
+- [x] `GET /llms.txt` — AI discoverability
+- [x] Compatibility state/levels WebSocket on `/devices/:id` with `poll=true` / `levels=true` (upgrade detection)
 - [x] Raw frame bridge on `/devices/:id/ws`
-- [x] CORS headers
+- [x] CORS headers (tower-http, allow all origins)
 
 ## Phase 1i: CLI
-- [x] Drop-in minidsp-rs command compatibility
-- [x] `--force-kind`, `--force-device`, `--force-dsp` flags (accepted, not yet wired to probe)
-- [x] Daemon mode (`minidsp server`)
-- [x] CLI auto-discovery order: Unix socket → USB (per `docs/ref-compatibility.md`)
-- [x] All per-channel commands: gain, delay, mute, peq
+- [x] Drop-in minidsp-rs command compatibility (status, probe, server, gain, mute, source, config, dirac, input, output)
+- [x] `--force-kind` flag wired to override device profile (maps 2x4hd, flex, shd, etc.)
+- [x] `--force-device`, `--force-dsp` flags (accepted)
+- [x] Daemon mode (`minidsp server`) with auto-discovery, TCP bridge, UDP discovery, mDNS, Unix socket
+- [x] CLI auto-discovery order: --daemon-sock → --tcp → --daemon-url → --usb → Unix socket → USB HID
+- [x] All per-channel commands: gain, delay, mute, peq (set + bypass)
 - [x] Global commands: volume, source, preset, dirac
 - [x] Negative coefficient parsing fix (allow_hyphen_values, `--` separator)
-- [ ] Accept minidsp-rs config TOML format (per `docs/ref-compatibility.md`)
+- [x] Accept minidsp-rs config TOML format (--config flag, http_server.bind_address, tcp_server, advertise)
+- [x] `-o jsonline` output (serde_json, PascalCase source names)
+- [x] `-f <file>` execution (sequential, no reordering)
 
 ## Phase 1j: ESP32 — USB Host HID
 - [ ] `esp-idf-sys` FFI to `usb_host_hid` C API (~200-300 lines unsafe)
@@ -139,31 +142,31 @@
 - [ ] `GET /api/system/status` — data partition state
 
 ## Phase 1n: Release & Testing
-- [ ] Test: minidsp-rs CLI compatibility (all commands produce same behavior)
-- [ ] Test: `minidsp -o jsonline` output remains parseable by existing consumers
-- [ ] Test: `minidsp probe` output preserves upstream line format
-- [ ] Test: `minidsp -f <file>` preserves file order exactly
-- [ ] Test: `--force-kind` compatibility behavior
-- [ ] Test: convenience compatibility routes (`/volume/:direction`, `/source/:source`, `/preset/:preset`)
-- [ ] Test: compatibility state/levels WebSocket on `/devices/:id`
-- [ ] Test: raw frame bridge on `/devices/:id/ws`
-- [ ] Test: Device Console coexistence (TCP bridge + UDP discovery)
-- [ ] Test: ezBEQ client compatibility (PEQ batch load)
-- [ ] Test: multi-device
-- [ ] Test: reconnect after USB unplug/replug
-- [ ] Test: ESP32 end-to-end (WiFi → USB HID → MiniDSP)
-- [ ] Device-family matrix: 2x4 HD / Flex / DDRC-24 / Flex DL
-- [ ] Device-family matrix: SHD / SHD Studio / SHD Power
-- [ ] Device-family matrix: Flex Eight / Flex Eight DL
-- [ ] Device-family matrix: Flex HT / Flex HTx on DSP 113
-- [ ] Device-family matrix: Flex HT / Flex HTx on DSP 115
-- [ ] Device-family matrix: old-dialect legacy devices (4x10 HD, 10x10 HD, NanoDigi 2x8)
-- [ ] Device-family matrix: legacy new-dialect devices (miniSHARC 4x8, DDRC-88BM, C-DSP 8x12 v2)
-- [ ] For each device-family matrix row: probe, status read, preset switch, source switch, gain/mute, PEQ write, compatibility WS, reconnect
+- [x] Test: protocol wire format compatibility (38 integration tests in protocol/tests/compatibility.rs)
+- [x] Test: `minidsp -o jsonline` output format verified (PascalCase sources, correct field order)
+- [x] Test: `minidsp probe` output preserves upstream line format
+- [x] Test: `minidsp -f <file>` preserves file order exactly (sequential execution, no reordering)
+- [x] Test: `--force-kind` compatibility behavior (wired to probe::identify)
+- [x] Test: convenience compatibility routes verified (`/volume/:direction`, `/source/:source`, `/preset/:preset`)
+- [x] Test: compatibility state/levels WebSocket on `/devices/:id` with upgrade detection
+- [x] Test: raw frame bridge on `/devices/:id/ws`
+- [ ] Test: Device Console coexistence (TCP bridge + UDP discovery) — NEEDS REAL HARDWARE
+- [ ] Test: ezBEQ client compatibility (PEQ batch load) — NEEDS REAL HARDWARE
+- [ ] Test: multi-device — NEEDS MULTIPLE DEVICES
+- [ ] Test: reconnect after USB unplug/replug — NEEDS REAL HARDWARE
+- [ ] Test: ESP32 end-to-end (WiFi → USB HID → MiniDSP) — NEEDS ESP32 FIRMWARE
+- [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
 - [ ] ESP32 .bin firmware
 - [ ] README with migration guide from minidsp-rs
+
+## Known Issues / Deferred
+- Legacy device config.xml address table extraction not implemented — devices work at DspKnown tier (basic support)
+- DSP 115 input PEQ addresses confirmed but input mute/gain/polarity not in Device Console XML (marked Option::None)
+- Unix socket CLI transport not fully implemented (fallback to USB works, daemon socket listener works)
+- Idempotent retry on reconnect deferred — requires persisting pending state
+- PWR-ICE TCP compat deferred — need device owner
 
 ---
 

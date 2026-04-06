@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 /// Discovered USB HID device.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HidDeviceInfo {
     pub path: String,
     pub vendor_id: u16,
@@ -67,6 +67,71 @@ impl HidTransport {
         let info = devices.first().ok_or(TransportError::NotFound)?;
         Self::open(&info.path)
     }
+}
+
+/// USB hotplug event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotplugEvent {
+    /// A new MiniDSP device was connected.
+    Connected(HidDeviceInfo),
+    /// A MiniDSP device was disconnected (identified by path).
+    Disconnected(String),
+}
+
+/// Watch for USB device connect/disconnect events by polling enumeration every 2 seconds.
+///
+/// Returns a `tokio::sync::watch::Receiver` that receives `Vec<HotplugEvent>` on each change.
+/// The daemon can use this to add/remove devices from state.
+pub fn watch_hotplug() -> (tokio::sync::watch::Receiver<Vec<HotplugEvent>>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = tokio::sync::watch::channel(Vec::new());
+
+    let handle = tokio::spawn(async move {
+        let mut known_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Initial enumeration
+        if let Ok(devices) = enumerate() {
+            for dev in &devices {
+                known_paths.insert(dev.path.clone());
+            }
+        }
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+
+            let current = match enumerate() {
+                Ok(devices) => devices,
+                Err(_) => continue,
+            };
+
+            let current_paths: std::collections::HashSet<String> =
+                current.iter().map(|d| d.path.clone()).collect();
+
+            let mut events = Vec::new();
+
+            // New devices
+            for dev in &current {
+                if !known_paths.contains(&dev.path) {
+                    events.push(HotplugEvent::Connected(dev.clone()));
+                }
+            }
+
+            // Removed devices
+            for path in &known_paths {
+                if !current_paths.contains(path) {
+                    events.push(HotplugEvent::Disconnected(path.clone()));
+                }
+            }
+
+            if !events.is_empty() {
+                let _ = tx.send(events);
+            }
+
+            known_paths = current_paths;
+        }
+    });
+
+    (rx, handle)
 }
 
 impl Transport for HidTransport {
