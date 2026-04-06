@@ -194,12 +194,14 @@ impl DeviceState {
 
     // -- DSP writes --
 
+    #[allow(dead_code)]
     pub fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), UsbHidError> {
         self.bus
             .command(&commands::write_biquad(addr, coeffs, self.dialect()))?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn bypass_filter(&self, addr: u16, bypass: bool) -> Result<(), UsbHidError> {
         self.bus
             .command(&commands::bypass_filter(addr, bypass, self.dialect()))?;
@@ -256,6 +258,7 @@ impl DeviceState {
 
     // -- Raw command --
 
+    #[allow(dead_code)]
     pub fn raw_command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
         self.bus.command(payload)
     }

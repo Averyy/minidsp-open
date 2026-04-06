@@ -1,4 +1,4 @@
-//! WiFi connection and SoftAP provisioning for ESP32-S3.
+//! WiFi connection, SoftAP provisioning, and auto-reconnection for ESP32-S3.
 //!
 //! Boot sequence:
 //! 1. Check NVS for saved WiFi credentials
@@ -6,6 +6,9 @@
 //! 3. If no credentials or AUTH_FAIL: start SoftAP captive portal
 //! 4. User enters WiFi credentials via web page
 //! 5. Save to NVS, restart into STA mode
+//!
+//! After connection, a background monitor thread watches for disconnects
+//! and reconnects automatically with exponential backoff.
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
@@ -15,6 +18,8 @@ use esp_idf_svc::wifi::{
     EspWifi,
 };
 use log::{info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const NVS_NAMESPACE: &str = "wifi";
@@ -40,11 +45,26 @@ impl std::fmt::Display for WifiError {
     }
 }
 
+/// Shared flag indicating whether WiFi is currently connected (STA mode).
+static WIFI_CONNECTED: AtomicBool = AtomicBool::new(false);
+
+/// Check if WiFi STA is connected (safe to call from any thread).
+#[allow(dead_code)]
+pub fn is_connected() -> bool {
+    WIFI_CONNECTED.load(Ordering::Relaxed)
+}
+
+/// Result of WiFi initialization.
+pub struct WifiHandle {
+    pub wifi: BlockingWifi<EspWifi<'static>>,
+    pub is_sta: bool,
+}
+
 /// Attempt to connect to saved WiFi, or start provisioning.
 /// Returns the WiFi handle (must be kept alive for WiFi to stay connected).
 pub fn connect_or_provision(
     nvs: EspDefaultNvsPartition,
-) -> Result<BlockingWifi<EspWifi<'static>>, WifiError> {
+) -> Result<WifiHandle, WifiError> {
     let sysloop =
         EspSystemEventLoop::take().map_err(|e| WifiError::Init(format!("eventloop: {e}")))?;
     let modem = unsafe { Modem::steal() };
@@ -68,7 +88,11 @@ pub fn connect_or_provision(
                     .map(|info| format!("{}", info.ip))
                     .unwrap_or_else(|_| "unknown".into());
                 info!("WiFi connected: {ip}");
-                return Ok(wifi);
+                WIFI_CONNECTED.store(true, Ordering::Relaxed);
+                return Ok(WifiHandle {
+                    wifi,
+                    is_sta: true,
+                });
             }
             Err(e) => {
                 warn!("WiFi connection failed: {e}");
@@ -83,9 +107,10 @@ pub fn connect_or_provision(
     info!("WiFi: starting SoftAP '{SOFTAP_SSID}' for provisioning");
     start_softap(&mut wifi)?;
 
-    // In provisioning mode, the HTTP server will handle credential submission
-    // For now, return the wifi handle in AP mode
-    Ok(wifi)
+    Ok(WifiHandle {
+        wifi,
+        is_sta: false,
+    })
 }
 
 /// Connect in STA mode with exponential backoff.
@@ -161,9 +186,172 @@ fn start_softap(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), WifiErr
     wifi.start()
         .map_err(|e| WifiError::Provision(format!("start: {e}")))?;
 
-    info!("SoftAP started: SSID='{SOFTAP_SSID}', IP=192.168.4.1");
+    info!("SoftAP started: SSID='{SOFTAP_SSID}'");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// WiFi monitor — auto-reconnect background thread
+// ---------------------------------------------------------------------------
+
+/// Start a background thread that monitors WiFi and reconnects on disconnect.
+pub fn start_monitor(
+    wifi: Arc<std::sync::Mutex<BlockingWifi<EspWifi<'static>>>>,
+) {
+    std::thread::Builder::new()
+        .name("wifi_mon".into())
+        .stack_size(8192)
+        .spawn(move || monitor_loop(wifi))
+        .expect("failed to spawn wifi monitor thread");
+}
+
+fn monitor_loop(
+    wifi: Arc<std::sync::Mutex<BlockingWifi<EspWifi<'static>>>>,
+) {
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(60);
+    let check_interval = Duration::from_secs(5);
+
+    info!("WiFi monitor started");
+
+    loop {
+        std::thread::sleep(check_interval);
+
+        let connected = {
+            let wifi = wifi.lock().unwrap_or_else(|e| e.into_inner());
+            wifi.is_connected().unwrap_or(false)
+        };
+
+        if connected {
+            if !WIFI_CONNECTED.load(Ordering::Relaxed) {
+                // Transition: disconnected → connected
+                let ip = {
+                    let wifi = wifi.lock().unwrap_or_else(|e| e.into_inner());
+                    wifi.wifi()
+                        .sta_netif()
+                        .get_ip_info()
+                        .map(|info| format!("{}", info.ip))
+                        .unwrap_or_else(|_| "unknown".into())
+                };
+                info!("WiFi reconnected: {ip}");
+                WIFI_CONNECTED.store(true, Ordering::Relaxed);
+                backoff = Duration::from_secs(1);
+            }
+            continue;
+        }
+
+        // Disconnected
+        if WIFI_CONNECTED.load(Ordering::Relaxed) {
+            warn!("WiFi disconnected — starting reconnect loop");
+            WIFI_CONNECTED.store(false, Ordering::Relaxed);
+        }
+
+        info!("WiFi: reconnect attempt (backoff: {backoff:?})");
+
+        // Connect — brief mutex hold, don't block on wait_netif_up under lock
+        let connect_ok = {
+            let mut wifi = wifi.lock().unwrap_or_else(|e| e.into_inner());
+            match wifi.connect() {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("WiFi: reconnect failed: {e}");
+                    false
+                }
+            }
+        };
+
+        if connect_ok {
+            // Wait for IP in a separate mutex scope
+            let wifi = wifi.lock().unwrap_or_else(|e| e.into_inner());
+            match wifi.wait_netif_up() {
+                Ok(()) => {
+                    let ip = wifi
+                        .wifi()
+                        .sta_netif()
+                        .get_ip_info()
+                        .map(|info| format!("{}", info.ip))
+                        .unwrap_or_else(|_| "unknown".into());
+                    info!("WiFi reconnected: {ip}");
+                    WIFI_CONNECTED.store(true, Ordering::Relaxed);
+                    backoff = Duration::from_secs(1);
+                    continue;
+                }
+                Err(e) => warn!("WiFi: netif_up failed: {e}"),
+            }
+        }
+
+        // Wait before next attempt
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Captive portal DNS hijack
+// ---------------------------------------------------------------------------
+
+/// Start a DNS server that responds to ALL queries with the given IP.
+/// This triggers captive portal detection on phones (iOS, Android, Windows).
+pub fn start_captive_dns(ip: std::net::Ipv4Addr) {
+    std::thread::Builder::new()
+        .name("dns_cp".into())
+        .stack_size(6144)
+        .spawn(move || captive_dns_loop(ip))
+        .expect("failed to spawn captive DNS thread");
+    info!("Captive portal DNS started (all queries → {ip})");
+}
+
+fn captive_dns_loop(ip: std::net::Ipv4Addr) {
+    use std::net::UdpSocket;
+
+    let socket = match UdpSocket::bind("0.0.0.0:53") {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("DNS bind failed: {e}");
+            return;
+        }
+    };
+
+    let mut buf = [0u8; 512];
+    loop {
+        let (len, src) = match socket.recv_from(&mut buf) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        // Minimum DNS header is 12 bytes
+        if len < 12 {
+            continue;
+        }
+
+        // Build response: copy the query, flip flags, append answer
+        let mut resp = Vec::with_capacity(len + 16);
+        resp.extend_from_slice(&buf[..len]);
+
+        // Response flags: QR=1, AA=1, RD=1, RA=1
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        // ANCOUNT = 1
+        resp[6] = 0x00;
+        resp[7] = 0x01;
+
+        // Answer record: name pointer → offset 12 (question name)
+        resp.extend_from_slice(&[
+            0xC0, 0x0C, // Name pointer
+            0x00, 0x01, // Type A
+            0x00, 0x01, // Class IN
+        ]);
+        resp.extend_from_slice(&60u32.to_be_bytes()); // TTL = 60s
+        resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH = 4
+        resp.extend_from_slice(&ip.octets()); // The IP address
+
+        let _ = socket.send_to(&resp, src);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NVS credentials
+// ---------------------------------------------------------------------------
 
 /// Read WiFi credentials from NVS.
 fn read_credentials(nvs: &EspDefaultNvsPartition) -> Option<(String, String)> {
@@ -191,7 +379,7 @@ pub fn save_credentials(
     ssid: &str,
     password: &str,
 ) -> Result<(), WifiError> {
-    let mut nvs = EspNvs::<NvsDefault>::new(nvs.clone(), NVS_NAMESPACE, true)
+    let nvs = EspNvs::<NvsDefault>::new(nvs.clone(), NVS_NAMESPACE, true)
         .map_err(|e| WifiError::Provision(format!("NVS open: {e}")))?;
 
     nvs.set_str(NVS_KEY_SSID, ssid)
@@ -201,6 +389,33 @@ pub fn save_credentials(
 
     info!("WiFi credentials saved to NVS");
     Ok(())
+}
+
+/// Read the actual SoftAP IP from the ESP-IDF network interface.
+/// Falls back to 192.168.4.1 if the interface isn't available.
+pub fn get_softap_ip() -> std::net::Ipv4Addr {
+    unsafe {
+        let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(
+            b"WIFI_AP_DEF\0".as_ptr() as _,
+        );
+        if !netif.is_null() {
+            let mut ip_info: esp_idf_svc::sys::esp_netif_ip_info_t = core::mem::zeroed();
+            if esp_idf_svc::sys::esp_netif_get_ip_info(netif, &mut ip_info)
+                == esp_idf_svc::sys::ESP_OK as i32
+            {
+                let ip = ip_info.ip.addr;
+                if ip != 0 {
+                    return std::net::Ipv4Addr::new(
+                        (ip & 0xFF) as u8,
+                        ((ip >> 8) & 0xFF) as u8,
+                        ((ip >> 16) & 0xFF) as u8,
+                        ((ip >> 24) & 0xFF) as u8,
+                    );
+                }
+            }
+        }
+    }
+    std::net::Ipv4Addr::new(192, 168, 4, 1)
 }
 
 /// Provisioning HTML page (minimal captive portal).
@@ -217,10 +432,10 @@ button:hover{background:#1a5276}
 </style></head><body>
 <h1>MiniDSP WiFi Setup</h1>
 <form method="POST" action="/api/wifi/connect">
-<label>Network Name (SSID)</label>
-<input name="ssid" required autofocus>
-<label>Password</label>
-<input name="password" type="password">
+<label for="ssid">Network Name (SSID)</label>
+<input id="ssid" name="ssid" required autofocus>
+<label for="password">Password</label>
+<input id="password" name="password" type="password">
 <button type="submit">Connect</button>
 </form>
 </body></html>"#;

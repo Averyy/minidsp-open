@@ -120,7 +120,7 @@
 - [x] 64-byte interrupt transfer read/write (no report ID on wire for report ID 0)
 - [x] Separate XferSync per transfer direction (OUT/IN) — prevents spurious callback races
 - [x] Blocking `command()` API with Mutex serialization — thread-safe for HTTP handlers
-- [ ] Hotplug detection (reconnect after unplug) — DEFERRED: requires background monitoring
+- [x] Hotplug detection (reconnect after unplug) — disconnect detection via callback, reconnect in main loop with backoff
 - [ ] VBUS drive (GPIO high for MiniDSP USB enable) — not needed on DevKitC (both boards powered via UART)
 
 ## Phase 1k: ESP32 — HTTP API (EspHttpServer)
@@ -137,7 +137,7 @@
 - [x] `POST /devices/0/preset/copy` — copy preset to flash
 - [x] `GET /llms.txt` — AI discoverability
 - [x] CORS headers (Access-Control-Allow-Origin: *)
-- [ ] WebSocket support — DEFERRED: EspHttpServer WebSocket experimental
+- [x] WebSocket support — /devices/0/ws with push-based status streaming (1s poll) + request-response
 
 ## Phase 1l: ESP32 — WiFi & Provisioning
 - [x] SoftAP mode (SSID `minidsp-setup`, open)
@@ -146,15 +146,18 @@
 - [x] Captive portal HTML page with SSID/password form
 - [x] `POST /api/wifi/connect` — save credentials + restart
 - [x] SoftAP fallback on no credentials or failed STA connect
-- [ ] mDNS via `EspMdns` — DEFERRED: add after basic WiFi works in production
-- [ ] Reason code handling (AUTH_FAIL vs BEACON_TIMEOUT) — DEFERRED
+- [x] mDNS via `EspMdns` — _minidsp._tcp:5380 with TXT records (hw_id, serial, product)
+- [x] Auto-reconnect after WiFi disconnect — background monitor thread, exponential backoff (1s–60s)
+- [ ] Reason code handling (AUTH_FAIL vs BEACON_TIMEOUT) — DEFERRED: monitor reconnects generically for now
 
 ## Phase 1m: ESP32 — Diagnostics
 - [x] System info collection (heap free, heap min, uptime)
 - [x] Periodic diagnostics logging (30s interval)
-- [ ] Custom `log::Log` ring buffer — DEFERRED: ESP logger to UART works
-- [ ] `GET /debug/info` endpoint — DEFERRED: diagnostics struct ready (SystemInfo)
-- [ ] Runtime log level change — DEFERRED
+- [x] Custom `log::Log` ring buffer — 4KB circular buffer, writes to both UART and ring buffer
+- [x] `GET /debug/info` endpoint — JSON system diagnostics (heap, WiFi, USB, uptime, log stats)
+- [x] `GET /debug/log` endpoint — ring buffer snapshot as text/plain
+- [x] `POST /debug/level` endpoint — runtime log level change (error/warn/info/debug/trace)
+- [x] Runtime log level change — via HTTP endpoint and esp_log_level_set FFI
 
 ## Phase 1n: Release & Testing
 - [x] Test: protocol wire format compatibility (38 integration tests in protocol/tests/compatibility.rs)
@@ -169,7 +172,11 @@
 - [ ] Test: ezBEQ client compatibility (PEQ batch load) — NEEDS REAL HARDWARE
 - [ ] Test: multi-device — NEEDS MULTIPLE DEVICES
 - [ ] Test: reconnect after USB unplug/replug — NEEDS REAL HARDWARE
-- [x] Test: ESP32 boots, WiFi SoftAP starts, USB host detects simulator, runs stable (221KB heap free, no crashes)
+- [x] Test: ESP32 boots, WiFi SoftAP starts, USB host detects simulator, runs stable (193KB heap free, no crashes)
+- [x] Test: full code review (31 issues — 3 critical, 9 high, 11 medium, 8 low) — all addressed
+- [x] Test: boot order verified — captive portal (DNS+HTTP) starts before USB init (which blocks 30s)
+- [x] Test: no boot loop — previous 4KB WiFi monitor stack caused stack overflow → watchdog reset. Fixed to 8KB.
+- [ ] Test: WiFi provisioning end-to-end (phone → SoftAP → captive portal → save creds → restart → STA) — NEXT
 - [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
@@ -182,7 +189,8 @@
 - Unix socket CLI transport not fully implemented (fallback to USB works, daemon socket listener works)
 - Idempotent retry on reconnect deferred — requires persisting pending state
 - PWR-ICE TCP compat deferred — need device owner
-- ESP32 flashing: close serial-mcp session before flashing. Use `idf.py -p /dev/cu.usbmodem<TARGET> flash` (NOT espflash). CH340 auto-resets via DTR/RTS — no boot button needed.
+- ESP32 flashing: close serial-mcp session before flashing. Use `espflash flash --port /dev/cu.usbmodem<TARGET> <elf>` (Rust project, no CMakeLists.txt). CH340 auto-resets via DTR/RTS — no boot button needed.
+- ESP32 SoftAP IP is 192.168.71.1 (not the default 192.168.4.1) — DNS hijack now reads actual IP from ESP-IDF netif dynamically.
 
 ---
 
@@ -206,6 +214,23 @@
 - [ ] MQTT discovery + HA entities
 - [ ] SSE live log streaming (`GET /debug/events`)
 - [ ] Syslog UDP (RFC 5424)
+
+---
+
+## Phase 3: ESP32 USB Audio Output (Measurement Sweeps)
+
+See [`docs/TODO-esp32-usb-audio.md`](docs/TODO-esp32-usb-audio.md) for full design (API, timing, clock sync, UAC2 driver details).
+
+- [ ] Integrate `esp-uac2-host` as ESP-IDF component (submodule or local path)
+- [ ] Open miniDSP UAC2 audio interface alongside existing HID interface
+- [ ] Sweep generator: real-time Farina ESS (sin/exp, 48kHz stereo 24-bit)
+- [ ] Signal structure: preamble → tone burst (80Hz, 3 cycles) → gap → sweep → decay
+- [ ] `POST /devices/{id}/play` endpoint — generate + stream sweep, return `startedAtUs` + sample offsets
+- [ ] `POST /sync` endpoint — clock sync (UDP ping-pong, min-RTT filtering)
+- [ ] Hardware timestamp of first audio frame output (`uac2_host_stream_get_start_time`)
+- [ ] Verify with real miniDSP: feedback format (10.14 vs 16.16), ASRC lock timing, full config descriptor
+- [ ] Test: open-sub-optimizer network measurement path (sync → mute → play → capture → deconvolve)
+- [ ] Test: REW manual sweep trigger via curl
 
 ---
 

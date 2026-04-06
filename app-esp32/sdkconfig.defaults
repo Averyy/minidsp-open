@@ -13,3 +13,9 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 
 # Heap — disable memory protection for full PSRAM access
 CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# HTTP server WebSocket support
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# mDNS
+CONFIG_MDNS_MAX_SERVICES=4
