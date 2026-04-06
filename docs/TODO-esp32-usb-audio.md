@@ -186,31 +186,52 @@ The miniDSP accepts audio via USB — that's a core product feature. The ESP32-S
 
 **Step 1: Audio streaming via `esp-uac2-host`**
 
-Open the miniDSP's audio interface alongside the existing HID interface. Use the UAC2 driver API:
+Open the miniDSP's audio interface alongside the existing HID interface. The UAC2 driver uses an install/uninstall lifecycle — it owns the USB Host client internally and discovers devices automatically:
 ```c
 #include "usb/uac2_host.h"
 
-// Open the UAC2 device after USB enumeration
-uac2_host_device_handle_t audio_dev;
-uac2_host_device_open(client, usb_dev, event_cb, event_cb_arg, &audio_dev);
+// Install the UAC2 driver (once, at startup, after usb_host_install)
+uac2_host_driver_config_t drv_cfg = {
+    .create_background_task = true,
+    .task_priority = 3,
+    .stack_size = 6144,
+    .core_id = 0,
+    .callback = driver_event_cb,   // fires UAC2_HOST_DRIVER_EVENT_TX_CONNECTED
+    .callback_arg = &app_state,
+};
+uac2_host_install(&drv_cfg);
 
-// Start streaming: 48kHz, 24-bit, stereo
-uac2_stream_config_t cfg = {
-    .sample_rate = 48000,
+// In driver_event_cb: open the playback interface when discovered
+// (addr and iface_num come from the callback)
+uac2_host_device_handle_t audio_dev;
+uac2_host_device_config_t dev_cfg = {
+    .addr = addr,
+    .iface_num = iface_num,
+    .callback = device_event_cb,   // fires TX_DONE, DISCONNECTED, etc.
+    .callback_arg = &app_state,
+};
+uac2_host_device_open(&dev_cfg, &audio_dev);
+
+// Start streaming: 48kHz, 24-bit, stereo (direction implicit from interface)
+uac2_host_stream_config_t cfg = {
+    .sample_freq = 48000,
     .bit_resolution = 24,
     .channels = 2,
 };
-uac2_host_stream_start(audio_dev, UAC2_STREAM_TX, &cfg);
+uac2_host_device_start(audio_dev, &cfg);
 
 // Write PCM data (blocks until ringbuf has space, or returns ESP_ERR_TIMEOUT)
-uac2_host_stream_write(audio_dev, pcm_data, num_bytes, timeout_ms);
+uac2_host_device_write(audio_dev, pcm_data, num_bytes, timeout_ms);
 
 // Get hardware timestamp of first audio frame output (microseconds)
-int64_t start_us = uac2_host_stream_get_start_time(audio_dev);
+int64_t start_us = uac2_host_device_get_start_time(audio_dev);
 
 // Stop and clean up
-uac2_host_stream_stop(audio_dev, UAC2_STREAM_TX);
+uac2_host_device_stop(audio_dev);
 uac2_host_device_close(audio_dev);
+
+// At shutdown
+uac2_host_uninstall();
 ```
 
 **Step 2: Sweep generation**
@@ -297,19 +318,21 @@ No special software needed beyond minidsp-open and REW.
 
 ## UAC2 Driver: `esp-uac2-host`
 
-**Status: COMPLETE.** The driver is at `~/code/esp-uac2-host` and provides:
-- UAC2 descriptor parsing (clock source/selector/multiplier entities, terminals, feature units)
+**Status: COMPLETE (v0.1.0).** The driver is at `~/code/esp-uac2-host` and provides:
+- Espressif-pattern install/uninstall lifecycle (`uac2_host_install`/`uac2_host_uninstall`)
+- Internal device discovery — driver owns the USB Host client, fires callbacks on connect
+- Two-level struct split: physical device (shared, refcounted) + logical interface (per-handle)
+- UAC2 descriptor parsing (clock source/selector/multiplier, terminals, feature units)
 - UAC2 control requests (CUR/RANGE for sample rate, clock validity, volume, mute)
 - SET_INTERFACE for proper endpoint activation/deactivation
-- Isochronous OUT with feedback-based adaptive packet sizing (10.14 and 16.16 format)
-- Isochronous IN (capture, limited by ESP32-S3 FIFO — not needed for sweeps)
+- Isochronous OUT with feedback-based adaptive packet sizing (4-byte 16.16 format confirmed on real miniDSP)
 - Ring buffer with configurable pre-fill and threshold-based events
-- Hardware timer start timestamp (`uac2_host_stream_get_start_time`)
-- Transfer error limiting (auto-stops after 10 consecutive errors)
-- All 5 automated tests pass (48kHz, volume/mute, stop/restart, 44.1kHz, long-running stability)
-- Reviewed by 6-agent code review, all findings fixed
-- Full cleanup/hardening pass: per-stream spinlocks, safe ringbuffer deletion, Kconfig, idf_component.yml
-- v1.0.0 (headers at `include/usb/uac2_host.h`, `include/usb/uac2_desc.h`)
+- Hardware timer start timestamp (`uac2_host_device_get_start_time`)
+- Device handle validation on all public API functions
+- Disconnect/reconnect support (idle disconnect verified, 3+ cycles)
+- All 12 tests pass on real miniDSP 2x4 HD + simulator, zero errors
+- Multiple code reviews with all findings fixed
+- Clean build with `-Werror -Wextra`, v0.1.0 (headers at `include/usb/uac2_host.h`, `include/usb/uac2_desc.h`)
 
 ### Using as ESP-IDF Component
 
@@ -431,10 +454,13 @@ For our use case, a simpler version suffices: 50-100 UDP round-trips before meas
 - **Can we open HID and Audio interfaces simultaneously?** YES, confirmed with the simulator. ESP-IDF supports claiming multiple interfaces on a composite device. The host driver opens the audio interface while HID is on a separate interface.
 - **ASRC lock time:** miniDSP ASRC needs ~2 seconds to lock. The 2-second preamble in the sweep signal covers this. The simulator does not replicate ASRC behavior — verify with real hardware.
 
-## Remaining Questions (Need Real Hardware)
+## Resolved Questions (Real Hardware Verified April 2026)
 
-- **Feedback format confirmation:** Expect 3 bytes / 10.14 from XMOS at Full Speed (based on XMOS source code). Simulator uses TinyUSB auto-conversion. Verify with real miniDSP.
-- **Full 373-byte config descriptor:** We have 257 bytes captured + 116 bytes reconstructed. Verify complete descriptor with real device.
+- **Feedback format:** **4 bytes / 16.16 format** (not 3-byte 10.14 as originally expected). Value at 48kHz: 0x00300000 (48.0000 samples/frame). Locks immediately, drift <0.002%.
+- **Full config descriptor:** Complete 373-byte descriptor captured from real miniDSP 2x4 HD. Stored at `~/code/esp-uac2-host/ref/minidsp_2x4hd_descriptors.h`.
+- **Volume range:** -127 to 0 dB, 1 dB resolution (master + per-channel).
+- **VBUS requirement:** miniDSP is self-powered but needs VBUS present. Bridge `USB-OTG` solder pads on DevKitC-1.
+- **Hot-unplug during streaming:** Causes ESP32 reset (ESP-IDF v5.4 HAL `abort()` in DWC_OTG ISR for isochronous channels). Not fixable in driver code. Board auto-recovers. Idle disconnect/reconnect works cleanly.
 
 ## References
 
