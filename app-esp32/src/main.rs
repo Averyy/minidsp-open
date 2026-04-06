@@ -74,34 +74,34 @@ fn main() {
         }
     }
 
-    // Step 3: USB Host HID initialization (blocks until device found)
+    // Step 3: USB Host HID initialization (sets up host library + background threads)
     info!("step 3: USB Host HID setup");
     let bus = match usb_hid::UsbHidBus::init() {
-        Ok(bus) => {
-            info!("USB HID bus initialized");
-            Some(Arc::new(bus))
-        }
+        Ok(bus) => Some(Arc::new(bus)),
         Err(e) => {
-            warn!("USB HID init failed: {e}");
+            error!("USB HID init failed: {e} — USB will not be available");
             None
         }
     };
 
-    // Step 4: Probe device and build state
+    // Step 4: Wait for MiniDSP device (up to 30s)
     if let Some(ref bus) = bus {
-        match device::DeviceState::probe(bus.clone()) {
-            Ok(state) => {
-                info!(
-                    "device: {} (hw_id={}, dsp={})",
-                    state.product_name(),
-                    state.hw_id().hw_id,
-                    state.dsp_version()
-                );
-                *device_state.lock().unwrap() = Some(Arc::new(state));
+        match bus.wait_for_device(Duration::from_secs(30)) {
+            Ok((_vid, _pid)) => {
+                match device::DeviceState::probe(bus.clone()) {
+                    Ok(state) => {
+                        info!(
+                            "device: {} (hw_id={}, dsp={})",
+                            state.product_name(),
+                            state.hw_id().hw_id,
+                            state.dsp_version()
+                        );
+                        *device_state.lock().unwrap() = Some(Arc::new(state));
+                    }
+                    Err(e) => error!("device probe failed: {e}"),
+                }
             }
-            Err(e) => {
-                error!("device probe failed: {e}");
-            }
+            Err(e) => warn!("No MiniDSP device found: {e} — will retry in background"),
         }
     }
 
@@ -148,52 +148,50 @@ fn main() {
         info!("[boot] {line}");
     }
 
-    // Main loop: diagnostics tick + USB reconnect check
-    let mut usb_reconnect_backoff = Duration::from_secs(5);
+    // Main loop: diagnostics tick + USB device detection/reconnection
+    let mut usb_backoff = Duration::from_secs(5);
     loop {
         diagnostics::tick();
 
-        // Check for USB reconnection if device disconnected
+        // Check for USB device — handles both initial detection and reconnection
         if let Some(ref bus) = bus {
-            if !bus.is_connected() {
-                let had_device = device_state.lock().unwrap().is_some();
-                if had_device {
-                    warn!("USB device lost — clearing device state");
-                    *device_state.lock().unwrap() = None;
-                }
+            let has_device = device_state.lock().unwrap().is_some();
 
-                info!("USB: attempting reconnect (backoff: {usb_reconnect_backoff:?})");
-                match bus.reconnect(Duration::from_secs(10)) {
-                    Ok(()) => {
-                        // Re-probe the device
+            if has_device && !bus.is_connected() {
+                // Device was connected but is now gone
+                warn!("USB device lost — clearing device state");
+                *device_state.lock().unwrap() = None;
+            }
+
+            // Scan if we don't have a working device (regardless of is_connected,
+            // since non-MiniDSP devices can set the flag)
+            if device_state.lock().unwrap().is_none() {
+                info!("USB: scanning for device (timeout: {usb_backoff:?})");
+                match bus.wait_for_device(usb_backoff) {
+                    Ok((_vid, _pid)) => {
                         match device::DeviceState::probe(bus.clone()) {
                             Ok(state) => {
                                 info!(
-                                    "USB reconnected: {} (hw_id={}, dsp={})",
+                                    "USB device found: {} (hw_id={}, dsp={})",
                                     state.product_name(),
                                     state.hw_id().hw_id,
                                     state.dsp_version()
                                 );
                                 *device_state.lock().unwrap() = Some(Arc::new(state));
-                                usb_reconnect_backoff = Duration::from_secs(5);
+                                usb_backoff = Duration::from_secs(5);
                             }
-                            Err(e) => {
-                                error!("USB re-probe failed: {e}");
-                            }
+                            Err(e) => error!("USB device probe failed: {e}"),
                         }
                     }
-                    Err(e) => {
-                        warn!("USB reconnect failed: {e}");
-                        usb_reconnect_backoff =
-                            (usb_reconnect_backoff * 2).min(Duration::from_secs(60));
+                    Err(_) => {
+                        // No device found within timeout — back off
+                        usb_backoff = (usb_backoff * 2).min(Duration::from_secs(60));
                     }
                 }
-            } else {
-                usb_reconnect_backoff = Duration::from_secs(5);
             }
         }
 
-        std::thread::sleep(Duration::from_secs(30));
+        std::thread::sleep(Duration::from_secs(5));
     }
 }
 

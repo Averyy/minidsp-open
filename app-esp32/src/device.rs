@@ -267,7 +267,7 @@ impl DeviceState {
 
     pub fn device_info(&self) -> DeviceInfo {
         DeviceInfo {
-            url: format!("usb://0x{:04x}:0x{:04x}", self.bus.vid, self.bus.pid),
+            url: format!("usb://0x{:04x}:0x{:04x}", self.bus.vid(), self.bus.pid()),
             version: DeviceVersion {
                 hw_id: self.hw_id.hw_id,
                 fw_major: self.hw_id.fw_major,

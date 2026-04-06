@@ -21,6 +21,9 @@ CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 
+# Stack overflow detection (hardware watchpoint at end of stack)
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+
 # Heap — disable memory protection for full PSRAM access
 CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
 

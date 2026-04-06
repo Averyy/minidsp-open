@@ -32,8 +32,8 @@ pub fn start(
 ) -> Result<EspHttpServer<'static>, Box<dyn std::error::Error>> {
     let config = Configuration {
         http_port: port,
-        max_uri_handlers: 30,
-        stack_size: 8192,
+        max_uri_handlers: 35,
+        stack_size: 16384,
         max_open_sockets: 13,
         uri_match_wildcard: true,
         ..Default::default()
@@ -128,18 +128,7 @@ pub fn start(
             }
 
             match dev.get_status_summary() {
-                Ok(status) => {
-                    let body = serde_json::to_string(&serde_json::json!({
-                        "master": {
-                            "preset": status.master.preset,
-                            "source": status.master.source,
-                            "volume": status.master.volume,
-                            "mute": status.master.mute,
-                            "dirac": status.master.dirac,
-                        }
-                    })).unwrap_or_default();
-                    send_json(req, 200, &body)
-                }
+                Ok(status) => send_json(req, 200, &master_status_json(&status)),
                 Err(e) => send_error(req, 500, &e.to_string()),
             }
         })?;
@@ -151,6 +140,17 @@ pub fn start(
     // Source and preset routes
     register_source_routes(&mut server, state.clone())?;
     register_preset_routes(&mut server, state.clone())?;
+
+    // POST /devices/0/config — stub (full config write not yet implemented on ESP32)
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/config", Method::Post, move |req| {
+            if get_device(&st).is_none() {
+                return send_json(req, 503, r#"{"error":"no device"}"#);
+            }
+            send_error(req, 501, "config write not yet implemented on ESP32")
+        })?;
+    }
 
     // Display, DRE, tokens, preset copy
     register_device_feature_routes(&mut server, state.clone())?;
@@ -167,11 +167,22 @@ pub fn start(
         send_text(req, "# minidsp-open\nMiniDSP audio processor controller.\nHTTP API on port 5380.\n")
     })?;
 
-    // WiFi provisioning page
-    server.fn_handler("/", Method::Get, |req| {
-        info!("serving provisioning page");
-        send_html(req, crate::wifi::PROVISION_HTML)
+    // CORS preflight handler — responds to OPTIONS on any path
+    server.fn_handler("/*", Method::Options, |req| {
+        send_cors_preflight(req)
     })?;
+
+    // Root page — provisioning in SoftAP mode, redirect to /devices in STA mode
+    if ap_ip.is_some() {
+        server.fn_handler("/", Method::Get, |req| {
+            info!("serving provisioning page");
+            send_html(req, crate::wifi::PROVISION_HTML)
+        })?;
+    } else {
+        server.fn_handler("/", Method::Get, |req| {
+            send_redirect(req, "/devices")
+        })?;
+    }
 
     // POST /api/wifi/connect — WiFi provisioning form handler
     server.fn_handler("/api/wifi/connect", Method::Post, move |mut req| {
@@ -324,8 +335,11 @@ fn register_volume_routes(
                 "toggle_mute" => dev.set_mute(!ms.is_muted()),
                 _ => Ok(()),
             };
-            match result {
-                Ok(()) => send_json(req, 200, r#"{"status":"ok"}"#),
+            if let Err(e) = result {
+                return send_error(req, 500, &e.to_string());
+            }
+            match dev.get_status_summary() {
+                Ok(status) => send_json(req, 200, &master_status_json(&status)),
                 Err(e) => send_error(req, 500, &e.to_string()),
             }
         })?;
@@ -333,33 +347,37 @@ fn register_volume_routes(
     Ok(())
 }
 
-/// Register per-source routes. Routes are fixed at startup — if the device
-/// reconnects as a different model, use POST /devices/0 {"source":"..."} instead.
+/// Register source routes for all known source names. The source is resolved
+/// dynamically from the device profile at request time, so this works even if the
+/// device wasn't connected at boot.
 fn register_source_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
-    let sources: Vec<(u8, String)> = get_device(&state)
-        .map(|s| {
-            s.profile()
-                .sources
-                .sources()
-                .iter()
-                .map(|(idx, src)| (*idx, src.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    for (idx, name) in sources {
+    // Register routes for all common MiniDSP sources (covers all device types)
+    for name in &["analog", "toslink", "spdif", "usb", "aesebu", "hdmi"] {
         let st = state.clone();
+        let source_name = name.to_string();
         let path = format!("/devices/0/source/{name}");
         server.fn_handler(&path, Method::Post, move |req| {
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            match dev.set_source(idx) {
-                Ok(()) => send_json(req, 200, r#"{"status":"ok"}"#),
+            // Resolve source name to index via the device profile
+            let src = match minidsp_protocol::source::Source::from_str_lowercase(&source_name) {
+                Some(s) => s,
+                None => return send_error(req, 400, "unknown source"),
+            };
+            let idx = match dev.profile().sources.index_for_source(src) {
+                Some(i) => i,
+                None => return send_error(req, 400, "source not available on this device"),
+            };
+            if let Err(e) = dev.set_source(idx) {
+                return send_error(req, 500, &e.to_string());
+            }
+            match dev.get_status_summary() {
+                Ok(status) => send_json(req, 200, &master_status_json(&status)),
                 Err(e) => send_error(req, 500, &e.to_string()),
             }
         })?;
@@ -379,8 +397,11 @@ fn register_preset_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            match dev.set_preset(preset) {
-                Ok(()) => send_json(req, 200, r#"{"status":"ok"}"#),
+            if let Err(e) = dev.set_preset(preset) {
+                return send_error(req, 500, &e.to_string());
+            }
+            match dev.get_status_summary() {
+                Ok(status) => send_json(req, 200, &master_status_json(&status)),
                 Err(e) => send_error(req, 500, &e.to_string()),
             }
         })?;
@@ -397,8 +418,11 @@ fn register_device_feature_routes(
         let st = state.clone();
         server.fn_handler("/devices/0/display", Method::Get, move |req| {
             let dev = match get_device(&st) {
-                Some(d) if d.profile().has_display => d,
-                _ => return send_json(req, 404, r#"{"error":"not supported"}"#),
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                Some(d) if !d.profile().has_display => {
+                    return send_json(req, 404, r#"{"error":"not supported"}"#)
+                }
+                Some(d) => d,
             };
             match dev.read_display() {
                 Ok((idle_time, brightness)) => {
@@ -415,8 +439,11 @@ fn register_device_feature_routes(
         let st = state.clone();
         server.fn_handler("/devices/0/display", Method::Post, move |mut req| {
             let dev = match get_device(&st) {
-                Some(d) if d.profile().has_display => d,
-                _ => return send_json(req, 404, r#"{"error":"not supported"}"#),
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                Some(d) if !d.profile().has_display => {
+                    return send_json(req, 404, r#"{"error":"not supported"}"#)
+                }
+                Some(d) => d,
             };
             let mut buf = [0u8; 256];
             let len = req.read(&mut buf).unwrap_or(0);
@@ -437,8 +464,11 @@ fn register_device_feature_routes(
         let st = state.clone();
         server.fn_handler("/devices/0/dre", Method::Get, move |req| {
             let dev = match get_device(&st) {
-                Some(d) if d.profile().has_dre => d,
-                _ => return send_json(req, 404, r#"{"error":"not supported"}"#),
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                Some(d) if !d.profile().has_dre => {
+                    return send_json(req, 404, r#"{"error":"not supported"}"#)
+                }
+                Some(d) => d,
             };
             match dev.read_dre() {
                 Ok(enabled) => {
@@ -455,8 +485,11 @@ fn register_device_feature_routes(
         let st = state.clone();
         server.fn_handler("/devices/0/dre", Method::Post, move |mut req| {
             let dev = match get_device(&st) {
-                Some(d) if d.profile().has_dre => d,
-                _ => return send_json(req, 404, r#"{"error":"not supported"}"#),
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                Some(d) if !d.profile().has_dre => {
+                    return send_json(req, 404, r#"{"error":"not supported"}"#)
+                }
+                Some(d) => d,
             };
             let mut buf = [0u8; 256];
             let len = req.read(&mut buf).unwrap_or(0);
@@ -576,6 +609,20 @@ fn send_redirect<C: esp_idf_svc::http::server::Connection>(
     Ok(())
 }
 
+fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+) -> Result<(), C::Error> {
+    let headers = [
+        ("Access-Control-Allow-Origin", "*"),
+        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+        ("Access-Control-Allow-Headers", "Content-Type"),
+        ("Access-Control-Max-Age", "86400"),
+    ];
+    let mut resp = req.into_response(204, None, &headers)?;
+    resp.write_all(b"")?;
+    Ok(())
+}
+
 fn send_error<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
     status: u16,
@@ -611,8 +658,28 @@ fn send_provision_error<C: esp_idf_svc::http::server::Connection>(
     Ok(())
 }
 
-/// Build the standard status JSON from a StatusSummary.
+/// Build the GET status JSON — omits null fields like dirac (per compat contract).
 fn status_json(status: &StatusSummary) -> String {
+    let mut master = serde_json::json!({
+        "preset": status.master.preset,
+        "source": status.master.source,
+        "volume": status.master.volume,
+        "mute": status.master.mute,
+    });
+    // Only include dirac if the device supports it (contract: omit for non-Dirac devices)
+    if let Some(dirac) = status.master.dirac {
+        master["dirac"] = serde_json::json!(dirac);
+    }
+    serde_json::to_string(&serde_json::json!({
+        "master": master,
+        "input_levels": status.input_levels,
+        "output_levels": status.output_levels,
+    }))
+    .unwrap_or_default()
+}
+
+/// Build the POST response JSON — includes null fields (per compat contract).
+fn master_status_json(status: &StatusSummary) -> String {
     serde_json::to_string(&serde_json::json!({
         "master": {
             "preset": status.master.preset,
@@ -620,9 +687,7 @@ fn status_json(status: &StatusSummary) -> String {
             "volume": status.master.volume,
             "mute": status.master.mute,
             "dirac": status.master.dirac,
-        },
-        "input_levels": status.input_levels,
-        "output_levels": status.output_levels,
+        }
     }))
     .unwrap_or_default()
 }

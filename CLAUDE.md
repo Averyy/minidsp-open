@@ -4,116 +4,76 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 ## Project State
 
-Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, connects to MiniDSP simulator via USB Host HID, runs WiFi SoftAP with captive portal, serves HTTP API. Blocking std architecture (no embassy). Flashed and tested on hardware — stable, 190KB heap free. Full code review (31 issues) completed and all fixes applied. **WiFi provisioning tested end-to-end on real hardware** (2026-04-06): phone → SoftAP → iOS captive portal auto-open → enter credentials → save to NVS → restart → STA mode connected (WPA3-SAE).
+Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, WiFi SoftAP with captive portal, serves HTTP API. Stable, 190KB heap free. **WiFi provisioning tested end-to-end** (2026-04-06): phone → SoftAP → iOS captive portal auto-open → save to NVS → restart → STA (WPA3-SAE).
 
 ## Build
 
 ```bash
-# Desktop (all crates)
-cargo build
-cargo test
+# Desktop
+cargo build && cargo test
 
-# ESP32 (separate toolchain) — MUST activate environment first
+# ESP32 — activate environment first (see /esp-idf skill for details)
 cd app-esp32
 export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/esp/bin:$PATH"
 . ~/esp/esp-idf/export.sh 2>/dev/null
 source ~/export-esp.sh
-cargo build  # uses rust-toolchain.toml (esp) and .cargo/config.toml
+cargo build
 ```
 
-### ESP32 Build Environment — CRITICAL
+**Use `/esp-idf` for general ESP-IDF knowledge** — environment setup, flashing, serial monitoring, common gotchas, DTR/RTS, Python issues.
 
-Claude Code's bash does NOT load `.zshrc`. Shell aliases like `get_idf` do NOT work. You MUST run these three lines before ANY `cargo build`, `espflash`, or ESP32 command:
+### ESP32 Flashing (project-specific)
+
+Flash with `esptool.py` (not espflash — it panics on our CH340 boards). The build produces an ELF that must be converted first:
 
 ```bash
-export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/esp/bin:$PATH"
-. ~/esp/esp-idf/export.sh 2>/dev/null
-source ~/export-esp.sh
+# 1. Close serial-mcp session
+# 2. Convert ELF → bin, then flash all three parts
+esptool.py --chip esp32s3 elf2image target/xtensa-esp32s3-espidf/debug/minidsp-esp32 -o /tmp/app.bin
+esptool.py --chip esp32s3 -p /dev/ttyUSB1 -b 460800 write_flash \
+  --flash_size 16MB 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 /tmp/app.bin
+# 3. Reopen serial-mcp
 ```
 
-What each line does:
-- Line 1: Homebrew Python 3.14 (NOT system 3.9), cargo, ldproxy, espflash
-- Line 2: ESP-IDF toolchain (cmake, ninja, xtensa-esp-elf-gcc, IDF_PATH). Redirect stderr — output is noisy.
-- Line 3: LIBCLANG_PATH + xtensa Rust toolchain paths
-
-If cmake cache errors appear (mismatched IDF paths), clean `app-esp32/target/` and rebuild.
-
-## ESP32 Flashing
-
-Both ESP32-S3 DevKitC-1 boards have two USB-C ports:
-- **Right (UART):** CH340 bridge (VID 0x1A86). Used for flashing AND serial monitor. Shows as `/dev/cu.usbmodem*`.
-- **Left (USB OTG):** Connected to other ESP32 for device-to-device USB. NOT used for flashing.
-
-Flash sequence — use `espflash` for Rust projects (NOT `idf.py`):
-```bash
-# 1. Close serial-mcp session on the target board (exclusive port lock)
-# 2. Flash (CH340 auto-resets via DTR/RTS — no boot button needed)
-espflash flash --monitor -p /dev/ttyUSB1 target/xtensa-esp32s3-espidf/debug/minidsp-esp32
-# 3. If not using --monitor: reopen serial-mcp after flash completes
-```
-
-Serial monitoring: use `serial-mcp` tools (serial_open, serial_read, serial_wait_for), NOT `idf.py monitor` (requires TTY).
-
-**Before flashing:** close any serial-mcp session (`serial_close`). If the port is stuck (Resource busy but no session listed), find the process with `lsof /dev/cu.usbmodem*` and `kill <pid>` — you have permission to kill serial-mcp or stale processes holding the port. Then reopen after flash.
-
-The port name doesn't change between flashes. Both boards can be flashed independently while their OTG ports remain connected. Never toggle DTR/RTS manually via serial_set_signals — it puts the board into download mode.
+Bootloader/partition-table binaries are in `target/xtensa-esp32s3-espidf/debug/`. If the port is stuck (Resource busy), `lsof` and `kill` the holding process — you have permission.
 
 ## ESP32 Dev Boards
 
-| Serial | Location | Role |
-|--------|----------|------|
-| firmware-board | 0-1 | miniDSP 2x4 HD simulator (TinyUSB device) |
-| simulator-board | 1-1 | minidsp-open firmware target (USB host) |
+| Serial | Port | Role |
+|--------|------|------|
+| firmware-board | `/dev/ttyUSB0` | miniDSP 2x4 HD simulator (TinyUSB device) |
+| simulator-board | `/dev/ttyUSB1` | minidsp-open firmware target (USB host) |
 
 ## Key Files
 
 | File | What |
 |------|------|
-| `PROJECT.md` | Scope of work — architecture, protocol reference, device tables, goals |
-| `PROGRESS.md` | Checklist of all tasks by phase — tick off as we go |
-| `docs/ref-devices.md` | Complete device registry — all hw_ids, DSP IDs, sources, USB PIDs, capabilities |
-| `docs/ref-compatibility.md` | Canonical external compatibility contract — CLI, HTTP, WebSocket, TCP bridge, UDP discovery |
-| `docs/ref-address-tables.md` | Every DSP register address for all 7 SHARC structures (verified against minidsp-rs + Device Console XML) |
-| `docs/ref-legacy-devices.md` | Legacy ADAU1445 device analysis — address tables, dialect, config.xml source data |
-| `docs/ref-ezbeq.md` | ezBEQ integration plan — protocol, API compat, ESP32 strategy, catalogue pipeline |
-| `docs/ref-command-pacing.md` | Command queue architecture — USB HID timing, priority scheme, batch operations |
-| `docs/ref-esp32-boot.md` | ESP32 boot sequence, WiFi reconnection, provisioning, data partition state machine |
-| `docs/ref-esp32-logging.md` | ESP32 diagnostics — ring buffer logging, /debug endpoints, system info |
-| `app/MiniDSP Device Console.app/` | Extracted official app — source of truth for device definitions and addresses |
-| `app/app-extracted/` | Decompiled Device Console JS (minified) — protocol details, command formats |
-| `app/apk-extracted/` | Decompiled miniDSP Controller Android app — hw_id source maps, flash addresses, legacy devices |
-| `docs/shared-understanding.md` | How this project fits with open-sub-optimizer and dirac-sparr |
-| `docs/FUTURE-12v-trigger.md` | 12V trigger — GPIO power control, hardware design, API, separate project after v1 |
-| `docs/FUTURE-pwr-ice.md` | PWR-ICE125/250 deferred support — protocol details, what we need from users |
+| `PROJECT.md` | Architecture, protocol reference, device tables, goals |
+| `PROGRESS.md` | Task checklist by phase |
+| `docs/ref-devices.md` | Device registry — hw_ids, DSP IDs, USB PIDs, capabilities |
+| `docs/ref-compatibility.md` | External compatibility contract — CLI, HTTP, WebSocket, TCP, UDP |
+| `docs/ref-address-tables.md` | DSP register addresses for all 7 SHARC structures |
+| `docs/ref-esp32-boot.md` | ESP32 boot sequence, WiFi provisioning (captive portal requirements), data partition |
+| `docs/ref-esp32-logging.md` | Ring buffer logging, /debug endpoints |
+| `app/MiniDSP Device Console.app/` | Official app — source of truth for device definitions and addresses |
 
 ## Critical Rules
 
-- **XML is source of truth for addresses.** SHARC: Device Console `DSP_default_parameters.xml`. Legacy ADAU1445: SigmaStudio `config.xml` exports. Both are manufacturer device data, not minidsp-rs code.
-- **Drop-in replacement for minidsp-rs.** The canonical compatibility contract is `docs/ref-compatibility.md`. Existing clients (Home Assistant, ezBEQ, mobile apps, CLI scripts) must work without changes. We only add, never remove or break. This includes: accepting `--force-kind`, not rejecting previously-accepted input (biquad coefficients), and passing through unknown TCP bridge commands.
-- **No UI on desktop.** Desktop target is API/CLI only. ESP32 serves ezBEQ's unmodified React UI from flash (auto-updated). Ship `llms.txt` at webapp root for AI/LLM discoverability.
-- **All devices from day one.** Full PEQ support for 13 devices (7 SHARC + 6 legacy). Basic support (volume/mute/preset) for 3 more (2x4 non-HD, nanoAVR, nanoAVR HDA). See `docs/ref-legacy-devices.md`.
-- **Dual target: Linux + ESP32-S3.** Use `cfg(target_os = "espidf")` for platform splits. Protocol crate is shared, transport and HTTP server are platform-specific.
-- **Linux: tokio + axum.** ESP32: embassy-executor on ESP-IDF (`arch-std`) + picoserve. Business logic shared, HTTP handler wiring is platform-specific.
-- **USB HID on ESP32** has no safe Rust wrappers. Use `esp-idf-sys` unsafe FFI to the C USB host API.
-- **No MCP server.** Skipped — zero demand. HTTP API + CLI already usable by LLMs. Ship `llms.txt` instead. Maybe add later as `--mcp` flag if requested.
-- **Clean-room implementation.** All code written from scratch. Protocol knowledge referenced from minidsp-rs (credited). Source data from manufacturer (Device Console XML, SigmaStudio config.xml). We do NOT copy minidsp-rs generated code or their codegen pipeline.
-- **MIT license.** Credit minidsp-rs in README as protocol reference and inspiration.
-
-## Tech Stack
-
-- **Language:** Rust
-- **Not a fork.** Clean-room implementation. Protocol knowledge from minidsp-rs (credited) + Device Console XML extraction
-- **Linux:** tokio + axum + hidapi
-- **ESP32-S3:** std-on-ESP-IDF. embassy-executor (`arch-std`) + picoserve + esp-idf-svc + esp-idf-sys FFI for USB host
-- **JSON:** serde_json (Linux), serde-json-core (ESP32, chosen for heap efficiency)
-- **Protocol crate:** Pure Rust, no_std, no platform deps, compiles everywhere
+- **XML is source of truth for addresses.** SHARC: Device Console `DSP_default_parameters.xml`. Legacy: SigmaStudio `config.xml`.
+- **Drop-in replacement for minidsp-rs.** Compatibility contract: `docs/ref-compatibility.md`. Never break existing clients.
+- **No UI on desktop.** API/CLI only. ESP32 serves ezBEQ React UI from flash.
+- **All devices from day one.** 13 devices full PEQ, 3 more basic support.
+- **Dual target.** `cfg(target_os = "espidf")` for platform splits. Protocol crate is shared.
+- **Desktop: tokio + axum.** ESP32: blocking std on ESP-IDF, EspHttpServer, esp-idf-sys FFI for USB host.
+- **Clean-room.** No copied code. Protocol knowledge from minidsp-rs (credited) + manufacturer XML.
+- **MIT license.**
 
 ## Protocol Quick Reference
 
 - USB HID: VID `0x2752`, 65-byte reports (report ID 0x00 + 64 bytes, 0xFF padded)
 - TCP: port 5333, length-prefixed frames with checksum
 - UDP discovery: port 3999, broadcast every 1s
-- HTTP API: port 5380 (Linux daemon), configurable on ESP32
+- HTTP API: port 5380 (desktop), port 80 SoftAP / 5380 STA (ESP32)
 - Frame: `[length] [payload] [checksum]` — length is self-inclusive, checksum = sum(all bytes) & 0xFF
 - Dialect: old devices use 2-byte addr + fixed-point, new devices use 3-byte addr + float32
 - Flash memory at page 0xFF (preset, volume, mute, source, tokens, display, DRE, serial)

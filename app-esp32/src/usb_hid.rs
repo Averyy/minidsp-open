@@ -23,7 +23,7 @@
 use esp_idf_sys::*;
 use log::{debug, error, info, warn};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -148,8 +148,8 @@ pub struct UsbHidBus {
     lock: Mutex<()>,
     out_sync: XferSync,
     in_sync: XferSync,
-    pub vid: u16,
-    pub pid: u16,
+    vid: AtomicU16,
+    pid: AtomicU16,
 }
 
 // Safety: all USB operations are serialized by self.lock. Raw pointers are only
@@ -158,7 +158,8 @@ unsafe impl Send for UsbHidBus {}
 unsafe impl Sync for UsbHidBus {}
 
 impl UsbHidBus {
-    /// Initialize USB host stack, wait for a MiniDSP device, claim HID interface.
+    /// Initialize USB host stack and background threads. Always succeeds even
+    /// without a device connected. Call `wait_for_device()` to detect a device.
     pub fn init() -> Result<Self, UsbHidError> {
         // Ensure callback state is initialized
         cb_state();
@@ -210,34 +211,62 @@ impl UsbHidBus {
             .spawn(move || usb_client_event_loop(client_hdl_copy as usb_host_client_handle_t))
             .map_err(|e| UsbHidError::Init(format!("spawn client task: {e}")))?;
 
-        // Wait for device and open it
-        let (dev_hdl, vid, pid, hid_intf, ep_in, ep_out) =
-            wait_and_open_device(client_hdl, Duration::from_secs(30))?;
-
-        // Create separate sync objects for OUT and IN transfers
-        let out_sync = XferSync::new();
-        let in_sync = XferSync::new();
-
-        // Allocate transfers
-        let out_xfer = alloc_transfer(dev_hdl, ep_out)?;
-        let in_xfer = alloc_transfer(dev_hdl, ep_in)?;
-
-        info!("USB HID bus ready");
-
         Ok(UsbHidBus {
             client_hdl,
-            dev_hdl: Mutex::new(dev_hdl),
-            out_xfer: Mutex::new(out_xfer),
-            in_xfer: Mutex::new(in_xfer),
-            ep_in: AtomicU8::new(ep_in),
-            ep_out: AtomicU8::new(ep_out),
-            hid_intf: AtomicU8::new(hid_intf),
+            dev_hdl: Mutex::new(ptr::null_mut()),
+            out_xfer: Mutex::new(ptr::null_mut()),
+            in_xfer: Mutex::new(ptr::null_mut()),
+            ep_in: AtomicU8::new(0),
+            ep_out: AtomicU8::new(0),
+            hid_intf: AtomicU8::new(0),
             lock: Mutex::new(()),
-            out_sync,
-            in_sync,
-            vid,
-            pid,
+            out_sync: XferSync::new(),
+            in_sync: XferSync::new(),
+            vid: AtomicU16::new(0),
+            pid: AtomicU16::new(0),
         })
+    }
+
+    /// Wait for a MiniDSP device and open it. Blocks up to `timeout`.
+    /// Returns the VID and PID of the found device.
+    pub fn wait_for_device(&self, timeout: Duration) -> Result<(u16, u16), UsbHidError> {
+        let _lock = self.lock.lock().unwrap();
+
+        // Close old device if any (required for USB host to detect reconnection)
+        self.cleanup_device();
+
+        let (dev_hdl, vid, pid, hid_intf, ep_in, ep_out) =
+            wait_and_open_device(self.client_hdl, timeout)?;
+
+        // Allocate transfers
+        let new_out = alloc_transfer(dev_hdl, ep_out)?;
+        let new_in = alloc_transfer(dev_hdl, ep_in)?;
+
+        // Free old transfers if any
+        {
+            let mut out = self.out_xfer.lock().unwrap();
+            if !(*out).is_null() {
+                unsafe { usb_host_transfer_free(*out) };
+            }
+            *out = new_out;
+        }
+        {
+            let mut inp = self.in_xfer.lock().unwrap();
+            if !(*inp).is_null() {
+                unsafe { usb_host_transfer_free(*inp) };
+            }
+            *inp = new_in;
+        }
+
+        *self.dev_hdl.lock().unwrap() = dev_hdl;
+        self.ep_in.store(ep_in, Ordering::SeqCst);
+        self.ep_out.store(ep_out, Ordering::SeqCst);
+        self.hid_intf.store(hid_intf, Ordering::SeqCst);
+        self.vid.store(vid, Ordering::SeqCst);
+        self.pid.store(pid, Ordering::SeqCst);
+
+        info!("USB HID bus ready");
+        Ok((vid, pid))
     }
 
     /// True if the USB device is currently connected.
@@ -245,41 +274,14 @@ impl UsbHidBus {
         cb_state().device_present.load(Ordering::SeqCst)
     }
 
-    /// Wait for a device reconnection after disconnect. Blocks up to `timeout`.
-    /// On success, internal handles are replaced with the new device.
-    pub fn reconnect(&self, timeout: Duration) -> Result<(), UsbHidError> {
-        let _lock = self.lock.lock().unwrap();
+    /// USB Vendor ID of the connected device (0 if none).
+    pub fn vid(&self) -> u16 {
+        self.vid.load(Ordering::SeqCst)
+    }
 
-        // Close old device (best-effort)
-        self.cleanup_device();
-
-        // Wait for new device
-        let (dev_hdl, _vid, _pid, hid_intf, ep_in, ep_out) =
-            wait_and_open_device(self.client_hdl, timeout)?;
-
-        // Allocate new transfers before freeing old ones (prevents dangling on partial failure)
-        let new_out = alloc_transfer(dev_hdl, ep_out)?;
-        let new_in = alloc_transfer(dev_hdl, ep_in)?;
-
-        {
-            let mut out = self.out_xfer.lock().unwrap();
-            unsafe { usb_host_transfer_free(*out) };
-            *out = new_out;
-        }
-        {
-            let mut inp = self.in_xfer.lock().unwrap();
-            unsafe { usb_host_transfer_free(*inp) };
-            *inp = new_in;
-        }
-
-        // Update handles
-        *self.dev_hdl.lock().unwrap() = dev_hdl;
-        self.ep_in.store(ep_in, Ordering::SeqCst);
-        self.ep_out.store(ep_out, Ordering::SeqCst);
-        self.hid_intf.store(hid_intf, Ordering::SeqCst);
-
-        info!("USB device reconnected");
-        Ok(())
+    /// USB Product ID of the connected device (0 if none).
+    pub fn pid(&self) -> u16 {
+        self.pid.load(Ordering::SeqCst)
     }
 
     /// Send a command payload and receive the response. Blocking, thread-safe.
@@ -294,14 +296,17 @@ impl UsbHidBus {
             return Err(UsbHidError::Disconnected);
         }
 
+        let out_xfer = *self.out_xfer.lock().unwrap();
+        let in_xfer = *self.in_xfer.lock().unwrap();
+        if out_xfer.is_null() || in_xfer.is_null() {
+            return Err(UsbHidError::Disconnected);
+        }
+
         // Encode frame: [length, payload, checksum] padded to 64 bytes with 0xFF
         let frame = minidsp_protocol::packet::encode_frame(payload);
         let mut out_buf = [0xFF_u8; USB_REPORT_SIZE];
         let copy_len = frame.len().min(USB_REPORT_SIZE);
         out_buf[..copy_len].copy_from_slice(&frame[..copy_len]);
-
-        let out_xfer = *self.out_xfer.lock().unwrap();
-        let in_xfer = *self.in_xfer.lock().unwrap();
 
         // Submit OUT transfer with dedicated sync
         self.out_sync.reset();
@@ -379,8 +384,14 @@ impl Drop for UsbHidBus {
     fn drop(&mut self) {
         self.cleanup_device();
         unsafe {
-            usb_host_transfer_free(*self.out_xfer.lock().unwrap());
-            usb_host_transfer_free(*self.in_xfer.lock().unwrap());
+            let out = *self.out_xfer.lock().unwrap();
+            if !out.is_null() {
+                usb_host_transfer_free(out);
+            }
+            let inp = *self.in_xfer.lock().unwrap();
+            if !inp.is_null() {
+                usb_host_transfer_free(inp);
+            }
         }
     }
 }
@@ -394,38 +405,48 @@ fn wait_and_open_device(
 ) -> Result<(usb_device_handle_t, u16, u16, u8, u8, u8), UsbHidError> {
     info!("waiting for MiniDSP device (VID 0x{MINIDSP_VID:04X})...");
 
-    // Reset the event flag so we wait for a fresh connection
     let cb = cb_state();
-    {
-        let (lock, _) = &cb.dev_event;
-        *lock.lock().unwrap() = false;
-    }
+    let deadline = std::time::Instant::now() + timeout;
 
-    let dev_addr = {
-        let (lock, cvar) = &cb.dev_event;
-        let guard = lock.lock().unwrap();
-        let result = cvar
-            .wait_timeout_while(guard, timeout, |connected| !*connected)
-            .unwrap();
-
-        if result.1.timed_out() {
+    // Loop: wait for device events, try to open each one, skip non-MiniDSP devices
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
             return Err(UsbHidError::DeviceNotFound);
         }
 
-        cb.new_dev_addr
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or(UsbHidError::DeviceNotFound)?
-    };
-    info!("USB device connected at address {dev_addr}");
+        // Wait for a device address under the dev_event lock (callback sets both
+        // new_dev_addr and dev_event under this same lock, so no race possible).
+        let dev_addr = {
+            let (lock, cvar) = &cb.dev_event;
+            let guard = lock.lock().unwrap();
+            // Use the condvar predicate to check for a queued address.
+            // This handles both "already queued" and "need to wait" cases.
+            let result = cvar
+                .wait_timeout_while(guard, remaining, |_| {
+                    cb.new_dev_addr.lock().unwrap().is_none()
+                })
+                .unwrap();
+            if result.1.timed_out() {
+                return Err(UsbHidError::DeviceNotFound);
+            }
+            match cb.new_dev_addr.lock().unwrap().take() {
+                Some(addr) => addr,
+                None => continue,
+            }
+        };
+        info!("USB device connected at address {dev_addr}");
 
-    // Open device
+    // Open device (may fail if device disappeared during enumeration)
     let dev_hdl = unsafe {
         let mut hdl: usb_device_handle_t = ptr::null_mut();
-        esp_ok(usb_host_device_open(client_hdl, dev_addr, &mut hdl))
-            .map_err(|e| UsbHidError::Init(format!("device_open: {e}")))?;
-        hdl
+        match esp_ok(usb_host_device_open(client_hdl, dev_addr, &mut hdl)) {
+            Ok(()) => hdl,
+            Err(e) => {
+                warn!("device_open({dev_addr}) failed: {e} — retrying");
+                continue;
+            }
+        }
     };
 
     // Check VID
@@ -438,11 +459,10 @@ fn wait_and_open_device(
     };
 
     if vid != MINIDSP_VID && vid != LEGACY_VID {
-        // Close the opened handle before returning error
+        // Not a MiniDSP — close and try the next device
         unsafe { usb_host_device_close(client_hdl, dev_hdl) };
-        return Err(UsbHidError::Init(format!(
-            "wrong VID: 0x{vid:04X} (expected 0x{MINIDSP_VID:04X})"
-        )));
+        warn!("skipping non-MiniDSP device VID=0x{vid:04X}");
+        continue;
     }
     info!("MiniDSP device: VID=0x{vid:04X} PID=0x{pid:04X}");
 
@@ -465,7 +485,8 @@ fn wait_and_open_device(
 
     cb.device_present.store(true, Ordering::SeqCst);
 
-    Ok((dev_hdl, vid, pid, hid_intf, ep_in, ep_out))
+    return Ok((dev_hdl, vid, pid, hid_intf, ep_in, ep_out));
+    } // end loop
 }
 
 /// Allocate a USB transfer object for the given device and endpoint.
@@ -480,6 +501,7 @@ fn alloc_transfer(
         (*xfer).device_handle = dev_hdl;
         (*xfer).bEndpointAddress = ep_addr;
         (*xfer).callback = Some(transfer_complete_callback);
+        (*xfer).context = ptr::null_mut(); // Set by command() before submit
         Ok(xfer)
     }
 }
@@ -564,12 +586,16 @@ unsafe extern "C" fn client_event_callback(
     if event.event == usb_host_client_event_t_USB_HOST_CLIENT_EVENT_NEW_DEV {
         let addr = event.__bindgen_anon_1.new_dev.address;
         info!("USB device connected: addr={addr}");
-        *cb.new_dev_addr.lock().unwrap() = Some(addr);
         cb.device_present.store(true, Ordering::SeqCst);
         cb.connect_generation.fetch_add(1, Ordering::SeqCst);
+        // Set address and signal under the same lock to avoid races with the waiter
         let (lock, cvar) = &cb.dev_event;
-        *lock.lock().unwrap() = true;
-        cvar.notify_all();
+        {
+            let mut guard = lock.lock().unwrap();
+            *cb.new_dev_addr.lock().unwrap() = Some(addr);
+            *guard = true;
+            cvar.notify_all();
+        }
     } else if event.event == usb_host_client_event_t_USB_HOST_CLIENT_EVENT_DEV_GONE {
         warn!("USB device disconnected");
         cb.device_present.store(false, Ordering::SeqCst);
@@ -580,7 +606,11 @@ unsafe extern "C" fn client_event_callback(
 
 /// Transfer completion callback — signals the waiting thread.
 unsafe extern "C" fn transfer_complete_callback(xfer: *mut usb_transfer_t) {
-    let sync = &*((*xfer).context as *const XferSync);
+    let ctx = (*xfer).context;
+    if ctx.is_null() {
+        return; // No waiter — transfer was not submitted by command()
+    }
+    let sync = &*(ctx as *const XferSync);
     sync.signal((*xfer).status as i32);
 }
 
