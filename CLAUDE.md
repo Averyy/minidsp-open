@@ -4,7 +4,7 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 ## Project State
 
-Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, connects to MiniDSP simulator via USB Host HID, runs WiFi SoftAP with captive portal, serves HTTP API. Blocking std architecture (no embassy). Flashed and tested on hardware — stable, 193KB heap free. Full code review (31 issues) completed and all fixes applied: NVS provisioning, boot order, thread stacks, mutex safety, DNS IP detection. WiFi provisioning ready for first real-network test.
+Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, connects to MiniDSP simulator via USB Host HID, runs WiFi SoftAP with captive portal, serves HTTP API. Blocking std architecture (no embassy). Flashed and tested on hardware — stable, 190KB heap free. Full code review (31 issues) completed and all fixes applied. **WiFi provisioning tested end-to-end on real hardware** (2026-04-06): phone → SoftAP → iOS captive portal auto-open → enter credentials → save to NVS → restart → STA mode connected (WPA3-SAE).
 
 ## Build
 
@@ -13,11 +13,30 @@ Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v
 cargo build
 cargo test
 
-# ESP32 (separate toolchain)
+# ESP32 (separate toolchain) — MUST activate environment first
 cd app-esp32
-# Requires: espup, ldproxy, ESP-IDF v5.4 with Python 3.14 venv via uv
+export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/esp/bin:$PATH"
+. ~/esp/esp-idf/export.sh 2>/dev/null
+source ~/export-esp.sh
 cargo build  # uses rust-toolchain.toml (esp) and .cargo/config.toml
 ```
+
+### ESP32 Build Environment — CRITICAL
+
+Claude Code's bash does NOT load `.zshrc`. Shell aliases like `get_idf` do NOT work. You MUST run these three lines before ANY `cargo build`, `espflash`, or ESP32 command:
+
+```bash
+export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/esp/bin:$PATH"
+. ~/esp/esp-idf/export.sh 2>/dev/null
+source ~/export-esp.sh
+```
+
+What each line does:
+- Line 1: Homebrew Python 3.14 (NOT system 3.9), cargo, ldproxy, espflash
+- Line 2: ESP-IDF toolchain (cmake, ninja, xtensa-esp-elf-gcc, IDF_PATH). Redirect stderr — output is noisy.
+- Line 3: LIBCLANG_PATH + xtensa Rust toolchain paths
+
+If cmake cache errors appear (mismatched IDF paths), clean `app-esp32/target/` and rebuild.
 
 ## ESP32 Flashing
 
@@ -25,15 +44,19 @@ Both ESP32-S3 DevKitC-1 boards have two USB-C ports:
 - **Right (UART):** CH340 bridge (VID 0x1A86). Used for flashing AND serial monitor. Shows as `/dev/cu.usbmodem*`.
 - **Left (USB OTG):** Connected to other ESP32 for device-to-device USB. NOT used for flashing.
 
-Flash sequence — use `idf.py`, NOT `espflash`:
+Flash sequence — use `espflash` for Rust projects (NOT `idf.py`):
 ```bash
 # 1. Close serial-mcp session on the target board (exclusive port lock)
-# 2. Flash via idf.py (CH340 auto-resets into download mode via DTR/RTS — no boot button needed)
-idf.py -p /dev/cu.usbmodem<TARGET> flash
-# 3. Reopen serial-mcp after flash completes
+# 2. Flash (CH340 auto-resets via DTR/RTS — no boot button needed)
+espflash flash --monitor -p /dev/ttyUSB1 target/xtensa-esp32s3-espidf/debug/minidsp-esp32
+# 3. If not using --monitor: reopen serial-mcp after flash completes
 ```
 
-The port name doesn't change between flashes. Both boards can be flashed independently while their OTG ports remain connected.
+Serial monitoring: use `serial-mcp` tools (serial_open, serial_read, serial_wait_for), NOT `idf.py monitor` (requires TTY).
+
+**Before flashing:** close any serial-mcp session (`serial_close`). If the port is stuck (Resource busy but no session listed), find the process with `lsof /dev/cu.usbmodem*` and `kill <pid>` — you have permission to kill serial-mcp or stale processes holding the port. Then reopen after flash.
+
+The port name doesn't change between flashes. Both boards can be flashed independently while their OTG ports remain connected. Never toggle DTR/RTS manually via serial_set_signals — it puts the board into download mode.
 
 ## ESP32 Dev Boards
 

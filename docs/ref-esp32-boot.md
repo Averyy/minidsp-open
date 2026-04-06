@@ -451,12 +451,19 @@ NVS has its own page-based wear leveling:
 5. Check manifest.json in background (3s timeout)
 6. Download updates if needed (15s timeout per file, non-blocking for API)
 
-### WiFi provisioning
+### WiFi provisioning (implemented and tested 2026-04-06)
 - SoftAP + captive portal, matching WLED/Tasmota pattern
-- Open AP named `minidsp-setup` (or `minidsp-XXXX`)
-- Web page with network scanner + password field
-- Save to NVS, connect, restart
-- Consider `esp-wifi-provisioning` crate as starting point
+- Open AP named `minidsp-setup`, IP 192.168.71.1
+- Glass-card styled provisioning page (open-sub-optimizer design)
+- Save to NVS, restart into STA mode
+- **Captive portal auto-open requires all of:**
+  1. DNS hijack on port 53 (only answer Type A queries, ANCOUNT=0 for others)
+  2. `esp_netif_set_dns_info` to advertise AP IP as DNS server in DHCP offers (note: `esp_netif_dhcps_option` with `ESP_NETIF_DOMAIN_NAME_SERVER` returns error 20481 — broken API, use `set_dns_info` instead)
+  3. DHCP Option 114 (RFC 8910) via `esp_netif_dhcps_option` with `ESP_NETIF_CAPTIVEPORTAL_URI`
+  4. HTTP `/*` wildcard catch-all with `uri_match_wildcard: true` in server config
+  5. Redirect must use **absolute URL** (`http://192.168.71.1/`) with **non-empty body** (iOS rejects empty redirect bodies)
+  6. `max_open_sockets: 13` and `CONFIG_LWIP_MAX_SOCKETS=16` (phones open many connections during portal detection)
+  7. DNS thread needs 8KB stack (6KB overflows with logging)
 
 ### Reconnection
 - App-level exponential backoff (ESP-IDF does not auto-reconnect)

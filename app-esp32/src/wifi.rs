@@ -295,7 +295,7 @@ fn monitor_loop(
 pub fn start_captive_dns(ip: std::net::Ipv4Addr) {
     std::thread::Builder::new()
         .name("dns_cp".into())
-        .stack_size(6144)
+        .stack_size(8192)
         .spawn(move || captive_dns_loop(ip))
         .expect("failed to spawn captive DNS thread");
     info!("Captive portal DNS started (all queries → {ip})");
@@ -305,7 +305,10 @@ fn captive_dns_loop(ip: std::net::Ipv4Addr) {
     use std::net::UdpSocket;
 
     let socket = match UdpSocket::bind("0.0.0.0:53") {
-        Ok(s) => s,
+        Ok(s) => {
+            info!("DNS server bound to 0.0.0.0:53");
+            s
+        }
         Err(e) => {
             warn!("DNS bind failed: {e}");
             return;
@@ -313,37 +316,70 @@ fn captive_dns_loop(ip: std::net::Ipv4Addr) {
     };
 
     let mut buf = [0u8; 512];
+    let mut query_count: u32 = 0;
     loop {
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                warn!("DNS recv error: {e}");
+                continue;
+            }
         };
+
+        query_count += 1;
+        if query_count <= 20 || query_count % 100 == 0 {
+            info!("DNS #{query_count} from {src} (len={len}) → {ip}");
+        }
 
         // Minimum DNS header is 12 bytes
         if len < 12 {
             continue;
         }
 
-        // Build response: copy the query, flip flags, append answer
+        // Build response: copy the query, set QR flag
         let mut resp = Vec::with_capacity(len + 16);
         resp.extend_from_slice(&buf[..len]);
 
         // Response flags: QR=1, AA=1, RD=1, RA=1
         resp[2] = 0x81;
         resp[3] = 0x80;
-        // ANCOUNT = 1
-        resp[6] = 0x00;
-        resp[7] = 0x01;
 
-        // Answer record: name pointer → offset 12 (question name)
-        resp.extend_from_slice(&[
-            0xC0, 0x0C, // Name pointer
-            0x00, 0x01, // Type A
-            0x00, 0x01, // Class IN
-        ]);
-        resp.extend_from_slice(&60u32.to_be_bytes()); // TTL = 60s
-        resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH = 4
-        resp.extend_from_slice(&ip.octets()); // The IP address
+        // Only answer Type A queries (0x0001). iOS sends AAAA/HTTPS queries too;
+        // responding with a Type A answer to those produces malformed responses
+        // that iOS rejects, breaking captive portal detection.
+        let qtype = if len >= 16 {
+            // Skip past the question name to find QTYPE
+            let mut pos = 12;
+            while pos < len && buf[pos] != 0 {
+                pos += 1 + buf[pos] as usize;
+            }
+            if pos + 4 < len {
+                u16::from_be_bytes([buf[pos + 1], buf[pos + 2]])
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if qtype == 1 {
+            // Type A query — answer with our IP
+            resp[6] = 0x00;
+            resp[7] = 0x01; // ANCOUNT = 1
+
+            resp.extend_from_slice(&[
+                0xC0, 0x0C, // Name pointer → question name
+                0x00, 0x01, // Type A
+                0x00, 0x01, // Class IN
+            ]);
+            resp.extend_from_slice(&60u32.to_be_bytes()); // TTL = 60s
+            resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH = 4
+            resp.extend_from_slice(&ip.octets());
+        } else {
+            // Non-A query — respond with ANCOUNT=0 (no answer)
+            resp[6] = 0x00;
+            resp[7] = 0x00;
+        }
 
         let _ = socket.send_to(&resp, src);
     }
@@ -418,24 +454,104 @@ pub fn get_softap_ip() -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(192, 168, 4, 1)
 }
 
-/// Provisioning HTML page (minimal captive portal).
+/// Configure DHCP server for captive portal:
+/// - Option 6 (DNS server) → AP IP so clients send DNS to us
+/// - Option 114 (RFC 8910 captive portal URI) → http://<AP IP>
+pub fn configure_dhcp_for_captive_portal(ip: std::net::Ipv4Addr) {
+    unsafe {
+        let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(
+            b"WIFI_AP_DEF\0".as_ptr() as _,
+        );
+        if netif.is_null() {
+            warn!("DHCP captive portal: netif not found");
+            return;
+        }
+
+        // Stop DHCP server to reconfigure
+        esp_idf_svc::sys::esp_netif_dhcps_stop(netif);
+
+        // Set DNS server for the AP interface so DHCP advertises it to clients
+        let ip_bytes = ip.octets();
+        let dns_info = esp_idf_svc::sys::esp_netif_dns_info_t {
+            ip: esp_idf_svc::sys::esp_ip_addr_t {
+                u_addr: esp_idf_svc::sys::_ip_addr__bindgen_ty_1 {
+                    ip4: esp_idf_svc::sys::esp_ip4_addr_t {
+                        addr: u32::from_le_bytes(ip_bytes),
+                    },
+                },
+                type_: 0, // ESP_IPADDR_TYPE_V4
+            },
+        };
+        let ret = esp_idf_svc::sys::esp_netif_set_dns_info(
+            netif,
+            esp_idf_svc::sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
+            &dns_info as *const _ as *mut _,
+        );
+        if ret != esp_idf_svc::sys::ESP_OK as i32 {
+            warn!("set DNS info failed: {ret}");
+        } else {
+            info!("DNS server set to {ip} for AP interface");
+        }
+
+        // Option 114: Captive portal URI
+        let uri = format!("http://{ip}\0");
+        let ret = esp_idf_svc::sys::esp_netif_dhcps_option(
+            netif,
+            esp_idf_svc::sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
+            esp_idf_svc::sys::esp_netif_dhcp_option_id_t_ESP_NETIF_CAPTIVEPORTAL_URI,
+            uri.as_ptr() as *mut _,
+            (uri.len() - 1) as u32,
+        );
+        if ret != esp_idf_svc::sys::ESP_OK as i32 {
+            warn!("DHCP Option 114 failed: {ret}");
+        } else {
+            info!("DHCP Option 114 set: http://{ip}");
+        }
+
+        // Restart DHCP server
+        let ret = esp_idf_svc::sys::esp_netif_dhcps_start(netif);
+        if ret != esp_idf_svc::sys::ESP_OK as i32 {
+            warn!("DHCP restart failed: {ret}");
+        }
+    }
+}
+
+/// Provisioning HTML page — glass-card style matching open-sub-optimizer.
+/// IMPORTANT: Do NOT include the word "Success" anywhere — iOS interprets it
+/// as a connectivity check pass and closes the captive portal sheet.
 pub const PROVISION_HTML: &str = r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <title>MiniDSP WiFi Setup</title>
 <style>
-body{font-family:system-ui;max-width:400px;margin:40px auto;padding:0 20px;background:#1a1a2e;color:#e0e0e0}
-h1{color:#fff;font-size:1.4em}
-input{width:100%;padding:12px;margin:8px 0;border:1px solid #444;border-radius:6px;background:#16213e;color:#fff;box-sizing:border-box}
-button{width:100%;padding:14px;background:#0f3460;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:1em;margin-top:12px}
-button:hover{background:#1a5276}
-.status{color:#53c28b;margin-top:16px}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
+body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
+background:#0B0B10;color:#E8E8ED;display:flex;align-items:center;justify-content:center;padding:1.5rem}
+.card{background:rgba(28,20,40,0.35);border:1px solid rgba(180,180,255,0.07);border-radius:16px;
+padding:2rem;width:100%;max-width:380px;backdrop-filter:blur(12px) saturate(150%);-webkit-backdrop-filter:blur(12px) saturate(150%)}
+h1{font-size:1.25rem;font-weight:600;color:#E8E8ED;margin-bottom:0.25rem}
+.subtitle{font-size:0.8rem;color:#A1A1A6;margin-bottom:1.5rem}
+label{display:block;font-size:0.8rem;font-weight:600;color:#A1A1A6;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:0.4rem}
+input{width:100%;height:40px;padding:0.5rem 0.75rem;background:rgba(255,255,255,0.04);color:#E8E8ED;
+border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:0.95rem;outline:none;margin-bottom:1rem;
+transition:border-color 0.15s}
+input:focus{border-color:rgba(59,138,255,0.4)}
+input::placeholder{color:#7C7C80}
+button{width:100%;height:44px;background:rgba(59,138,255,0.15);color:#6BA7FF;
+border:1px solid rgba(59,138,255,0.2);border-radius:10px;font-size:0.95rem;font-weight:500;
+cursor:pointer;transition:background 0.15s,border-color 0.15s}
+button:hover,button:active{background:rgba(59,138,255,0.25);border-color:rgba(59,138,255,0.35)}
 </style></head><body>
+<div class="card">
 <h1>MiniDSP WiFi Setup</h1>
+<p class="subtitle">Connect your MiniDSP controller to WiFi</p>
 <form method="POST" action="/api/wifi/connect">
-<label for="ssid">Network Name (SSID)</label>
-<input id="ssid" name="ssid" required autofocus>
+<label for="ssid">Network Name</label>
+<input id="ssid" name="ssid" required autofocus placeholder="Your WiFi network">
 <label for="password">Password</label>
-<input id="password" name="password" type="password">
+<input id="password" name="password" type="password" placeholder="WiFi password">
 <button type="submit">Connect</button>
 </form>
+</div>
 </body></html>"#;
+

@@ -143,9 +143,14 @@
 - [x] SoftAP mode (SSID `minidsp-setup`, open)
 - [x] WiFi credential storage (NVS) — read/write ssid+password
 - [x] WiFi STA connection with exponential backoff (1s base, 2x, 60s max, 5 retries)
-- [x] Captive portal HTML page with SSID/password form
+- [x] Captive portal HTML page with SSID/password form — glass-card design (open-sub-optimizer style)
 - [x] `POST /api/wifi/connect` — save credentials + restart
 - [x] SoftAP fallback on no credentials or failed STA connect
+- [x] Captive portal auto-open on iOS/Android — DNS hijack + DHCP Option 114 + `esp_netif_set_dns_info` + wildcard HTTP redirect
+- [x] DNS server: only answers Type A queries (non-A get ANCOUNT=0), 8KB stack
+- [x] HTTP `/*` catch-all with `uri_match_wildcard: true`, absolute URL redirect, non-empty body (iOS requirement)
+- [x] DHCP: `esp_netif_set_dns_info` to advertise AP IP as DNS server + Option 114 (RFC 8910 captive portal URI)
+- [x] `CONFIG_LWIP_MAX_SOCKETS=16`, `max_open_sockets=13` for captive portal probe burst
 - [x] mDNS via `EspMdns` — _minidsp._tcp:5380 with TXT records (hw_id, serial, product)
 - [x] Auto-reconnect after WiFi disconnect — background monitor thread, exponential backoff (1s–60s)
 - [ ] Reason code handling (AUTH_FAIL vs BEACON_TIMEOUT) — DEFERRED: monitor reconnects generically for now
@@ -176,7 +181,7 @@
 - [x] Test: full code review (31 issues — 3 critical, 9 high, 11 medium, 8 low) — all addressed
 - [x] Test: boot order verified — captive portal (DNS+HTTP) starts before USB init (which blocks 30s)
 - [x] Test: no boot loop — previous 4KB WiFi monitor stack caused stack overflow → watchdog reset. Fixed to 8KB.
-- [ ] Test: WiFi provisioning end-to-end (phone → SoftAP → captive portal → save creds → restart → STA) — NEXT
+- [x] Test: WiFi provisioning end-to-end (phone → SoftAP → captive portal auto-open → save creds → restart → STA) — PASSED 2026-04-06, connected to WPA3-SAE network at 192.0.2.246
 - [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
@@ -189,8 +194,10 @@
 - Unix socket CLI transport not fully implemented (fallback to USB works, daemon socket listener works)
 - Idempotent retry on reconnect deferred — requires persisting pending state
 - PWR-ICE TCP compat deferred — need device owner
-- ESP32 flashing: close serial-mcp session before flashing. Use `espflash flash --port /dev/cu.usbmodem<TARGET> <elf>` (Rust project, no CMakeLists.txt). CH340 auto-resets via DTR/RTS — no boot button needed.
-- ESP32 SoftAP IP is 192.168.71.1 (not the default 192.168.4.1) — DNS hijack now reads actual IP from ESP-IDF netif dynamically.
+- ESP32 flashing: close serial-mcp session before flashing. Use `esptool.py` with ELF→bin conversion (espflash panics on CH340). CH340 auto-resets via DTR/RTS — no boot button needed.
+- ESP32 SoftAP IP is 192.168.71.1 (not the default 192.168.4.1) — DNS hijack and DHCP both configured dynamically from netif.
+- ESP32 flash is 16MB (DevKitC-1 N8R8) — custom partition table required (`CONFIG_ESPTOOLPY_FLASHSIZE_16MB`, `CONFIG_PARTITION_TABLE_CUSTOM`). Debug binary is ~2.4MB.
+- `esp_netif_dhcps_option` with `ESP_NETIF_DOMAIN_NAME_SERVER` returns error 20481 (invalid params) — use `esp_netif_set_dns_info` instead to set DHCP-advertised DNS server.
 
 ---
 

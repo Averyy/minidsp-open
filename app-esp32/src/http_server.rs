@@ -23,15 +23,19 @@ pub type SharedDeviceState = Arc<Mutex<Option<Arc<DeviceState>>>>;
 
 /// Start the HTTP server with all routes.
 /// `port` should be 80 for SoftAP provisioning (captive portal), 5380 for normal STA mode.
+/// `ap_ip` is the SoftAP IP for captive portal redirects (None in STA mode).
 pub fn start(
     state: SharedDeviceState,
     port: u16,
     nvs: EspDefaultNvsPartition,
+    ap_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<EspHttpServer<'static>, Box<dyn std::error::Error>> {
     let config = Configuration {
         http_port: port,
         max_uri_handlers: 30,
         stack_size: 8192,
+        max_open_sockets: 13,
+        uri_match_wildcard: true,
         ..Default::default()
     };
     let mut server = EspHttpServer::new(&config)?;
@@ -165,6 +169,7 @@ pub fn start(
 
     // WiFi provisioning page
     server.fn_handler("/", Method::Get, |req| {
+        info!("serving provisioning page");
         send_html(req, crate::wifi::PROVISION_HTML)
     })?;
 
@@ -217,6 +222,23 @@ pub fn start(
         });
         Ok(())
     })?;
+
+    // Catch-all: redirect any unrecognized path to "/".
+    // This is essential for captive portal auto-open — iOS/Android/Windows probe
+    // random URLs (e.g. /hotspot-detect.html, /generate_204) and expect a redirect
+    // or non-standard response to trigger the captive portal popup.
+    // ESP-IDF httpd matches exact URIs first, so this won't shadow registered routes.
+    // Catch-all: redirect any unrecognized path to the portal.
+    // Uses absolute URL (required for iOS/Android captive portal detection)
+    // with non-empty body (iOS requires content to trigger the portal sheet).
+    if let Some(ip) = ap_ip {
+        let portal_url = format!("http://{ip}/");
+        server.fn_handler("/*", Method::Get, move |req| {
+            let uri = req.uri().to_string();
+            info!("captive portal redirect: {uri} → {portal_url}");
+            send_redirect(req, &portal_url)
+        })?;
+    }
 
     info!("HTTP routes registered");
     Ok(server)
@@ -531,6 +553,26 @@ fn send_html<C: esp_idf_svc::http::server::Connection>(
     ];
     let mut resp = req.into_response(200, None, &headers)?;
     resp.write_all(html.as_bytes())?;
+    Ok(())
+}
+
+fn send_redirect<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    location: &str,
+) -> Result<(), C::Error> {
+    let headers = [
+        ("Location", location),
+        ("Content-Type", "text/html"),
+        ("Cache-Control", "no-store"),
+    ];
+    // iOS requires a non-empty body to trigger captive portal detection.
+    // Do NOT include the word "Success" — iOS treats it as a connectivity check pass.
+    let body = format!(
+        "<html><body>Redirecting to <a href=\"{loc}\">setup page</a></body></html>",
+        loc = location
+    );
+    let mut resp = req.into_response(302, Some("Found"), &headers)?;
+    resp.write_all(body.as_bytes())?;
     Ok(())
 }
 

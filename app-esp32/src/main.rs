@@ -63,8 +63,9 @@ fn main() {
     if !wifi_is_sta && wifi_handle.is_some() {
         let ap_ip = wifi::get_softap_ip();
         info!("step 2: starting captive portal at {ap_ip}");
+        wifi::configure_dhcp_for_captive_portal(ap_ip);
         wifi::start_captive_dns(ap_ip);
-        match http_server::start(device_state.clone(), 80, nvs.clone()) {
+        match http_server::start(device_state.clone(), 80, nvs.clone(), Some(ap_ip)) {
             Ok(server) => {
                 info!("captive portal running on port 80");
                 Box::leak(Box::new(server));
@@ -119,7 +120,7 @@ fn main() {
     // Step 6: Start HTTP server (STA mode — SoftAP portal already started above)
     if wifi_is_sta && wifi_handle.is_some() {
         info!("step 6: starting HTTP server on port 5380");
-        match http_server::start(device_state.clone(), 5380, nvs.clone()) {
+        match http_server::start(device_state.clone(), 5380, nvs.clone(), None) {
             Ok(server) => {
                 info!("HTTP server running on port 5380");
                 Box::leak(Box::new(server));
@@ -140,6 +141,12 @@ fn main() {
     }
 
     info!("minidsp-open ready");
+
+    // Dump the boot log from ring buffer so late serial connections can see it
+    let boot_log = diagnostics::log_snapshot();
+    for line in boot_log.lines() {
+        info!("[boot] {line}");
+    }
 
     // Main loop: diagnostics tick + USB reconnect check
     let mut usb_reconnect_backoff = Duration::from_secs(5);

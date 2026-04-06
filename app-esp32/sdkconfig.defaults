@@ -1,11 +1,21 @@
 # ESP32-S3 target
 CONFIG_IDF_TARGET="esp32s3"
 
+# Flash size (DevKitC-1 N8R8 = 8MB flash, but our boards have 16MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Custom partition table (3MB app + 960KB data)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
 # USB Host support
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512
 
 # WiFi
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+
+# LwIP — phones open many simultaneous connections during captive portal detection
+CONFIG_LWIP_MAX_SOCKETS=16
 
 # Stack sizes for blocking I/O
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
