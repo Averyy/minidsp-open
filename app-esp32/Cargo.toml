@@ -9,18 +9,13 @@ license = "MIT"
 minidsp-protocol = { path = "../protocol" }
 
 # ESP-IDF Rust ecosystem (v0.52 = latest stable, targets IDF v5.4)
-esp-idf-svc = { version = "0.52", features = ["alloc", "embassy-sync"] }
+esp-idf-svc = { version = "0.52", features = ["alloc"] }
 esp-idf-hal = "0.46"
 esp-idf-sys = { version = "0.37", features = ["binstart"] }
-
-# Async runtime (embassy on std — runs as FreeRTOS task)
-embassy-executor = { version = "0.7", features = ["arch-std", "executor-thread"] }
-embassy-sync = "0.6"
 
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-heapless = "0.9"
 
 # Logging
 log = "0.4"

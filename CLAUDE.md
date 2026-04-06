@@ -4,7 +4,7 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 ## Project State
 
-Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware compiles (IDF v5.4). ESP32 USB Host HID FFI and WiFi provisioning still need implementation.
+Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, connects to MiniDSP simulator via USB Host HID, runs WiFi SoftAP, serves HTTP API. Blocking std architecture (no embassy). Flashed and tested on hardware — stable, 221KB heap free.
 
 ## Build
 

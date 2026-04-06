@@ -115,32 +115,46 @@
 
 ## Phase 1j: ESP32 — USB Host HID
 - [x] ESP32 firmware compiles (esp-idf-svc 0.52, IDF v5.4, Python 3.14 venv via uv)
-- [ ] `esp-idf-sys` FFI to `usb_host_hid` C API (~200-300 lines unsafe)
-- [ ] Device enumeration (VID 0x2752)
-- [ ] 65-byte HID report read/write
-- [ ] Hotplug detection
-- [ ] VBUS drive (GPIO high for MiniDSP USB enable)
+- [x] `esp-idf-sys` FFI to USB Host raw API (not HID managed component) — descriptor walk, interface claim, interrupt transfers
+- [x] Device enumeration (VID 0x2752) — auto-detect on USB connect event
+- [x] 64-byte interrupt transfer read/write (no report ID on wire for report ID 0)
+- [x] Separate XferSync per transfer direction (OUT/IN) — prevents spurious callback races
+- [x] Blocking `command()` API with Mutex serialization — thread-safe for HTTP handlers
+- [ ] Hotplug detection (reconnect after unplug) — DEFERRED: requires background monitoring
+- [ ] VBUS drive (GPIO high for MiniDSP USB enable) — not needed on DevKitC (both boards powered via UART)
 
-## Phase 1k: ESP32 — HTTP API (picoserve)
-- [ ] picoserve route wiring (same handler logic as axum)
-- [ ] serde-json-core responses (fixed buffer sizing)
-- [ ] WebSocket support (picoserve `ws` feature)
-- [ ] Connection limit management (~4-8 concurrent)
+## Phase 1k: ESP32 — HTTP API (EspHttpServer)
+- [x] EspHttpServer (ESP-IDF httpd) — replaced picoserve (compatibility issues)
+- [x] `GET /devices` — list connected devices
+- [x] `GET /devices/0` — device status (volume, mute, source, preset, dirac)
+- [x] `POST /devices/0` — set master status (returns error on USB failure, not 200)
+- [x] `POST /devices/0/volume/{up,down,toggle_mute}` — compatibility routes
+- [x] `POST /devices/0/source/{name}` — per-source routes from device profile
+- [x] `POST /devices/0/preset/{0-3}` — preset switch routes
+- [x] `GET/POST /devices/0/display` — brightness and idle time
+- [x] `GET/POST /devices/0/dre` — DRE enable/disable
+- [x] `GET /devices/0/tokens` — modification tokens
+- [x] `POST /devices/0/preset/copy` — copy preset to flash
+- [x] `GET /llms.txt` — AI discoverability
+- [x] CORS headers (Access-Control-Allow-Origin: *)
+- [ ] WebSocket support — DEFERRED: EspHttpServer WebSocket experimental
 
 ## Phase 1l: ESP32 — WiFi & Provisioning
-- [ ] SoftAP + captive portal (SSID `minidsp-setup`)
-- [ ] WiFi credential storage (NVS)
-- [ ] WiFi reconnection with backoff (1s base, 2x, 60s cap)
-- [ ] Reason code handling (AUTH_FAIL → re-provision, BEACON_TIMEOUT → aggressive retry)
-- [ ] mDNS via `EspMdns` from `esp-idf-svc`
-- [ ] `POST /api/system/reprovision`
+- [x] SoftAP mode (SSID `minidsp-setup`, open)
+- [x] WiFi credential storage (NVS) — read/write ssid+password
+- [x] WiFi STA connection with exponential backoff (1s base, 2x, 60s max, 5 retries)
+- [x] Captive portal HTML page with SSID/password form
+- [x] `POST /api/wifi/connect` — save credentials + restart
+- [x] SoftAP fallback on no credentials or failed STA connect
+- [ ] mDNS via `EspMdns` — DEFERRED: add after basic WiFi works in production
+- [ ] Reason code handling (AUTH_FAIL vs BEACON_TIMEOUT) — DEFERRED
 
 ## Phase 1m: ESP32 — Diagnostics
-- [ ] Custom `log::Log` implementation (UART + 4KB ring buffer)
-- [ ] `GET /debug/log` — ring buffer snapshot
-- [ ] `GET /debug/info` — JSON system diagnostics (heap, WiFi, USB, uptime)
-- [ ] `POST /debug/level` — runtime log level change
-- [ ] `GET /api/system/status` — data partition state
+- [x] System info collection (heap free, heap min, uptime)
+- [x] Periodic diagnostics logging (30s interval)
+- [ ] Custom `log::Log` ring buffer — DEFERRED: ESP logger to UART works
+- [ ] `GET /debug/info` endpoint — DEFERRED: diagnostics struct ready (SystemInfo)
+- [ ] Runtime log level change — DEFERRED
 
 ## Phase 1n: Release & Testing
 - [x] Test: protocol wire format compatibility (38 integration tests in protocol/tests/compatibility.rs)
@@ -155,7 +169,7 @@
 - [ ] Test: ezBEQ client compatibility (PEQ batch load) — NEEDS REAL HARDWARE
 - [ ] Test: multi-device — NEEDS MULTIPLE DEVICES
 - [ ] Test: reconnect after USB unplug/replug — NEEDS REAL HARDWARE
-- [ ] Test: ESP32 end-to-end (WiFi → USB HID → MiniDSP) — NEEDS ESP32 FIRMWARE
+- [x] Test: ESP32 boots, WiFi SoftAP starts, USB host detects simulator, runs stable (221KB heap free, no crashes)
 - [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
