@@ -4,7 +4,23 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 ## Project State
 
-Planning/research complete. Not yet coding. All protocol details, device definitions, and address tables extracted and verified.
+Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware compiles (IDF v5.4). ESP32 USB Host HID FFI and WiFi provisioning still need implementation.
+
+## Build
+
+```bash
+# Desktop (all crates)
+cargo build
+cargo test
+
+# ESP32 (separate toolchain)
+cd app-esp32
+# Requires: espup, ldproxy, ESP-IDF v5.4 with Python 3.14 venv via uv
+cargo build  # uses rust-toolchain.toml (esp) and .cargo/config.toml
+
+# Flash ESP32 (close serial MCP first, hold BOOT button for download mode)
+espflash flash --port /dev/cu.usbmodemXXX target/xtensa-esp32s3-espidf/debug/minidsp-esp32
+```
 
 ## Key Files
 
