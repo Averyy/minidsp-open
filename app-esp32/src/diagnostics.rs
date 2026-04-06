@@ -23,7 +23,7 @@ pub async fn run() {
     // TODO: Periodic system info collection (heap free, WiFi RSSI, USB state)
 
     loop {
-        embassy_time::Timer::after(embassy_time::Duration::from_secs(30)).await;
+        { std::thread::sleep(std::time::Duration::from_secs(30)); };
         // Collect system stats periodically
         unsafe {
             let heap_free = esp_idf_svc::sys::esp_get_free_heap_size();

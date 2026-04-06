@@ -3,10 +3,7 @@
 //! Uses esp-idf-sys FFI to the ESP-IDF USB Host HID driver.
 //! This is ~200 lines of unsafe code wrapping the C API.
 
-use esp_idf_svc::sys;
-use log::{info, warn, error};
-use core::ffi::c_void;
-use core::ptr;
+use log::info;
 
 /// MiniDSP USB VID.
 const MINIDSP_VID: u16 = 0x2752;
@@ -88,7 +85,7 @@ pub async fn init_and_find_device() -> Result<MiniDspDevice, UsbHidError> {
 /// and waits for the response.
 pub async fn hid_roundtrip(payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
     // Encode as HID report
-    let report = minidsp_protocol::packet::encode_hid(payload);
+    let _report = minidsp_protocol::packet::encode_hid(payload);
 
     // TODO: Send report via usb_host_transfer_submit()
     // TODO: Wait for response via HID input report callback

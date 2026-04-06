@@ -8,7 +8,7 @@
 //! 5. Save to NVS, restart into STA mode
 
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use log::{info, warn, error};
+use log::info;
 
 /// WiFi connection error.
 #[derive(Debug)]
@@ -31,7 +31,7 @@ impl core::fmt::Display for WifiError {
 /// Attempt to connect to saved WiFi, or start provisioning.
 ///
 /// Returns true if WiFi is connected, false if in provisioning mode.
-pub async fn connect_or_provision(nvs: EspDefaultNvsPartition) -> Result<bool, WifiError> {
+pub async fn connect_or_provision(_nvs: EspDefaultNvsPartition) -> Result<bool, WifiError> {
     // TODO: Implement WiFi connection flow
     // 1. Read SSID/password from NVS
     // 2. If present: esp_wifi_connect() with backoff
@@ -56,7 +56,7 @@ pub async fn connect_or_provision(nvs: EspDefaultNvsPartition) -> Result<bool, W
 /// SSID: minidsp-setup (open network)
 /// DNS redirects all queries to 192.168.4.1
 /// Serves a simple HTML page with network scanner + password field.
-pub async fn start_provisioning(nvs: EspDefaultNvsPartition) -> Result<(), WifiError> {
+pub async fn start_provisioning(_nvs: EspDefaultNvsPartition) -> Result<(), WifiError> {
     info!("WiFi: starting SoftAP provisioning (SSID: minidsp-setup)");
 
     // TODO: Implement SoftAP + captive portal

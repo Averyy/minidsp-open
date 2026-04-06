@@ -114,12 +114,12 @@
 - [x] `-f <file>` execution (sequential, no reordering)
 
 ## Phase 1j: ESP32 — USB Host HID
+- [x] ESP32 firmware compiles (esp-idf-svc 0.52, IDF v5.4, Python 3.14 venv via uv)
 - [ ] `esp-idf-sys` FFI to `usb_host_hid` C API (~200-300 lines unsafe)
 - [ ] Device enumeration (VID 0x2752)
 - [ ] 65-byte HID report read/write
 - [ ] Hotplug detection
 - [ ] VBUS drive (GPIO high for MiniDSP USB enable)
-**BLOCKER:** ESP-IDF Python environment has broken `ruamel.yaml.clib` package metadata on macOS + Python 3.9 (Xcode). `pkg_resources` can't find the package due to namespace package naming (`ruamel_yaml_clib` vs `ruamel.yaml.clib`). Fix: install Python 3.12 via Homebrew and recreate the venv, or patch `idf_tools.py` to use `importlib.metadata`.
 
 ## Phase 1k: ESP32 — HTTP API (picoserve)
 - [ ] picoserve route wiring (same handler logic as axum)

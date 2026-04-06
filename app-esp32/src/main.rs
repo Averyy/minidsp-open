@@ -3,7 +3,6 @@
 //! USB Host HID → MiniDSP protocol → WiFi HTTP API + TCP bridge + UDP discovery.
 //! Runs on ESP-IDF with embassy-executor for async.
 
-use esp_idf_svc::hal::prelude::*;
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::sys;
 use log::{info, warn, error};
@@ -23,10 +22,6 @@ fn main() {
     // Initialize NVS (required for WiFi credentials)
     let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take()
         .expect("failed to initialize NVS");
-
-    // Initialize peripherals
-    let peripherals = Peripherals::take()
-        .expect("failed to take peripherals");
 
     // Start the main async runtime
     let executor = embassy_executor::Executor::new();
@@ -82,6 +77,6 @@ async fn main_task(
 
     // Keep main task alive
     loop {
-        embassy_time::Timer::after(embassy_time::Duration::from_secs(60)).await;
+        { std::thread::sleep(std::time::Duration::from_secs(60)); };
     }
 }

@@ -3,14 +3,14 @@
 //! Serves the same API as the desktop daemon (axum) but using picoserve
 //! for zero-heap-allocation HTTP handling.
 
-use log::{info, warn};
+use log::info;
 
 /// Run the HTTP server.
 ///
 /// Uses picoserve with a fixed number of connection slots.
 /// Same API routes as the desktop daemon.
 #[embassy_executor::task]
-pub async fn run(device: Option<crate::usb_hid::MiniDspDevice>) {
+pub async fn run(_device: Option<crate::usb_hid::MiniDspDevice>) {
     info!("HTTP server starting on port 5380");
 
     // TODO: Implement picoserve routes
@@ -38,6 +38,6 @@ pub async fn run(device: Option<crate::usb_hid::MiniDspDevice>) {
 
     // Placeholder: keep task alive
     loop {
-        embassy_time::Timer::after(embassy_time::Duration::from_secs(60)).await;
+        { std::thread::sleep(std::time::Duration::from_secs(60)); };
     }
 }

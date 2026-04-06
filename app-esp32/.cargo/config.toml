@@ -10,6 +10,6 @@ build-std = ["std", "panic_abort"]
 
 [env]
 MCU = "esp32s3"
-# ESP-IDF v5.3
-ESP_IDF_VERSION = "v5.3"
+# ESP-IDF v5.4 — matches esp-uac2-host driver
+ESP_IDF_VERSION = "v5.4"
 ESP_IDF_TOOLS_INSTALL_DIR = "global"
