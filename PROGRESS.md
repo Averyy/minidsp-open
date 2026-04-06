@@ -168,7 +168,7 @@
 - Unix socket CLI transport not fully implemented (fallback to USB works, daemon socket listener works)
 - Idempotent retry on reconnect deferred — requires persisting pending state
 - PWR-ICE TCP compat deferred — need device owner
-- ESP32 flashing: need to close serial MCP session before flashing (`espflash` needs exclusive port access). The CH343 UART port requires the board to be in download mode (hold BOOT + press RESET) for flashing via UART. Alternative: flash via USB-JTAG port if available.
+- ESP32 flashing: close serial-mcp session before flashing. Use `idf.py -p /dev/cu.usbmodem<TARGET> flash` (NOT espflash). CH340 auto-resets via DTR/RTS — no boot button needed.
 
 ---
 

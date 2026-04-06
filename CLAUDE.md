@@ -17,10 +17,30 @@ cargo test
 cd app-esp32
 # Requires: espup, ldproxy, ESP-IDF v5.4 with Python 3.14 venv via uv
 cargo build  # uses rust-toolchain.toml (esp) and .cargo/config.toml
-
-# Flash ESP32 (close serial MCP first, hold BOOT button for download mode)
-espflash flash --port /dev/cu.usbmodemXXX target/xtensa-esp32s3-espidf/debug/minidsp-esp32
 ```
+
+## ESP32 Flashing
+
+Both ESP32-S3 DevKitC-1 boards have two USB-C ports:
+- **Right (UART):** CH340 bridge (VID 0x1A86). Used for flashing AND serial monitor. Shows as `/dev/cu.usbmodem*`.
+- **Left (USB OTG):** Connected to other ESP32 for device-to-device USB. NOT used for flashing.
+
+Flash sequence — use `idf.py`, NOT `espflash`:
+```bash
+# 1. Close serial-mcp session on the target board (exclusive port lock)
+# 2. Flash via idf.py (CH340 auto-resets into download mode via DTR/RTS — no boot button needed)
+idf.py -p /dev/cu.usbmodem<TARGET> flash
+# 3. Reopen serial-mcp after flash completes
+```
+
+The port name doesn't change between flashes. Both boards can be flashed independently while their OTG ports remain connected.
+
+## ESP32 Dev Boards
+
+| Serial | Location | Role |
+|--------|----------|------|
+| firmware-board | 0-1 | miniDSP 2x4 HD simulator (TinyUSB device) |
+| simulator-board | 1-1 | minidsp-open firmware target (USB host) |
 
 ## Key Files
 
