@@ -7,6 +7,7 @@ members = [
     "app-desktop",
     # "app-esp32",  # Cross-compiled separately with ESP-IDF toolchain
 ]
+exclude = ["app-esp32"]
 
 [workspace.package]
 version = "0.1.0"

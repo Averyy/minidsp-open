@@ -119,6 +119,7 @@
 - [ ] 65-byte HID report read/write
 - [ ] Hotplug detection
 - [ ] VBUS drive (GPIO high for MiniDSP USB enable)
+**BLOCKER:** ESP-IDF Python environment has broken `ruamel.yaml.clib` package metadata on macOS + Python 3.9 (Xcode). `pkg_resources` can't find the package due to namespace package naming (`ruamel_yaml_clib` vs `ruamel.yaml.clib`). Fix: install Python 3.12 via Homebrew and recreate the venv, or patch `idf_tools.py` to use `importlib.metadata`.
 
 ## Phase 1k: ESP32 — HTTP API (picoserve)
 - [ ] picoserve route wiring (same handler logic as axum)

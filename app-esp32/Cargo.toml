@@ -1,0 +1,32 @@
+[package]
+name = "minidsp-esp32"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+# Shared protocol crate (no_std compatible)
+minidsp-protocol = { path = "../protocol" }
+
+# ESP-IDF Rust ecosystem
+esp-idf-svc = { version = "0.51", features = ["alloc", "embassy-sync", "embassy-time-driver"] }
+esp-idf-hal = "0.45"
+esp-idf-sys = { version = "0.36", features = ["binstart"] }
+
+# Async runtime
+embassy-executor = { version = "0.7", features = ["arch-std", "executor-thread"] }
+embassy-time = "0.4"
+embassy-sync = "0.6"
+
+# HTTP server — using esp-idf-svc built-in httpd (simpler than picoserve for std target)
+
+# JSON — using serde_json since we're in std mode on ESP-IDF
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+heapless = "0.8"
+
+# Logging
+log = "0.4"
+
+[build-dependencies]
+embuild = "0.33"
