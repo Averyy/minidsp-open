@@ -188,7 +188,7 @@ The miniDSP accepts audio via USB — that's a core product feature. The ESP32-S
 
 Open the miniDSP's audio interface alongside the existing HID interface. Use the UAC2 driver API:
 ```c
-#include "uac2_host.h"
+#include "usb/uac2_host.h"
 
 // Open the UAC2 device after USB enumeration
 uac2_host_device_handle_t audio_dev;
@@ -308,6 +308,8 @@ No special software needed beyond minidsp-open and REW.
 - Transfer error limiting (auto-stops after 10 consecutive errors)
 - All 5 automated tests pass (48kHz, volume/mute, stop/restart, 44.1kHz, long-running stability)
 - Reviewed by 6-agent code review, all findings fixed
+- Full cleanup/hardening pass: per-stream spinlocks, safe ringbuffer deletion, Kconfig, idf_component.yml
+- v1.0.0 (headers at `include/usb/uac2_host.h`, `include/usb/uac2_desc.h`)
 
 ### Using as ESP-IDF Component
 
