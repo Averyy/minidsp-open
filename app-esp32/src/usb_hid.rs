@@ -8,6 +8,12 @@
 //! - Background std::thread runs usb_host_lib_handle_events() loop
 //! - UsbHidBus::command() does blocking OUT+IN transfers with Condvar sync
 //! - Internal Mutex serializes all USB operations
+//!
+//! Hardware notes:
+//! - DevKitC-1 does NOT supply 5V on the OTG port. The connected device
+//!   must be self-powered (e.g. simulator via UART) or use a powered hub.
+//! - interface_claim() does NOT send SET_INTERFACE — fine for HID (no alt settings).
+//! - interface_release() can fail if URBs in-flight — Drop retries 5 times.
 
 use esp_idf_sys::*;
 use log::{debug, error, info, warn};
@@ -371,7 +377,21 @@ impl Drop for UsbHidBus {
         unsafe {
             usb_host_transfer_free(self.out_xfer);
             usb_host_transfer_free(self.in_xfer);
-            usb_host_interface_release(self.client_hdl, self.dev_hdl, self.hid_intf);
+            // interface_release can fail with ESP_ERR_INVALID_STATE if URBs are
+            // in-flight. Retry a few times with short delays.
+            for attempt in 0..5 {
+                let err = usb_host_interface_release(
+                    self.client_hdl,
+                    self.dev_hdl,
+                    self.hid_intf,
+                );
+                if err == ESP_OK as i32 {
+                    break;
+                }
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
             usb_host_device_close(self.client_hdl, self.dev_hdl);
         }
     }
