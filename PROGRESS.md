@@ -136,8 +136,10 @@
 - [x] `GET /devices/0/tokens` — modification tokens
 - [x] `POST /devices/0/preset/copy` — copy preset to flash
 - [x] `GET /llms.txt` — AI discoverability
-- [x] CORS headers (Access-Control-Allow-Origin: *)
-- [x] WebSocket support — /devices/0/ws with push-based status streaming (1s poll) + request-response
+- [x] CORS headers (Access-Control-Allow-Origin: *) + OPTIONS wildcard preflight (204)
+- [x] WebSocket raw bridge — /devices/0/ws with push-based status streaming (1s poll) + request-response
+- [x] WebSocket compat — /devices/0 with GET/WS dual handling (FFI upgrade detection), ?levels=true (250ms) / ?poll=true (1s)
+- [x] Level meter reading — CMD_READ_FLOATS (0x14) via DSP address table, contiguous batching, float→dB conversion
 
 ## Phase 1l: ESP32 — WiFi & Provisioning
 - [x] SoftAP mode (SSID `minidsp-setup`, open)
@@ -151,7 +153,7 @@
 - [x] HTTP `/*` catch-all with `uri_match_wildcard: true`, absolute URL redirect, non-empty body (iOS requirement)
 - [x] DHCP: `esp_netif_set_dns_info` to advertise AP IP as DNS server + Option 114 (RFC 8910 captive portal URI)
 - [x] `CONFIG_LWIP_MAX_SOCKETS=16`, `max_open_sockets=13` for captive portal probe burst
-- [x] mDNS via `EspMdns` — _minidsp._tcp:5380 with TXT records (hw_id, serial, product)
+- [x] mDNS via `EspMdns` — _minidsp._tcp:5380 with TXT records (hw_id, serial, product). Uses `espressif/mdns` from IDF Component Registry (moved out of core IDF in v5.4).
 - [x] Auto-reconnect after WiFi disconnect — background monitor thread, exponential backoff (1s–60s)
 - [ ] Reason code handling (AUTH_FAIL vs BEACON_TIMEOUT) — DEFERRED: monitor reconnects generically for now
 
@@ -176,12 +178,16 @@
 - [ ] Test: Device Console coexistence (TCP bridge + UDP discovery) — NEEDS REAL HARDWARE
 - [ ] Test: ezBEQ client compatibility (PEQ batch load) — NEEDS REAL HARDWARE
 - [ ] Test: multi-device — NEEDS MULTIPLE DEVICES
-- [ ] Test: reconnect after USB unplug/replug — NEEDS REAL HARDWARE
-- [x] Test: ESP32 boots, WiFi SoftAP starts, USB host detects simulator, runs stable (193KB heap free, no crashes)
+- [x] Test: ESP32 boots, WiFi SoftAP starts, USB host detects simulator, runs stable (167KB heap free, no crashes)
 - [x] Test: full code review (31 issues — 3 critical, 9 high, 11 medium, 8 low) — all addressed
 - [x] Test: boot order verified — captive portal (DNS+HTTP) starts before USB init (which blocks 30s)
 - [x] Test: no boot loop — previous 4KB WiFi monitor stack caused stack overflow → watchdog reset. Fixed to 8KB.
 - [x] Test: WiFi provisioning end-to-end (phone → SoftAP → captive portal auto-open → save creds → restart → STA) — PASSED 2026-04-06, connected to WPA3-SAE network at 192.0.2.246
+- [x] Test: ESP32 full network test (2026-04-06) — 15 bugs found and fixed across 3 sessions. All 31 HTTP routes + 2 WS endpoints verified.
+- [x] Test: USB hotplug — device power cycle (auto-reconnect ~4s), firmware reboot (device found in 6.7s), firmware-first/device-later (503 → background scan → auto-detect)
+- [x] Test: mDNS discovery — hostname resolves, _minidsp._tcp browsable, TXT records correct
+- [x] Test: WebSocket compat — levels=true (~250ms), poll=true (~1s), GET/WS interleave, raw bridge
+- [x] Test: heap stability — 167KB free after 20 GET + 3 WS sessions, no leak, min watermark 139KB
 - [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
@@ -191,13 +197,9 @@
 ## Known Issues / Deferred
 - Legacy device config.xml address table extraction not implemented — devices work at DspKnown tier (basic support)
 - DSP 115 input PEQ addresses confirmed but input mute/gain/polarity not in Device Console XML (marked Option::None)
-- Unix socket CLI transport not fully implemented (fallback to USB works, daemon socket listener works)
 - Idempotent retry on reconnect deferred — requires persisting pending state
 - PWR-ICE TCP compat deferred — need device owner
-- ESP32 flashing: close serial-mcp session before flashing. Use `esptool.py` with ELF→bin conversion (espflash panics on CH340). CH340 auto-resets via DTR/RTS — no boot button needed.
-- ESP32 SoftAP IP is 192.168.71.1 (not the default 192.168.4.1) — DNS hijack and DHCP both configured dynamically from netif.
-- ESP32 flash is 16MB (DevKitC-1 N8R8) — custom partition table required (`CONFIG_ESPTOOLPY_FLASHSIZE_16MB`, `CONFIG_PARTITION_TABLE_CUSTOM`). Debug binary is ~2.4MB.
-- `esp_netif_dhcps_option` with `ESP_NETIF_DOMAIN_NAME_SERVER` returns error 20481 (invalid params) — use `esp_netif_set_dns_info` instead to set DHCP-advertised DNS server.
+- ESP32 simulator uses 2-byte address parsing for CMD_READ_FLOATS — returns 0 floats. Real hardware uses 3-byte (NEW dialect) correctly. Update simulator at `~/code/esp-uac2-host/simulators/minidsp-2x4hd/`.
 
 ---
 

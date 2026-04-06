@@ -65,7 +65,10 @@ pub fn start(
         })?;
     }
 
-    // GET /devices/0 — device status
+    // GET /devices/0 — device status (+ WebSocket compat polling when WS enabled)
+    // When WS is enabled, this path is registered as ws_handler in register_ws_routes
+    // to support both regular GET and WebSocket upgrade on the same path.
+    #[cfg(not(esp_idf_httpd_ws_support))]
     {
         let st = state.clone();
         server.fn_handler("/devices/0", Method::Get, move |req| {
@@ -701,104 +704,274 @@ fn register_ws_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
+    use esp_idf_svc::http::server::ws::EspHttpWsConnection;
     use esp_idf_svc::ws::FrameType;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Track the active polling thread's stop flag (one connection at a time)
-    let active_stop: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
-
-    let st = state.clone();
-    let stop_ref = active_stop.clone();
-
-    server.ws_handler("/devices/0/ws", None, move |ws| {
-        if ws.is_new() {
-            // Stop any previous polling thread
-            if let Ok(mut guard) = stop_ref.lock() {
-                if let Some(old_stop) = guard.take() {
-                    old_stop.store(true, Ordering::Relaxed);
-                }
-            }
-
-            // Create detached sender for push-based streaming
-            match ws.create_detached_sender() {
-                Ok(sender) => {
-                    let stop = Arc::new(AtomicBool::new(false));
-                    if let Ok(mut guard) = stop_ref.lock() {
-                        *guard = Some(stop.clone());
-                    }
-
-                    let dev_state = st.clone();
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("ws_poll".into())
-                        .stack_size(8192)
-                        .spawn(move || {
-                            ws_poll_loop(sender, dev_state, stop);
-                        })
-                    {
-                        log::warn!("WebSocket: failed to spawn poll thread: {e}");
-                    }
-                }
-                Err(e) => {
-                    log::warn!("WebSocket: failed to create sender: {e:?}");
-                }
-            }
-            return Ok::<(), esp_idf_svc::sys::EspError>(());
+    // -- Compat endpoint: /devices/0 (regular GET + WebSocket state/levels polling) --
+    // ezBEQ and ecosystem clients connect here with ?levels=true&poll=true
+    {
+        // Track active WebSocket session (fd + stop flag) to avoid cross-connection interference
+        struct ActiveWs {
+            stop: Arc<AtomicBool>,
+            fd: i32,
         }
+        let active_ws: Arc<Mutex<Option<ActiveWs>>> = Arc::new(Mutex::new(None));
 
-        if ws.is_closed() {
-            // Stop the polling thread
-            if let Ok(mut guard) = stop_ref.lock() {
-                if let Some(stop) = guard.take() {
-                    stop.store(true, Ordering::Relaxed);
-                }
-            }
-            return Ok(());
-        }
+        let st = state.clone();
+        let ws_ref = active_ws.clone();
 
-        // Handle incoming frames: on any text/binary, send current status back immediately
-        let mut buf = [0u8; 256];
-        match ws.recv(&mut buf) {
-            Ok((FrameType::Text(_), _)) | Ok((FrameType::Binary(_), _)) => {
-                // Send immediate status response
-                let json = match get_device(&st) {
-                    Some(dev) => match dev.get_status_summary() {
-                        Ok(status) => status_json(&status),
-                        Err(_) => r#"{"error":"device read failed"}"#.to_string(),
-                    },
-                    None => r#"{"error":"no device"}"#.to_string(),
+        server.ws_handler("/devices/0", None, move |ws| {
+            if ws.is_new() {
+                // Extract the raw request pointer for header inspection and HTTP response
+                let raw_req = match ws {
+                    EspHttpWsConnection::New(_, req) => *req,
+                    _ => return Ok::<(), esp_idf_svc::sys::EspError>(()),
                 };
-                let _ = ws.send(FrameType::Text(false), json.as_bytes());
+
+                // Detect WebSocket upgrade vs regular GET by checking for WS handshake header.
+                // ESP-IDF httpd calls our handler for BOTH — with handshake (WS) or without (GET).
+                if !unsafe { ws_is_upgrade(raw_req) } {
+                    // Regular GET — send JSON status response via raw httpd API
+                    let (status, json) = match get_device(&st) {
+                        Some(dev) => match dev.get_status_summary() {
+                            Ok(s) => (200, status_json(&s)),
+                            Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "\\\""))),
+                        },
+                        None => (503, r#"{"error":"no device"}"#.to_string()),
+                    };
+                    unsafe { ws_send_http_json(raw_req, status, &json) };
+                    return Ok(());
+                }
+
+                // WebSocket upgrade — parse query params for poll interval
+                let (_poll, levels) = unsafe { ws_parse_query(raw_req) };
+                let interval_ms: u64 = if levels { 250 } else { 1000 };
+
+                // Stop any previous polling thread
+                if let Ok(mut guard) = ws_ref.lock() {
+                    if let Some(prev) = guard.take() {
+                        prev.stop.store(true, Ordering::Relaxed);
+                    }
+                }
+
+                // Create detached sender for push-based streaming
+                match ws.create_detached_sender() {
+                    Ok(sender) => {
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let fd = ws.session();
+                        if let Ok(mut guard) = ws_ref.lock() {
+                            *guard = Some(ActiveWs { stop: stop.clone(), fd });
+                        }
+
+                        let dev_state = st.clone();
+                        if let Err(e) = std::thread::Builder::new()
+                            .name("ws_compat".into())
+                            .stack_size(16384)
+                            .spawn(move || {
+                                ws_poll_loop(sender, dev_state, stop, interval_ms);
+                            })
+                        {
+                            log::warn!("WebSocket compat: failed to spawn poll thread: {e}");
+                        }
+                    }
+                    Err(e) => log::warn!("WebSocket compat: failed to create sender: {e:?}"),
+                }
+                return Ok(());
             }
-            Ok((FrameType::Close, _)) => {
-                let _ = ws.send(FrameType::Close, &[]);
+
+            if ws.is_closed() {
+                // Only stop poll thread if the closing fd matches the active WS session
+                let closing_fd = ws.session();
+                if let Ok(mut guard) = ws_ref.lock() {
+                    if guard.as_ref().is_some_and(|a| a.fd == closing_fd) {
+                        if let Some(active) = guard.take() {
+                            active.stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                return Ok(());
             }
-            Ok((FrameType::Ping, _)) => {
-                let _ = ws.send(FrameType::Pong, &[]);
+
+            // Handle incoming WebSocket frames
+            let mut buf = [0u8; 256];
+            match ws.recv(&mut buf) {
+                Ok((FrameType::Text(_), _)) | Ok((FrameType::Binary(_), _)) => {
+                    let json = match get_device(&st) {
+                        Some(dev) => match dev.get_status_summary() {
+                            Ok(status) => status_json(&status),
+                            Err(_) => r#"{"error":"device read failed"}"#.to_string(),
+                        },
+                        None => r#"{"error":"no device"}"#.to_string(),
+                    };
+                    let _ = ws.send(FrameType::Text(false), json.as_bytes());
+                }
+                Ok((FrameType::Close, _)) => {
+                    let _ = ws.send(FrameType::Close, &[]);
+                }
+                Ok((FrameType::Ping, _)) => {
+                    let _ = ws.send(FrameType::Pong, &[]);
+                }
+                _ => {}
             }
-            _ => {}
+            Ok(())
+        })?;
+
+        info!("WebSocket compat endpoint registered: /devices/0");
+    }
+
+    // -- Raw frame bridge: /devices/0/ws --
+    {
+        struct ActiveWs {
+            stop: Arc<AtomicBool>,
+            fd: i32,
         }
+        let active_ws: Arc<Mutex<Option<ActiveWs>>> = Arc::new(Mutex::new(None));
 
-        Ok(())
-    })?;
+        let st = state.clone();
+        let ws_ref = active_ws.clone();
 
-    info!("WebSocket endpoint registered: /devices/0/ws");
+        server.ws_handler("/devices/0/ws", None, move |ws| {
+            if ws.is_new() {
+                if let Ok(mut guard) = ws_ref.lock() {
+                    if let Some(prev) = guard.take() {
+                        prev.stop.store(true, Ordering::Relaxed);
+                    }
+                }
+
+                match ws.create_detached_sender() {
+                    Ok(sender) => {
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let fd = ws.session();
+                        if let Ok(mut guard) = ws_ref.lock() {
+                            *guard = Some(ActiveWs { stop: stop.clone(), fd });
+                        }
+
+                        let dev_state = st.clone();
+                        if let Err(e) = std::thread::Builder::new()
+                            .name("ws_raw".into())
+                            .stack_size(16384)
+                            .spawn(move || {
+                                ws_poll_loop(sender, dev_state, stop, 1000);
+                            })
+                        {
+                            log::warn!("WebSocket raw: failed to spawn poll thread: {e}");
+                        }
+                    }
+                    Err(e) => log::warn!("WebSocket raw: failed to create sender: {e:?}"),
+                }
+                return Ok::<(), esp_idf_svc::sys::EspError>(());
+            }
+
+            if ws.is_closed() {
+                let closing_fd = ws.session();
+                if let Ok(mut guard) = ws_ref.lock() {
+                    if guard.as_ref().is_some_and(|a| a.fd == closing_fd) {
+                        if let Some(active) = guard.take() {
+                            active.stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            let mut buf = [0u8; 256];
+            match ws.recv(&mut buf) {
+                Ok((FrameType::Text(_), _)) | Ok((FrameType::Binary(_), _)) => {
+                    let json = match get_device(&st) {
+                        Some(dev) => match dev.get_status_summary() {
+                            Ok(status) => status_json(&status),
+                            Err(_) => r#"{"error":"device read failed"}"#.to_string(),
+                        },
+                        None => r#"{"error":"no device"}"#.to_string(),
+                    };
+                    let _ = ws.send(FrameType::Text(false), json.as_bytes());
+                }
+                Ok((FrameType::Close, _)) => {
+                    let _ = ws.send(FrameType::Close, &[]);
+                }
+                Ok((FrameType::Ping, _)) => {
+                    let _ = ws.send(FrameType::Pong, &[]);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+
+        info!("WebSocket raw bridge registered: /devices/0/ws");
+    }
+
     Ok(())
 }
 
-/// Background thread that pushes device status over WebSocket at 1s intervals.
+// ---------------------------------------------------------------------------
+// WebSocket FFI helpers — access raw httpd_req_t for dual GET/WS handling
+// ---------------------------------------------------------------------------
+
+/// Check if a request was a WebSocket upgrade (Sec-WebSocket-Key header present).
+/// When ESP-IDF httpd calls a ws_handler for a regular GET (no upgrade), the handshake
+/// is NOT performed and this returns false.
+#[cfg(esp_idf_httpd_ws_support)]
+unsafe fn ws_is_upgrade(raw_req: *mut esp_idf_svc::sys::httpd_req_t) -> bool {
+    esp_idf_svc::sys::httpd_req_get_hdr_value_len(
+        raw_req,
+        b"Sec-WebSocket-Key\0".as_ptr(),
+    ) > 0
+}
+
+/// Parse query parameters from the request URI for WebSocket poll configuration.
+#[cfg(esp_idf_httpd_ws_support)]
+unsafe fn ws_parse_query(raw_req: *mut esp_idf_svc::sys::httpd_req_t) -> (bool, bool) {
+    let uri = std::ffi::CStr::from_ptr((*raw_req).uri.as_ptr())
+        .to_str()
+        .unwrap_or("");
+    (uri.contains("poll=true"), uri.contains("levels=true"))
+}
+
+/// Send a regular HTTP JSON response from within a ws_handler callback.
+/// Used when the handler detects a non-WebSocket GET request.
+#[cfg(esp_idf_httpd_ws_support)]
+unsafe fn ws_send_http_json(
+    raw_req: *mut esp_idf_svc::sys::httpd_req_t,
+    status: u16,
+    json: &str,
+) {
+    use esp_idf_svc::sys::*;
+
+    httpd_resp_set_type(raw_req, b"application/json\0".as_ptr());
+    httpd_resp_set_hdr(
+        raw_req,
+        b"Access-Control-Allow-Origin\0".as_ptr(),
+        b"*\0".as_ptr(),
+    );
+
+    if status == 503 {
+        httpd_resp_set_status(raw_req, b"503 Service Unavailable\0".as_ptr());
+    } else if status == 500 {
+        httpd_resp_set_status(raw_req, b"500 Internal Server Error\0".as_ptr());
+    }
+
+    let ret = httpd_resp_send(raw_req, json.as_ptr(), json.len() as isize);
+    if ret != ESP_OK {
+        log::warn!("ws_send_http_json: httpd_resp_send failed ({ret})");
+    }
+}
+
+/// Background thread that pushes device status over WebSocket at a configurable interval.
 #[cfg(esp_idf_httpd_ws_support)]
 fn ws_poll_loop(
     mut sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
     state: SharedDeviceState,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    interval_ms: u64,
 ) {
     use esp_idf_svc::ws::FrameType;
     use std::sync::atomic::Ordering;
 
-    log::info!("WebSocket poll thread started");
+    log::info!("WebSocket poll thread started (interval={interval_ms}ms)");
 
     while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
 
         if stop.load(Ordering::Relaxed) {
             break;

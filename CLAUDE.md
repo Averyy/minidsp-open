@@ -4,7 +4,7 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 ## Project State
 
-Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, WiFi SoftAP with captive portal, serves HTTP API. Stable, 190KB heap free. **WiFi provisioning tested end-to-end** (2026-04-06): phone → SoftAP → iOS captive portal auto-open → save to NVS → restart → STA (WPA3-SAE).
+Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, WiFi SoftAP with captive portal, serves full HTTP API + WebSocket. Stable, 167KB heap free. **Network-tested end-to-end** (2026-04-06): all 15 bugs from first network test fixed, mDNS advertising, compat WebSocket on `/devices/0` (ezBEQ-compatible), level meter reading via CMD_READ_FLOATS, USB hotplug across all boot orderings, 31 HTTP routes + 2 WS endpoints.
 
 ## Build
 
@@ -56,6 +56,7 @@ Bootloader/partition-table binaries are in `target/xtensa-esp32s3-espidf/debug/`
 | `docs/ref-esp32-boot.md` | ESP32 boot sequence, WiFi provisioning (captive portal requirements), data partition |
 | `docs/ref-esp32-logging.md` | Ring buffer logging, /debug endpoints |
 | `app/MiniDSP Device Console.app/` | Official app — source of truth for device definitions and addresses |
+| `~/code/esp-uac2-host/simulators/minidsp-2x4hd/` | 2x4 HD simulator firmware (separate repo) |
 
 ## Critical Rules
 

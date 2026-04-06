@@ -57,7 +57,7 @@ minidsp-open/
     transport/tcp.rs         ← Shared (tokio, works on both platforms)
   daemon/                ← HTTP API + TCP server + discovery
     http/server_axum.rs      ← Linux: axum handlers (thin wrappers calling minidsp/ business logic)
-    http/server_espidf.rs    ← ESP32: picoserve handlers (thin wrappers calling same business logic)
+    http/server_espidf.rs    ← ESP32: EspHttpServer handlers (thin wrappers calling same business logic)
     tcp/mod.rs               ← Shared TCP bridge server (port 5333)
     discovery/mod.rs         ← Shared UDP discovery (port 3999)
   app-esp32/             ← ESP32 binary: WiFi provisioning, NVS config, GPIO trigger, OTA
@@ -70,18 +70,19 @@ Platform splits use `cfg(target_os = "espidf")`. Proven pattern in esp-rs ecosys
 
 | Component | Linux | ESP32-S3 |
 |-----------|-------|----------|
-| USB HID transport | hidapi (libusb) | ESP-IDF `usb_host_hid` via unsafe FFI (~100 lines) |
-| Async runtime | tokio (full, multi-thread) | embassy-executor on ESP-IDF (`arch-std`, runs as FreeRTOS task) |
-| HTTP server | axum | picoserve (zero heap alloc, axum-like API) |
-| JSON | serde_json | serde-json-core (fixed buffer, no alloc) |
+| USB HID transport | hidapi (libusb) | ESP-IDF USB Host raw API via unsafe FFI (~300 lines) |
+| Runtime | tokio (full, multi-thread) | Blocking std on FreeRTOS (no async) |
+| HTTP server | axum | EspHttpServer (ESP-IDF httpd, FreeRTOS task pool) |
+| WebSocket | axum (native) | EspHttpServer ws_handler + raw FFI for GET/WS dual handling |
+| JSON | serde_json | serde_json (same crate — ESP32 has enough heap) |
 | Config storage | filesystem | NVS (ESP32 flash) |
 | WiFi / mDNS / NVS | N/A | esp-idf-svc (std, wraps ESP-IDF C APIs) |
-| 12V trigger | N/A | GPIO + MOSFET |
-| WiFi provisioning | N/A | ESP-IDF captive portal |
+| 12V trigger | N/A | GPIO + MOSFET (future) |
+| WiFi provisioning | N/A | Captive portal (DNS hijack + DHCP Option 114) |
 
-**ESP32 is std-on-ESP-IDF, not no_std.** embassy-executor runs as a FreeRTOS task via `arch-std`. esp-idf-svc (std) provides WiFi, mDNS, and NVS. picoserve and serde-json-core are no_std-*compatible* libraries chosen for heap efficiency — not because the target is no_std. The protocol crate is the only true no_std crate (pure Rust, no platform deps).
+**ESP32 is std-on-ESP-IDF, not no_std.** Blocking architecture — each HTTP request runs in an EspHttpServer FreeRTOS task. esp-idf-svc (std) provides WiFi, mDNS, NVS, and HTTP server. The protocol crate is the only true no_std crate (pure Rust, no platform deps). Device tables are all `&'static` / `const` — they live in flash (.rodata), not heap.
 
-axum on ESP32 was proven but too heavy (~30-40KB per connection, OOMs at 5 concurrent). picoserve uses zero heap allocation with user-controlled per-connection buffers (~2-4KB each). Device tables are all `&'static` / `const` — they live in flash (.rodata), not heap. ~15-20KB flash across all devices, near-zero RAM impact.
+Original plan used picoserve (zero-alloc) and embassy-executor (async). Switched to EspHttpServer + blocking std after picoserve had compatibility issues with ESP-IDF httpd. serde_json works fine on ESP32 — 167KB heap free at steady state with 13 open sockets.
 
 ## Hardware (ESP32 target)
 
@@ -330,26 +331,26 @@ Canonical compatibility reference:
 
 ## ESP32-S3 Constraints
 
-- 512KB SRAM (~150-200KB free heap after WiFi/FreeRTOS), optional 8MB PSRAM
+- 512KB SRAM (~167KB free heap at steady state after WiFi/FreeRTOS/HTTP), optional 8MB PSRAM
 - WiFi stack: ~60-100KB heap
-- picoserve: minimal overhead, ~2-4KB per connection (user-controlled buffers)
-- Realistic capacity: 4-8 concurrent connections with headroom for application state
-- USB Host HID: no safe Rust wrappers. Use `esp-idf-sys` unsafe FFI to C API.
+- EspHttpServer: ESP-IDF httpd, 16KB stack per handler, 13 max open sockets, 35 URI handlers
+- Realistic capacity: 13 concurrent connections, heap min watermark ~139KB under load
+- USB Host HID: no safe Rust wrappers. `esp-idf-sys` unsafe FFI to C USB Host raw API (~300 lines).
 - Device tables: ~15-20KB in flash (.rodata), near-zero heap (all `&'static const`)
-- JSON: serde-json-core (fixed buffer, no alloc) — streams directly to socket via picoserve
-- WiFi provisioning: SoftAP + captive portal, SSID/password saved to NVS
+- JSON: serde_json (standard crate — ESP32 has enough heap, ~167KB free)
+- WiFi provisioning: SoftAP + captive portal (DNS hijack + DHCP Option 114), SSID/password saved to NVS
 - WiFi reconnection: app-level exponential backoff (ESP-IDF does NOT auto-reconnect)
 - Data partition: LittleFS (wear leveling + power-loss safety), ~5 MB for UI + catalogue
 - Diagnostics: 4KB ring buffer + `/debug/log` + `/debug/info` endpoints (~4.2KB persistent RAM)
-- Command queue: `heapless::Deque` (16 capacity), `embassy_sync` primitives
-- mDNS: `EspMdns` from `esp-idf-svc` (singleton, own FreeRTOS task)
+- USB bus: Mutex-serialized blocking `command()` API, shared across HTTP handler threads
+- mDNS: `EspMdns` from `esp-idf-svc` (singleton, own FreeRTOS task). Component from IDF Component Registry (`espressif/mdns`).
 
 ## Phase Overview
 
 See `PROGRESS.md` for the full task checklist. High-level phasing:
 
 **Phase 1 — Desktop + ESP32 core (ship first, verify it works):**
-Protocol crate, all device definitions (7 SHARC + 6 legacy), command queue, config read-back, measurement mode, connection resilience, USB/TCP transports, HTTP API (axum + picoserve), CLI, ESP32 USB host HID, WiFi provisioning, diagnostics, testing.
+Protocol crate, all device definitions (7 SHARC + 6 legacy), command queue, config read-back, measurement mode, connection resilience, USB/TCP transports, HTTP API (axum + EspHttpServer), CLI, ESP32 USB host HID, WiFi provisioning, mDNS, WebSocket compat, level meters, diagnostics, testing.
 
 **Phase 2 — ezBEQ on ESP32 (after core is verified):**
 Catalogue index pipeline, data partition + auto-update, ezBEQ backend API, serve React UI from flash.
@@ -375,7 +376,7 @@ Beyond what minidsp-rs supports, we add from day one:
 **After v1 (separate projects):**
 - **12V trigger** — ESP32 GPIO + MOSFET for power control. API endpoints, optional trigger input for receiver power state detection. Solves minidsp-rs #663. Needs hardware validation first.
 - **MQTT discovery + state** — publish HA auto-discovery configs to `homeassistant/{type}/minidsp_{serial}/{entity}/config`. Ongoing state/control via MQTT topics. Complementary to mDNS.
-- **SSE live log streaming** — `GET /debug/events` on ESP32 via picoserve `EventStream`.
+- **SSE live log streaming** — `GET /debug/events` on ESP32 via EspHttpServer chunked response.
 - **Syslog UDP** — optional remote logging for ESP32, configured via API. RFC 5424 format.
 
 **Someday / maybe:**
@@ -527,11 +528,11 @@ Modification tokens (EEPROM 0xFFC8, 4 × u32 per preset) detect if another clien
 
 ## Resolved Technical Questions
 
-### picoserve WebSocket: YES
-picoserve v0.18.0 fully supports WebSocket behind the `ws` feature flag. Provides `WebSocketUpgrade` extractor, `SocketRx`/`SocketTx` for async frame I/O, ping/pong, protocol negotiation. Suitable for both ezBEQ API compat and live level streaming.
+### picoserve WebSocket: YES (but not used)
+picoserve v0.18.0 supports WebSocket, but we switched to EspHttpServer (ESP-IDF httpd) due to picoserve compatibility issues. EspHttpServer's `ws_handler` provides WebSocket with detached sender for push-based streaming. For the compat endpoint on `/devices/0` (dual GET + WS on same path), we use raw FFI to detect upgrade requests and send HTTP responses from within a ws_handler callback.
 
-### Embassy + esp-idf interop: WORKS with caveats
-`embassy-executor` with `arch-std` feature works alongside `esp-idf-svc`. Key: remove `critical-section` from embassy features to avoid conflicts. Known timer driver bugs (esp-idf-svc#619, #630) caused by FreeRTOS priority inversion — fixed by using `embassy-executor` (not `async-executor`) or latest `edge-executor`.
+### Embassy + esp-idf interop: WORKS but not used
+Research confirmed `embassy-executor` works with `esp-idf-svc`, but we went with blocking std instead. EspHttpServer runs handlers in a FreeRTOS task pool — simpler than async, and the USB HID bus is inherently blocking (Mutex-serialized `command()` API). 167KB heap free at steady state proves blocking approach has plenty of headroom.
 
 ### hidapi on RPi5: NO BLOCKERS
 No Pi 5-specific hidapi issues with standard HID devices. Kernel 6.12.x had a hid-core regression (fixed in 6.12.75). Main issue is permissions — ship udev rules:

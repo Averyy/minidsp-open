@@ -22,3 +22,8 @@ log = "0.4"
 
 [build-dependencies]
 embuild = "0.33"
+
+# Pull espressif/mdns from IDF Component Registry (moved out of core IDF in v5.4).
+# This sets cfg(esp_idf_comp_espressif__mdns_enabled) at build time.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mdns", version = "1.4" }

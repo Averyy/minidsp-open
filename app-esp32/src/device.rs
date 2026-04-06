@@ -125,6 +125,15 @@ impl DeviceState {
             None
         };
 
+        // Read level meters if DSP table is available
+        let (input_levels, output_levels) = if let Some(table) = self.profile.dsp_table {
+            let il = self.read_meters(table.meters.input).unwrap_or_default();
+            let ol = self.read_meters(table.meters.output).unwrap_or_default();
+            (il, ol)
+        } else {
+            (vec![], vec![])
+        };
+
         Ok(StatusSummary {
             master: MasterStatusView {
                 preset: ms.preset,
@@ -133,9 +142,70 @@ impl DeviceState {
                 mute: ms.is_muted(),
                 dirac,
             },
-            input_levels: vec![],
-            output_levels: vec![],
+            input_levels,
+            output_levels,
         })
+    }
+
+    /// Read float values from DSP memory starting at `addr`.
+    fn read_floats(&self, addr: u16, count: u8) -> Result<Vec<f32>, UsbHidError> {
+        let resp = self
+            .bus
+            .command(&commands::read_floats(addr, count, self.dialect()))?;
+        match commands::parse_response(&resp, self.dialect()) {
+            Response::Floats(values) => Ok(values),
+            other => Err(UsbHidError::Protocol(format!(
+                "read_floats: {other:?}"
+            ))),
+        }
+    }
+
+    /// Read meter values from an array of DSP addresses and convert to dB.
+    /// Batches contiguous addresses into single CMD_READ_FLOATS calls (max 14 per call).
+    fn read_meters(&self, addrs: &[u16]) -> Result<Vec<f32>, UsbHidError> {
+        if addrs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut all_values = Vec::with_capacity(addrs.len());
+
+        // Check if addresses are contiguous for a single bulk read
+        let is_contiguous =
+            addrs.len() <= 14 && addrs.windows(2).all(|w| w[1] == w[0] + 1);
+
+        if is_contiguous {
+            let values = self.read_floats(addrs[0], addrs.len() as u8)?;
+            all_values.extend(values);
+        } else {
+            // Find contiguous runs and read each in bulk
+            let mut i = 0;
+            while i < addrs.len() {
+                let start = i;
+                while i + 1 < addrs.len()
+                    && addrs[i + 1] == addrs[i] + 1
+                    && (i - start + 1) < 14
+                {
+                    i += 1;
+                }
+                let count = (i - start + 1).min(14);
+                let values = self.read_floats(addrs[start], count as u8)?;
+                all_values.extend(values);
+                i += 1;
+            }
+        }
+
+        // Convert raw float to dB: 20 * log10(abs(value)), clamped to -140 dB
+        let db_values: Vec<f32> = all_values
+            .iter()
+            .map(|&v| {
+                if v.abs() < 1e-10 {
+                    -140.0
+                } else {
+                    20.0 * v.abs().log10()
+                }
+            })
+            .collect();
+        Ok(db_values)
     }
 
     // -- Control commands --
