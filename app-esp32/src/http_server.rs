@@ -34,7 +34,11 @@ pub fn start(
 ) -> Result<EspHttpServer<'static>, Box<dyn std::error::Error>> {
     let config = Configuration {
         http_port: port,
-        max_uri_handlers: 55,
+        // STA mode with ezBEQ enabled currently registers 58 handlers:
+        // core device routes, debug routes, WS endpoints, ezBEQ API, UI/static
+        // routes, and CORS/catch-all handlers. Keep some headroom so the HTTP
+        // server doesn't fail with ESP_ERR_HTTPD_HANDLERS_FULL as routes evolve.
+        max_uri_handlers: 64,
         stack_size: 16384,
         max_open_sockets: 13,
         uri_match_wildcard: true,
@@ -45,12 +49,15 @@ pub fn start(
     // GET /devices — list connected devices
     {
         let st = state.clone();
+        let port_copy = port;
+        let ap_ip_copy = ap_ip;
         server.fn_handler("/devices", Method::Get, move |req| {
             let body = match get_device(&st) {
                 Some(dev) => {
                     let info = dev.device_info();
+                    let ws_url = esp32_device_ws_url(port_copy, ap_ip_copy);
                     serde_json::to_string(&serde_json::json!([{
-                        "url": info.url,
+                        "url": ws_url,
                         "product_name": info.product_name,
                         "version": {
                             "hw_id": info.version.hw_id,
@@ -368,7 +375,7 @@ pub fn start(
     register_device_feature_routes(&mut server, state.clone())?;
 
     // Debug / diagnostics endpoints
-    register_debug_routes(&mut server, state.clone())?;
+    register_debug_routes(&mut server, state.clone(), nvs.clone())?;
 
     // WebSocket for status streaming (gated on ESP-IDF httpd WS support)
     #[cfg(esp_idf_httpd_ws_support)]
@@ -508,6 +515,34 @@ pub fn start(
     Ok(server)
 }
 
+fn esp32_device_ws_url(port: u16, ap_ip: Option<std::net::Ipv4Addr>) -> String {
+    let host = if let Some(ip) = ap_ip {
+        ip.to_string()
+    } else if let Some(ip) = get_sta_ip_string() {
+        ip
+    } else {
+        "127.0.0.1".to_string()
+    };
+    format!("ws://{host}:{port}/devices/0/ws")
+}
+
+fn get_sta_ip_string() -> Option<String> {
+    use esp_idf_svc::sys::{esp_netif_get_handle_from_ifkey, esp_netif_get_ip_info, esp_netif_ip_info_t};
+
+    unsafe {
+        let netif = esp_netif_get_handle_from_ifkey(b"WIFI_STA_DEF\0".as_ptr() as _);
+        if netif.is_null() {
+            return None;
+        }
+        let mut info = esp_netif_ip_info_t::default();
+        if esp_netif_get_ip_info(netif, &mut info) != 0 {
+            return None;
+        }
+        let octets = info.ip.addr.to_le_bytes();
+        Some(format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Debug / diagnostics routes
 // ---------------------------------------------------------------------------
@@ -515,6 +550,7 @@ pub fn start(
 fn register_debug_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    nvs: EspDefaultNvsPartition,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     // GET /debug/info — JSON system diagnostics
     {
@@ -557,6 +593,81 @@ fn register_debug_routes(
             None => send_error(req, 400, "invalid level (use: error, warn, info, debug, trace)"),
         }
     })?;
+
+    // GET /debug/updater — current updater config/status
+    {
+        let nvs = nvs.clone();
+        server.fn_handler("/debug/updater", Method::Get, move |req| {
+            let body = serde_json::to_string(&serde_json::json!({
+                "baseUrl": crate::updater::base_url(&nvs),
+                "installedVersion": crate::updater::installed_version(&nvs),
+                "hasCatalogueData": crate::updater::has_catalogue_data(),
+            }))
+            .unwrap_or_default();
+            send_json(req, 200, &body)
+        })?;
+    }
+
+    // POST /debug/updater — set or clear updater base URL override
+    {
+        let nvs = nvs.clone();
+        server.fn_handler("/debug/updater", Method::Post, move |mut req| {
+            let mut buf = [0u8; 512];
+            let len = req.read(&mut buf).unwrap_or(0);
+            let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
+                Ok(v) => v,
+                Err(_) => return send_error(req, 400, "invalid JSON"),
+            };
+
+            let url = json
+                .get("baseUrl")
+                .or_else(|| json.get("base_url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            match crate::updater::set_base_url(&nvs, url) {
+                Ok(active_url) => {
+                    let body = serde_json::to_string(&serde_json::json!({
+                        "status": "ok",
+                        "baseUrl": active_url,
+                    }))
+                    .unwrap_or_default();
+                    send_json(req, 200, &body)
+                }
+                Err(e) => send_error(req, 400, &e.to_string()),
+            }
+        })?;
+    }
+
+    // POST /debug/updater/check — run update check immediately
+    {
+        let nvs = nvs.clone();
+        server.fn_handler("/debug/updater/check", Method::Post, move |req| {
+            let result = crate::updater::check_and_update(&nvs);
+            let body = match result {
+                crate::updater::UpdateResult::Current => serde_json::json!({
+                    "status": "current",
+                    "baseUrl": crate::updater::base_url(&nvs),
+                }),
+                crate::updater::UpdateResult::Updated { version, files } => serde_json::json!({
+                    "status": "updated",
+                    "baseUrl": crate::updater::base_url(&nvs),
+                    "version": version,
+                    "files": files,
+                }),
+                crate::updater::UpdateResult::NoStorage => serde_json::json!({
+                    "status": "no_storage",
+                    "baseUrl": crate::updater::base_url(&nvs),
+                }),
+                crate::updater::UpdateResult::Error(error) => serde_json::json!({
+                    "status": "error",
+                    "baseUrl": crate::updater::base_url(&nvs),
+                    "error": error,
+                }),
+            };
+            send_json(req, 200, &serde_json::to_string(&body).unwrap_or_default())
+        })?;
+    }
 
     Ok(())
 }

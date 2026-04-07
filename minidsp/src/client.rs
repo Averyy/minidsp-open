@@ -39,6 +39,7 @@ pub struct SavedPeqState {
 /// Connected MiniDSP device client.
 pub struct MiniDspClient {
     queue: Arc<CommandQueue>,
+    transport_url: String,
     profile: DeviceProfile,
     hw_id: HardwareId,
     dsp_version: u8,
@@ -50,6 +51,7 @@ pub struct MiniDspClient {
 impl MiniDspClient {
     /// Connect to a device via transport, probe its identity, and return a client.
     pub async fn connect(transport: Box<dyn Transport>) -> Result<Self, ClientError> {
+        let transport_url = transport.url();
         let queue = Arc::new(CommandQueue::new(transport));
 
         // Step 1: Read hardware ID
@@ -93,6 +95,7 @@ impl MiniDspClient {
 
         Ok(Self {
             queue,
+            transport_url,
             profile,
             hw_id,
             dsp_version,
@@ -118,9 +121,9 @@ impl MiniDspClient {
     }
 
     /// Get device info for the /devices list endpoint.
-    pub fn device_info(&self, url: &str) -> DeviceInfo {
+    pub fn device_info(&self) -> DeviceInfo {
         DeviceInfo {
-            url: url.to_string(),
+            url: self.transport_url.clone(),
             version: DeviceVersion {
                 hw_id: self.hw_id.hw_id,
                 fw_major: self.hw_id.fw_major,
@@ -130,6 +133,10 @@ impl MiniDspClient {
             },
             product_name: probe::product_name(self.hw_id.hw_id, self.dsp_version).to_string(),
         }
+    }
+
+    pub fn transport_url(&self) -> &str {
+        &self.transport_url
     }
 
     /// Read master status from EEPROM.

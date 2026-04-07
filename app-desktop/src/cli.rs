@@ -1,9 +1,19 @@
 //! CLI command implementations.
 
-use crate::{Cli, ChannelCommand, PeqCommand, CrossoverCommand, CompressorCommand, FirCommand, connect};
+use crate::{
+    Cli, ChannelCommand, PeqCommand, CrossoverCommand, CompressorCommand, FirCommand,
+    apply_force_kind, connect, connect_all_local, discover_daemon_tcp,
+    discover_network_devices,
+};
+#[cfg(unix)]
+use crate::discover_daemon_unix;
 use minidsp::client::MiniDspClient;
 use minidsp::transport::hid;
+use minidsp::transport::tcp::TcpTransport;
+use minidsp::transport::ws::WsTransport;
+use minidsp_daemon::http::json::DeviceJson;
 use minidsp_protocol::device::probe;
+use minidsp_protocol::status::DeviceInfo;
 use minidsp_protocol::source::Source;
 use crate::output;
 
@@ -35,57 +45,209 @@ struct AdvertiseConfig {
     ip: Option<String>,
 }
 
+fn print_probe_device(
+    index: usize,
+    product_name: &str,
+    serial: impl std::fmt::Display,
+    url: &str,
+    hw_id: impl std::fmt::Display,
+    dsp_version: impl std::fmt::Display,
+) {
+    println!(
+        "{index}: Found {product_name} with serial {serial} at {url} [hw_id: {hw_id}, dsp_version: {dsp_version}]"
+    );
+}
+
+trait ProbeDeviceView {
+    fn product_name(&self) -> &str;
+    fn serial(&self) -> u32;
+    fn url(&self) -> &str;
+    fn hw_id(&self) -> u8;
+    fn dsp_version(&self) -> u8;
+}
+
+impl ProbeDeviceView for DeviceInfo {
+    fn product_name(&self) -> &str {
+        &self.product_name
+    }
+
+    fn serial(&self) -> u32 {
+        self.version.serial
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn hw_id(&self) -> u8 {
+        self.version.hw_id
+    }
+
+    fn dsp_version(&self) -> u8 {
+        self.version.dsp_version
+    }
+}
+
+impl ProbeDeviceView for DeviceJson {
+    fn product_name(&self) -> &str {
+        &self.product_name
+    }
+
+    fn serial(&self) -> u32 {
+        self.version.serial
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn hw_id(&self) -> u8 {
+        self.version.hw_id
+    }
+
+    fn dsp_version(&self) -> u8 {
+        self.version.dsp_version
+    }
+}
+
+fn print_discovered_devices<T: ProbeDeviceView>(devices: &[T]) -> bool {
+    for (i, dev) in devices.iter().enumerate() {
+        print_probe_device(
+            i,
+            dev.product_name(),
+            dev.serial(),
+            dev.url(),
+            dev.hw_id(),
+            dev.dsp_version(),
+        );
+    }
+    !devices.is_empty()
+}
+
 /// Print device status.
 pub async fn status(client: &MiniDspClient, format: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let summary = client.get_status_summary().await?;
 
-    if format == Some("jsonline") {
-        output::print_status_json(&summary)?;
-    } else {
-        output::print_status_text(&summary, client.profile());
+    match format {
+        Some("jsonline") => output::print_status_json(&summary, false)?,
+        Some("json") => output::print_status_json(&summary, true)?,
+        _ => output::print_status_text(&summary, client.profile()),
     }
     Ok(())
 }
 
 /// Enumerate connected devices.
-pub async fn probe(_cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let devices = hid::enumerate()?;
-    if devices.is_empty() {
-        println!("No MiniDSP devices found");
-        return Ok(());
-    }
+pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut printed = false;
+    let env_sock = std::env::var("MINIDSP_SOCK").ok();
+    let env_tcp = std::env::var("MINIDSP_TCP").ok();
+    let env_url = std::env::var("MINIDSP_URL").ok();
+    let env_daemon_url = std::env::var("MINIDSPD_URL").ok();
+    let env_usb = std::env::var("MINIDSP_USB").ok();
 
-    for (i, dev) in devices.iter().enumerate() {
-        // Need to open device to read hw_id and dsp_version
-        match hid::HidTransport::open(&dev.path) {
-            Ok(transport) => {
-                match MiniDspClient::connect(Box::new(transport)).await {
-                    Ok(client) => {
-                        let name = probe::product_name(client.hw_id().hw_id, client.dsp_version());
-                        let url = format!(
-                            "usb:{}?vid={:04x}&pid={:04x}",
-                            urlencoding::encode(&dev.path),
-                            dev.vendor_id,
-                            dev.product_id,
-                        );
-                        // Match minidsp-rs probe output format exactly
-                        println!(
-                            "{i}: Found {name} with serial {} at {url} [hw_id: {}, dsp_version: {}]",
-                            client.serial(),
-                            client.hw_id().hw_id,
-                            client.dsp_version(),
-                        );
-                    }
-                    Err(e) => {
-                        println!("{i}: Device at {} (open failed: {e})", dev.path);
+    if let Some(path) = cli.daemon_sock.as_deref().or(env_sock.as_deref()) {
+        #[cfg(unix)]
+        {
+            let devices = discover_daemon_unix(path).await?;
+            printed = print_discovered_devices(&devices);
+        }
+    } else if let Some(addr) = cli.tcp.as_deref().or(env_tcp.as_deref()) {
+        let client = MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
+        let info = client.device_info();
+        print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+        printed = true;
+    } else if let Some(url) = cli.url.as_deref().or(env_url.as_deref()) {
+        if url.starts_with("tcp://") {
+            let addr = &url["tcp://".len()..];
+            let client = MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
+            let info = client.device_info();
+            print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+            printed = true;
+        } else if (url.starts_with("http://") || url.starts_with("ws://")) && !url.ends_with("/ws") {
+            let devices = discover_daemon_tcp(url).await?;
+            printed = print_discovered_devices(&devices);
+        } else if url.starts_with("http://") || url.starts_with("ws://") {
+            let client = MiniDspClient::connect(Box::new(WsTransport::connect(url, 0).await?)).await?;
+            let info = client.device_info();
+            print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+            printed = true;
+        } else if url.starts_with("usb://") || url.starts_with("usb:") {
+            let path = if let Some(rest) = url.strip_prefix("usb://") {
+                urlencoding::decode(rest.split('?').next().unwrap_or(rest))?.into_owned()
+            } else {
+                let rest = &url["usb:".len()..];
+                urlencoding::decode(rest.split('?').next().unwrap_or(rest))?.into_owned()
+            };
+            let transport = hid::HidTransport::open(&path)?;
+            let client = MiniDspClient::connect(Box::new(transport)).await?;
+            let info = client.device_info();
+            print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+            printed = true;
+        }
+    } else if let Some(url) = cli.daemon_url.as_deref().or(env_daemon_url.as_deref()) {
+        let devices = discover_daemon_tcp(url).await?;
+        printed = print_discovered_devices(&devices);
+    } else if let Some(path) = cli.usb.as_deref().or(env_usb.as_deref()) {
+        let transport = hid::HidTransport::open(path)?;
+        let client = MiniDspClient::connect(Box::new(transport)).await?;
+        let info = client.device_info();
+        print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+        printed = true;
+    } else {
+        let devices = hid::enumerate()?;
+        for (i, dev) in devices.iter().enumerate() {
+            match hid::HidTransport::open(&dev.path) {
+                Ok(transport) => {
+                    match MiniDspClient::connect(Box::new(transport)).await {
+                        Ok(client) => {
+                            let name = probe::product_name(client.hw_id().hw_id, client.dsp_version());
+                            let url = format!(
+                                "usb:{}?vid={:04x}&pid={:04x}",
+                                urlencoding::encode(&dev.path),
+                                dev.vendor_id,
+                                dev.product_id,
+                            );
+                            print_probe_device(
+                                i,
+                                &name,
+                                client.serial(),
+                                &url,
+                                client.hw_id().hw_id,
+                                client.dsp_version(),
+                            );
+                        }
+                        Err(e) => {
+                            println!("{i}: Device at {} (open failed: {e})", dev.path);
+                        }
                     }
                 }
+                Err(e) => {
+                    println!("{i}: Device at {} (open failed: {e})", dev.path);
+                }
             }
-            Err(e) => {
-                println!("{i}: Device at {} (open failed: {e})", dev.path);
+        }
+        printed = !devices.is_empty();
+    }
+
+    if !printed {
+        println!("No MiniDSP devices found");
+    }
+
+    if matches!(&cli.command, Some(crate::Command::Probe { net: true })) {
+        println!("Probing for network devices...");
+        let devices = discover_network_devices(std::time::Duration::from_secs(8))?;
+        if devices.is_empty() {
+            println!("No network devices detected");
+        } else {
+            for device in devices {
+                println!(
+                    "Found: {} ({}) [hw_id: {}, dsp_version: {}, serial: {}]",
+                    device.hostname, device.ip, device.hw_id, device.dsp_version, device.serial
+                );
             }
         }
     }
+
     Ok(())
 }
 
@@ -254,6 +416,26 @@ pub async fn server(bind: &str, config_path: Option<&str>, cli_advertise: Option
 /// Execute commands from a file (minidsp -f <file>).
 pub async fn execute_file(path: &str, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let contents = std::fs::read_to_string(path)?;
+    if cli._all_local_devices {
+        let mut clients = connect_all_local(cli).await?;
+        for client in &mut clients {
+            apply_force_kind(client, cli).await?;
+        }
+        for (line_num, line) in contents.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            for client in &clients {
+                if let Err(e) = execute_line(client, line).await {
+                    eprintln!("Error on line {}: {e}", line_num + 1);
+                    return Err(e);
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let client = connect(cli).await?;
 
     for (line_num, line) in contents.lines().enumerate() {

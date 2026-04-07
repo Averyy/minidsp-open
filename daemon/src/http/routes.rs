@@ -219,9 +219,11 @@ async fn read_dirac_state(client: &minidsp::client::MiniDspClient) -> Option<boo
 async fn list_devices(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let devices = state.devices.read().await;
     let mut list = Vec::new();
-    for (&id, client) in devices.iter() {
-        let url = format!("ws://localhost:5380/devices/{id}/ws");
-        let info = client.device_info(&url);
+    let mut ids: Vec<_> = devices.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let Some(client) = devices.get(&id) else { continue };
+        let info = client.device_info();
         list.push(DeviceJson {
             url: info.url,
             version: VersionJson {

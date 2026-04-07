@@ -19,6 +19,7 @@ const BASE_URL: &str = "https://minidsp-open.github.io/minidsp-open";
 /// NVS namespace and key for tracking installed catalogue version.
 const NVS_NAMESPACE: &str = "beq";
 const NVS_VERSION_KEY: &str = "cat_ver";
+const NVS_BASE_URL_KEY: &str = "base_url";
 
 /// Chunk size for streaming downloads to flash (4KB).
 const DOWNLOAD_CHUNK: usize = 4096;
@@ -71,7 +72,8 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
     }
 
     // Fetch manifest
-    let manifest = match fetch_manifest() {
+    let base_url = base_url(nvs);
+    let manifest = match fetch_manifest(&base_url) {
         Ok(m) => m,
         Err(e) => return UpdateResult::Error(format!("manifest fetch: {e}")),
     };
@@ -105,7 +107,7 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
             warn!("unsafe filename in manifest: {filename}");
             return UpdateResult::Error(format!("unsafe filename: {filename}"));
         }
-        match download_file(filename, info) {
+        match download_file(&base_url, filename, info) {
             Ok(()) => {
                 info!("  downloaded {filename} ({} bytes)", info.size);
                 downloaded += 1;
@@ -158,8 +160,8 @@ fn delete_data_files() {
 }
 
 /// Fetch and parse the manifest.json.
-fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
-    let url = format!("{BASE_URL}/manifest.json");
+fn fetch_manifest(base_url: &str) -> Result<Manifest, Box<dyn std::error::Error>> {
+    let url = format!("{base_url}/manifest.json");
     let body = fetch_to_memory(&url, 8192)?;
     let manifest: Manifest = serde_json::from_slice(&body)?;
     Ok(manifest)
@@ -167,8 +169,12 @@ fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
 
 /// Download a file from the catalogue server directly to LittleFS in chunks.
 /// Verifies SHA-256 integrity after download; deletes corrupted files.
-fn download_file(filename: &str, info: &FileInfo) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{BASE_URL}/{filename}");
+fn download_file(
+    base_url: &str,
+    filename: &str,
+    info: &FileInfo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{base_url}/{filename}");
     let path = storage::full_path(filename);
 
     // Create parent directories
@@ -265,6 +271,15 @@ fn read_nvs_version(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<St
     val.map(|s| s.to_string())
 }
 
+fn read_nvs_base_url(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
+    use esp_idf_svc::nvs::EspNvs;
+
+    let nvs = EspNvs::new(nvs.clone(), NVS_NAMESPACE, false).ok()?;
+    let mut buf = [0u8; 256];
+    let val = nvs.get_str(NVS_BASE_URL_KEY, &mut buf).ok()?;
+    val.map(|s| s.to_string())
+}
+
 /// Write the installed catalogue version to NVS.
 fn write_nvs_version(
     nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
@@ -277,9 +292,44 @@ fn write_nvs_version(
     Ok(())
 }
 
+fn write_nvs_base_url(
+    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
+    url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use esp_idf_svc::nvs::EspNvs;
+
+    let nvs = EspNvs::new(nvs.clone(), NVS_NAMESPACE, true)?;
+    nvs.set_str(NVS_BASE_URL_KEY, url)?;
+    Ok(())
+}
+
 /// Get the currently installed catalogue version (if any).
 pub fn installed_version(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
     read_nvs_version(nvs)
+}
+
+/// Get the configured updater base URL, falling back to the built-in default.
+pub fn base_url(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> String {
+    read_nvs_base_url(nvs)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| BASE_URL.to_string())
+}
+
+/// Persist an updater base URL override. Empty string clears the override.
+pub fn set_base_url(
+    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
+    url: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let normalized = url.trim().trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        write_nvs_base_url(nvs, "")?;
+        return Ok(BASE_URL.to_string());
+    }
+    if !(normalized.starts_with("http://") || normalized.starts_with("https://")) {
+        return Err("base_url must start with http:// or https://".into());
+    }
+    write_nvs_base_url(nvs, &normalized)?;
+    Ok(normalized)
 }
 
 /// Check if catalogue data files exist on the data partition.

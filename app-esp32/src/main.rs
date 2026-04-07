@@ -436,18 +436,26 @@ fn udp_discovery(state: http_server::SharedDeviceState) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        // Get device info (skip broadcast if no device)
-        let dev = match http_server::get_device(&state) {
-            Some(d) => d,
-            None => continue,
+        let Some(packet) = discovery_packet_for_state(&state) else {
+            continue;
         };
+        let pkt = packet.encode();
 
-        // Get the ESP32's STA IP address
-        let ip = get_sta_ip().unwrap_or([192, 168, 1, 1]);
+        if let Err(e) = socket.send_to(&pkt, "255.255.255.255:3999") {
+            log::debug!("UDP discovery send failed: {e}");
+        }
+        let _ = socket.send_to(&pkt, "224.0.0.250:3999");
+    }
+}
 
-        // Build discovery packet using shared protocol encoding
+fn discovery_packet_for_state(
+    state: &http_server::SharedDeviceState,
+) -> Option<minidsp_protocol::discovery::DiscoveryPacket> {
+    let ip = get_sta_ip()?;
+
+    if let Some(dev) = http_server::get_device(state) {
         let hw = dev.hw_id();
-        let packet = minidsp_protocol::discovery::DiscoveryPacket::from_device(
+        return Some(minidsp_protocol::discovery::DiscoveryPacket::from_device(
             ip,
             hw.hw_id,
             hw.fw_major,
@@ -455,13 +463,24 @@ fn udp_discovery(state: http_server::SharedDeviceState) {
             dev.dsp_version(),
             dev.serial(),
             format!("minidsp-{:08x}", dev.serial()),
-        );
-        let pkt = packet.encode();
-
-        if let Err(e) = socket.send_to(&pkt, "255.255.255.255:3999") {
-            log::debug!("UDP discovery send failed: {e}");
-        }
+        ));
     }
+
+    let serial = fallback_discovery_serial();
+    Some(minidsp_protocol::discovery::DiscoveryPacket::from_device(
+        ip,
+        0,
+        0,
+        1,
+        0,
+        serial,
+        format!("minidsp-bridge-{serial}"),
+    ))
+}
+
+fn fallback_discovery_serial() -> u32 {
+    let mac = get_sta_mac().unwrap_or([0, 0, 0, 0, 0, 0]);
+    900_000 + ((mac[3] as u32) << 16) + ((mac[4] as u32) << 8) + mac[5] as u32
 }
 
 /// Get the ESP32's STA IP address.
@@ -480,5 +499,17 @@ fn get_sta_ip() -> Option<[u8; 4]> {
         }
         let ip = ip_info.ip.addr.to_le_bytes();
         Some(ip)
+    }
+}
+
+fn get_sta_mac() -> Option<[u8; 6]> {
+    use esp_idf_svc::sys::{esp_wifi_get_mac, wifi_interface_t_WIFI_IF_STA, ESP_OK};
+
+    unsafe {
+        let mut mac = [0u8; 6];
+        if esp_wifi_get_mac(wifi_interface_t_WIFI_IF_STA, mac.as_mut_ptr()) != ESP_OK {
+            return None;
+        }
+        Some(mac)
     }
 }

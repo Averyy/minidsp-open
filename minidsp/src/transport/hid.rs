@@ -171,15 +171,8 @@ impl Transport for HidTransport {
                 if n == 0 {
                     return Err(TransportError::Timeout);
                 }
-                // Decode HID report: strip report ID (byte 0), decode frame
-                if n == packet::HID_REPORT_SIZE {
-                    packet::decode_hid(buf[..packet::HID_REPORT_SIZE].try_into().unwrap())
-                        .ok_or_else(|| TransportError::Hid("failed to decode HID frame".into()))
-                } else {
-                    // Partial read — try to decode as frame
-                    packet::decode_frame(&buf[1..n])
-                        .ok_or_else(|| TransportError::Hid("failed to decode HID frame".into()))
-                }
+                packet::decode_hid_response(&buf[..n])
+                    .ok_or_else(|| TransportError::Hid("failed to decode HID response".into()))
             })
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?

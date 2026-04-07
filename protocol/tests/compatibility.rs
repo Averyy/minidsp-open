@@ -118,6 +118,23 @@ fn hid_report_format() {
 }
 
 #[test]
+fn hid_response_uses_length_only_without_checksum() {
+    let data = [
+        0x0c, 0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x21, 0xf6, 0x08, 0x5b,
+    ];
+    let payload = packet::decode_hid_response(&data).unwrap();
+    assert_eq!(payload, vec![0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+}
+
+#[test]
+fn hid_ack_response_can_be_single_length_byte() {
+    let data = [0x01, 0x42, 0x14, 0xfe, 0x30, 0x39, 0x00, 0x00];
+    let payload = packet::decode_hid_response(&data).unwrap();
+    assert!(payload.is_empty());
+}
+
+#[test]
 fn set_volume_wire_format() {
     // SetVolume: [0x42, value]
     // value=20 means -10.0 dB (gain = -0.5 * value)

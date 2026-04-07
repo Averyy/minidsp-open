@@ -395,26 +395,13 @@ impl UsbHidBus {
             );
         }
 
-        // Decode HID response.
-        // ESP-IDF USB Host returns 64 bytes from the interrupt IN endpoint.
-        // The first byte may be a report ID (0x00 or 0x01). Skip it to get the frame.
-        // Frame format: [length][payload][checksum][0xFF padding]
-        // Try decoding with and without report ID prefix.
+        // HID responses are `[len][payload]` with no checksum; bytes after the
+        // frame boundary in the 64-byte interrupt packet may be arbitrary.
         let data = &resp_buf;
-
-        // Try decode starting at byte 0 (no report ID prefix)
-        if let Some(payload) = minidsp_protocol::packet::decode_frame(data) {
+        if let Some(payload) = minidsp_protocol::packet::decode_hid_response(data) {
             return Ok(payload);
         }
 
-        // Try decode starting at byte 1 (report ID prefix from USB Host)
-        if data.len() > 1 {
-            if let Some(payload) = minidsp_protocol::packet::decode_frame(&data[1..]) {
-                return Ok(payload);
-            }
-        }
-
-        // Neither worked — log and return error
         let hex: String = data.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
         Err(UsbHidError::Protocol(format!("invalid response frame ({} bytes): {hex}", data.len())))
     }

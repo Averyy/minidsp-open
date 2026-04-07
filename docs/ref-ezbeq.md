@@ -2,7 +2,9 @@
 
 ezBEQ is the primary reason people run minidsp-rs. It's a per-movie bass EQ system — community members measure what bass was rolled off in consumer releases and publish correction filters. Users browse a catalogue, tap a movie, and the filters get written to their MiniDSP's PEQ slots. After the movie, the filters get cleared.
 
-minidsp-open must be a 100% drop-in replacement for minidsp-rs in ezBEQ workflows, and on ESP32 we go further: we replace the entire RPi + minidsp-rs + ezBEQ stack with a single $10 board.
+minidsp-open targets drop-in compatibility with minidsp-rs in ezBEQ workflows, and on ESP32 we go further: we replace the entire RPi + minidsp-rs + ezBEQ stack with a single $10 board.
+
+Current implementation status lives in `docs/TODO-fix-compatibility.md`. This file describes the required ezBEQ-facing behavior and the intended end state, not a blanket claim that every transport permutation has already been hardware-validated.
 
 **Repo:** https://github.com/3ll3d00d/ezbeq
 **Docs:** https://ezbeq.readthedocs.io/en/latest/
@@ -381,9 +383,9 @@ Two API surfaces that share the same device control core:
 
 **Zero ezBEQ code. Zero UI code. Everything auto-updates.** We consume public build artifacts and catalogue data. The ~80-line GitHub Action is the only thing that touches the catalogue. The ESP32 self-updates. The only time we ship firmware is when our own Rust code changes.
 
-### Desktop users: pure drop-in replacement
+### Desktop users: intended drop-in replacement
 
-On desktop (Linux/macOS/Windows), the story is even simpler. Our `minidsp` binary is a 100% drop-in replacement for minidsp-rs. Users swap the binary, change nothing in their ezBEQ config, and everything works. They get auto-reconnect, auto-detection, config read-back, and all-device support for free.
+On desktop (Linux/macOS/Windows), the target user experience is still binary swap compatibility: users replace `minidsp-rs` with our `minidsp` binary and keep the same ezBEQ configuration. The core CLI, daemon, WebSocket, and batch-command surfaces are implemented for that workflow, but the remaining validation caveats are tracked in `docs/TODO-fix-compatibility.md`.
 
 No catalogue index, no web UI, no GitHub Actions involved. ezBEQ runs on the same machine and shells out to our `minidsp` binary exactly as it does to minidsp-rs today.
 

@@ -3,7 +3,10 @@ use minidsp::client::MiniDspClient;
 use minidsp::transport::hid::HidTransport;
 use minidsp::transport::tcp::TcpTransport;
 use minidsp::transport::ws::WsTransport;
+use minidsp_daemon::http::json::DeviceJson;
 use minidsp_protocol::source::Source;
+use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod cli;
 mod output;
@@ -96,12 +99,16 @@ fn resolve_force_kind(kind: &str) -> Option<(u8, u8)> {
     }
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
     /// Print device status (default if no command given)
     Status,
     /// Enumerate connected devices
-    Probe,
+    Probe {
+        /// Listen for advertisement broadcasts from WI-DG / network daemons
+        #[arg(long, short)]
+        net: bool,
+    },
     /// Start the HTTP API daemon
     Server {
         /// Bind address
@@ -165,7 +172,7 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum DebugCommand {
     /// Send raw hex payload and print hex response
     Send {
@@ -184,7 +191,7 @@ enum DebugCommand {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ChannelCommand {
     /// Set channel gain in dB
     Gain {
@@ -237,7 +244,7 @@ enum ChannelCommand {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum CrossoverCommand {
     /// Set crossover biquad coefficients (group of 4: [b0 b1 b2 a1 a2] x4)
     Set {
@@ -254,7 +261,7 @@ enum CrossoverCommand {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum CompressorCommand {
     /// Set compressor bypass
     Bypass {
@@ -275,7 +282,7 @@ enum CompressorCommand {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum FirCommand {
     /// Set FIR bypass
     Bypass {
@@ -289,7 +296,7 @@ enum FirCommand {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum PeqCommand {
     /// Set biquad coefficients
     Set {
@@ -358,7 +365,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Handle probe (doesn't need a connection)
-    if matches!(cli.command, Some(Command::Probe)) {
+    if matches!(cli.command, Some(Command::Probe { .. })) {
         return cli::probe(&cli).await;
     }
 
@@ -367,10 +374,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return cli::server(bind, config.as_deref(), advertise.as_deref(), ip.as_deref()).await;
     }
 
+    if cli._all_local_devices {
+        let mut clients = connect_all_local(&cli).await?;
+        if clients.is_empty() {
+            return Err("no MiniDSP devices found".into());
+        }
+        for client in &mut clients {
+            apply_force_kind(client, &cli).await?;
+            execute_command(client, &cli).await?;
+        }
+        return Ok(());
+    }
+
     // Connect to device
     let mut client = connect(&cli).await?;
+    apply_force_kind(&mut client, &cli).await?;
+    execute_command(&mut client, &cli).await?;
+    Ok(())
+}
 
-    // Apply --force-kind override
+pub(crate) async fn apply_force_kind(client: &mut MiniDspClient, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref kind) = cli.force_kind {
         if let Some((hw_id, dsp_version)) = resolve_force_kind(kind) {
             let profile = minidsp_protocol::device::probe::identify(hw_id, dsp_version);
@@ -380,22 +403,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("unknown device kind '{kind}'").into());
         }
     }
+    Ok(())
+}
 
-    // Execute command
-    match cli.command {
+async fn execute_command(client: &mut MiniDspClient, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    match &cli.command {
         None | Some(Command::Status) => {
-            cli::status(&client, cli.output.as_deref()).await?;
+            cli::status(client, cli.output.as_deref()).await?;
         }
         Some(Command::Gain { db, relative }) => {
-            if relative {
+            if *relative {
                 let current = client.get_master_status().await?;
-                let new_vol = current.volume_db() + db;
+                let new_vol = current.volume_db() + *db;
                 client.set_volume_db(new_vol).await?;
             } else {
-                client.set_volume_db(db).await?;
+                client.set_volume_db(*db).await?;
             }
         }
-        Some(Command::Mute { ref state }) => {
+        Some(Command::Mute { state }) => {
             let mute = match state.to_lowercase().as_str() {
                 "toggle" => {
                     let current = client.get_master_status().await?;
@@ -405,7 +430,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             client.set_mute(mute).await?;
         }
-        Some(Command::Source { ref name }) => {
+        Some(Command::Source { name }) => {
             let src = Source::from_str_lowercase(name)
                 .ok_or_else(|| format!("unknown source '{name}'"))?;
             let idx = client.profile().sources.index_for_source(src)
@@ -413,12 +438,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             client.set_source(idx).await?;
         }
         Some(Command::Config { preset }) => {
-            client.set_config(preset).await?;
+            client.set_config(*preset).await?;
         }
-        Some(Command::Dirac { ref state }) => {
+        Some(Command::Dirac { state }) => {
             let dirac_on = match state.to_lowercase().as_str() {
                 "toggle" => {
-                    // Read current dirac state and invert
                     let status = client.get_status_summary().await?;
                     !status.master.dirac.unwrap_or(false)
                 }
@@ -427,13 +451,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             client.set_dirac_bypass(!dirac_on).await?;
         }
         Some(Command::Input { channel, cmd }) => {
-            cli::channel_command(&client, true, channel, cmd).await?;
+            cli::channel_command(client, true, *channel, cmd.clone()).await?;
         }
         Some(Command::Output { channel, cmd }) => {
-            cli::channel_command(&client, false, channel, cmd).await?;
+            cli::channel_command(client, false, *channel, cmd.clone()).await?;
         }
         Some(Command::Debug { cmd }) => {
-            match cmd {
+            match cmd.clone() {
                 DebugCommand::Send { hex } => {
                     if hex.len() % 2 != 0 {
                         return Err("hex string must have even length".into());
@@ -468,13 +492,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Some(Command::Probe) | Some(Command::Server { .. }) => unreachable!(),
+        Some(Command::Probe { .. }) | Some(Command::Server { .. }) => unreachable!(),
     }
-
     Ok(())
 }
 
-async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::error::Error>> {
+pub(crate) async fn connect_all_local(cli: &Cli) -> Result<Vec<MiniDspClient>, Box<dyn std::error::Error>> {
+    if has_non_local_transport(cli) {
+        return Err("--all-local-devices only supports local USB discovery in this implementation".into());
+    }
+
+    let devices = minidsp::transport::hid::enumerate()?;
+    let mut clients = Vec::new();
+    for dev in devices {
+        let transport = HidTransport::open(&dev.path)?;
+        clients.push(MiniDspClient::connect(Box::new(transport)).await?);
+    }
+    Ok(clients)
+}
+
+pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::error::Error>> {
     // Environment variable overrides (minidsp-rs compatible)
     let env_url = std::env::var("MINIDSP_URL").ok();
     let env_daemon_url = std::env::var("MINIDSPD_URL").ok();
@@ -504,6 +541,10 @@ async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::error::Error>>
     if let Some(path) = cli.daemon_sock.as_deref().or(env_sock.as_deref()) {
         #[cfg(unix)]
         {
+            let devices = discover_daemon_unix(path).await?;
+            if device_idx >= devices.len() {
+                return Err(format!("device index {device_idx} out of range (found {} device{})", devices.len(), if devices.len() == 1 { "" } else { "s" }).into());
+            }
             let transport = WsTransport::connect_unix(path, device_idx).await?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
         }
@@ -524,21 +565,34 @@ async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::error::Error>>
             let addr = &url["tcp://".len()..];
             let transport = TcpTransport::connect(addr).await?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
+        } else if url.starts_with("ws://") || url.starts_with("http://") {
+            if !is_direct_ws_endpoint(url) {
+                let devices = discover_daemon_tcp(url).await?;
+                if device_idx >= devices.len() {
+                    return Err(format!("device index {device_idx} out of range (found {} device{})", devices.len(), if devices.len() == 1 { "" } else { "s" }).into());
+                }
+            }
+            let transport = WsTransport::connect(url, device_idx).await?;
+            return Ok(MiniDspClient::connect(Box::new(transport)).await?);
         } else if url.starts_with("usb://") {
-            let path = &url["usb://".len()..];
-            let transport = HidTransport::open(path)?;
+            let path = parse_usb_url_path(&url["usb://".len()..])?;
+            let transport = HidTransport::open(&path)?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
         } else if url.starts_with("usb:") {
-            let path = &url["usb:".len()..];
-            let transport = HidTransport::open(path)?;
+            let path = parse_usb_url_path(&url["usb:".len()..])?;
+            let transport = HidTransport::open(&path)?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
         } else {
-            return Err(format!("unsupported URL scheme in '{url}' (expected tcp://, usb://, or usb:)").into());
+            return Err(format!("unsupported URL scheme in '{url}' (expected tcp://, ws://, http://, usb://, or usb:)").into());
         }
     }
 
     // 4. Daemon URL (or MINIDSPD_URL env var) — connects via WebSocket to /devices/{id}/ws
     if let Some(url) = cli.daemon_url.as_deref().or(env_daemon_url.as_deref()) {
+        let devices = discover_daemon_tcp(url).await?;
+        if device_idx >= devices.len() {
+            return Err(format!("device index {device_idx} out of range (found {} device{})", devices.len(), if devices.len() == 1 { "" } else { "s" }).into());
+        }
         let transport = WsTransport::connect(url, device_idx).await?;
         return Ok(MiniDspClient::connect(Box::new(transport)).await?);
     }
@@ -582,5 +636,152 @@ async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::error::Error>>
             Ok(transport) => Ok(MiniDspClient::connect(Box::new(transport)).await?),
             Err(e) => Err(format!("no MiniDSP device found: {e}").into()),
         }
+    }
+}
+
+fn parse_usb_url_path(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let path = url.split('?').next().unwrap_or(url);
+    Ok(urlencoding::decode(path)?.into_owned())
+}
+
+fn is_direct_ws_endpoint(url: &str) -> bool {
+    (url.starts_with("ws://") || url.starts_with("http://"))
+        && url.contains("/devices/")
+        && url.ends_with("/ws")
+}
+
+fn has_non_local_transport(cli: &Cli) -> bool {
+    cli.daemon_sock.is_some()
+        || cli.daemon_url.is_some()
+        || cli.tcp.is_some()
+        || cli.url.as_deref().is_some_and(|u| !u.starts_with("usb://") && !u.starts_with("usb:"))
+}
+
+fn normalize_http_addr(base: &str) -> String {
+    let stripped = base
+        .trim_start_matches("http://")
+        .trim_start_matches("ws://");
+    let host_port = stripped.split('/').next().unwrap_or(stripped);
+    if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:5380")
+    }
+}
+
+pub(crate) async fn discover_daemon_tcp(base: &str) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
+    let addr = normalize_http_addr(base);
+    let mut stream = tokio::net::TcpStream::connect(&addr).await?;
+    let request = format!(
+        "GET /devices HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    parse_device_list_response(&buf)
+}
+
+#[cfg(unix)]
+pub(crate) async fn discover_daemon_unix(path: &str) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
+    let mut stream = tokio::net::UnixStream::connect(path).await?;
+    let request = "GET /devices HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    parse_device_list_response(&buf)
+}
+
+fn parse_device_list_response(data: &[u8]) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(data)?;
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("invalid HTTP response")?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return Err(format!("unexpected HTTP response: {}", head.lines().next().unwrap_or(head)).into());
+    }
+    let devices: Vec<DeviceJson> = serde_json::from_str(body)?;
+    Ok(devices)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct NetworkProbeDevice {
+    hostname: String,
+    ip: String,
+    hw_id: u8,
+    dsp_version: u8,
+    serial: u32,
+}
+
+pub(crate) fn discover_network_devices(timeout: std::time::Duration) -> Result<Vec<NetworkProbeDevice>, Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    use std::net::{Ipv4Addr, UdpSocket};
+
+    let debug = std::env::var_os("MINIDSP_DEBUG_DISCOVERY").is_some();
+    let socket = UdpSocket::bind("0.0.0.0:3999")?;
+    socket.join_multicast_v4(&Ipv4Addr::new(224, 0, 0, 250), &Ipv4Addr::UNSPECIFIED)?;
+    socket.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = BTreeMap::<(String, u8, u8, u32), NetworkProbeDevice>::new();
+    let mut buf = [0u8; 512];
+
+    while std::time::Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((n, addr)) => {
+                if debug {
+                    eprintln!("discovery recv: {addr} {n} bytes");
+                }
+                if let Some(pkt) = minidsp_protocol::discovery::DiscoveryPacket::decode(&buf[..n]) {
+                    let ip = format!("{}.{}.{}.{}", pkt.ip[0], pkt.ip[1], pkt.ip[2], pkt.ip[3]);
+                    let serial = 900000 + pkt.serial as u32;
+                    if debug {
+                        eprintln!(
+                            "discovery decode: host={} ip={} hw_id={} dsp={} serial={}",
+                            pkt.hostname, ip, pkt.hw_id, pkt.dsp_id, serial
+                        );
+                    }
+                    let dev = NetworkProbeDevice {
+                        hostname: pkt.hostname.clone(),
+                        ip: ip.clone(),
+                        hw_id: pkt.hw_id,
+                        dsp_version: pkt.dsp_id,
+                        serial,
+                    };
+                    seen.insert((ip, pkt.hw_id, pkt.dsp_id, serial), dev);
+                } else if debug {
+                    eprintln!("discovery decode: dropped invalid packet");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(seen.into_values().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_ws_endpoint_detection() {
+        assert!(is_direct_ws_endpoint("ws://localhost:5380/devices/0/ws"));
+        assert!(is_direct_ws_endpoint("http://localhost:5380/devices/1/ws"));
+        assert!(!is_direct_ws_endpoint("http://localhost:5380"));
+    }
+
+    #[test]
+    fn http_addr_normalization() {
+        assert_eq!(normalize_http_addr("http://localhost:5380"), "localhost:5380");
+        assert_eq!(normalize_http_addr("ws://example.com"), "example.com:5380");
+        assert_eq!(normalize_http_addr("example.com:1234"), "example.com:1234");
+    }
+
+    #[test]
+    fn parse_devices_http_response() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[{\"url\":\"usb:%2Fdev%2Fhidraw3?vid=2752&pid=0011\",\"version\":{\"hw_id\":10,\"fw_major\":1,\"fw_minor\":13,\"dsp_version\":100,\"serial\":912345},\"product_name\":\"2x4HD\"}]";
+        let devices = parse_device_list_response(resp).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].product_name, "2x4HD");
+        assert_eq!(devices[0].version.hw_id, 10);
     }
 }

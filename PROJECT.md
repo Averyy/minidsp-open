@@ -105,16 +105,21 @@ Separate project, after v1. See `docs/FUTURE-12v-trigger.md`.
 ```
 VID: 0x2752 (MiniDSP) or legacy 0x04D8/0x003F
 Report size: 65 bytes (1 byte report ID 0x00 + 64 bytes data)
-Write: [0x00] [payload] [0xFF padding to 65 bytes]
-Read: 65 bytes, timeout 500ms
+Write: [0x00] [request_frame] [0xFF padding to 65 bytes]
+Read: 64 bytes data from interrupt IN; logical response is [len][payload], bytes after frame boundary may be arbitrary tail data
 ```
 
-### Frame encoding (packet.rs)
+### Request frame encoding (packet.rs)
 ```
 Byte 0:     (payload.len() + 1) as u8    // length, self-inclusive
 Bytes 1..N: payload (command bytes)
 Byte N+1:   checksum = sum(all preceding bytes) & 0xFF
 ```
+
+### Response frame encoding
+- HID / direct USB responses: `[len][payload]` with no checksum
+- TCP server responses: `[len][payload]` with no checksum
+- HID interrupt IN packets may contain arbitrary non-protocol bytes after the logical frame boundary inside the fixed 64-byte packet; ignore them
 
 ### TCP server (port 5333)
 - Server-side framing: read `buf[0] + 1` bytes total (`buf[0]` is self-inclusive length covering length byte + payload; the extra +1 is the checksum appended after)
@@ -767,7 +772,7 @@ fw=1.85  api=5380  tcp=5333  ezbeq=1
 
 ### Home Assistant (future)
 
-No HA custom component at launch. The existing `minidsp-rs-hass` WebSocket integration works with our drop-in API immediately.
+No HA custom component at launch. The intended compatibility surface is the existing `minidsp-rs-hass` WebSocket integration; current implementation and runtime-validation status are tracked in `docs/TODO-fix-compatibility.md`.
 
 Future HA integration could use `_minidsp._tcp` zeroconf for auto-discovery. MQTT discovery (phase 2) would provide native HA entities without a custom component. Neither is needed for launch — the existing ecosystem works as-is.
 

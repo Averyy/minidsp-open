@@ -6,7 +6,9 @@ If this file conflicts with `PROJECT.md`, `PROGRESS.md`, or any other planning d
 
 ## Goal
 
-minidsp-open is a drop-in replacement for minidsp-rs on desktop and on the wire.
+minidsp-open's compatibility target is drop-in replacement for minidsp-rs on desktop and on the wire.
+
+Implementation status and remaining validation gaps are tracked in `docs/TODO-fix-compatibility.md`. This file defines the contract the code is expected to satisfy.
 
 That means existing clients should continue to work without changes:
 - ezBEQ

@@ -1,13 +1,19 @@
-//! Frame encoding: length-prefixed with checksum, 0xFF padding for HID.
+//! Packet framing helpers for MiniDSP request/response traffic.
 //!
-//! Wire format:
+//! Host-to-device request format:
 //! ```text
 //! Byte 0:     (payload.len() + 1) as u8   // length, self-inclusive
 //! Bytes 1..N: payload (command bytes)
 //! Byte N+1:   checksum = sum(all preceding bytes) & 0xFF
 //! ```
 //!
-//! HID wrapping adds report ID 0x00 prefix and 0xFF padding to 65 bytes.
+//! Device-to-host responses differ by transport:
+//! - HID / direct USB responses are `[len][payload]` with no checksum and
+//!   arbitrary padding or garbage after the frame boundary inside the 64-byte
+//!   interrupt packet.
+//! - TCP server responses are also `[len][payload]` with no checksum.
+//!
+//! HID request wrapping adds report ID `0x00` and `0xFF` padding to 65 bytes.
 
 /// Maximum payload size in a single HID report (64 bytes data - 1 length - 1 checksum).
 pub const MAX_PAYLOAD: usize = 62;
@@ -75,11 +81,26 @@ pub fn decode_frame(data: &[u8]) -> Option<Vec<u8>> {
     Some(data[1..len].to_vec())
 }
 
-/// Unwrap a 65-byte HID report and decode the inner frame.
+/// Decode a device response frame from raw bytes (`[len][payload]`, no checksum).
 ///
-/// Strips report ID (byte 0), then decodes the frame from the data portion.
-pub fn decode_hid(report: &[u8; HID_REPORT_SIZE]) -> Option<Vec<u8>> {
-    decode_frame(&report[1..])
+/// Returns `(payload, bytes_consumed)` on success. Any bytes after the frame
+/// boundary are ignored by the caller; for HID responses these are often
+/// garbage/non-zero padding from a fixed 64-byte interrupt packet.
+pub fn decode_response_frame(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    if data.is_empty() {
+        return None;
+    }
+    let len = data[0] as usize; // self-inclusive
+    if len == 0 || data.len() < len {
+        return None;
+    }
+    Some((data[1..len].to_vec(), len))
+}
+
+/// Decode a HID response packet from a 64-byte data buffer (no report ID).
+pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
+    let (payload, _) = decode_response_frame(data)?;
+    Some(payload)
 }
 
 /// Parse a TCP stream frame. TCP framing: `buf[0]` is self-inclusive length,
@@ -129,12 +150,8 @@ pub fn decode_tcp_response(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     if offset >= data.len() {
         return None;
     }
-    let len = data[offset] as usize; // self-inclusive length
-    if len == 0 || data.len() - offset < len {
-        return None; // insufficient data
-    }
-    let payload = data[offset + 1..offset + len].to_vec();
-    Some((payload, offset + len))
+    let (payload, consumed) = decode_response_frame(&data[offset..])?;
+    Some((payload, offset + consumed))
 }
 
 #[cfg(test)]
@@ -153,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn hid_roundtrip() {
+    fn hid_request_format() {
         let payload = &[0x42, 0x10]; // SetVolume, value=0x10
         let report = encode_hid(payload);
         assert_eq!(report[0], 0x00); // report ID
@@ -162,8 +179,25 @@ mod tests {
         for &b in &report[1 + frame_len..] {
             assert_eq!(b, 0xFF);
         }
-        let decoded = decode_hid(&report).unwrap();
-        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn hid_response_without_checksum() {
+        let mut report = [0u8; HID_DATA_SIZE];
+        report[..12].copy_from_slice(&[
+            0x0c, 0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        report[12..16].copy_from_slice(&[0x21, 0xf6, 0x08, 0x5b]); // garbage after frame
+
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(decoded, vec![0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn hid_ack_response_without_checksum() {
+        let report = [0x01, 0x42, 0x14, 0xfe, 0x30, 0x39, 0x00, 0x00];
+        let decoded = decode_hid_response(&report).unwrap();
+        assert!(decoded.is_empty());
     }
 
     #[test]

@@ -31,16 +31,16 @@ pub fn print_status_text(summary: &StatusSummary, profile: &DeviceProfile) {
     }
 }
 
-/// Print status as JSON (minidsp -o jsonline compatible).
+/// Print status as JSON.
 ///
-/// Uses serde_json for safe serialization — source names are properly escaped.
-/// Format matches minidsp-rs StatusSummary:
-/// ```json
-/// {"master":{"preset":0,"source":"Toslink","volume":-8.0,"mute":false},"input_levels":[-131.36],"output_levels":[-140.2]}
-/// ```
-pub fn print_status_json(summary: &StatusSummary) -> Result<(), Box<dyn std::error::Error>> {
-    // Use StatusSummary's Serialize derive for correct f32 precision
-    // and skip_serializing_if on dirac
-    println!("{}", serde_json::to_string(summary)?);
+/// `jsonline` matches upstream compact single-line output, while `json`
+/// matches upstream pretty-printed JSON.
+pub fn print_status_json(summary: &StatusSummary, pretty: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let rendered = if pretty {
+        serde_json::to_string_pretty(summary)?
+    } else {
+        serde_json::to_string(summary)?
+    };
+    println!("{rendered}");
     Ok(())
 }

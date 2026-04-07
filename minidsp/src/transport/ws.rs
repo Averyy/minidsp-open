@@ -94,6 +94,13 @@ impl WsTransport {
 
 /// Normalize a base URL to a WebSocket URL for the raw frame bridge.
 fn format_ws_url(base: &str, device_id: usize) -> String {
+    if (base.starts_with("ws://") || base.starts_with("http://"))
+        && base.contains("/devices/")
+        && base.ends_with("/ws")
+    {
+        return base.replacen("http://", "ws://", 1);
+    }
+
     let stripped = base
         .trim_start_matches("http://")
         .trim_start_matches("ws://");

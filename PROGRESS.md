@@ -110,6 +110,9 @@
 - [x] Global commands: volume, source, preset, dirac
 - [x] Negative coefficient parsing fix (allow_hyphen_values, `--` separator)
 - [x] Accept minidsp-rs config TOML format (--config flag, http_server.bind_address, tcp_server, advertise)
+- [x] `probe` is transport-aware and supports `probe --net`
+- [x] `--all-local-devices` fans out normal CLI and batch-file execution across local HID devices
+- [x] `--daemon-url` / `--daemon-sock` preflight through `GET /devices` before opening the raw WS bridge
 - [x] `-o jsonline` output (serde_json, PascalCase source names)
 - [x] `-f <file>` execution (sequential, no reordering)
 
@@ -184,10 +187,12 @@
 - [x] Test: no boot loop — previous 4KB WiFi monitor stack caused stack overflow → watchdog reset. Fixed to 8KB.
 - [x] Test: WiFi provisioning end-to-end (phone → SoftAP → captive portal auto-open → save creds → restart → STA) — PASSED 2026-04-06, connected to WPA3-SAE network at 192.0.2.246
 - [x] Test: ESP32 full network test (2026-04-06) — 15 bugs found and fixed across 3 sessions. All 31 HTTP routes + 2 WS endpoints verified.
+- [x] Test: ESP32 no-MiniDSP appliance path (2026-04-07) — reflashed via `esptool.py`, fixed `ESP_ERR_HTTPD_HANDLERS_FULL`, verified `/`, `/devices`, `/api/1/version`, `/api/2/devices`, `/debug/info`, `/debug/updater`, `/debug/updater/check`
 - [x] Test: USB hotplug — device power cycle (auto-reconnect ~4s), firmware reboot (device found in 6.7s), firmware-first/device-later (503 → background scan → auto-detect)
 - [x] Test: mDNS discovery — hostname resolves, _minidsp._tcp browsable, TXT records correct
 - [x] Test: WebSocket compat — levels=true (~250ms), poll=true (~1s), GET/WS interleave, raw bridge
 - [x] Test: heap stability — 167KB free after 20 GET + 3 WS sessions, no leak, min watermark 139KB
+- [x] Test: `probe --net` against live ESP32 with no MiniDSP attached (2026-04-07) — fixed ESP32 fallback UDP advertisement, desktop CLI now discovers `minidsp-bridge-*` over UDP 3999
 - [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
@@ -224,13 +229,14 @@
 - [x] Dead code removed: StatusSummaryJson, MasterStatusGetJson, encode_invert, TcpTransport::connect_unix
 
 ## Known Issues / Deferred
+- Primary next blocker: live ESP32 validation with a real MiniDSP attached. The no-MiniDSP appliance path is now verified; remaining risk is real USB-host command I/O and ezBEQ filter application against hardware.
 - Legacy device config.xml address table extraction not implemented — devices work at DspKnown tier (basic support)
 - DSP 115 input PEQ addresses confirmed but input mute/gain/polarity not in Device Console XML (marked Option::None)
 - Idempotent retry on reconnect deferred — requires persisting pending state
 - PWR-ICE TCP compat deferred — need device owner
-- ESP32 USB Host HID response framing: real 2x4 HD response bytes don't match `decode_frame` checksum. See `docs/TODO-fix-minidsp.md` for analysis.
+- ESP32 HID framing issue resolved in shared packet layer: HID/device responses use `[len][payload]` with no checksum; fixed in desktop + ESP32 transports. Real hardware re-test still needed. See `docs/TODO-fix-minidsp.md`.
+- ESP32 flashing on CH340 boards must use `esptool.py`, not `espflash` / `cargo run`; repo-local `CLAUDE.md` documents the working flow and Codex memory/skill were updated accordingly
 - ESP32 GET /config handler not registered (POST /config works)
-- GET /devices URL is hardcoded "ws://localhost:5380/..." instead of actual transport URL
 - POST /config silently ignores routing/crossover/compressor/FIR fields (CLI subcommands implemented)
 
 ---
@@ -251,7 +257,7 @@ JS shim injected into React UI intercepts WebSocket catalogue loading, caches in
 - [x] ezBEQ WebSocket: /ws endpoint (device state, level meters, catalogue meta)
 - [x] Browser-direct catalogue: JS shim fetches database.json from beqcatalogue, caches in IndexedDB
 - [x] Serve ezBEQ React UI static files from flash (SPA with catch-all fallback)
-- [ ] Test: ezBEQ end-to-end on ESP32 — NEEDS HARDWARE TEST
+- [ ] Test: ezBEQ end-to-end on ESP32 with a real MiniDSP attached — NO-MINIDSP UI/API path is verified, filter load/write path still needs hardware
 
 ---
 
