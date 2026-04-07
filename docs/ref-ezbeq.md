@@ -4,7 +4,7 @@ ezBEQ is the primary reason people run minidsp-rs. It's a per-movie bass EQ syst
 
 minidsp-open targets drop-in compatibility with minidsp-rs in ezBEQ workflows, and on ESP32 we go further: we replace the entire RPi + minidsp-rs + ezBEQ stack with a single $10 board.
 
-Current implementation status lives in `docs/TODO-fix-compatibility.md`. This file describes the required ezBEQ-facing behavior and the intended end state, not a blanket claim that every transport permutation has already been hardware-validated.
+This file describes ezBEQ-facing behavior and architecture. It is not the place to track temporary validation state. Current status lives in `PROGRESS.md`, and the compatibility verification checklist lives in `docs/todo-checker.md`.
 
 **Repo:** https://github.com/3ll3d00d/ezbeq
 **Docs:** https://ezbeq.readthedocs.io/en/latest/
@@ -385,7 +385,7 @@ Two API surfaces that share the same device control core:
 
 ### Desktop users: intended drop-in replacement
 
-On desktop (Linux/macOS/Windows), the target user experience is still binary swap compatibility: users replace `minidsp-rs` with our `minidsp` binary and keep the same ezBEQ configuration. The core CLI, daemon, WebSocket, and batch-command surfaces are implemented for that workflow, but the remaining validation caveats are tracked in `docs/TODO-fix-compatibility.md`.
+On desktop (Linux/macOS/Windows), the target user experience is still binary swap compatibility: users replace `minidsp-rs` with our `minidsp` binary and keep the same ezBEQ configuration. The core CLI, daemon, WebSocket, and batch-command surfaces are implemented for that workflow. Current verification status is tracked in `PROGRESS.md` and `docs/todo-checker.md`.
 
 No catalogue index, no web UI, no GitHub Actions involved. ezBEQ runs on the same machine and shells out to our `minidsp` binary exactly as it does to minidsp-rs today.
 
@@ -395,12 +395,16 @@ The ezBEQ docs warn:
 
 > "Bear in mind that, so far, settings cannot be read back from the MiniDSP 2x4HD. This means that no applications are able to show your currently loaded configs."
 
-**This is a minidsp-rs software limitation, not a hardware limitation.** The MiniDSP protocol has command `0x14` (`ReadFloats`) that reads any DSP register — the same command used for level metering. minidsp-rs never pointed it at the config registers. Even MiniDSP's own Device Console doesn't read config back — it uses modification tokens and local XML cache.
+**This is still the architectural direction, but it is not fully verified across all transports yet.** The MiniDSP protocol has command `0x14` (`ReadFloats`) that reads DSP registers, and minidsp-open uses that mechanism for config read-back. However, current real-hardware verification shows that ESP32 config-register reads on a physical 2x4 HD still need additional parser work before they can be claimed as working parity behavior. Even MiniDSP's own Device Console doesn't read config back — it uses modification tokens and local XML cache.
 
-We implement full config read-back:
+Implemented target behavior:
 - Read every biquad coefficient, gain, delay, mute state, compressor param, mixer routing
-- ~45 USB round-trips for a complete 2x4HD read = ~225ms
 - Expose via `GET /devices/{id}/config` returning full state as JSON
-- Enables: true status display, measurement mode (save/flatten/measure/restore), preset export, write verification
+- Enable true status display, measurement mode (save/flatten/measure/restore), preset export, and write verification
 
-This eliminates ezBEQ's "periodically reload" workaround. We can verify what's actually loaded on the device instead of guessing from local state files.
+Verified reality today:
+- Desktop still tracks this as implemented behavior.
+- ESP32 physical-hardware validation has only closed status/meter/basic-control paths so far.
+- ESP32 config read-back remains an active bug under `PROGRESS.md` and `docs/todo-checker.md`.
+
+Once the remaining ESP32 config read-back bug is fixed, this removes ezBEQ's "periodically reload" workaround by letting us verify what is actually loaded on the device instead of guessing from local state files.

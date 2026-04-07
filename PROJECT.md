@@ -264,6 +264,10 @@ No high-level read function exists in minidsp-rs, but the primitives are there:
 - Build a `read_full_config()` that reads all DSP addresses for the current device → returns a full Config struct
 - Use for: backup before modification, verification after write, measurement mode save/restore
 
+Verification note:
+- Desktop config read-back is implemented.
+- ESP32 physical-hardware config read-back is not yet verified end to end; current live 2x4 HD testing shows status/meter/control working, but config-register `ReadFloats` still need additional real-device decoding work.
+
 ### Config write constraints
 - **Cannot write to non-active preset.** All DSP writes go to currently active state. Must switch preset first (causes brief audio interruption).
 - **Atomic deployment strategy:** Switch to target preset → write all parameters → verify via read-back. No way to stage silently.
@@ -415,7 +419,7 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 | 4 | ARM .deb broken on Bookworm (glibc mismatch) | COMMON | We ship native static binaries for all platforms | Solved |
 | 5 | Multi-device setup extremely difficult (#662) | COMMON | Per-device connection isolation, no global lock | Planned |
 | 6 | HTx firmware update breaks minidsp-rs (#701) | MODERATE | DSP 115 definition, auto-detect hw_id, `--force-kind` escape hatch | Planned |
-| 7 | Cannot read config back from device | VERY COMMON | Full config read-back via cmd 0x14 (`ReadFloats`) | Planned |
+| 7 | Cannot read config back from device | VERY COMMON | Full config read-back via cmd 0x14 (`ReadFloats`) | Implemented, still being verified on real ESP32 hardware |
 | 8 | HID error on newer platforms (RPi5, newer kernels) | MODERATE | Test hidapi on RPi5 + newer kernels during dev | **NEW — needs testing** |
 | 9 | Version upgrade breaks config / bind defaults | COMMON | Design config format from scratch, sane defaults (bind 0.0.0.0) | Planned |
 | 10 | Windows config file location undocumented | MODERATE | Unified config across platforms, XDG/well-known paths | Planned |
@@ -516,7 +520,7 @@ Our advantages:
 
 Full device state is ~2.1 KB per preset (~528 floats × 4 bytes). All 4 presets = ~8.4 KB. Trivially small.
 
-Enabled by config read-back (cmd 0x14, `ReadFloats`):
+Intended once config read-back is fully verified across the relevant transport paths:
 - `GET /devices/{id}/config` — full state as JSON
 - `POST /devices/{id}/config` — restore from JSON
 - `GET /devices/{id}/config/export` — Device Console XML format (for interop)
@@ -772,7 +776,7 @@ fw=1.85  api=5380  tcp=5333  ezbeq=1
 
 ### Home Assistant (future)
 
-No HA custom component at launch. The intended compatibility surface is the existing `minidsp-rs-hass` WebSocket integration; current implementation and runtime-validation status are tracked in `docs/TODO-fix-compatibility.md`.
+No HA custom component at launch. The intended compatibility surface is the existing `minidsp-rs-hass` WebSocket integration; current implementation and runtime-validation status are tracked in `PROGRESS.md` and `docs/todo-checker.md`.
 
 Future HA integration could use `_minidsp._tcp` zeroconf for auto-discovery. MQTT discovery (phase 2) would provide native HA entities without a custom component. Neither is needed for launch — the existing ecosystem works as-is.
 

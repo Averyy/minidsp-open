@@ -4,13 +4,14 @@
 //! All methods are blocking and thread-safe (via Arc<UsbHidBus>).
 
 use crate::usb_hid::{UsbHidBus, UsbHidError};
-use log::debug;
+use log::{debug, warn};
 use minidsp_protocol::commands::{self, HardwareId, Response};
 use minidsp_protocol::device::probe;
 use minidsp_protocol::device::DeviceProfile;
 use minidsp_protocol::dialect::Dialect;
 use minidsp_protocol::eeprom;
 use minidsp_protocol::status::*;
+use serde::Serialize;
 use std::sync::Arc;
 
 /// Device state — holds the USB bus, device profile, and identification info.
@@ -22,12 +23,47 @@ pub struct DeviceState {
     serial: u32,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ConfigReadResponse {
+    pub inputs: Vec<InputConfigRead>,
+    pub outputs: Vec<OutputConfigRead>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InputConfigRead {
+    pub index: u8,
+    pub peq: Option<Vec<PeqConfigRead>>,
+    pub gain: Option<f32>,
+    pub mute: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutputConfigRead {
+    pub index: u8,
+    pub peq: Option<Vec<PeqConfigRead>>,
+    pub gain: Option<f32>,
+    pub mute: Option<bool>,
+    pub delay: Option<std::time::Duration>,
+    pub invert: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PeqConfigRead {
+    pub index: u8,
+    pub coeff: Option<BiquadCoeffs>,
+    pub bypass: Option<bool>,
+}
+
 impl DeviceState {
     /// Probe a device via USB HID: ReadHardwareId, read dsp_version, read serial.
     pub fn probe(bus: Arc<UsbHidBus>) -> Result<Self, UsbHidError> {
         // ReadHardwareId
         let resp = bus.command(&commands::read_hardware_id())?;
-        let parsed = commands::parse_response(&resp, &Dialect::NEW);
+        let parsed = commands::parse_response_for_request(
+            &commands::read_hardware_id(),
+            &resp,
+            &Dialect::NEW,
+        );
         let hw_id = match parsed {
             Response::HardwareId(id) => id,
             other => {
@@ -43,9 +79,10 @@ impl DeviceState {
 
         // Read DSP version from EEPROM 0xFFA1
         let (addr_hi, addr_lo) = eeprom::DSP_VERSION_ADDR;
-        let resp = bus.command(&commands::read_flash(addr_hi, addr_lo, 1))?;
+        let req = commands::read_flash(addr_hi, addr_lo, 1);
+        let resp = bus.command(&req)?;
         debug!("dsp_version raw resp ({} bytes): {:02x?}", resp.len(), &resp[..resp.len().min(10)]);
-        let parsed = commands::parse_response(&resp, &Dialect::NEW);
+        let parsed = commands::parse_response_for_request(&req, &resp, &Dialect::NEW);
         let dsp_version = match parsed {
             Response::FlashData(ref data) => {
                 debug!("dsp_version FlashData ({} bytes): {:02x?}", data.len(), data);
@@ -57,8 +94,9 @@ impl DeviceState {
 
         // Read serial from EEPROM 0xFFFE
         let (addr_hi, addr_lo) = eeprom::SERIAL_ADDR;
-        let resp = bus.command(&commands::read_flash(addr_hi, addr_lo, 2))?;
-        let parsed = commands::parse_response(&resp, &Dialect::NEW);
+        let req = commands::read_flash(addr_hi, addr_lo, 2);
+        let resp = bus.command(&req)?;
+        let parsed = commands::parse_response_for_request(&req, &resp, &Dialect::NEW);
         let serial = match parsed {
             Response::FlashData(data) => eeprom::parse_serial(&data).unwrap_or(0),
             _ => 0,
@@ -102,8 +140,9 @@ impl DeviceState {
 
     pub fn get_master_status(&self) -> Result<eeprom::MasterStatusRaw, UsbHidError> {
         let (hi, lo) = eeprom::MASTER_STATUS_ADDR;
-        let resp = self.bus.command(&commands::read_flash(hi, lo, 4))?;
-        match commands::parse_response(&resp, self.dialect()) {
+        let req = commands::read_flash(hi, lo, 4);
+        let resp = self.bus.command(&req)?;
+        match commands::parse_response_for_request(&req, &resp, self.dialect()) {
             Response::FlashData(data) if data.len() >= 4 => {
                 eeprom::MasterStatusRaw::from_bytes(&data)
                     .ok_or_else(|| UsbHidError::Protocol("bad master status".into()))
@@ -131,8 +170,20 @@ impl DeviceState {
 
         // Read level meters if DSP table is available
         let (input_levels, output_levels) = if let Some(table) = self.profile.dsp_table {
-            let il = self.read_meters(table.meters.input).unwrap_or_default();
-            let ol = self.read_meters(table.meters.output).unwrap_or_default();
+            let il = match self.read_meters(table.meters.input) {
+                Ok(values) => values,
+                Err(e) => {
+                    warn!("input meter read failed: {e}");
+                    vec![]
+                }
+            };
+            let ol = match self.read_meters(table.meters.output) {
+                Ok(values) => values,
+                Err(e) => {
+                    warn!("output meter read failed: {e}");
+                    vec![]
+                }
+            };
             (il, ol)
         } else {
             (vec![], vec![])
@@ -151,12 +202,125 @@ impl DeviceState {
         })
     }
 
+    pub fn read_config(&self) -> Result<ConfigReadResponse, UsbHidError> {
+        let table = self
+            .profile
+            .dsp_table
+            .ok_or_else(|| UsbHidError::Protocol("config read unsupported".into()))?;
+        let sample_rate = self.profile.sample_rate as f32;
+        let is_fixed_point = self.profile.dialect.value_format
+            == minidsp_protocol::dialect::ValueFormat::FixedPoint;
+
+        let decode_mute = |v: f32| -> bool {
+            if is_fixed_point {
+                v == 0.0
+            } else {
+                v >= 2.0
+            }
+        };
+        let decode_invert = |v: f32| -> bool {
+            if is_fixed_point {
+                v < 0.0
+            } else {
+                v != 0.0
+            }
+        };
+        let decode_gain_db = |linear: f32| -> f32 { 20.0 * linear.max(1e-10).log10() };
+
+        let mut inputs = Vec::new();
+        for (ch_idx, input) in table.inputs.iter().enumerate() {
+            let mut peqs = Vec::new();
+            for (band_idx, band) in input.peq.iter().enumerate() {
+                match self.read_floats(band.addr, 5) {
+                    Ok(coeffs) if coeffs.len() == 5 => {
+                        peqs.push(PeqConfigRead {
+                            index: band_idx as u8,
+                            coeff: Some(BiquadCoeffs::from_array(&[
+                                coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
+                            ])),
+                            bypass: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            let gain = input
+                .gain
+                .and_then(|addr| self.read_floats(addr, 1).ok())
+                .and_then(|v| v.first().copied())
+                .map(decode_gain_db);
+            let mute = input
+                .mute
+                .and_then(|addr| self.read_floats(addr, 1).ok())
+                .and_then(|v| v.first().copied())
+                .map(decode_mute);
+
+            inputs.push(InputConfigRead {
+                index: ch_idx as u8,
+                peq: Some(peqs),
+                gain,
+                mute,
+            });
+        }
+
+        let mut outputs = Vec::new();
+        for (ch_idx, output) in table.outputs.iter().enumerate() {
+            let mut peqs = Vec::new();
+            for (band_idx, band) in output.peq.iter().enumerate() {
+                match self.read_floats(band.addr, 5) {
+                    Ok(coeffs) if coeffs.len() == 5 => {
+                        peqs.push(PeqConfigRead {
+                            index: band_idx as u8,
+                            coeff: Some(BiquadCoeffs::from_array(&[
+                                coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
+                            ])),
+                            bypass: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            let gain = self
+                .read_floats(output.gain, 1)
+                .ok()
+                .and_then(|v| v.first().copied())
+                .map(decode_gain_db);
+            let mute = self
+                .read_floats(output.mute, 1)
+                .ok()
+                .and_then(|v| v.first().copied())
+                .map(decode_mute);
+            let delay = self
+                .read_floats(output.delay, 1)
+                .ok()
+                .and_then(|v| v.first().copied())
+                .map(|samples| std::time::Duration::from_secs_f32(samples / sample_rate));
+            let invert = self
+                .read_floats(output.polarity, 1)
+                .ok()
+                .and_then(|v| v.first().copied())
+                .map(decode_invert);
+
+            outputs.push(OutputConfigRead {
+                index: ch_idx as u8,
+                peq: Some(peqs),
+                gain,
+                mute,
+                delay,
+                invert,
+            });
+        }
+
+        Ok(ConfigReadResponse { inputs, outputs })
+    }
+
     /// Read float values from DSP memory starting at `addr`.
     fn read_floats(&self, addr: u16, count: u8) -> Result<Vec<f32>, UsbHidError> {
-        let resp = self
-            .bus
-            .command(&commands::read_floats(addr, count, self.dialect()))?;
-        match commands::parse_response(&resp, self.dialect()) {
+        let req = commands::read_floats(addr, count, self.dialect());
+        let resp = self.bus.command(&req)?;
+        match commands::parse_response_for_request(&req, &resp, self.dialect()) {
             Response::Floats(values) => Ok(values),
             other => Err(UsbHidError::Protocol(format!(
                 "read_floats: {other:?}"
@@ -304,10 +468,9 @@ impl DeviceState {
         addr_lo: u8,
         count: u8,
     ) -> Result<Vec<u8>, UsbHidError> {
-        let resp = self
-            .bus
-            .command(&commands::read_flash(addr_hi, addr_lo, count))?;
-        match commands::parse_response(&resp, self.dialect()) {
+        let req = commands::read_flash(addr_hi, addr_lo, count);
+        let resp = self.bus.command(&req)?;
+        match commands::parse_response_for_request(&req, &resp, self.dialect()) {
             Response::FlashData(data) => Ok(data),
             other => Err(UsbHidError::Protocol(format!("flash read: {other:?}"))),
         }

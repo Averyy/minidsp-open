@@ -8,7 +8,10 @@ If this file conflicts with `PROJECT.md`, `PROGRESS.md`, or any other planning d
 
 minidsp-open's compatibility target is drop-in replacement for minidsp-rs on desktop and on the wire.
 
-Implementation status and remaining validation gaps are tracked in `docs/TODO-fix-compatibility.md`. This file defines the contract the code is expected to satisfy.
+This file defines the contract the code is expected to satisfy. Verification status and release-gate testing live in:
+
+- `PROGRESS.md` — current project status and open issues
+- `docs/todo-checker.md` — master compatibility verification checklist
 
 That means existing clients should continue to work without changes:
 - ezBEQ
@@ -357,6 +360,7 @@ Representative behavior:
 ### Compatibility requirements
 
 - Broadcast every 1 second to `255.255.255.255:3999`
+- Also send the same packet to multicast `224.0.0.250:3999` for Device Console compatibility
 - Use the expected magic bytes and packet layout
 - Include MAC, IP, hw_id, firmware version, dsp_id, serial, and hostname fields in the expected format
 - Packet byte layout is part of compatibility, not just high-level semantics
@@ -505,7 +509,8 @@ ignore_advertisements = false
 
 These are allowed, but they are not part of the compatibility contract unless later promoted here:
 
-- `/devices/{id}/config` full read-back/write
+- `GET /devices/{id}/config` full config read-back
+- extended `/devices/{id}/config` fields beyond the compatibility request body documented above
 - measurement-mode endpoints
 - display endpoints
 - DRE endpoints
@@ -519,6 +524,10 @@ These are allowed, but they are not part of the compatibility contract unless la
 Additive rule:
 - additive features must not break or redefine compatibility endpoints
 - additive features should prefer new routes over behavior changes on compatibility routes
+
+Current verification note:
+- Desktop config read-back is implemented.
+- ESP32 `GET /devices/0/config` now exists, but physical-hardware verification is still open because real 2x4 HD config-register `ReadFloats` replies are not yet decoding into valid PEQ/gain state. That route must not be treated as parity-complete until `docs/todo-checker.md` closes Section 6.2.
 
 ## Canonical Ownership
 
@@ -547,7 +556,7 @@ Before release, verify:
 | TCP | Device Console coexistence through the bridge |
 | UDP | discovery packet recognized by existing clients |
 
-`PROGRESS.md` should track these as explicit release gates.
+`PROGRESS.md` and `docs/todo-checker.md` should track these as explicit release gates.
 
 ## Final Freeze Checklist
 

@@ -4,7 +4,12 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 ## Project State
 
-Desktop Phase 1 complete. 84 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, WiFi STA connects, serves full HTTP API + WebSocket + TCP bridge + UDP discovery. 135KB heap free. **Flashed to real 2x4 HD** (2026-04-06): USB Host detects device (VID=0x2752 PID=0x0011, interface 4 claimed). **Blocking issue:** HID response frame decoding — real hardware response bytes don't pass `decode_frame` checksum validation. See `docs/TODO-fix-minidsp.md`. Desktop CLI has full minidsp-rs compat: WsTransport, crossover/compressor/FIR/routing, debug subcommand, env vars, -v/--log.
+Desktop Phase 1 is feature-complete. ESP32 firmware (IDF v5.4) boots, WiFi STA connects, serves the compatibility HTTP API + WebSocket + TCP bridge + UDP discovery, and both the no-MiniDSP appliance path and the basic real-MiniDSP control path are verified on hardware. The shared HID response framing bug is fixed in code; the remaining live compatibility bug is ESP32 config-register read-back (`GET /devices/0/config`) on physical hardware. Desktop CLI has the full intended minidsp-rs compatibility surface: WsTransport, crossover/compressor/FIR/routing, debug subcommand, env vars, and `-v`/`--log`.
+
+Status tracking:
+- `PROGRESS.md` = source of truth for project status and open work
+- `docs/ref-compatibility.md` = source of truth for compatibility contract
+- `docs/todo-checker.md` = master verification checklist before retiring temporary TODO docs
 
 ## Build
 

@@ -217,14 +217,14 @@ impl CommandQueue {
         match self.transport.recv_frame(500).await {
             Ok(raw) => {
                 let dialect = self.dialect.lock().await;
-                let response = commands::parse_response(&raw, &dialect);
+                let response = commands::parse_response_for_request(&cmd.payload, &raw, &dialect);
 
                 // Handle preset change: wait for PresetComplete
                 if cmd.payload.first() == Some(&commands::CMD_SET_CONFIG) {
                     if matches!(response, Response::Ack) {
                         match self.transport.recv_frame(5000).await {
                             Ok(raw2) => {
-                                let resp2 = commands::parse_response(&raw2, &dialect);
+                                let resp2 = commands::parse_response_for_request(&cmd.payload, &raw2, &dialect);
                                 let _ = cmd.response_tx.send(Ok(QueueResponse { parsed: resp2, raw: raw2 }));
                                 return;
                             }

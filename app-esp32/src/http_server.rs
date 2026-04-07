@@ -160,6 +160,27 @@ pub fn start(
     register_source_routes(&mut server, state.clone())?;
     register_preset_routes(&mut server, state.clone())?;
 
+    // GET /devices/0/config — full config read-back
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/config", Method::Get, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            match dev.read_config() {
+                Ok(config) => {
+                    let body = serde_json::to_string(&config).unwrap_or_else(|_| "{}".into());
+                    send_json(req, 200, &body)
+                }
+                Err(e) if e.to_string().contains("unsupported") => {
+                    send_error(req, 501, "config read unsupported")
+                }
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
     // POST /devices/0/config — full config write (PEQ, gain, mute, delay, polarity, master)
     {
         let st = state.clone();
@@ -1452,7 +1473,7 @@ fn register_ezbeq_ws(
                 log::info!("ezBEQ WS: ft={ft:?} len={len} msg='{msg}'");
 
                 if msg == "load catalogue" {
-                    // Browser JS shim handles catalogue loading directly from beqcatalogue.
+                    // Browser JS shim handles catalogue loading from our Pages mirror.
                     // Send empty response as safety fallback (shim intercepts before this fires).
                     log::info!("load catalogue: handled by browser shim");
                     let empty = r#"{"message":"CatalogueEntries","data":[]}"#;

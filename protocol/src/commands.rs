@@ -290,6 +290,46 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
     }
 }
 
+/// Parse a response payload with access to the original request payload.
+///
+/// Real MiniDSP hardware may echo the flash address bytes in `ReadFlash`
+/// responses (`[0x05, addr_hi, addr_lo, data...]`), while the simulator and
+/// older assumptions use `[0x05, data...]`. This helper accepts both forms.
+pub fn parse_response_for_request(
+    request: &[u8],
+    data: &[u8],
+    dialect: &Dialect,
+) -> Response {
+    if request.first() == Some(&CMD_READ_FLASH) && data.first() == Some(&CMD_READ_FLASH) {
+        if request.len() >= 4 && data.len() >= 2 {
+            let addr_hi = request[1];
+            let addr_lo = request[2];
+            let count = request[3] as usize;
+            let body = &data[1..];
+
+            if body.len() >= count + 2 && body[0] == addr_hi && body[1] == addr_lo {
+                return Response::FlashData(body[2..2 + count].to_vec());
+            }
+
+            if body.len() >= count {
+                return Response::FlashData(body[..count].to_vec());
+            }
+        }
+    }
+
+    if request.first() == Some(&CMD_READ_FLOATS) && data.first() == Some(&CMD_READ_FLOATS) {
+        if data.starts_with(request) && request.len() < data.len() {
+            let count = request.last().copied().unwrap_or(0) as usize;
+            let remaining = &data[request.len()..];
+            if let Some(values) = decode_float_block_with_offset(remaining, count, dialect) {
+                return Response::Floats(values);
+            }
+        }
+    }
+
+    parse_response(data, dialect)
+}
+
 /// Parse a ReadFloats response into float values.
 /// Response format: [0x14, float_data...] — command echo followed by float bytes.
 /// Verified against miniDSP 2x4 HD simulator: NO address echo in response.
@@ -298,14 +338,83 @@ fn parse_floats_response(data: &[u8], dialect: &Dialect) -> Response {
         return Response::Floats(vec![]);
     }
     let float_data = &data[1..]; // skip command echo byte
+    let floats = decode_float_chunks(float_data, float_data.len() / 4, dialect);
+    Response::Floats(floats)
+}
+
+fn decode_float_chunks(data: &[u8], count: usize, dialect: &Dialect) -> Vec<f32> {
     let mut floats = Vec::new();
-    for chunk in float_data.chunks(4) {
+    for chunk in data.chunks(4).take(count) {
         if chunk.len() == 4 {
             let bytes: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
             floats.push(dialect::decode_value(&bytes, dialect));
         }
     }
-    Response::Floats(floats)
+    floats
+}
+
+fn decode_float_block_with_offset(data: &[u8], count: usize, dialect: &Dialect) -> Option<Vec<f32>> {
+    if count == 0 {
+        return Some(vec![]);
+    }
+    let needed = count * 4;
+    if data.len() < needed {
+        return None;
+    }
+
+    let mut best: Option<(usize, usize, Vec<f32>)> = None;
+
+    for offset in 0..=data.len().saturating_sub(needed) {
+        let values = decode_float_chunks(&data[offset..offset + needed], count, dialect);
+        if values.len() != count {
+            continue;
+        }
+
+        if let Some(score) = score_float_candidate(&values) {
+            let replace = match &best {
+                Some((best_score, best_offset, _)) => {
+                    score > *best_score || (score == *best_score && offset < *best_offset)
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((score, offset, values));
+            }
+        }
+    }
+
+    if let Some((_, _, values)) = best {
+        return Some(values);
+    }
+
+    Some(decode_float_chunks(&data[..needed], count, dialect))
+}
+
+fn score_float_candidate(values: &[f32]) -> Option<usize> {
+    let mut score = 0usize;
+
+    for value in values {
+        if !value.is_finite() {
+            return None;
+        }
+
+        let abs = value.abs();
+        if abs == 0.0 {
+            score += 5;
+        } else if !value.is_normal() {
+            return None;
+        } else if abs <= 10.0 {
+            score += 4;
+        } else if abs <= 1000.0 {
+            score += 3;
+        } else if abs <= 50_000.0 {
+            score += 1;
+        } else {
+            return None;
+        }
+    }
+
+    Some(score)
 }
 
 /// Check if a command opcode expects a specific response type.
@@ -474,6 +583,81 @@ mod tests {
                 assert_eq!(bytes, vec![0x00, 0x02, 0x00, 0x00]);
             }
             _ => panic!("expected FlashData"),
+        }
+    }
+
+    #[test]
+    fn parse_flash_read_for_request_simulator_shape() {
+        let req = read_flash(0xFF, 0xD8, 4);
+        let data = [0x05, 0x00, 0x02, 0x14, 0x00];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        match resp {
+            Response::FlashData(bytes) => {
+                assert_eq!(bytes, vec![0x00, 0x02, 0x14, 0x00]);
+            }
+            _ => panic!("expected FlashData"),
+        }
+    }
+
+    #[test]
+    fn parse_flash_read_for_request_with_echoed_address() {
+        let req = read_flash(0xFF, 0xD8, 4);
+        let data = [0x05, 0xFF, 0xD8, 0x00, 0x02, 0x14, 0x00];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        match resp {
+            Response::FlashData(bytes) => {
+                assert_eq!(bytes, vec![0x00, 0x02, 0x14, 0x00]);
+            }
+            _ => panic!("expected FlashData"),
+        }
+    }
+
+    #[test]
+    fn parse_read_floats_for_request_with_echoed_prefix() {
+        let req = read_floats(0x0FC8, 1, &Dialect::NEW);
+        let mut data = req.clone();
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        match resp {
+            Response::Floats(values) => {
+                assert_eq!(values.len(), 1);
+                assert!((values[0] - 1.0).abs() < 0.0001);
+            }
+            _ => panic!("expected Floats response"),
+        }
+    }
+
+    #[test]
+    fn parse_read_floats_for_request_with_two_byte_header_before_float() {
+        let req = read_floats(0x0FC8, 1, &Dialect::NEW);
+        let mut data = req.clone();
+        data.extend_from_slice(&[0x16, 0x01]);
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        match resp {
+            Response::Floats(values) => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0], 0.0);
+            }
+            _ => panic!("expected Floats response"),
+        }
+    }
+
+    #[test]
+    fn parse_read_floats_for_request_with_longer_header_before_float_block() {
+        let req = read_floats(0x281d, 2, &Dialect::NEW);
+        let mut data = req.clone();
+        data.extend_from_slice(&[0x00, 0x00, 0x21, 0xf6, 0x08, 0x5b]);
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        data.extend_from_slice(&(-2.0f32).to_le_bytes());
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        match resp {
+            Response::Floats(values) => {
+                assert_eq!(values.len(), 2);
+                assert!((values[0] - 1.0).abs() < 0.0001);
+                assert!((values[1] + 2.0).abs() < 0.0001);
+            }
+            _ => panic!("expected Floats response"),
         }
     }
 

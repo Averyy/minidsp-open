@@ -193,6 +193,7 @@
 - [x] Test: WebSocket compat — levels=true (~250ms), poll=true (~1s), GET/WS interleave, raw bridge
 - [x] Test: heap stability — 167KB free after 20 GET + 3 WS sessions, no leak, min watermark 139KB
 - [x] Test: `probe --net` against live ESP32 with no MiniDSP attached (2026-04-07) — fixed ESP32 fallback UDP advertisement, desktop CLI now discovers `minidsp-bridge-*` over UDP 3999
+- [x] Test: ESP32 with physical MiniDSP 2x4 HD attached (2026-04-07) — flashed via `esptool.py`, fixed real-hardware `ReadFlash` and `ReadFloats` response-shape handling enough for live probe, `/devices`, `/devices/0`, `/debug/info`, `/devices/0/tokens`, and basic write routes (`POST /devices/0`, `/volume/toggle_mute`, `/source/toslink`, `/preset/1`)
 - [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
@@ -234,9 +235,9 @@
 - DSP 115 input PEQ addresses confirmed but input mute/gain/polarity not in Device Console XML (marked Option::None)
 - Idempotent retry on reconnect deferred — requires persisting pending state
 - PWR-ICE TCP compat deferred — need device owner
-- ESP32 HID framing issue resolved in shared packet layer: HID/device responses use `[len][payload]` with no checksum; fixed in desktop + ESP32 transports. Real hardware re-test still needed. See `docs/TODO-fix-minidsp.md`.
+- ESP32 HID framing issue resolved in shared packet layer: HID/device responses use `[len][payload]` with no checksum. Real-hardware follow-up narrowed the remaining problem to config-register `ReadFloats` handling rather than generic framing. See `docs/todo-checker.md`.
 - ESP32 flashing on CH340 boards must use `esptool.py`, not `espflash` / `cargo run`; repo-local `CLAUDE.md` documents the working flow and Codex memory/skill were updated accordingly
-- ESP32 GET /config handler not registered (POST /config works)
+- ESP32 `GET /devices/0/config` is now registered, but real-hardware config read-back is still incorrect on a physical 2x4 HD: live `ReadFloats` responses for config addresses return echoed requests plus trailing bytes that do not yet decode to valid PEQ/gain state, and broader parser scans currently push the route into timeout territory
 - POST /config silently ignores routing/crossover/compressor/FIR fields (CLI subcommands implemented)
 
 ---

@@ -99,8 +99,26 @@ pub fn decode_response_frame(data: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 /// Decode a HID response packet from a 64-byte data buffer (no report ID).
 pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
-    let (payload, _) = decode_response_frame(data)?;
-    Some(payload)
+    if let Some((payload, _)) = decode_response_frame(data) {
+        return Some(payload);
+    }
+
+    // Some real devices prepend a report ID 0x00 on IN packets even though
+    // the logical MiniDSP response still begins at the next byte.
+    if data.first() == Some(&0x00) {
+        // Real hardware may return an unframed payload with a leading report ID
+        // byte for ReadFloats responses: `[0x00, 0x14, ...]`. Handle this
+        // before trying to interpret `0x14` as a length byte.
+        if data.get(1) == Some(&crate::commands::CMD_READ_FLOATS) {
+            return Some(data[1..].to_vec());
+        }
+
+        if let Some((payload, _)) = decode_response_frame(&data[1..]) {
+            return Some(payload);
+        }
+    }
+
+    None
 }
 
 /// Parse a TCP stream frame. TCP framing: `buf[0]` is self-inclusive length,
@@ -198,6 +216,21 @@ mod tests {
         let report = [0x01, 0x42, 0x14, 0xfe, 0x30, 0x39, 0x00, 0x00];
         let decoded = decode_hid_response(&report).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn hid_response_with_leading_zero_report_id() {
+        let mut report = [0u8; HID_DATA_SIZE];
+        report[..13].copy_from_slice(&[
+            0x00, 0x0c, 0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00,
+        ]);
+
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(
+            decoded,
+            vec![0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
