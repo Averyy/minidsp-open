@@ -20,9 +20,12 @@ jobs:
     outputs:
       updated: ${{ steps.version_check.outputs.skip != 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: astral-sh/setup-uv@v4
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - uses: astral-sh/setup-uv@v8
 
       - name: Check for updates
         id: version_check
@@ -45,7 +48,7 @@ jobs:
           mkdir -p site
           uv run tools/build-catalogue.py --output-dir site
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         if: steps.version_check.outputs.skip != 'true'
         with:
           path: site
@@ -56,7 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deploy
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
