@@ -1,6 +1,8 @@
 //! Command queue with priority, batch execution, and level polling pause.
 
+use crate::reconnect::{ReconnectConfig, backoff_delay};
 use crate::transport::{Transport, TransportError};
+use crate::transport::{hid::HidTransport, tcp::TcpTransport, ws::WsTransport};
 use minidsp_protocol::commands::{self, Response};
 use minidsp_protocol::dialect::Dialect;
 use std::collections::VecDeque;
@@ -49,7 +51,9 @@ pub const MAX_QUEUE_DEPTH: usize = 64;
 
 /// Per-device command queue with priority scheduling.
 pub struct CommandQueue {
-    transport: Box<dyn Transport>,
+    transport: Mutex<Box<dyn Transport>>,
+    transport_url: String,
+    reconnect_config: ReconnectConfig,
     queues: Mutex<[VecDeque<QueuedCommand>; 4]>,
     #[allow(dead_code)]
     state: Mutex<QueueState>,
@@ -58,12 +62,21 @@ pub struct CommandQueue {
     next_batch_id: std::sync::atomic::AtomicU64,
     // We default to new dialect for parsing responses; the client overrides this
     dialect: Mutex<Dialect>,
+    reconnect_epoch: std::sync::atomic::AtomicU64,
+    processing: Mutex<()>,
 }
 
 impl CommandQueue {
     pub fn new(transport: Box<dyn Transport>) -> Self {
+        Self::with_reconnect(transport, ReconnectConfig::default())
+    }
+
+    pub fn with_reconnect(transport: Box<dyn Transport>, reconnect_config: ReconnectConfig) -> Self {
+        let transport_url = transport.url();
         Self {
-            transport,
+            transport: Mutex::new(transport),
+            transport_url,
+            reconnect_config,
             queues: Mutex::new([
                 VecDeque::new(),
                 VecDeque::new(),
@@ -75,6 +88,8 @@ impl CommandQueue {
             levels_paused: std::sync::atomic::AtomicBool::new(false),
             next_batch_id: std::sync::atomic::AtomicU64::new(1),
             dialect: Mutex::new(Dialect::NEW),
+            reconnect_epoch: std::sync::atomic::AtomicU64::new(0),
+            processing: Mutex::new(()),
         }
     }
 
@@ -188,8 +203,13 @@ impl CommandQueue {
         self.levels_paused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn reconnect_epoch(&self) -> u64 {
+        self.reconnect_epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Process the next command in the queue.
     async fn process_next(&self) {
+        let _processing = self.processing.lock().await;
         let cmd = {
             let mut queues = self.queues.lock().await;
             // Pick highest-priority non-empty queue
@@ -207,40 +227,179 @@ impl CommandQueue {
             return;
         }
 
-        // Send raw payload — transport handles wire encoding
-        if let Err(e) = self.transport.send_frame(&cmd.payload).await {
-            let _ = cmd.response_tx.send(Err(e));
-            return;
-        }
-
-        // Receive decoded payload from transport
-        match self.transport.recv_frame(500).await {
-            Ok(raw) => {
-                let dialect = self.dialect.lock().await;
-                let response = commands::parse_response_for_request(&cmd.payload, &raw, &dialect);
-
-                // Handle preset change: wait for PresetComplete
-                if cmd.payload.first() == Some(&commands::CMD_SET_CONFIG) {
-                    if matches!(response, Response::Ack) {
-                        match self.transport.recv_frame(5000).await {
-                            Ok(raw2) => {
-                                let resp2 = commands::parse_response_for_request(&cmd.payload, &raw2, &dialect);
-                                let _ = cmd.response_tx.send(Ok(QueueResponse { parsed: resp2, raw: raw2 }));
-                                return;
-                            }
-                            Err(_) => {
-                                let _ = cmd.response_tx.send(Ok(QueueResponse { parsed: response, raw: raw.clone() }));
-                                return;
-                            }
-                        }
+        loop {
+            match self.execute_queued_command(&cmd).await {
+                Ok(response) => {
+                    let _ = cmd.response_tx.send(Ok(response));
+                    return;
+                }
+                Err(TransportError::Disconnected) => {
+                    if let Err(e) = self.reconnect_transport().await {
+                        let _ = cmd.response_tx.send(Err(e));
+                        return;
                     }
                 }
-
-                let _ = cmd.response_tx.send(Ok(QueueResponse { parsed: response, raw }));
-            }
-            Err(e) => {
-                let _ = cmd.response_tx.send(Err(e));
+                Err(e) => {
+                    let _ = cmd.response_tx.send(Err(e));
+                    return;
+                }
             }
         }
     }
+
+    async fn execute_queued_command(
+        &self,
+        cmd: &QueuedCommand,
+    ) -> Result<QueueResponse, TransportError> {
+        let transport = self.transport.lock().await;
+
+        transport.send_frame(&cmd.payload).await?;
+
+        let raw = transport.recv_frame(500).await?;
+        let dialect = self.dialect.lock().await;
+        let response = commands::parse_response_for_request(&cmd.payload, &raw, &dialect);
+
+        // Handle preset change: wait for PresetComplete
+        if cmd.payload.first() == Some(&commands::CMD_SET_CONFIG) && matches!(response, Response::Ack) {
+            match transport.recv_frame(5000).await {
+                Ok(raw2) => {
+                    let resp2 = commands::parse_response_for_request(&cmd.payload, &raw2, &dialect);
+                    return Ok(QueueResponse { parsed: resp2, raw: raw2 });
+                }
+                Err(TransportError::Disconnected) => return Err(TransportError::Disconnected),
+                Err(_) => {
+                    return Ok(QueueResponse { parsed: response, raw });
+                }
+            }
+        }
+
+        Ok(QueueResponse { parsed: response, raw })
+    }
+
+    async fn reconnect_transport(&self) -> Result<(), TransportError> {
+        let mut attempt = 0u32;
+
+        loop {
+            if self.reconnect_config.max_retries != 0 && attempt >= self.reconnect_config.max_retries {
+                return Err(TransportError::Disconnected);
+            }
+
+            let delay = backoff_delay(&self.reconnect_config, attempt);
+            tracing::warn!(
+                "transport disconnected; reconnecting via {} in {:?} (attempt {})",
+                self.transport_url,
+                delay,
+                attempt + 1,
+            );
+            tokio::time::sleep(delay).await;
+
+            match open_transport(&self.transport_url).await {
+                Ok(new_transport) => {
+                    let mut transport = self.transport.lock().await;
+                    *transport = new_transport;
+                    self.reconnect_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!("transport reconnected via {}", self.transport_url);
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("transport reconnect attempt {} failed: {}", attempt + 1, e);
+                    attempt += 1;
+                }
+            }
+        }
+    }
+}
+
+async fn open_transport(url: &str) -> Result<Box<dyn Transport>, TransportError> {
+    if let Some(addr) = url.strip_prefix("tcp://") {
+        return Ok(Box::new(TcpTransport::connect(addr).await?));
+    }
+
+    if url.starts_with("ws://") || url.starts_with("http://") {
+        return Ok(Box::new(WsTransport::connect(url, 0).await?));
+    }
+
+    if let Some(rest) = url.strip_prefix("ws+unix:") {
+        let (path, device_id) = parse_ws_unix_url(rest)?;
+        #[cfg(unix)]
+        {
+            return Ok(Box::new(WsTransport::connect_unix(&path, device_id).await?));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, device_id);
+            return Err(TransportError::Io("ws+unix reconnect is only supported on unix".into()));
+        }
+    }
+
+    if let Some(rest) = url.strip_prefix("usb:") {
+        let usb = parse_usb_url(rest)?;
+        match HidTransport::open(&usb.path) {
+            Ok(transport) => return Ok(Box::new(transport)),
+            Err(path_err) => {
+                tracing::warn!(
+                    "failed to reopen HID device at {}; re-enumerating vid={:04x} pid={:04x}: {}",
+                    usb.path,
+                    usb.vid,
+                    usb.pid,
+                    path_err
+                );
+                let devices = crate::transport::hid::enumerate()?;
+                if let Some(device) = devices.into_iter().find(|device| {
+                    device.vendor_id == usb.vid && device.product_id == usb.pid
+                }) {
+                    return Ok(Box::new(HidTransport::open(&device.path)?));
+                }
+                return Err(path_err);
+            }
+        }
+    }
+
+    Err(TransportError::Io(format!("unsupported transport url for reconnect: {url}")))
+}
+
+fn parse_ws_unix_url(rest: &str) -> Result<(String, usize), TransportError> {
+    let (path, suffix) = rest.rsplit_once("/devices/")
+        .ok_or_else(|| TransportError::Io(format!("invalid ws+unix transport url: {rest}")))?;
+    let device_id = suffix
+        .strip_suffix("/ws")
+        .ok_or_else(|| TransportError::Io(format!("invalid ws+unix transport url: {rest}")))?
+        .parse::<usize>()
+        .map_err(|e| TransportError::Io(format!("invalid ws+unix device id: {e}")))?;
+    Ok((path.to_string(), device_id))
+}
+
+struct ParsedUsbUrl {
+    path: String,
+    vid: u16,
+    pid: u16,
+}
+
+fn parse_usb_url(rest: &str) -> Result<ParsedUsbUrl, TransportError> {
+    let (encoded_path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let path = urlencoding::decode(encoded_path)
+        .map_err(|e| TransportError::Io(format!("invalid usb path encoding: {e}")))?;
+
+    let mut vid = None;
+    let mut pid = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else { continue };
+        match key {
+            "vid" => {
+                vid = Some(u16::from_str_radix(value, 16)
+                    .map_err(|e| TransportError::Io(format!("invalid usb vid: {e}")))?);
+            }
+            "pid" => {
+                pid = Some(u16::from_str_radix(value, 16)
+                    .map_err(|e| TransportError::Io(format!("invalid usb pid: {e}")))?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ParsedUsbUrl {
+        path: path.into_owned(),
+        vid: vid.ok_or_else(|| TransportError::Io("missing usb vid in transport url".into()))?,
+        pid: pid.ok_or_else(|| TransportError::Io("missing usb pid in transport url".into()))?,
+    })
 }

@@ -185,7 +185,7 @@ fn main() {
     if let Some(handle) = wifi_handle {
         if handle.is_sta {
             let wifi_mutex = Arc::new(std::sync::Mutex::new(handle.wifi));
-            wifi::start_monitor(wifi_mutex);
+            wifi::start_monitor(wifi_mutex, nvs.clone());
 
             // Background catalogue update (initial check after WiFi is stable, then every 24h)
             if let Err(e) = updater::start_background_updater(nvs.clone()) {

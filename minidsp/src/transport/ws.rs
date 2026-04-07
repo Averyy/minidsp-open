@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::WebSocketStream;
 
 /// WebSocket transport that connects to the daemon's raw frame bridge.
@@ -26,6 +26,21 @@ pub struct WsTransport {
 /// Helper trait alias for async read+write+send+unpin.
 trait AsyncRw: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncRw for T {}
+
+fn map_ws_error(err: WsError) -> TransportError {
+    match err {
+        WsError::ConnectionClosed | WsError::AlreadyClosed => TransportError::Disconnected,
+        WsError::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof => TransportError::Disconnected,
+            _ => TransportError::Io(format!("WS I/O: {io_err}")),
+        },
+        other => TransportError::Io(format!("WS error: {other}")),
+    }
+}
 
 impl WsTransport {
     /// Connect to a daemon WebSocket endpoint over TCP.
@@ -121,7 +136,7 @@ impl Transport for WsTransport {
             let mut sink = sink.lock().await;
             sink.send(Message::Binary(frame.into()))
                 .await
-                .map_err(|e| TransportError::Io(format!("WS send: {e}")))?;
+                .map_err(map_ws_error)?;
             Ok(())
         })
     }
@@ -151,7 +166,7 @@ impl Transport for WsTransport {
                     }
                     Ok(Some(Ok(_))) => continue, // Skip text/ping/pong
                     Ok(Some(Err(e))) => {
-                        return Err(TransportError::Io(format!("WS recv: {e}")));
+                        return Err(map_ws_error(e));
                     }
                     Err(_) => return Err(TransportError::Timeout),
                 }
@@ -169,7 +184,7 @@ impl Transport for WsTransport {
             let mut sink = sink.lock().await;
             sink.send(Message::Close(None))
                 .await
-                .map_err(|e| TransportError::Io(format!("WS close: {e}")))?;
+                .map_err(map_ws_error)?;
             Ok(())
         })
     }

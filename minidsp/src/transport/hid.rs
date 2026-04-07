@@ -70,6 +70,20 @@ impl HidTransport {
     }
 }
 
+fn map_hid_error(message: String) -> TransportError {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("device disconnected")
+        || lower.contains("disconnected")
+        || lower.contains("no such device")
+        || lower.contains("device not found")
+        || lower.contains("not connected")
+    {
+        TransportError::Disconnected
+    } else {
+        TransportError::Hid(message)
+    }
+}
+
 /// USB hotplug event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HotplugEvent {
@@ -153,7 +167,7 @@ impl Transport for HidTransport {
                             std::thread::sleep(std::time::Duration::from_millis(250));
                             tracing::warn!("HID write retry ({retries} left): {e}");
                         }
-                        Err(e) => return Err(TransportError::Hid(e.to_string())),
+                        Err(e) => return Err(map_hid_error(e.to_string())),
                     }
                 }
             })
@@ -170,7 +184,7 @@ impl Transport for HidTransport {
                 let mut buf = [0u8; packet::HID_REPORT_SIZE];
                 let timeout = timeout_ms.min(i32::MAX as u64) as i32;
                 let n = dev.read_timeout(&mut buf, timeout)
-                    .map_err(|e| TransportError::Hid(e.to_string()))?;
+                    .map_err(|e| map_hid_error(e.to_string()))?;
                 if n == 0 {
                     return Err(TransportError::Timeout);
                 }

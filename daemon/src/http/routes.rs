@@ -671,6 +671,9 @@ async fn enter_measurement_mode(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
     client.enter_measurement_mode().await.map_err(client_error_to_status)?;
+    let saved = client.saved_measurement_state().await
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.set_saved_peq(id, saved).await;
     Ok(Json(serde_json::json!({ "status": "measurement_mode_active" })))
 }
 
@@ -679,7 +682,11 @@ async fn restore_measurement_mode(
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
-    client.restore_measurement_mode().await.map_err(client_error_to_status)?;
+    let saved = state.get_saved_peq(id).await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    client.restore_measurement_mode_with(&saved).await.map_err(client_error_to_status)?;
+    client.set_saved_measurement_state(None).await;
+    state.clear_saved_peq(id).await;
     Ok(Json(serde_json::json!({ "status": "measurement_mode_restored" })))
 }
 

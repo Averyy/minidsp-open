@@ -14,6 +14,9 @@ Permanent technical detail belongs in:
 
 - Desktop `/devices/{id}/config` is fixed and verified on the physical 2x4 HD.
 - ESP32 `/devices/{id}/config` parity is fixed and verified on the physical 2x4 HD.
+- Desktop queue reconnect now re-acquires transports on disconnect and replays idempotent pending PEQ batch writes after reconnect.
+- Measurement-mode saved PEQ state now persists in daemon state so restore survives client rebuild/reconnect.
+- ESP32 WiFi monitor now records disconnect reason codes, distinguishes credential failures from transient AP loss, and exposes `lastWifiDisconnectReason` in `/debug/info`.
 - All 13 exact modern Device Console `HW`/`DSP` pairs are implemented and test-gated.
 - All 7 cached legacy `config.xml` families are implemented as source-backed runtime tables and test-gated.
 - The repeatable official-app importer/report pipeline is in place:
@@ -24,6 +27,7 @@ Permanent technical detail belongs in:
 
 ## Active Work
 
+- [ ] Verify reconnect retry, pending-PEQ replay, and WiFi disconnect-reason handling on a real ESP32-S3 with real MiniDSP attach/detach cycles.
 - [ ] Resolve exact runtime identity for the remaining official USB-only labels if stronger official evidence is found:
   - `HA-DSP`
   - `DDRC-22`
@@ -83,6 +87,7 @@ Permanent technical detail belongs in:
 - [ ] CI for desktop targets
 - [ ] CI for ESP32 cross-build
 - [ ] ezBEQ expansion after core device-matrix work is stable
+- [ ] ESP32 VBUS GPIO drive — not needed on DevKitC boards (both boards powered via UART); only needed for custom PCB where ESP32-S3 must supply 5V to the MiniDSP over the OTG port (GPIO19 high before `usb_host_install`)
 
 ## Standard Validation
 

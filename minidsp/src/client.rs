@@ -38,6 +38,11 @@ pub struct SavedPeqState {
     pub bands: Vec<(u16, [f32; 5], bool)>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingWrite {
+    bands: Vec<(u16, [f32; 5], bool)>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PeqShadow {
     coeffs: [f32; 5],
@@ -54,8 +59,10 @@ pub struct MiniDspClient {
     serial: u32,
     /// Saved PEQ state from measurement mode entry, for later restore.
     saved_peq: Mutex<Option<SavedPeqState>>,
+    /// PEQ batch write that should be replayed after a reconnect.
+    pending_write: Arc<Mutex<Option<PendingWrite>>>,
     /// Shadow state for PEQ bands when the device does not expose live coeff readback.
-    peq_shadow: Mutex<HashMap<u16, PeqShadow>>,
+    peq_shadow: Arc<Mutex<HashMap<u16, PeqShadow>>>,
 }
 
 fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
@@ -79,6 +86,38 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
         }
     }
     shadow
+}
+
+async fn execute_peq_batch(
+    queue: &Arc<CommandQueue>,
+    dialect: &minidsp_protocol::dialect::Dialect,
+    peq_shadow: &Arc<Mutex<HashMap<u16, PeqShadow>>>,
+    bands: &[(u16, [f32; 5], bool)],
+) -> Result<(), ClientError> {
+    let mut phase1_cmds = Vec::with_capacity(bands.len());
+    for &(addr, _, _) in bands {
+        phase1_cmds.push(commands::bypass_filter(addr, true, dialect));
+    }
+    queue.execute_batch(phase1_cmds, Priority::Critical).await?;
+
+    let mut phase2_cmds = Vec::with_capacity(bands.len());
+    for &(addr, ref coeffs, _) in bands {
+        phase2_cmds.push(commands::write_biquad(addr, coeffs, dialect));
+    }
+    queue.execute_batch(phase2_cmds, Priority::Critical).await?;
+
+    let mut phase3_cmds = Vec::with_capacity(bands.len());
+    for &(addr, _, bypass) in bands {
+        phase3_cmds.push(commands::bypass_filter(addr, bypass, dialect));
+    }
+    queue.execute_batch(phase3_cmds, Priority::Critical).await?;
+
+    let mut shadow = peq_shadow.lock().await;
+    for &(addr, coeffs, bypass) in bands {
+        shadow.insert(addr, PeqShadow { coeffs, bypass });
+    }
+
+    Ok(())
 }
 
 impl MiniDspClient {
@@ -126,7 +165,8 @@ impl MiniDspClient {
         // Step 5: Set dialect on queue so responses are parsed correctly
         queue.set_dialect(profile.dialect).await;
 
-        let peq_shadow = build_peq_shadow(&profile);
+        let peq_shadow = Arc::new(Mutex::new(build_peq_shadow(&profile)));
+        let pending_write = Arc::new(Mutex::new(None));
 
         Ok(Self {
             queue,
@@ -136,7 +176,8 @@ impl MiniDspClient {
             dsp_version,
             serial,
             saved_peq: Mutex::new(None),
-            peq_shadow: Mutex::new(peq_shadow),
+            pending_write,
+            peq_shadow,
         })
     }
 
@@ -508,6 +549,14 @@ impl MiniDspClient {
         self.profile = profile;
     }
 
+    pub async fn saved_measurement_state(&self) -> Option<SavedPeqState> {
+        self.saved_peq.lock().await.clone()
+    }
+
+    pub async fn set_saved_measurement_state(&self, state: Option<SavedPeqState>) {
+        *self.saved_peq.lock().await = state;
+    }
+
     /// Enter measurement mode: save all PEQ states, then bypass all PEQ bands.
     ///
     /// Reads current coefficients and bypass state for every PEQ band on every
@@ -555,10 +604,17 @@ impl MiniDspClient {
         let saved = self.saved_peq.lock().await.take()
             .ok_or_else(|| ClientError::Protocol("no saved measurement mode state".into()))?;
 
-        self.write_peq_batch(&saved.bands).await?;
+        self.restore_measurement_mode_with(&saved).await?;
 
         tracing::info!("measurement mode: restored {} PEQ bands", saved.bands.len());
         Ok(())
+    }
+
+    pub async fn restore_measurement_mode_with(
+        &self,
+        saved: &SavedPeqState,
+    ) -> Result<(), ClientError> {
+        self.write_peq_batch(&saved.bands).await
     }
 
     /// Check if measurement mode state is currently saved.
@@ -582,27 +638,43 @@ impl MiniDspClient {
             return Ok(());
         }
 
-        // Phase 1: Bypass all bands (safe state)
-        let mut phase1_cmds = Vec::with_capacity(bands.len());
-        for &(addr, _, _) in bands {
-            phase1_cmds.push(commands::bypass_filter(addr, true, &self.profile.dialect));
+        {
+            let mut pending = self.pending_write.lock().await;
+            *pending = Some(PendingWrite {
+                bands: bands.to_vec(),
+            });
         }
-        self.queue.execute_batch(phase1_cmds, Priority::Critical).await?;
 
-        // Phase 2: Write coefficients
-        let mut phase2_cmds = Vec::with_capacity(bands.len());
-        for &(addr, ref coeffs, _) in bands {
-            phase2_cmds.push(commands::write_biquad(addr, coeffs, &self.profile.dialect));
+        let mut reconnect_epoch = self.queue.reconnect_epoch();
+        loop {
+            let replay = {
+                let pending = self.pending_write.lock().await;
+                pending.as_ref().map(|pending| pending.bands.clone())
+            };
+            let replay = replay.ok_or_else(|| ClientError::Protocol("missing pending PEQ write".into()))?;
+
+            execute_peq_batch(
+                &self.queue,
+                &self.profile.dialect,
+                &self.peq_shadow,
+                &replay,
+            )
+            .await?;
+
+            let current_epoch = self.queue.reconnect_epoch();
+            if current_epoch == reconnect_epoch {
+                break;
+            }
+
+            tracing::warn!(
+                "replaying pending PEQ write after reconnect (epoch {} -> {})",
+                reconnect_epoch,
+                current_epoch
+            );
+            reconnect_epoch = current_epoch;
         }
-        self.queue.execute_batch(phase2_cmds, Priority::Critical).await?;
 
-        // Phase 3: Set final bypass states
-        let mut phase3_cmds = Vec::with_capacity(bands.len());
-        for &(addr, _, bypass) in bands {
-            phase3_cmds.push(commands::bypass_filter(addr, bypass, &self.profile.dialect));
-        }
-        self.queue.execute_batch(phase3_cmds, Priority::Critical).await?;
-
+        *self.pending_write.lock().await = None;
         Ok(())
     }
 

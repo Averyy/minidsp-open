@@ -1254,14 +1254,7 @@ fn register_ws_routes(
 
     // -- Raw frame bridge: /devices/0/ws --
     {
-        struct ActiveWs {
-            stop: Arc<AtomicBool>,
-            fd: i32,
-        }
-        let active_ws: Arc<Mutex<Option<ActiveWs>>> = Arc::new(Mutex::new(None));
-
         let st = state.clone();
-        let ws_ref = active_ws.clone();
 
         server.ws_handler("/devices/0/ws", None, move |ws| {
             // Raw frame bridge — NO status polling thread. Only responds to binary frames.

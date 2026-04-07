@@ -33,6 +33,17 @@ impl TcpTransport {
     // The daemon Unix socket serves HTTP/WS, not raw TCP bridge frames.
 }
 
+fn map_io_error(err: std::io::Error) -> TransportError {
+    match err.kind() {
+        std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::UnexpectedEof => TransportError::Disconnected,
+        _ => TransportError::Io(err.to_string()),
+    }
+}
+
 impl Transport for TcpTransport {
     fn send_frame(&self, payload: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
         let stream = self.stream.clone();
@@ -42,11 +53,11 @@ impl Transport for TcpTransport {
             stream
                 .write_all(&frame)
                 .await
-                .map_err(|e| TransportError::Io(e.to_string()))?;
+                .map_err(map_io_error)?;
             stream
                 .flush()
                 .await
-                .map_err(|e| TransportError::Io(e.to_string()))?;
+                .map_err(map_io_error)?;
             Ok(())
         })
     }
@@ -83,7 +94,7 @@ impl Transport for TcpTransport {
                         let mut buf = read_buf.lock().await;
                         buf.extend_from_slice(&tmp[..n]);
                     }
-                    Ok(Err(e)) => return Err(TransportError::Io(e.to_string())),
+                    Ok(Err(e)) => return Err(map_io_error(e)),
                     Err(_) => return Err(TransportError::Timeout),
                 }
             }
@@ -101,7 +112,7 @@ impl Transport for TcpTransport {
             stream
                 .shutdown()
                 .await
-                .map_err(|e| TransportError::Io(e.to_string()))
+                .map_err(map_io_error)
         })
     }
 

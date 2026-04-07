@@ -263,6 +263,8 @@ pub struct WifiInfo {
     pub ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<u8>,
+    #[serde(rename = "lastWifiDisconnectReason")]
+    pub last_wifi_disconnect_reason: u32,
 }
 
 #[derive(serde::Serialize)]
@@ -329,6 +331,7 @@ fn collect_wifi_info() -> WifiInfo {
                 rssi: None,
                 ip: None,
                 channel: None,
+                last_wifi_disconnect_reason: crate::wifi::last_disconnect_reason(),
             };
         }
 
@@ -346,6 +349,7 @@ fn collect_wifi_info() -> WifiInfo {
             rssi: Some(ap_info.rssi),
             ip,
             channel: Some(ap_info.primary),
+            last_wifi_disconnect_reason: crate::wifi::last_disconnect_reason(),
         }
     }
 }

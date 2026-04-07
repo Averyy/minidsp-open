@@ -10,15 +10,15 @@
 //! After connection, a background monitor thread watches for disconnects
 //! and reconnects automatically with exponential backoff.
 
-use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::eventloop::{EspSubscription, EspSystemEventLoop, System};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, BlockingWifi, ClientConfiguration, Configuration,
-    EspWifi,
+    EspWifi, WifiEvent,
 };
 use log::{info, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +47,18 @@ impl std::fmt::Display for WifiError {
 
 /// Shared flag indicating whether WiFi is currently connected (STA mode).
 static WIFI_CONNECTED: AtomicBool = AtomicBool::new(false);
+static LAST_DISCONNECT_REASON: AtomicU32 = AtomicU32::new(0);
+
+const WIFI_REASON_UNSPECIFIED: u32 = 1;
+const WIFI_REASON_ASSOC_EXPIRE: u32 = 4;
+const WIFI_REASON_MIC_FAILURE: u32 = 14;
+const WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: u32 = 15;
+const WIFI_REASON_BEACON_TIMEOUT: u32 = 200;
+const WIFI_REASON_NO_AP_FOUND: u32 = 201;
+const WIFI_REASON_AUTH_FAIL: u32 = 202;
+const WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY: u32 = 210;
+const WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD: u32 = 211;
+const WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD: u32 = 212;
 
 /// Check if WiFi STA is connected (safe to call from any thread).
 #[allow(dead_code)]
@@ -54,10 +66,15 @@ pub fn is_connected() -> bool {
     WIFI_CONNECTED.load(Ordering::Relaxed)
 }
 
+pub fn last_disconnect_reason() -> u32 {
+    LAST_DISCONNECT_REASON.load(Ordering::Relaxed)
+}
+
 /// Result of WiFi initialization.
 pub struct WifiHandle {
     pub wifi: BlockingWifi<EspWifi<'static>>,
     pub is_sta: bool,
+    _disconnect_subscription: EspSubscription<'static, System>,
 }
 
 /// Attempt to connect to saved WiFi, or start provisioning.
@@ -72,9 +89,10 @@ pub fn connect_or_provision(
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(modem, sysloop.clone(), Some(nvs.clone()))
             .map_err(|e| WifiError::Init(format!("EspWifi: {e}")))?,
-        sysloop,
+        sysloop.clone(),
     )
     .map_err(|e| WifiError::Init(format!("BlockingWifi: {e}")))?;
+    let disconnect_subscription = register_disconnect_reason_handler(&sysloop)?;
 
     // Try to read saved credentials from NVS
     if let Some((ssid, password)) = read_credentials(&nvs) {
@@ -92,6 +110,7 @@ pub fn connect_or_provision(
                 return Ok(WifiHandle {
                     wifi,
                     is_sta: true,
+                    _disconnect_subscription: disconnect_subscription,
                 });
             }
             Err(e) => {
@@ -110,6 +129,7 @@ pub fn connect_or_provision(
     Ok(WifiHandle {
         wifi,
         is_sta: false,
+        _disconnect_subscription: disconnect_subscription,
     })
 }
 
@@ -190,6 +210,25 @@ fn start_softap(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), WifiErr
     Ok(())
 }
 
+fn register_disconnect_reason_handler(
+    sysloop: &EspSystemEventLoop,
+) -> Result<EspSubscription<'static, System>, WifiError> {
+    sysloop
+        .subscribe::<WifiEvent, _>(move |event| {
+            if let WifiEvent::StaDisconnected(disconnected) = event {
+                let reason = disconnected.reason() as u32;
+                LAST_DISCONNECT_REASON.store(reason, Ordering::Relaxed);
+                WIFI_CONNECTED.store(false, Ordering::Relaxed);
+                warn!(
+                    "WiFi disconnect reason {} ({})",
+                    reason,
+                    disconnect_reason_name(reason)
+                );
+            }
+        })
+        .map_err(|e| WifiError::Init(format!("wifi disconnect subscription: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // WiFi monitor — auto-reconnect background thread
 // ---------------------------------------------------------------------------
@@ -197,20 +236,23 @@ fn start_softap(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), WifiErr
 /// Start a background thread that monitors WiFi and reconnects on disconnect.
 pub fn start_monitor(
     wifi: Arc<std::sync::Mutex<BlockingWifi<EspWifi<'static>>>>,
+    nvs: EspDefaultNvsPartition,
 ) {
     std::thread::Builder::new()
         .name("wifi_mon".into())
         .stack_size(8192)
-        .spawn(move || monitor_loop(wifi))
+        .spawn(move || monitor_loop(wifi, nvs))
         .expect("failed to spawn wifi monitor thread");
 }
 
 fn monitor_loop(
     wifi: Arc<std::sync::Mutex<BlockingWifi<EspWifi<'static>>>>,
+    nvs: EspDefaultNvsPartition,
 ) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(60);
     let check_interval = Duration::from_secs(5);
+    let mut credential_retries = 0u8;
 
     info!("WiFi monitor started");
 
@@ -236,6 +278,7 @@ fn monitor_loop(
                 info!("WiFi reconnected: {ip}");
                 WIFI_CONNECTED.store(true, Ordering::Relaxed);
                 backoff = Duration::from_secs(1);
+                credential_retries = 0;
             }
             continue;
         }
@@ -246,7 +289,32 @@ fn monitor_loop(
             WIFI_CONNECTED.store(false, Ordering::Relaxed);
         }
 
-        info!("WiFi: reconnect attempt (backoff: {backoff:?})");
+        let reason = LAST_DISCONNECT_REASON.load(Ordering::Relaxed);
+        if is_credential_disconnect(reason) {
+            credential_retries = credential_retries.saturating_add(1);
+            warn!(
+                "WiFi: credential-related disconnect {} ({}) retry {}/3",
+                reason,
+                disconnect_reason_name(reason),
+                credential_retries
+            );
+            if credential_retries >= 3 {
+                warn!("WiFi: restarting into provisioning mode after repeated credential failures");
+                if let Err(e) = clear_credentials(&nvs) {
+                    warn!("WiFi: failed to clear credentials before provisioning fallback: {e}");
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            }
+        } else {
+            credential_retries = 0;
+            info!(
+                "WiFi: reconnect attempt (reason: {} {}, backoff: {:?})",
+                reason,
+                disconnect_reason_name(reason),
+                backoff
+            );
+        }
 
         // Connect — brief mutex hold, don't block on wait_netif_up under lock
         let connect_ok = {
@@ -281,8 +349,50 @@ fn monitor_loop(
         }
 
         // Wait before next attempt
-        std::thread::sleep(backoff);
-        backoff = (backoff * 2).min(max_backoff);
+        if is_transient_disconnect(reason) || reason == 0 || reason == WIFI_REASON_UNSPECIFIED {
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(max_backoff);
+        } else {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
+
+fn is_credential_disconnect(reason: u32) -> bool {
+    matches!(
+        reason,
+        WIFI_REASON_AUTH_FAIL
+            | WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT
+            | WIFI_REASON_MIC_FAILURE
+    )
+}
+
+fn is_transient_disconnect(reason: u32) -> bool {
+    matches!(
+        reason,
+        WIFI_REASON_BEACON_TIMEOUT
+            | WIFI_REASON_ASSOC_EXPIRE
+            | WIFI_REASON_NO_AP_FOUND
+            | WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY
+            | WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD
+            | WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD
+            | WIFI_REASON_UNSPECIFIED
+    )
+}
+
+fn disconnect_reason_name(reason: u32) -> &'static str {
+    match reason {
+        WIFI_REASON_UNSPECIFIED => "unspecified",
+        WIFI_REASON_ASSOC_EXPIRE => "assoc_expire",
+        WIFI_REASON_MIC_FAILURE => "mic_failure",
+        WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT => "4way_handshake_timeout",
+        WIFI_REASON_BEACON_TIMEOUT => "beacon_timeout",
+        WIFI_REASON_NO_AP_FOUND => "no_ap_found",
+        WIFI_REASON_AUTH_FAIL => "auth_fail",
+        WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY => "no_ap_found_compatible_security",
+        WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD => "no_ap_found_authmode_threshold",
+        WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD => "no_ap_found_rssi_threshold",
+        _ => "other",
     }
 }
 
@@ -427,6 +537,18 @@ pub fn save_credentials(
     Ok(())
 }
 
+/// Clear saved WiFi credentials from NVS so the next boot falls back to provisioning.
+pub fn clear_credentials(nvs: &EspDefaultNvsPartition) -> Result<(), WifiError> {
+    let nvs = EspNvs::<NvsDefault>::new(nvs.clone(), NVS_NAMESPACE, true)
+        .map_err(|e| WifiError::Provision(format!("NVS open: {e}")))?;
+
+    let _ = nvs.remove(NVS_KEY_SSID);
+    let _ = nvs.remove(NVS_KEY_PASS);
+
+    info!("WiFi credentials cleared from NVS");
+    Ok(())
+}
+
 /// Read the actual SoftAP IP from the ESP-IDF network interface.
 /// Falls back to 192.168.4.1 if the interface isn't available.
 pub fn get_softap_ip() -> std::net::Ipv4Addr {
@@ -554,4 +676,3 @@ button:hover,button:active{background:rgba(59,138,255,0.25);border-color:rgba(59
 </form>
 </div>
 </body></html>"#;
-
