@@ -310,6 +310,12 @@ impl MiniDspClient {
         Ok(())
     }
 
+    /// Set channel polarity inversion using dialect-aware encoding.
+    pub async fn set_invert(&self, addr: u16, inverted: bool) -> Result<(), ClientError> {
+        let val = minidsp_protocol::dialect::polarity_value(inverted, &self.profile.dialect);
+        self.write_dsp(addr, val, true).await
+    }
+
     /// Write DSP parameter.
     pub async fn write_dsp(&self, addr: u16, value: f32, save: bool) -> Result<(), ClientError> {
         self.queue

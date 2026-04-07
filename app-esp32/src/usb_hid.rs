@@ -211,6 +211,40 @@ impl UsbHidBus {
             .spawn(move || usb_client_event_loop(client_hdl_copy as usb_host_client_handle_t))
             .map_err(|e| UsbHidError::Init(format!("spawn client task: {e}")))?;
 
+        // Give the client event loop time to process any already-connected devices.
+        // ESP-IDF fires NEW_DEV for pre-connected devices only after
+        // usb_host_client_handle_events() processes the pending event queue.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Check if any devices are already connected via the address list
+        unsafe {
+            let mut num_devs: i32 = 0;
+            let mut dev_addrs = [0u8; 8];
+            let err = usb_host_device_addr_list_fill(
+                dev_addrs.len() as i32,
+                dev_addrs.as_mut_ptr(),
+                &mut num_devs,
+            );
+            if err == ESP_OK as i32 && num_devs > 0 {
+                info!("USB: {num_devs} device(s) already connected at boot");
+                let cb = cb_state();
+                for i in 0..num_devs as usize {
+                    let addr = dev_addrs[i];
+                    if addr > 0 {
+                        // Inject the address as if NEW_DEV just fired
+                        let (lock, cvar) = &cb.dev_event;
+                        let mut guard = lock.lock().unwrap();
+                        *cb.new_dev_addr.lock().unwrap() = Some(addr);
+                        cb.device_present.store(true, Ordering::SeqCst);
+                        *guard = true;
+                        cvar.notify_all();
+                        info!("USB: pre-connected device at addr={addr}");
+                        break; // Only handle one device
+                    }
+                }
+            }
+        }
+
         Ok(UsbHidBus {
             client_hdl,
             dev_hdl: Mutex::new(ptr::null_mut()),
@@ -352,9 +386,37 @@ impl UsbHidBus {
             );
         }
 
-        // Decode frame
-        minidsp_protocol::packet::decode_frame(&resp_buf)
-            .ok_or_else(|| UsbHidError::Protocol("invalid response frame".into()))
+        // Log raw response for debugging
+        if resp_buf.len() >= 4 {
+            debug!(
+                "USB IN: {} bytes, first 8: {:02x?}",
+                resp_buf.len(),
+                &resp_buf[..resp_buf.len().min(8)]
+            );
+        }
+
+        // Decode HID response.
+        // ESP-IDF USB Host returns 64 bytes from the interrupt IN endpoint.
+        // The first byte may be a report ID (0x00 or 0x01). Skip it to get the frame.
+        // Frame format: [length][payload][checksum][0xFF padding]
+        // Try decoding with and without report ID prefix.
+        let data = &resp_buf;
+
+        // Try decode starting at byte 0 (no report ID prefix)
+        if let Some(payload) = minidsp_protocol::packet::decode_frame(data) {
+            return Ok(payload);
+        }
+
+        // Try decode starting at byte 1 (report ID prefix from USB Host)
+        if data.len() > 1 {
+            if let Some(payload) = minidsp_protocol::packet::decode_frame(&data[1..]) {
+                return Ok(payload);
+            }
+        }
+
+        // Neither worked — log and return error
+        let hex: String = data.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+        Err(UsbHidError::Protocol(format!("invalid response frame ({} bytes): {hex}", data.len())))
     }
 
     /// Best-effort cleanup of the current device (release interface, close).

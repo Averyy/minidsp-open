@@ -4,7 +4,7 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 ## Project State
 
-Desktop Phase 1 complete. 83 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, WiFi SoftAP with captive portal, serves full HTTP API + WebSocket. Stable, 167KB heap free. **Network-tested end-to-end** (2026-04-06): all 15 bugs from first network test fixed, mDNS advertising, compat WebSocket on `/devices/0` (ezBEQ-compatible), level meter reading via CMD_READ_FLOATS, USB hotplug across all boot orderings, 31 HTTP routes + 2 WS endpoints.
+Desktop Phase 1 complete. 84 tests passing, zero warnings. ESP32 firmware (IDF v5.4) boots, WiFi STA connects, serves full HTTP API + WebSocket + TCP bridge + UDP discovery. 135KB heap free. **Flashed to real 2x4 HD** (2026-04-06): USB Host detects device (VID=0x2752 PID=0x0011, interface 4 claimed). **Blocking issue:** HID response frame decoding — real hardware response bytes don't pass `decode_frame` checksum validation. See `docs/TODO-fix-minidsp.md`. Desktop CLI has full minidsp-rs compat: WsTransport, crossover/compressor/FIR/routing, debug subcommand, env vars, -v/--log.
 
 ## Build
 

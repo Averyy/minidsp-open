@@ -49,8 +49,8 @@ impl Source {
             Source::Bluetooth => "Bluetooth",
             Source::Hdmi => "Hdmi",
             Source::AesEbu => "Aesebu",
-            Source::AnalogSingleEnd => "AnalogSingleEnd",
-            Source::AnalogBalanced => "AnalogBalanced",
+            Source::AnalogSingleEnd => "Rca",
+            Source::AnalogBalanced => "Xlr",
             Source::Lan => "Lan",
         }
     }
@@ -82,8 +82,8 @@ impl Source {
             "Bluetooth" => Some(Source::Bluetooth),
             "Hdmi" => Some(Source::Hdmi),
             "Aesebu" => Some(Source::AesEbu),
-            "AnalogSingleEnd" | "RCA" => Some(Source::AnalogSingleEnd),
-            "AnalogBalanced" | "XLR" => Some(Source::AnalogBalanced),
+            "Rca" | "RCA" | "AnalogSingleEnd" => Some(Source::AnalogSingleEnd),
+            "Xlr" | "XLR" | "AnalogBalanced" => Some(Source::AnalogBalanced),
             "Lan" => Some(Source::Lan),
             _ => None,
         }

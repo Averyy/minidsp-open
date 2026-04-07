@@ -14,3 +14,4 @@ pub mod biquad;
 pub mod eeprom;
 pub mod source;
 pub mod status;
+pub mod discovery;

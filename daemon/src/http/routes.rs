@@ -10,9 +10,38 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::{CorsLayer, Any};
+
+/// JSON error response — minidsp-rs compatible format: `{"error": "message"}`.
+#[derive(Debug, Serialize)]
+struct ApiError {
+    error: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Self>) {
+        (status, Json(Self { error: msg.into() }))
+    }
+    fn not_found() -> (StatusCode, Json<Self>) {
+        Self::new(StatusCode::NOT_FOUND, "device not found")
+    }
+    fn internal(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
+    }
+    fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
+        Self::new(StatusCode::BAD_REQUEST, msg)
+    }
+}
+
+/// Result type alias for handlers returning JSON errors.
+type ApiResult<T> = Result<T, (StatusCode, Json<ApiError>)>;
+
+/// Get device or return JSON 404.
+async fn get_device_or_404(state: &DaemonState, id: usize) -> ApiResult<Arc<minidsp::client::MiniDspClient>> {
+    state.get_device(id).await.ok_or_else(|| ApiError::not_found())
+}
 
 pub fn router(state: Arc<DaemonState>) -> Router {
     let cors = CorsLayer::new()
@@ -36,6 +65,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/devices/{id}/ws", get(ws_raw_bridge))
         .route("/openapi.json", get(openapi))
         .route("/llms.txt", get(llms_txt))
+        .fallback(fallback)
         .layer(cors)
         .with_state(state)
 }
@@ -74,22 +104,13 @@ async fn device_get_or_ws(
         return Ok(ws.on_upgrade(move |socket| ws_state_levels(socket, client, poll, levels)).into_response());
     }
 
-    // Otherwise return JSON status
+    // Otherwise return JSON status — uses StatusSummary's Serialize derive directly
+    // for correct f32 precision and skip_serializing_if on dirac
     let status = client
         .get_status_summary()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(StatusSummaryJson {
-        master: MasterStatusGetJson {
-            preset: status.master.preset,
-            source: status.master.source,
-            volume: status.master.volume,
-            mute: status.master.mute,
-            dirac: status.master.dirac,
-        },
-        input_levels: status.input_levels,
-        output_levels: status.output_levels,
-    }).into_response())
+    Ok(Json(status).into_response())
 }
 
 /// WebSocket: state + level streaming (compatibility endpoint on /devices/{id}).
@@ -102,24 +123,23 @@ async fn ws_state_levels(
     let interval_ms = if levels { 250 } else if poll { 1000 } else { 5000 };
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
 
+    // Send initial status immediately so clients don't wait for first tick
+    if let Ok(status) = client.get_status_summary().await {
+        let json = serde_json::to_string(&status).unwrap_or_default();
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
     loop {
         tokio::select! {
             // Send status on each tick
             _ = tick.tick() => {
                 match client.get_status_summary().await {
                     Ok(status) => {
-                        let json = serde_json::json!({
-                            "master": {
-                                "preset": status.master.preset,
-                                "source": status.master.source,
-                                "volume": status.master.volume,
-                                "mute": status.master.mute,
-                                "dirac": status.master.dirac,
-                            },
-                            "input_levels": status.input_levels,
-                            "output_levels": status.output_levels,
-                        });
-                        if socket.send(Message::Text(json.to_string().into())).await.is_err() {
+                        // Use serde_json::to_string for correct f32 precision and dirac skip_serializing_if
+                        let json = serde_json::to_string(&status).unwrap_or_default();
+                        if socket.send(Message::Text(json.into())).await.is_err() {
                             return;
                         }
                     }
@@ -221,30 +241,35 @@ async fn set_device_status(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
     Json(body): Json<MasterStatusPostJson>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+) -> ApiResult<impl IntoResponse> {
+    let client = get_device_or_404(&state, id).await?;
 
     if let Some(volume) = body.volume {
-        client.set_volume_db(volume).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        client.set_volume_db(volume).await.map_err(|e| ApiError::internal(e.to_string()))?;
     }
     if let Some(mute) = body.mute {
-        client.set_mute(mute).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        client.set_mute(mute).await.map_err(|e| ApiError::internal(e.to_string()))?;
     }
     if let Some(preset) = body.preset {
-        client.set_config(preset).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        client.set_config(preset).await.map_err(|e| ApiError::internal(e.to_string()))?;
     }
     if let Some(source) = &body.source {
-        if let Some(src) = minidsp_protocol::source::Source::from_str_pascal(source) {
-            if let Some(idx) = client.profile().sources.index_for_source(src) {
-                client.set_source(idx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            }
-        }
+        let src = minidsp_protocol::source::Source::from_str_pascal(source)
+            .or_else(|| minidsp_protocol::source::Source::from_str_lowercase(source))
+            .ok_or_else(|| ApiError::bad_request(format!("unknown source '{source}'")))?;
+        let idx = client.profile().sources.index_for_source(src)
+            .ok_or_else(|| ApiError::bad_request("source not available on this device"))?;
+        client.set_source(idx).await.map_err(|e| ApiError::internal(e.to_string()))?;
     }
     if let Some(dirac) = body.dirac {
-        let _ = client.set_dirac_bypass(!dirac).await;
+        match client.set_dirac_bypass(!dirac).await {
+            Ok(()) => {}
+            Err(minidsp::client::ClientError::Unsupported) => {}
+            Err(e) => return Err(ApiError::internal(e.to_string())),
+        }
     }
 
-    let master = client.get_master_status().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let master = client.get_master_status().await.map_err(|e| ApiError::internal(e.to_string()))?;
     let source_name = client.profile().sources.source_for_index(master.source).map(|s| s.pascal_case().to_string());
     let dirac = read_dirac_state(&client).await;
     Ok(Json(MasterStatusResponseJson {
@@ -296,6 +321,7 @@ async fn set_source(
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
     let src = minidsp_protocol::source::Source::from_str_lowercase(&source)
+        .or_else(|| minidsp_protocol::source::Source::from_str_pascal(&source))
         .ok_or(StatusCode::BAD_REQUEST)?;
     let idx = client.profile().sources.index_for_source(src)
         .ok_or(StatusCode::BAD_REQUEST)?;
@@ -350,10 +376,18 @@ async fn write_config(
             client.set_mute(mute).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
         if let Some(source) = &ms.source {
-            if let Some(src) = minidsp_protocol::source::Source::from_str_pascal(source) {
-                if let Some(idx) = client.profile().sources.index_for_source(src) {
-                    client.set_source(idx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                }
+            let src = minidsp_protocol::source::Source::from_str_pascal(source)
+                .or_else(|| minidsp_protocol::source::Source::from_str_lowercase(source))
+                .ok_or(StatusCode::BAD_REQUEST)?;
+            let idx = client.profile().sources.index_for_source(src)
+                .ok_or(StatusCode::BAD_REQUEST)?;
+            client.set_source(idx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        if let Some(dirac) = ms.dirac {
+            match client.set_dirac_bypass(!dirac).await {
+                Ok(()) => {}
+                Err(minidsp::client::ClientError::Unsupported) => {} // expected for non-Dirac devices
+                Err(e) => return Err(client_error_to_status(e)),
             }
         }
     }
@@ -375,6 +409,20 @@ async fn write_config(
                                     .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                             }
                         }
+                    }
+                }
+                // Per-channel gain (input channels have Option<u16> addresses)
+                if let Some(gain) = input.gain {
+                    if let Some(gain_addr) = input_ch.gain {
+                        client.set_channel_gain(gain_addr, gain).await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    }
+                }
+                // Per-channel mute
+                if let Some(mute) = input.mute {
+                    if let Some(mute_addr) = input_ch.mute {
+                        client.set_channel_mute(mute_addr, mute).await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                     }
                 }
             }
@@ -400,6 +448,28 @@ async fn write_config(
                         }
                     }
                 }
+                // Per-channel gain (output channels always have gain address)
+                if let Some(gain) = output.gain {
+                    client.set_channel_gain(output_ch.gain, gain).await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                }
+                // Per-channel mute
+                if let Some(mute) = output.mute {
+                    client.set_channel_mute(output_ch.mute, mute).await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                }
+                // Delay (Duration format: secs + nanos → sample count)
+                if let Some(delay) = output.delay {
+                    let sample_rate = client.profile().sample_rate as f32;
+                    let samples = (delay.as_secs_f32() * sample_rate).round().clamp(0.0, 48000.0);
+                    client.write_dsp(output_ch.delay, samples, true).await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                }
+                // Polarity inversion (dialect-aware encoding)
+                if let Some(invert) = output.invert {
+                    client.set_invert(output_ch.polarity, invert).await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                }
             }
         }
     }
@@ -413,8 +483,63 @@ async fn read_config(
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
     let table = client.profile().dsp_table.ok_or(StatusCode::NOT_IMPLEMENTED)?;
+    let sample_rate = client.profile().sample_rate as f32;
+    let is_fixed_point = client.profile().dialect.value_format
+        == minidsp_protocol::dialect::ValueFormat::FixedPoint;
 
-    // Read all output PEQ values
+    // Dialect-aware decoders for readback values
+    let decode_mute = |v: f32| -> bool {
+        if is_fixed_point { v == 0.0 } else { v >= 2.0 } // Old: 0.0=muted, 1.0=unmuted; New: 2.0=muted, 1.0=unmuted
+    };
+    let decode_invert = |v: f32| -> bool {
+        if is_fixed_point { v < 0.0 } else { v != 0.0 } // Old: -1.0=inverted, 1.0=normal; New: 1.0=inverted, 0.0=normal
+    };
+    let decode_gain_db = |linear: f32| -> f32 {
+        20.0 * linear.max(1e-10).log10() // Guard against log10(0) = -Infinity
+    };
+
+    // Read input channels
+    let mut inputs = Vec::new();
+    for (ch_idx, input) in table.inputs.iter().enumerate() {
+        let mut peqs = Vec::new();
+        for (band_idx, band) in input.peq.iter().enumerate() {
+            match client.read_floats(band.addr, 5).await {
+                Ok(coeffs) if coeffs.len() == 5 => {
+                    peqs.push(PeqConfigJson {
+                        index: band_idx as u8,
+                        coeff: Some(BiquadCoeffJson {
+                            b0: coeffs[0], b1: coeffs[1], b2: coeffs[2],
+                            a1: coeffs[3], a2: coeffs[4],
+                        }),
+                        bypass: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let gain = if let Some(gain_addr) = input.gain {
+            client.read_floats(gain_addr, 1).await.ok()
+                .and_then(|v| v.first().copied())
+                .map(decode_gain_db)
+        } else {
+            None
+        };
+        let mute = if let Some(mute_addr) = input.mute {
+            client.read_floats(mute_addr, 1).await.ok()
+                .and_then(|v| v.first().copied())
+                .map(decode_mute)
+        } else {
+            None
+        };
+        inputs.push(InputConfigJson {
+            index: ch_idx as u8,
+            peq: Some(peqs),
+            gain,
+            mute,
+        });
+    }
+
+    // Read output channels
     let mut outputs = Vec::new();
     for (ch_idx, output) in table.outputs.iter().enumerate() {
         let mut peqs = Vec::new();
@@ -427,21 +552,37 @@ async fn read_config(
                             b0: coeffs[0], b1: coeffs[1], b2: coeffs[2],
                             a1: coeffs[3], a2: coeffs[4],
                         }),
-                        bypass: None, // TODO: read bypass state
+                        bypass: None,
                     });
                 }
                 _ => {}
             }
         }
-        outputs.push(InputConfigJson {
+        let gain = client.read_floats(output.gain, 1).await.ok()
+            .and_then(|v| v.first().copied())
+            .map(decode_gain_db);
+        let mute = client.read_floats(output.mute, 1).await.ok()
+            .and_then(|v| v.first().copied())
+            .map(decode_mute);
+        let delay = client.read_floats(output.delay, 1).await.ok()
+            .and_then(|v| v.first().copied())
+            .map(|samples| std::time::Duration::from_secs_f32(samples / sample_rate));
+        let invert = client.read_floats(output.polarity, 1).await.ok()
+            .and_then(|v| v.first().copied())
+            .map(decode_invert);
+
+        outputs.push(OutputConfigJson {
             index: ch_idx as u8,
             peq: Some(peqs),
-            gain: None,
-            mute: None,
+            gain,
+            mute,
+            delay,
+            invert,
         });
     }
 
     Ok(Json(serde_json::json!({
+        "inputs": inputs,
         "outputs": outputs,
     })).into_response())
 }
@@ -596,6 +737,11 @@ fn client_error_to_status(e: minidsp::client::ClientError) -> StatusCode {
         minidsp::client::ClientError::Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// Axum fallback handler — returns JSON errors for unmatched routes.
+async fn fallback() -> impl IntoResponse {
+    ApiError::new(StatusCode::NOT_FOUND, "not found")
 }
 
 async fn openapi() -> impl IntoResponse {

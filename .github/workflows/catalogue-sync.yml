@@ -1,0 +1,62 @@
+name: Catalogue Sync
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'  # Every 4 hours
+  workflow_dispatch: {}     # Manual trigger
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: catalogue-sync
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.version_check.outputs.skip != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Check for updates
+        id: version_check
+        run: |
+          REMOTE_VERSION=$(curl -sf https://beqcatalogue.readthedocs.io/en/latest/version.txt | tr -dc 'A-Za-z0-9._-' | head -c 64 || echo "unknown")
+          CACHED_VERSION=$(curl -sf https://${{ github.repository_owner }}.github.io/minidsp-open/version.txt | tr -dc 'A-Za-z0-9._-' | head -c 64 || echo "none")
+          echo "remote=$REMOTE_VERSION" >> $GITHUB_OUTPUT
+          echo "cached=$CACHED_VERSION" >> $GITHUB_OUTPUT
+          if [ "$REMOTE_VERSION" = "$CACHED_VERSION" ] && [ "$REMOTE_VERSION" != "unknown" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Catalogue up to date ($REMOTE_VERSION)"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Update available: $CACHED_VERSION -> $REMOTE_VERSION"
+          fi
+
+      - name: Build catalogue + UI
+        if: steps.version_check.outputs.skip != 'true'
+        run: |
+          mkdir -p site
+          uv run tools/build-catalogue.py --output-dir site
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.version_check.outputs.skip != 'true'
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

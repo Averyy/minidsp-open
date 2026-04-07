@@ -115,6 +115,28 @@ pub fn encode_tcp_response(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Decode a TCP server response frame. Server responses use `[len][payload]` with
+/// NO checksum (unlike client requests which include a checksum byte).
+/// Skips leading zero-byte padding (WI-DG compat).
+///
+/// Returns `(payload, bytes_consumed)` or None if insufficient data.
+pub fn decode_tcp_response(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    // Skip zero-byte padding
+    let mut offset = 0;
+    while offset < data.len() && data[offset] == 0 {
+        offset += 1;
+    }
+    if offset >= data.len() {
+        return None;
+    }
+    let len = data[offset] as usize; // self-inclusive length
+    if len == 0 || data.len() - offset < len {
+        return None; // insufficient data
+    }
+    let payload = data[offset + 1..offset + len].to_vec();
+    Some((payload, offset + len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +179,27 @@ mod tests {
         let mut tcp_data = vec![0x00, 0x00]; // zero padding
         tcp_data.extend_from_slice(&frame);
         let (payload, consumed) = decode_tcp_frame(&tcp_data).unwrap();
+        assert_eq!(payload, &[0x31]);
+        assert_eq!(consumed, 2 + frame.len()); // 2 padding + frame
+    }
+
+    #[test]
+    fn tcp_response_roundtrip() {
+        let payload = &[0x31, 0x0A, 0x64];
+        let frame = encode_tcp_response(payload);
+        assert_eq!(frame[0], 4); // self-inclusive length = 3 + 1
+        assert_eq!(frame.len(), 4); // no checksum byte
+        let (decoded, consumed) = decode_tcp_response(&frame).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn tcp_response_with_padding() {
+        let frame = encode_tcp_response(&[0x31]);
+        let mut data = vec![0x00, 0x00]; // zero padding
+        data.extend_from_slice(&frame);
+        let (payload, consumed) = decode_tcp_response(&data).unwrap();
         assert_eq!(payload, &[0x31]);
         assert_eq!(consumed, 2 + frame.len()); // 2 padding + frame
     }

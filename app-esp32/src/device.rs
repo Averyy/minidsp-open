@@ -44,10 +44,14 @@ impl DeviceState {
         // Read DSP version from EEPROM 0xFFA1
         let (addr_hi, addr_lo) = eeprom::DSP_VERSION_ADDR;
         let resp = bus.command(&commands::read_flash(addr_hi, addr_lo, 1))?;
+        debug!("dsp_version raw resp ({} bytes): {:02x?}", resp.len(), &resp[..resp.len().min(10)]);
         let parsed = commands::parse_response(&resp, &Dialect::NEW);
         let dsp_version = match parsed {
-            Response::FlashData(data) => eeprom::parse_dsp_version(&data).unwrap_or(0),
-            _ => 0,
+            Response::FlashData(ref data) => {
+                debug!("dsp_version FlashData ({} bytes): {:02x?}", data.len(), data);
+                eeprom::parse_dsp_version(data).unwrap_or(0)
+            }
+            ref other => { debug!("dsp_version response: {other:?}"); 0 }
         };
         debug!("dsp_version: {dsp_version}");
 
@@ -276,6 +280,20 @@ impl DeviceState {
         self.bus
             .command(&commands::bypass_filter(addr, bypass, self.dialect()))?;
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn write_dsp(&self, addr: u16, value: f32, save: bool) -> Result<(), UsbHidError> {
+        self.bus
+            .command(&commands::write_dsp(addr, value, save, self.dialect()))?;
+        Ok(())
+    }
+
+    /// Set channel polarity inversion using dialect-aware encoding.
+    #[allow(dead_code)]
+    pub fn set_invert(&self, addr: u16, inverted: bool) -> Result<(), UsbHidError> {
+        let val = minidsp_protocol::dialect::polarity_value(inverted, self.dialect());
+        self.write_dsp(addr, val, true)
     }
 
     // -- Flash reads --

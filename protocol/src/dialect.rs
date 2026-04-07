@@ -155,23 +155,17 @@ pub fn decode_mute(data: &[u8], dialect: &Dialect) -> Option<bool> {
     }
 }
 
-/// Encode polarity/invert value.
-pub fn encode_invert(inverted: bool, dialect: &Dialect) -> Vec<u8> {
+/// Get the float value to pass to write_dsp for polarity inversion.
+/// New (SHARC): 1.0 = inverted, 0.0 = normal.
+/// Old (ADAU1445): -1.0 = inverted, 1.0 = normal (gain multiplier).
+pub fn polarity_value(inverted: bool, dialect: &Dialect) -> f32 {
     match dialect.value_format {
-        ValueFormat::Float32 => {
-            let val: u16 = if inverted { 1 } else { 0 };
-            val.to_le_bytes().to_vec()
-        }
-        ValueFormat::FixedPoint => {
-            // Old: inverted = 0xFF800000, non-inverted = 0x00800000
-            if inverted {
-                0xFF800000u32.to_be_bytes().to_vec()
-            } else {
-                0x00800000u32.to_be_bytes().to_vec()
-            }
-        }
+        ValueFormat::Float32 => if inverted { 1.0 } else { 0.0 },
+        ValueFormat::FixedPoint => if inverted { -1.0 } else { 1.0 },
     }
 }
+
+// encode_invert removed — use polarity_value() + write_dsp() instead.
 
 #[cfg(test)]
 mod tests {

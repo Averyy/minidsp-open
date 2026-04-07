@@ -6,6 +6,10 @@ ESP32-S3 N16R8 (16 MB flash, 8 MB PSRAM): https://www.aliexpress.com/item/100500
 
 Select the **N16R8** variant. The N8R2 (2 MB PSRAM) is too constrained for USB audio + WiFi + HID simultaneously.
 
+## Enable USB OTG Mode
+
+On most dev boards (this one included) there's 2 solder pads on the back of the ESP32 that need to be bridged together so that the device will supply 5v on the OTG (left) USB port. In order for the device to connect to the ESP32 this must be done.
+
 ## Why N16R8
 
 - 8 MB PSRAM: room for USB audio ring buffers, WiFi stack, HID control, HTTP server

@@ -116,6 +116,7 @@ impl Default for MasterStatus {
 ///
 /// Used by ezBEQ, Home Assistant, and other consumers.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
 pub struct StatusSummary {
     pub master: MasterStatusView,
     pub input_levels: Vec<f32>,
@@ -130,6 +131,7 @@ pub struct MasterStatusView {
     pub source: String,
     pub volume: f32,
     pub mute: bool,
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
     pub dirac: Option<bool>,
 }
 

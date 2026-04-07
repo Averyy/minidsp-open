@@ -19,25 +19,6 @@ pub struct VersionJson {
     pub serial: u32,
 }
 
-/// Status summary for GET /devices/{id} — omits null fields.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StatusSummaryJson {
-    pub master: MasterStatusGetJson,
-    pub input_levels: Vec<f32>,
-    pub output_levels: Vec<f32>,
-}
-
-/// Master status for GET responses — null fields omitted.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MasterStatusGetJson {
-    pub preset: u8,
-    pub source: String,
-    pub volume: f32,
-    pub mute: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dirac: Option<bool>,
-}
-
 /// Master status for POST request body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MasterStatusPostJson {
@@ -63,7 +44,7 @@ pub struct MasterStatusResponseJson {
 pub struct ConfigWriteJson {
     pub master_status: Option<MasterStatusPostJson>,
     pub inputs: Option<Vec<InputConfigJson>>,
-    pub outputs: Option<Vec<InputConfigJson>>,
+    pub outputs: Option<Vec<OutputConfigJson>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,6 +53,19 @@ pub struct InputConfigJson {
     pub peq: Option<Vec<PeqConfigJson>>,
     pub gain: Option<f32>,
     pub mute: Option<bool>,
+}
+
+/// Output config for POST /devices/{id}/config — includes delay and polarity.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OutputConfigJson {
+    pub index: u8,
+    pub peq: Option<Vec<PeqConfigJson>>,
+    pub gain: Option<f32>,
+    pub mute: Option<bool>,
+    /// Delay in Duration format: {"secs": N, "nanos": N} (matches minidsp-rs wire format).
+    pub delay: Option<std::time::Duration>,
+    /// Polarity inversion: true = inverted, false = normal.
+    pub invert: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

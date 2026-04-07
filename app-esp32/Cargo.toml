@@ -27,3 +27,7 @@ embuild = "0.33"
 # This sets cfg(esp_idf_comp_espressif__mdns_enabled) at build time.
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/mdns", version = "1.4" }
+
+# LittleFS for data partition (ezBEQ catalogue, UI assets, config)
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "joltwallet/littlefs", version = "1.20" }

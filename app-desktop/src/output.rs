@@ -39,22 +39,8 @@ pub fn print_status_text(summary: &StatusSummary, profile: &DeviceProfile) {
 /// {"master":{"preset":0,"source":"Toslink","volume":-8.0,"mute":false},"input_levels":[-131.36],"output_levels":[-140.2]}
 /// ```
 pub fn print_status_json(summary: &StatusSummary) -> Result<(), Box<dyn std::error::Error>> {
-    let mut master = serde_json::json!({
-        "preset": summary.master.preset,
-        "source": summary.master.source,
-        "volume": summary.master.volume,
-        "mute": summary.master.mute,
-    });
-    if let Some(dirac) = summary.master.dirac {
-        master.as_object_mut().unwrap().insert("dirac".to_string(), serde_json::json!(dirac));
-    }
-
-    let json = serde_json::json!({
-        "master": master,
-        "input_levels": summary.input_levels,
-        "output_levels": summary.output_levels,
-    });
-
-    println!("{}", serde_json::to_string(&json)?);
+    // Use StatusSummary's Serialize derive for correct f32 precision
+    // and skip_serializing_if on dirac
+    println!("{}", serde_json::to_string(summary)?);
     Ok(())
 }

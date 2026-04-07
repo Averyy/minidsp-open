@@ -16,3 +16,5 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 hidapi = "2"
 urlencoding = "2"
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"

@@ -24,15 +24,17 @@ pub type SharedDeviceState = Arc<Mutex<Option<Arc<DeviceState>>>>;
 /// Start the HTTP server with all routes.
 /// `port` should be 80 for SoftAP provisioning (captive portal), 5380 for normal STA mode.
 /// `ap_ip` is the SoftAP IP for captive portal redirects (None in STA mode).
+/// `beq_state` is the shared ezBEQ slot state (None in SoftAP mode).
 pub fn start(
     state: SharedDeviceState,
     port: u16,
     nvs: EspDefaultNvsPartition,
     ap_ip: Option<std::net::Ipv4Addr>,
+    beq_state: Option<crate::ezbeq::SharedEzBeqState>,
 ) -> Result<EspHttpServer<'static>, Box<dyn std::error::Error>> {
     let config = Configuration {
         http_port: port,
-        max_uri_handlers: 35,
+        max_uri_handlers: 55,
         stack_size: 16384,
         max_open_sockets: 13,
         uri_match_wildcard: true,
@@ -109,14 +111,19 @@ pub fn start(
                 }
             }
             if let Some(source) = json.get("source").and_then(|v| v.as_str()) {
-                if let Some(src) = minidsp_protocol::source::Source::from_str_pascal(source)
+                let src = match minidsp_protocol::source::Source::from_str_pascal(source)
                     .or_else(|| minidsp_protocol::source::Source::from_str_lowercase(source))
                 {
-                    if let Some(idx) = dev.profile().sources.index_for_source(src) {
+                    Some(s) => s,
+                    None => return send_error(req, 400, &format!("unknown source '{source}'")),
+                };
+                match dev.profile().sources.index_for_source(src) {
+                    Some(idx) => {
                         if let Err(e) = dev.set_source(idx) {
                             return send_error(req, 500, &format!("set_source: {e}"));
                         }
                     }
+                    None => return send_error(req, 400, "source not available on this device"),
                 }
             }
             if let Some(preset) = json.get("preset").and_then(|v| v.as_u64()) {
@@ -125,8 +132,10 @@ pub fn start(
                 }
             }
             if let Some(dirac) = json.get("dirac").and_then(|v| v.as_bool()) {
-                if let Err(e) = dev.set_dirac_bypass(!dirac) {
-                    return send_error(req, 500, &format!("set_dirac: {e}"));
+                match dev.set_dirac_bypass(!dirac) {
+                    Ok(()) => {}
+                    Err(e) if e.to_string().contains("unsupported") => {}
+                    Err(e) => return send_error(req, 500, &format!("set_dirac: {e}")),
                 }
             }
 
@@ -144,14 +153,214 @@ pub fn start(
     register_source_routes(&mut server, state.clone())?;
     register_preset_routes(&mut server, state.clone())?;
 
-    // POST /devices/0/config — stub (full config write not yet implemented on ESP32)
+    // POST /devices/0/config — full config write (PEQ, gain, mute, delay, polarity, master)
     {
         let st = state.clone();
-        server.fn_handler("/devices/0/config", Method::Post, move |req| {
-            if get_device(&st).is_none() {
-                return send_json(req, 503, r#"{"error":"no device"}"#);
+        server.fn_handler("/devices/0/config", Method::Post, move |mut req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            let mut buf = [0u8; 8192];
+            let len = req.read(&mut buf).unwrap_or(0);
+            let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
+                Ok(v) => v,
+                Err(_) => return send_error(req, 400, "invalid JSON"),
+            };
+
+            // master_status: {preset, volume, mute, source, dirac}
+            if let Some(ms) = json.get("master_status") {
+                if let Some(preset) = ms.get("preset").and_then(|v| v.as_u64()) {
+                    if let Err(e) = dev.set_preset(preset as u8) {
+                        return send_error(req, 500, &format!("set_preset: {e}"));
+                    }
+                }
+                if let Some(volume) = ms.get("volume").and_then(|v| v.as_f64()) {
+                    if let Err(e) = dev.set_volume_db(volume as f32) {
+                        return send_error(req, 500, &format!("set_volume: {e}"));
+                    }
+                }
+                if let Some(mute) = ms.get("mute").and_then(|v| v.as_bool()) {
+                    if let Err(e) = dev.set_mute(mute) {
+                        return send_error(req, 500, &format!("set_mute: {e}"));
+                    }
+                }
+                if let Some(source) = ms.get("source").and_then(|v| v.as_str()) {
+                    let src = match minidsp_protocol::source::Source::from_str_pascal(source)
+                        .or_else(|| minidsp_protocol::source::Source::from_str_lowercase(source))
+                    {
+                        Some(s) => s,
+                        None => return send_error(req, 400, &format!("unknown source '{source}'")),
+                    };
+                    match dev.profile().sources.index_for_source(src) {
+                        Some(idx) => {
+                            if let Err(e) = dev.set_source(idx) {
+                                return send_error(req, 500, &format!("set_source: {e}"));
+                            }
+                        }
+                        None => return send_error(req, 400, "source not available on this device"),
+                    }
+                }
+                if let Some(dirac) = ms.get("dirac").and_then(|v| v.as_bool()) {
+                    // Ignore Unsupported (non-Dirac device), propagate transport errors
+                    match dev.set_dirac_bypass(!dirac) {
+                        Ok(()) => {}
+                        Err(e) if e.to_string().contains("unsupported") => {}
+                        Err(e) => return send_error(req, 500, &format!("set_dirac: {e}")),
+                    }
+                }
             }
-            send_error(req, 501, "config write not yet implemented on ESP32")
+
+            let table = match dev.profile().dsp_table {
+                Some(t) => t,
+                None => return send_empty_200(req),
+            };
+
+            // inputs: [{index, peq: [{index, coeff, bypass}], gain, mute}]
+            if let Some(inputs) = json.get("inputs").and_then(|v| v.as_array()) {
+                for input in inputs {
+                    let idx = match input.get("index").and_then(|v| v.as_u64()) {
+                        Some(i) => i as usize,
+                        None => return send_error(req, 400, "input missing 'index' field"),
+                    };
+                    if let Some(input_ch) = table.inputs.get(idx) {
+                        // PEQ bands
+                        if let Some(peqs) = input.get("peq").and_then(|v| v.as_array()) {
+                            for peq in peqs {
+                                let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
+                                    Some(i) => i as usize,
+                                    None => return send_error(req, 400, "peq missing 'index' field"),
+                                };
+                                if let Some(band) = input_ch.peq.get(band_idx) {
+                                    if let Some(coeff) = peq.get("coeff") {
+                                        let c = [
+                                            coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("b1").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("b2").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("a1").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("a2").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                        ];
+                                        if c.iter().any(|v| !v.is_finite()) {
+                                            return send_error(req, 400, "biquad coefficients must be finite");
+                                        }
+                                        if let Err(e) = dev.write_biquad(band.addr, &c) {
+                                            return send_error(req, 500, &format!("write_biquad: {e}"));
+                                        }
+                                    }
+                                    if let Some(bypass) = peq.get("bypass").and_then(|v| v.as_bool()) {
+                                        if let Err(e) = dev.bypass_filter(band.addr, bypass) {
+                                            return send_error(req, 500, &format!("bypass_filter: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Per-channel gain
+                        if let Some(gain) = input.get("gain").and_then(|v| v.as_f64()) {
+                            if !gain.is_finite() || gain.abs() > 120.0 {
+                                return send_error(req, 400, "gain out of range (must be finite, |gain| <= 120 dB)");
+                            }
+                            if let Some(gain_addr) = input_ch.gain {
+                                let linear = 10.0f32.powf(gain as f32 / 20.0);
+                                if let Err(e) = dev.write_dsp(gain_addr, linear, true) {
+                                    return send_error(req, 500, &format!("set_gain: {e}"));
+                                }
+                            }
+                        }
+                        // Per-channel mute
+                        if let Some(mute) = input.get("mute").and_then(|v| v.as_bool()) {
+                            if let Some(mute_addr) = input_ch.mute {
+                                let val = if mute { 2.0 } else { 1.0 };
+                                if let Err(e) = dev.write_dsp(mute_addr, val, true) {
+                                    return send_error(req, 500, &format!("set_mute: {e}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // outputs: [{index, peq: [...], gain, mute, delay, invert}]
+            if let Some(outputs) = json.get("outputs").and_then(|v| v.as_array()) {
+                for output in outputs {
+                    let idx = match output.get("index").and_then(|v| v.as_u64()) {
+                        Some(i) => i as usize,
+                        None => return send_error(req, 400, "output missing 'index' field"),
+                    };
+                    if let Some(output_ch) = table.outputs.get(idx) {
+                        // PEQ bands
+                        if let Some(peqs) = output.get("peq").and_then(|v| v.as_array()) {
+                            for peq in peqs {
+                                let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
+                                    Some(i) => i as usize,
+                                    None => return send_error(req, 400, "peq missing 'index' field"),
+                                };
+                                if let Some(band) = output_ch.peq.get(band_idx) {
+                                    if let Some(coeff) = peq.get("coeff") {
+                                        let c = [
+                                            coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("b1").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("b2").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("a1").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("a2").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                        ];
+                                        if c.iter().any(|v| !v.is_finite()) {
+                                            return send_error(req, 400, "biquad coefficients must be finite");
+                                        }
+                                        if let Err(e) = dev.write_biquad(band.addr, &c) {
+                                            return send_error(req, 500, &format!("write_biquad: {e}"));
+                                        }
+                                    }
+                                    if let Some(bypass) = peq.get("bypass").and_then(|v| v.as_bool()) {
+                                        if let Err(e) = dev.bypass_filter(band.addr, bypass) {
+                                            return send_error(req, 500, &format!("bypass_filter: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Per-channel gain
+                        if let Some(gain) = output.get("gain").and_then(|v| v.as_f64()) {
+                            if !gain.is_finite() || gain.abs() > 120.0 {
+                                return send_error(req, 400, "gain out of range (must be finite, |gain| <= 120 dB)");
+                            }
+                            let linear = 10.0f32.powf(gain as f32 / 20.0);
+                            if let Err(e) = dev.write_dsp(output_ch.gain, linear, true) {
+                                return send_error(req, 500, &format!("set_gain: {e}"));
+                            }
+                        }
+                        // Per-channel mute
+                        if let Some(mute) = output.get("mute").and_then(|v| v.as_bool()) {
+                            let val = if mute { 2.0 } else { 1.0 };
+                            if let Err(e) = dev.write_dsp(output_ch.mute, val, true) {
+                                return send_error(req, 500, &format!("set_mute: {e}"));
+                            }
+                        }
+                        // Delay (Duration format: {secs, nanos} or float seconds)
+                        if let Some(delay) = output.get("delay") {
+                            let secs = if let Some(s) = delay.get("secs").and_then(|v| v.as_f64()) {
+                                let nanos = delay.get("nanos").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                s + nanos / 1_000_000_000.0
+                            } else {
+                                delay.as_f64().unwrap_or(0.0)
+                            };
+                            let sample_rate = dev.profile().sample_rate as f32;
+                            let samples = (secs as f32 * sample_rate).round().clamp(0.0, 48000.0);
+                            if let Err(e) = dev.write_dsp(output_ch.delay, samples, true) {
+                                return send_error(req, 500, &format!("set_delay: {e}"));
+                            }
+                        }
+                        // Polarity inversion (dialect-aware encoding)
+                        if let Some(invert) = output.get("invert").and_then(|v| v.as_bool()) {
+                            if let Err(e) = dev.set_invert(output_ch.polarity, invert) {
+                                return send_error(req, 500, &format!("set_polarity: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
+
+            send_empty_200(req)
         })?;
     }
 
@@ -165,6 +374,13 @@ pub fn start(
     #[cfg(esp_idf_httpd_ws_support)]
     register_ws_routes(&mut server, state.clone())?;
 
+    // ezBEQ REST API + WebSocket (only in STA mode with beq_state)
+    if let Some(ref beq) = beq_state {
+        crate::ezbeq::register_routes(&mut server, state.clone(), beq.clone())?;
+        #[cfg(esp_idf_httpd_ws_support)]
+        register_ezbeq_ws(&mut server, state.clone(), beq.clone())?;
+    }
+
     // GET /llms.txt
     server.fn_handler("/llms.txt", Method::Get, |req| {
         send_text(req, "# minidsp-open\nMiniDSP audio processor controller.\nHTTP API on port 5380.\n")
@@ -175,7 +391,7 @@ pub fn start(
         send_cors_preflight(req)
     })?;
 
-    // Root page — provisioning in SoftAP mode, redirect to /devices in STA mode
+    // Root page — provisioning in SoftAP mode, serve UI or redirect in STA mode
     if ap_ip.is_some() {
         server.fn_handler("/", Method::Get, |req| {
             info!("serving provisioning page");
@@ -183,7 +399,13 @@ pub fn start(
         })?;
     } else {
         server.fn_handler("/", Method::Get, |req| {
-            send_redirect(req, "/devices")
+            // Serve ezBEQ UI index.html if available, otherwise redirect to API
+            let index = crate::storage::full_path("ui/index.html");
+            if std::path::Path::new(&index).exists() {
+                send_static_file(req, &index)
+            } else {
+                send_redirect(req, "/devices")
+            }
         })?;
     }
 
@@ -237,20 +459,48 @@ pub fn start(
         Ok(())
     })?;
 
-    // Catch-all: redirect any unrecognized path to "/".
-    // This is essential for captive portal auto-open — iOS/Android/Windows probe
-    // random URLs (e.g. /hotspot-detect.html, /generate_204) and expect a redirect
-    // or non-standard response to trigger the captive portal popup.
+    // Catch-all GET handler:
+    // - SoftAP mode: redirect to captive portal
+    // - STA mode: serve static files from LittleFS /data/ui/ (ezBEQ React SPA)
     // ESP-IDF httpd matches exact URIs first, so this won't shadow registered routes.
-    // Catch-all: redirect any unrecognized path to the portal.
-    // Uses absolute URL (required for iOS/Android captive portal detection)
-    // with non-empty body (iOS requires content to trigger the portal sheet).
     if let Some(ip) = ap_ip {
         let portal_url = format!("http://{ip}/");
         server.fn_handler("/*", Method::Get, move |req| {
             let uri = req.uri().to_string();
             info!("captive portal redirect: {uri} → {portal_url}");
             send_redirect(req, &portal_url)
+        })?;
+    } else {
+        server.fn_handler("/*", Method::Get, |req| {
+            let uri = req.uri();
+            // Strip query string for file path lookup
+            let path = uri.split('?').next().unwrap_or(uri);
+
+            // Never serve HTML for API paths — return 404 JSON instead
+            if path.starts_with("/api/") || path.starts_with("/devices") || path.starts_with("/debug") {
+                return send_json(req, 404, r#"{"error":"not found"}"#);
+            }
+
+            // Path traversal protection: reject ".." in any encoding
+            if path.contains("..") || path.contains("%2e") || path.contains("%2E")
+                || path.contains('\0') || path.contains("%00")
+            {
+                return send_json(req, 400, r#"{"error":"bad path"}"#);
+            }
+
+            let file_path = crate::storage::full_path(&format!("ui{path}"));
+
+            if std::path::Path::new(&file_path).is_file() {
+                send_static_file(req, &file_path)
+            } else {
+                // SPA fallback: serve index.html for client-side routing
+                let index = crate::storage::full_path("ui/index.html");
+                if std::path::Path::new(&index).exists() {
+                    send_static_file(req, &index)
+                } else {
+                    send_json(req, 404, r#"{"error":"not found"}"#)
+                }
+            }
         })?;
     }
 
@@ -545,14 +795,14 @@ fn register_device_feature_routes(
 // -- Helpers --
 
 /// Extract the current device from shared state.
-fn get_device(state: &SharedDeviceState) -> Option<Arc<DeviceState>> {
+pub fn get_device(state: &SharedDeviceState) -> Option<Arc<DeviceState>> {
     state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
 }
 
-fn send_json<C: esp_idf_svc::http::server::Connection>(
+pub fn send_json<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
     status: u16,
     body: &str,
@@ -617,7 +867,7 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
 ) -> Result<(), C::Error> {
     let headers = [
         ("Access-Control-Allow-Origin", "*"),
-        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS"),
         ("Access-Control-Allow-Headers", "Content-Type"),
         ("Access-Control-Max-Age", "86400"),
     ];
@@ -626,7 +876,18 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
     Ok(())
 }
 
-fn send_error<C: esp_idf_svc::http::server::Connection>(
+fn send_empty_200<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+) -> Result<(), C::Error> {
+    let headers = [
+        ("Access-Control-Allow-Origin", "*"),
+    ];
+    let mut resp = req.into_response(200, None, &headers)?;
+    resp.write_all(b"")?;
+    Ok(())
+}
+
+pub fn send_error<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
     status: u16,
     message: &str,
@@ -661,38 +922,28 @@ fn send_provision_error<C: esp_idf_svc::http::server::Connection>(
     Ok(())
 }
 
-/// Build the GET status JSON — omits null fields like dirac (per compat contract).
+/// Build the GET status JSON — uses StatusSummary's Serialize for correct f32 precision
+/// and skip_serializing_if on dirac (omitted for non-Dirac devices).
 fn status_json(status: &StatusSummary) -> String {
-    let mut master = serde_json::json!({
-        "preset": status.master.preset,
-        "source": status.master.source,
-        "volume": status.master.volume,
-        "mute": status.master.mute,
-    });
-    // Only include dirac if the device supports it (contract: omit for non-Dirac devices)
-    if let Some(dirac) = status.master.dirac {
-        master["dirac"] = serde_json::json!(dirac);
-    }
-    serde_json::to_string(&serde_json::json!({
-        "master": master,
-        "input_levels": status.input_levels,
-        "output_levels": status.output_levels,
-    }))
-    .unwrap_or_default()
+    serde_json::to_string(status).unwrap_or_default()
 }
 
-/// Build the POST response JSON — includes null fields (per compat contract).
+/// Build the POST response JSON — flat object with dirac:null included (per compat contract).
+/// Note: POST responses must include dirac:null for non-Dirac devices, which differs from
+/// GET responses that omit the field. This is why we can't use StatusSummary's Serialize here.
 fn master_status_json(status: &StatusSummary) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "master": {
-            "preset": status.master.preset,
-            "source": status.master.source,
-            "volume": status.master.volume,
-            "mute": status.master.mute,
-            "dirac": status.master.dirac,
-        }
-    }))
-    .unwrap_or_default()
+    // Build JSON manually to preserve f32 precision (not f64 via json!())
+    // and include dirac as null when absent
+    let mut map = serde_json::Map::new();
+    map.insert("preset".into(), serde_json::json!(status.master.preset));
+    map.insert("source".into(), serde_json::Value::String(status.master.source.clone()));
+    map.insert("volume".into(), serde_json::to_value(status.master.volume).unwrap_or_default());
+    map.insert("mute".into(), serde_json::json!(status.master.mute));
+    map.insert("dirac".into(), match status.master.dirac {
+        Some(d) => serde_json::json!(d),
+        None => serde_json::Value::Null,
+    });
+    serde_json::to_string(&map).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -832,52 +1083,44 @@ fn register_ws_routes(
         let ws_ref = active_ws.clone();
 
         server.ws_handler("/devices/0/ws", None, move |ws| {
+            // Raw frame bridge — NO status polling thread. Only responds to binary frames.
             if ws.is_new() {
-                if let Ok(mut guard) = ws_ref.lock() {
-                    if let Some(prev) = guard.take() {
-                        prev.stop.store(true, Ordering::Relaxed);
-                    }
-                }
-
-                match ws.create_detached_sender() {
-                    Ok(sender) => {
-                        let stop = Arc::new(AtomicBool::new(false));
-                        let fd = ws.session();
-                        if let Ok(mut guard) = ws_ref.lock() {
-                            *guard = Some(ActiveWs { stop: stop.clone(), fd });
-                        }
-
-                        let dev_state = st.clone();
-                        if let Err(e) = std::thread::Builder::new()
-                            .name("ws_raw".into())
-                            .stack_size(16384)
-                            .spawn(move || {
-                                ws_poll_loop(sender, dev_state, stop, 1000);
-                            })
-                        {
-                            log::warn!("WebSocket raw: failed to spawn poll thread: {e}");
-                        }
-                    }
-                    Err(e) => log::warn!("WebSocket raw: failed to create sender: {e:?}"),
-                }
+                log::info!("WS raw bridge: client connected");
                 return Ok::<(), esp_idf_svc::sys::EspError>(());
             }
 
             if ws.is_closed() {
-                let closing_fd = ws.session();
-                if let Ok(mut guard) = ws_ref.lock() {
-                    if guard.as_ref().is_some_and(|a| a.fd == closing_fd) {
-                        if let Some(active) = guard.take() {
-                            active.stop.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
+                log::info!("WS raw bridge: client disconnected");
                 return Ok(());
             }
 
             let mut buf = [0u8; 256];
             match ws.recv(&mut buf) {
-                Ok((FrameType::Text(_), _)) | Ok((FrameType::Binary(_), _)) => {
+                Ok((FrameType::Binary(_), len)) => {
+                    // Raw frame bridge: decode framed packet, forward payload to device
+                    if let Some(payload) = minidsp_protocol::packet::decode_frame(&buf[..len]) {
+                        match get_device(&st) {
+                            Some(dev) => {
+                                match dev.raw_command(&payload) {
+                                    Ok(resp) => {
+                                        let frame = minidsp_protocol::packet::encode_frame(&resp);
+                                        let _ = ws.send(FrameType::Binary(false), &frame);
+                                    }
+                                    Err(e) => {
+                                        log::warn!("WS raw bridge: device error: {e}");
+                                    }
+                                }
+                            }
+                            None => {
+                                log::warn!("WS raw bridge: no device connected");
+                            }
+                        }
+                    } else {
+                        log::warn!("WS raw bridge: invalid frame ({len} bytes)");
+                    }
+                }
+                Ok((FrameType::Text(_), _)) => {
+                    // Text frames: return status JSON (compat with clients that send text)
                     let json = match get_device(&st) {
                         Some(dev) => match dev.get_status_summary() {
                             Ok(status) => status_json(&status),
@@ -970,6 +1213,16 @@ fn ws_poll_loop(
 
     log::info!("WebSocket poll thread started (interval={interval_ms}ms)");
 
+    // Send initial status immediately so clients don't wait for first tick
+    if let Some(dev) = get_device(&state) {
+        if let Ok(status) = dev.get_status_summary() {
+            let json = status_json(&status);
+            if sender.send(FrameType::Text(false), json.as_bytes()).is_err() {
+                return;
+            }
+        }
+    }
+
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
 
@@ -991,6 +1244,309 @@ fn ws_poll_loop(
     }
 
     log::info!("WebSocket poll thread stopped");
+}
+
+// ---------------------------------------------------------------------------
+// ezBEQ WebSocket handler (/ws)
+// ---------------------------------------------------------------------------
+
+/// Register the ezBEQ WebSocket endpoint at /ws.
+///
+/// Protocol (from ezBEQ React UI):
+///   Server → Client on connect: {"message":"Catalogue","data":{version,count}}
+///   Server → Client on connect: {"message":"DeviceState","data":{...}}
+///   Client → Server: "load catalogue" → no-op (browser JS shim handles this)
+///   Client → Server: "subscribe levels <name>" → periodic Levels messages
+#[cfg(esp_idf_httpd_ws_support)]
+fn register_ezbeq_ws(
+    server: &mut EspHttpServer<'static>,
+    state: SharedDeviceState,
+    beq_state: crate::ezbeq::SharedEzBeqState,
+) -> Result<(), esp_idf_svc::sys::EspError> {
+    use esp_idf_svc::ws::FrameType;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let active_ws: Arc<Mutex<Option<ActiveWsBeq>>> = Arc::new(Mutex::new(None));
+
+    let st = state.clone();
+    let beq = beq_state.clone();
+    let ws_ref = active_ws.clone();
+
+    server.ws_handler("/ws", None, move |ws| {
+        if ws.is_new() {
+            // Stop any previous session
+            if let Ok(mut guard) = ws_ref.lock() {
+                if let Some(prev) = guard.take() {
+                    prev.stop.store(true, Ordering::Relaxed);
+                }
+            }
+
+            // Send initial Catalogue meta
+            let catalogue_meta = build_catalogue_meta();
+            let _ = ws.send(FrameType::Text(false), catalogue_meta.as_bytes());
+
+            // Send initial DeviceState
+            if let Some(dev) = get_device(&st) {
+                let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
+                let state_json = crate::ezbeq::device_state_json(&dev, &beq_guard);
+                let _ = ws.send(FrameType::Text(false), state_json.as_bytes());
+            }
+
+            // Store a detached sender for REST → WS broadcasts
+            let fd = ws.session();
+            match ws.create_detached_sender() {
+                Ok(sender) => {
+                    log::info!("ezBEQ WS: detached sender created (fd={fd})");
+                    if let Ok(mut beq_guard) = beq.lock() {
+                        beq_guard.ws_sender = Some(sender);
+                    }
+                    // Record fd so is_closed() can match and clean up even without subscribe
+                    if let Ok(mut guard) = ws_ref.lock() {
+                        *guard = Some(ActiveWsBeq {
+                            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            fd,
+                        });
+                    }
+                }
+                Err(e) => log::warn!("ezBEQ WS: create_detached_sender failed: {e:?}"),
+            }
+
+            return Ok::<(), esp_idf_svc::sys::EspError>(());
+        }
+
+        if ws.is_closed() {
+            let closing_fd = ws.session();
+            if let Ok(mut guard) = ws_ref.lock() {
+                if guard.as_ref().is_some_and(|a| a.fd == closing_fd) {
+                    if let Some(active) = guard.take() {
+                        active.stop.store(true, Ordering::Relaxed);
+                    }
+                    // Only clear ws_sender if this is the active session's fd
+                    if let Ok(mut beq_guard) = beq.lock() {
+                        beq_guard.ws_sender = None;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle incoming messages
+        let mut buf = [0u8; 256];
+        match ws.recv(&mut buf) {
+            Ok((ft, len)) => {
+                let msg = std::str::from_utf8(&buf[..len])
+                    .unwrap_or("")
+                    .trim_end_matches('\0')
+                    .trim();
+                log::info!("ezBEQ WS: ft={ft:?} len={len} msg='{msg}'");
+
+                if msg == "load catalogue" {
+                    // Browser JS shim handles catalogue loading directly from beqcatalogue.
+                    // Send empty response as safety fallback (shim intercepts before this fires).
+                    log::info!("load catalogue: handled by browser shim");
+                    let empty = r#"{"message":"CatalogueEntries","data":[]}"#;
+                    let _ = ws.send(FrameType::Text(false), empty.as_bytes());
+                } else if msg.starts_with("subscribe levels") {
+                    if let Ok(mut beq_guard) = beq.lock() {
+                        if let Some(sender) = beq_guard.ws_sender.take() {
+                            let stop = Arc::new(AtomicBool::new(false));
+                            let fd = ws.session();
+                            if let Ok(mut guard) = ws_ref.lock() {
+                                *guard = Some(ActiveWsBeq { stop: stop.clone(), fd });
+                            }
+
+                            let dev_state = st.clone();
+                            let beq_clone = beq.clone();
+                            let ws_ref_clone = ws_ref.clone();
+                            if let Err(e) = std::thread::Builder::new()
+                                .name("beq_lvl".into())
+                                .stack_size(8192)
+                                .spawn(move || {
+                                    push_levels(sender, dev_state, stop, beq_clone, fd, ws_ref_clone);
+                                })
+                            {
+                                log::warn!("failed to spawn levels thread: {e}");
+                            }
+                        }
+                    }
+                }
+
+                if matches!(ft, FrameType::Close) {
+                    let _ = ws.send(FrameType::Close, &[]);
+                } else if matches!(ft, FrameType::Ping) {
+                    let _ = ws.send(FrameType::Pong, &[]);
+                }
+            }
+            Err(e) => {
+                log::warn!("ezBEQ WS recv error: {e:?}");
+            }
+        }
+        Ok(())
+    })?;
+
+    info!("ezBEQ WebSocket registered: /ws");
+    Ok(())
+}
+
+/// Build the Catalogue meta message sent on WebSocket connect.
+#[cfg(esp_idf_httpd_ws_support)]
+fn build_catalogue_meta() -> String {
+    // Read installed version from data partition
+    let version = crate::storage::read_file("version.txt")
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "0".to_string());
+
+    // Count entries from the binary index header
+    let count = match std::fs::File::open(crate::storage::full_path("catalogue.bin")) {
+        Ok(mut f) => {
+            let mut header = [0u8; 12];
+            if std::io::Read::read_exact(&mut f, &mut header).is_ok()
+                && &header[0..4] == b"BEQ\x02"
+            {
+                u32::from_le_bytes(header[4..8].try_into().unwrap())
+            } else {
+                0
+            }
+        }
+        Err(_) => 0,
+    };
+
+    serde_json::to_string(&serde_json::json!({
+        "message": "Catalogue",
+        "data": {
+            "version": version,
+            "loaded": 0,
+            "count": count,
+        }
+    }))
+    .unwrap_or_default()
+}
+
+/// Active WebSocket session tracker for ezBEQ (module-level for push_levels access).
+#[cfg(esp_idf_httpd_ws_support)]
+struct ActiveWsBeq {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    fd: i32,
+}
+
+/// Push level meter data over WebSocket at ~4Hz.
+/// Returns the sender to beq_state when done ONLY if the session fd still matches
+/// (prevents overwriting a new client's sender).
+#[cfg(esp_idf_httpd_ws_support)]
+fn push_levels(
+    mut sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
+    state: SharedDeviceState,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    beq_state: crate::ezbeq::SharedEzBeqState,
+    session_fd: i32,
+    active_ws: Arc<Mutex<Option<ActiveWsBeq>>>,
+) {
+    use esp_idf_svc::ws::FrameType;
+    use std::sync::atomic::Ordering;
+
+    log::info!("levels push thread started");
+
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let json = match get_device(&state) {
+            Some(dev) => match dev.get_status_summary() {
+                Ok(status) => {
+                    let mut levels = serde_json::Map::new();
+                    for (i, &v) in status.input_levels.iter().enumerate() {
+                        levels.insert(
+                            format!("I{i}"),
+                            serde_json::Value::from(v),
+                        );
+                    }
+                    for (i, &v) in status.output_levels.iter().enumerate() {
+                        levels.insert(
+                            format!("O{i}"),
+                            serde_json::Value::from(v),
+                        );
+                    }
+                    serde_json::to_string(&serde_json::json!({
+                        "message": "Levels",
+                        "data": {
+                            "name": "master",
+                            "ts": 0,
+                            "levels": levels,
+                        }
+                    }))
+                    .unwrap_or_default()
+                }
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+
+        if sender.send(FrameType::Text(false), json.as_bytes()).is_err() {
+            break;
+        }
+    }
+
+    log::info!("levels push thread stopped");
+
+    // Only return sender if the session is still the same (no new client replaced us)
+    let still_active = active_ws.lock().ok()
+        .and_then(|g| g.as_ref().map(|a| a.fd == session_fd))
+        .unwrap_or(false);
+    if still_active {
+        if let Ok(mut beq_guard) = beq_state.lock() {
+            beq_guard.ws_sender = Some(sender);
+        }
+    } else {
+        log::info!("levels: session replaced, not restoring sender");
+    }
+}
+
+/// Serve a static file from LittleFS with correct Content-Type.
+/// Streams in 4KB chunks to avoid loading large files into memory.
+fn send_static_file<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    path: &str,
+) -> Result<(), C::Error> {
+    // Open file BEFORE sending 200 — if it fails, return 404
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            return send_json(req, 404, r#"{"error":"not found"}"#);
+        }
+    };
+    let content_type = match path.rsplit('.').next() {
+        Some("html") => "text/html",
+        Some("js") => "application/javascript",
+        Some("css") => "text/css",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
+        Some("map") => "application/json",
+        _ => "application/octet-stream",
+    };
+    let headers = [
+        ("Content-Type", content_type),
+        ("Access-Control-Allow-Origin", "*"),
+        ("Cache-Control", "public, max-age=3600"),
+    ];
+    let mut resp = req.into_response(200, None, &headers)?;
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        resp.write_all(&buf[..n])?;
+    }
+    Ok(())
 }
 
 /// Simple percent-decoding for form values.

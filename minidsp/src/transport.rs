@@ -47,3 +47,4 @@ pub trait Transport: Send + Sync + 'static {
 
 pub mod hid;
 pub mod tcp;
+pub mod ws;

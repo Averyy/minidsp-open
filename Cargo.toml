@@ -26,6 +26,7 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
 
 # Internal crates
 minidsp-protocol = { path = "protocol" }

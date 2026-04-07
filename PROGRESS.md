@@ -194,35 +194,64 @@
 - [ ] ESP32 .bin firmware
 - [ ] README with migration guide from minidsp-rs
 
+## Phase 1o: CLI & API Compatibility (2026-04-06)
+- [x] WsTransport for --daemon-url (tokio-tungstenite, connects to /devices/{id}/ws)
+- [x] WsTransport for --daemon-sock (Unix socket WebSocket upgrade)
+- [x] Crossover CLI subcommand (set coefficients, bypass)
+- [x] Compressor CLI subcommand (set threshold/ratio/attack/release, bypass)
+- [x] FIR CLI subcommand (bypass, load from file)
+- [x] Routing CLI subcommand (input N routing M gain_db)
+- [x] Debug subcommand (send hex, id, dump-float)
+- [x] -v/--verbose/--log flags (verbose count, log filter)
+- [x] --all-local-devices hidden flag (backward compat)
+- [x] --force-device/--force-dsp hidden deprecated flags (backward compat)
+- [x] Env var support: MINIDSP_URL, MINIDSP_SOCK, MINIDSP_TCP, MINIDSP_USB, MINIDSPD_URL, MINIDSP_INDEX, MINIDSP_LOG
+- [x] server --advertise/--ip CLI flags
+- [x] SHD source names: Rca/Xlr (was AnalogSingleEnd/AnalogBalanced)
+- [x] JSON error format: ApiError type with {"error":"..."} on daemon
+- [x] execute_line: invert command support in -f batch files
+- [x] Discovery packet encoding moved to protocol crate (shared ESP32+daemon)
+- [x] polarity_value() in protocol crate (shared set_invert dedup)
+- [x] decode_tcp_response in protocol crate (client TCP recv without checksum)
+- [x] --force-kind: added msharc4x8, c8x12v2, m4x10hd, m10x10hd variants
+- [x] Daemon delay clamp (0..48000 samples, matching ESP32)
+- [x] Per-channel gain validation (|gain| <= 120 dB, finite check on ESP32)
+- [x] Manifest filename sanitization (reject .., /, null bytes)
+- [x] Path traversal: reject %2e/%2E/%00 in addition to ..
+- [x] TCP bridge read_buf cap at 1024 bytes (ESP32 OOM protection)
+- [x] WS fd tracking: push_levels only restores sender if session unchanged
+- [x] ezBEQ title/author truncation (256 bytes max)
+- [x] Dead code removed: StatusSummaryJson, MasterStatusGetJson, encode_invert, TcpTransport::connect_unix
+
 ## Known Issues / Deferred
 - Legacy device config.xml address table extraction not implemented — devices work at DspKnown tier (basic support)
 - DSP 115 input PEQ addresses confirmed but input mute/gain/polarity not in Device Console XML (marked Option::None)
 - Idempotent retry on reconnect deferred — requires persisting pending state
 - PWR-ICE TCP compat deferred — need device owner
-- ESP32 simulator uses 2-byte address parsing for CMD_READ_FLOATS — returns 0 floats. Real hardware uses 3-byte (NEW dialect) correctly. Update simulator at `~/code/esp-uac2-host/simulators/minidsp-2x4hd/`.
+- ESP32 USB Host HID response framing: real 2x4 HD response bytes don't match `decode_frame` checksum. See `docs/TODO-fix-minidsp.md` for analysis.
+- ESP32 GET /config handler not registered (POST /config works)
+- GET /devices URL is hardcoded "ws://localhost:5380/..." instead of actual transport URL
+- POST /config silently ignores routing/crossover/compressor/FIR fields (CLI subcommands implemented)
 
 ---
 
 ## Phase 2: ezBEQ on ESP32
 
-- [ ] GitHub Action: catalogue index pipeline (~80 lines Python)
-- [ ] Data partition: LittleFS setup (~5 MB)
-- [ ] Boot sequence: manifest check → download UI + catalogue → serve
-- [ ] Auto-update from GitHub Pages (background, non-blocking)
-- [ ] ezBEQ backend API: entry ID lookup (ephemeral + stable hash)
-- [ ] ezBEQ backend API: biquad write to MiniDSP
-- [ ] ezBEQ backend API: WebSocket catalogue browsing
-- [ ] Serve ezBEQ React UI static files from flash
-- [ ] Test: ezBEQ end-to-end on ESP32
+Architecture: Browser fetches full catalogue directly from beqcatalogue.readthedocs.io.
+ESP32 only stores binary biquad index (~3MB) + React UI (~1.3MB) = ~4.4MB on LittleFS.
+JS shim injected into React UI intercepts WebSocket catalogue loading, caches in IndexedDB.
 
----
-
-## Separate Projects (after v1)
-
-- [ ] 12V trigger: GPIO + MOSFET, `POST /trigger/on|off`, `GET /trigger/status`
-- [ ] MQTT discovery + HA entities
-- [ ] SSE live log streaming (`GET /debug/events`)
-- [ ] Syslog UDP (RFC 5424)
+- [x] GitHub Action: catalogue pipeline (build-catalogue.py) — digest-keyed binary index + React UI from PyPI + JS shim injection
+- [x] Data partition: LittleFS setup (12 MB, ~37% utilized)
+- [x] Boot sequence: manifest check → download catalogue.bin + UI → serve
+- [x] Auto-update from GitHub Pages (background, non-blocking, every 4h version check)
+- [x] ezBEQ backend API: biquad lookup by digest hash (binary search on catalogue.bin)
+- [x] ezBEQ backend API: biquad write to MiniDSP input PEQ bands
+- [x] ezBEQ backend API: REST routes (load/clear filter, device control, slot state)
+- [x] ezBEQ WebSocket: /ws endpoint (device state, level meters, catalogue meta)
+- [x] Browser-direct catalogue: JS shim fetches database.json from beqcatalogue, caches in IndexedDB
+- [x] Serve ezBEQ React UI static files from flash (SPA with catch-all fallback)
+- [ ] Test: ezBEQ end-to-end on ESP32 — NEEDS HARDWARE TEST
 
 ---
 
@@ -246,9 +275,6 @@ See [`docs/TODO-esp32-usb-audio.md`](docs/TODO-esp32-usb-audio.md) for full desi
 ## Stretch / Someday
 
 - [ ] Preset import/export (Device Console XML format)
-- [ ] Per-source volume offsets
-- [ ] Template/offline device (in-memory simulation)
-- [ ] MCP server (`--mcp` flag)
 - [ ] OTA firmware updates (ESP32)
 - [ ] Custom PCB (USB stick form factor)
-- [ ] WiSA speaker management
+- [ ] 12V trigger: GPIO + MOSFET, `POST /trigger/on|off`, `GET /trigger/status`
