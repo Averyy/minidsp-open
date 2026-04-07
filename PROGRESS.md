@@ -1,5 +1,9 @@
 # minidsp-open Progress
 
+Active restart note:
+- Ongoing `/devices/{id}/config` debugging is tracked in `docs/context-dump.md`.
+- Current state: desktop real-hardware `/devices/{id}/config` is fixed on the 2x4 HD by combining typed scalar reads, official-app write-command shapes, and a PEQ shadow/default model. ESP32 parity is still pending. The broader next objective is the repeatable official-app extractor/import pipeline tracked in `docs/context-dump.md`. Keep that document updated until all-device support is data-driven and stable.
+
 ## Phase 0: Project Setup
 - [x] Cargo workspace (protocol, minidsp, daemon, app-desktop, app-esp32)
 - [ ] CI: GitHub Actions for Linux (x86_64, armhf, arm64), macOS (x86_64, aarch64), Windows
@@ -37,6 +41,9 @@
 - [x] Two-stage device identification (dsp_version → address table, hw_id → profile)
 - [x] Capability tiers (Universal / DspKnown / Full)
 - [x] Per-device delay limits, sample rates, source mappings
+- [ ] Repeatable official-app device importer/enumerator from `app/app-extracted` and `app/apk-extracted`
+- [ ] Enumerate every official-app device against the current support table
+- [ ] Systematically import missing device definitions, source maps, config typing, and capability flags from official app assets
 
 ## Phase 1c: Transport & Connection
 - [x] Transport trait (send_frame/recv_frame — transport handles wire encoding)
@@ -58,10 +65,12 @@
 - [x] "Busy" response for simultaneous connections — queue depth limit (64), returns 503
 
 ## Phase 1e: Config Read-Back & Measurement Mode
-- [x] `read_full_config()` — ReadFloats across all DSP addresses (GET /devices/:id/config)
+- [x] `read_full_config()` — current implementation reads config over DSP addresses (GET /devices/:id/config)
 - [x] Config struct (JSON-serializable: DeviceConfig, InputChannelConfig, OutputChannelConfig, BiquadCoeffs, CompressorConfig)
 - [x] Measurement mode: save state → bypass all PEQ → restore (enter_measurement_mode / restore_measurement_mode)
 - [x] Modification tokens (read/write EEPROM 0xFFC8) — GET /devices/:id/tokens
+- [x] Typed config read-back model from official app assets on desktop — direct USB and extracted app analysis confirmed config slots are not uniformly float32; desktop `/config` now uses typed scalar decoding plus a PEQ shadow/default model for live hardware.
+- [ ] Port the fixed typed config model + official-app write shapes to ESP32 and verify on physical hardware.
 
 ## Phase 1f: Partial Write Recovery
 - [x] Bypass-first write ordering for batch PEQ writes (write_peq_batch: bypass all → write coeffs → set final bypass)
@@ -194,6 +203,7 @@
 - [x] Test: heap stability — 167KB free after 20 GET + 3 WS sessions, no leak, min watermark 139KB
 - [x] Test: `probe --net` against live ESP32 with no MiniDSP attached (2026-04-07) — fixed ESP32 fallback UDP advertisement, desktop CLI now discovers `minidsp-bridge-*` over UDP 3999
 - [x] Test: ESP32 with physical MiniDSP 2x4 HD attached (2026-04-07) — flashed via `esptool.py`, fixed real-hardware `ReadFlash` and `ReadFloats` response-shape handling enough for live probe, `/devices`, `/devices/0`, `/debug/info`, `/devices/0/tokens`, and basic write routes (`POST /devices/0`, `/volume/toggle_mute`, `/source/toslink`, `/preset/1`)
+- [x] Test: typed config read-back parity on direct USB — PASSED 2026-04-07 on physical 2x4 HD. Desktop daemon `/devices/0/config` now round-trips scalar writes on hardware and returns PEQ/default state via the daemon-side shadow model when live PEQ reads return the all-zero placeholder.
 - [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
@@ -230,6 +240,8 @@
 - [x] Dead code removed: StatusSummaryJson, MasterStatusGetJson, encode_invert, TcpTransport::connect_unix
 
 ## Known Issues / Deferred
+- Active investigation restart point: `docs/context-dump.md` tracks the current real-hardware `/config` debugging state, confirmed protocol findings, and next steps until this work is fully resolved and folded back into the permanent docs.
+- We only have one physical MiniDSP for validation. The long-term support plan must therefore be repeatable from extracted official app assets, with the 2x4 HD used as the shared live regression case rather than pretending we can bench-test every model.
 - Primary next blocker: live ESP32 validation with a real MiniDSP attached. The no-MiniDSP appliance path is now verified; remaining risk is real USB-host command I/O and ezBEQ filter application against hardware.
 - Legacy device config.xml address table extraction not implemented — devices work at DspKnown tier (basic support)
 - DSP 115 input PEQ addresses confirmed but input mute/gain/polarity not in Device Console XML (marked Option::None)
@@ -237,7 +249,9 @@
 - PWR-ICE TCP compat deferred — need device owner
 - ESP32 HID framing issue resolved in shared packet layer: HID/device responses use `[len][payload]` with no checksum. Real-hardware follow-up narrowed the remaining problem to config-register `ReadFloats` handling rather than generic framing. See `docs/todo-checker.md`.
 - ESP32 flashing on CH340 boards must use `esptool.py`, not `espflash` / `cargo run`; repo-local `CLAUDE.md` documents the working flow and Codex memory/skill were updated accordingly
-- ESP32 `GET /devices/0/config` is now registered, but real-hardware config read-back is still incorrect on a physical 2x4 HD: live `ReadFloats` responses for config addresses return echoed requests plus trailing bytes that do not yet decode to valid PEQ/gain state, and broader parser scans currently push the route into timeout territory
+- ESP32 `GET /devices/0/config` is now registered, but real-hardware config parity is still pending on a physical 2x4 HD. Desktop investigation established the correct model: typed scalar reads, official-app 2-byte write addresses for `0x13` / `0x19` / `0x30`, and a PEQ shadow/default model because live PEQ `0x14` reads still return the all-zero placeholder.
+- Direct desktop comparison against the extracted official app/XML and upstream `minidsp-rs` confirmed that our old local `DSP_100` table was wrong. The shared `protocol/src/device/dsp.rs` definition now matches the official DSP 100 map (`0..83`, `84/2133/4182/6231`, `8280+`, `8380+`, `8580+`). This address-table correction applies to the DSP 100 family only (2x4 HD and Flex non-DL), not all devices.
+- Shared protocol layer fixes from the same investigation do apply more broadly: `ReadFloats` now uses the correct upstream wire format, the HID decoder preserves unframed leading-zero `0x02` DSP-read responses instead of truncating them, and modern-device write commands (`0x13` / `0x19` / `0x30`) now use the official app’s 2-byte address shape instead of the old minidsp-rs-style 3-byte write-address assumption.
 - POST /config silently ignores routing/crossover/compressor/FIR fields (CLI subcommands implemented)
 
 ---

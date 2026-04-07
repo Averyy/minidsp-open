@@ -2,11 +2,16 @@
 
 Research date: 2026-03-30. All data from minidsp-rs `dev` branch source code, MiniDSP Device Console, and miniDSP Controller Android APK.
 
+Important status note:
+- this document shows what legacy-device source data exists and how to turn it into support
+- it does not mean legacy full support is already complete
+- the required next step is a repeatable clean-room importer from the extracted official app assets plus legacy `config.xml` sources
+
 ## Executive Summary
 
 Complete address tables for every legacy device exist in SigmaStudio config.xml exports (the same files minidsp-rs uses as source data). These config.xml files are MiniDSP device data (SigmaStudio project exports), not minidsp-rs code. We use them as source data for our own device definitions, same as we use Device Console XML for SHARC devices.
 
-**Recommendation: Include all legacy devices at launch. Source data is available; we write our own extraction and device definitions.**
+**Status:** Source data exists for full legacy support, but `minidsp-open` currently ships legacy devices at `DspKnown` or basic-support tiers until the clean-room importer and `config.xml` extraction path are implemented. Treat this file as source-data and planning reference, not as a claim that full legacy parity is already shipped.
 
 **Clean-room note:** We reference minidsp-rs's protocol knowledge (credited) and use the same public source data (SigmaStudio config.xml exports). All code — extraction, device definitions, dialect handling — is written from scratch. We do NOT copy minidsp-rs's generated Rust files or their codegen pipeline.
 
@@ -76,7 +81,7 @@ This is already fully implemented in minidsp-rs `dev` and works correctly for al
 
 ## Legacy Device Inventory
 
-### Tier 1: Full address tables exist in minidsp-rs (INCLUDE AT LAUNCH)
+### Tier 1: Full address tables exist in source data (follow-on implementation work)
 
 | Device | hw_id | dsp_version | Dialect | I/O | PEQ per ch | Config.xml | Generated .rs |
 |--------|-------|-------------|---------|-----|------------|------------|---------------|
@@ -182,40 +187,26 @@ Our additions:
 (32, 115) -> FlexHtx (new FW with input PEQ)
 ```
 
-## Recommendation
+## Current Project Status
 
-### Include at launch (Full Support -- 13 devices):
+### Implemented today
 
-**SHARC / New dialect (7 devices, already have address tables in ref-address-tables.md):**
-1. 2x4 HD (hw_id 10, DSP 100)
-2. DDRC-24 (hw_id 10, DSP 101)
-3. Flex (hw_id 27, DSP 100)
-4. Flex DL (hw_id 27, DSP 101)
-5. SHD / SHD Studio / SHD Power (hw_id 14/17/21, DSP 105)
-6. Flex Eight / Flex Eight DL (hw_id 30, DSP 110/111) -- NEW
-7. Flex HT / Flex HTx (hw_id 31/32, DSP 113/115) -- NEW
+- SHARC-era devices covered by `docs/ref-address-tables.md` are implemented in `minidsp-open`.
+- Legacy 4x10 HD, 10x10 HD, NanoDigi 2x8, miniSHARC 4x8, DDRC-88BM, and C-DSP 8x12 v2 are identified and supported at `DspKnown` tier in current code.
+- miniDSP 2x4 non-HD, nanoAVR, and nanoAVR HDA remain basic-support devices.
 
-**Legacy / Old dialect (6 devices, port from minidsp-rs dev branch):**
-8. 4x10 HD (hw_id 1, old dialect)
-9. 10x10 HD (hw_id 1/dsp 51, old dialect)
-10. NanoDigi 2x8 (hw_id 2/dsp 54, old dialect)
-11. miniSHARC 4x8 (hw_id 4, new dialect despite age)
-12. DDRC-88BM (hw_id 6/dsp 95, new dialect)
-13. C-DSP 8x12 v2 (hw_id 11/dsp 97, new dialect)
-
-### Include at launch (Basic Support only -- 3 devices):
-
-14. miniDSP 2x4 non-HD (hw_id 2/dsp 22) -- symbols exist but input/output wiring incomplete
-15. nanoAVR (hw_id 7) -- no config.xml, basic only
-16. nanoAVR HDA (hw_id 8) -- no config.xml, basic only
-
-Basic support = volume, mute, source, preset, dirac bypass. No PEQ/crossover/delay/compressor.
-
-### Defer:
+### Still deferred or incomplete
 
 - **PWR-ICE125/250** (hw_id 3) -- already deferred per FUTURE-pwr-ice.md
 - **CDSP 8x12DL** -- need probe from device owner
 - **hw_id 5** (10x10HD variant) -- probably shares address table with hw_id 1/dsp 51, but unconfirmed
+
+### Follow-on work to reach full legacy parity
+
+- Build the repeatable importer/enumeration pipeline from `app/app-extracted`, `app/apk-extracted`, and legacy `config.xml` sources
+- Implement the clean-room SigmaStudio `config.xml` parser
+- Extract and wire full address tables for Tier 1 legacy devices
+- Promote legacy devices from `DspKnown`/basic support to full support as each device family is verified
 
 ### Effort estimate for legacy devices:
 

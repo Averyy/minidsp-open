@@ -21,6 +21,12 @@ That means existing clients should continue to work without changes:
 
 Rule: compatibility behavior is frozen. New features are additive and must use new paths, new flags, or new payload fields without changing compatibility semantics.
 
+Scope note:
+- this file defines the external contract once a device family is supported
+- it does not imply that every device in MiniDSP's official apps is already fully implemented in this repo
+- coverage progress and importer work are tracked in `PROGRESS.md` and `docs/context-dump.md`
+- when protocol details differ between `minidsp-rs` and MiniDSP's own extracted app assets, the official app assets are the source of truth
+
 ## Surface Areas
 
 Compatibility applies to six public surfaces:

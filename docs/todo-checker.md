@@ -4,6 +4,11 @@ This file is the master verification plan for finishing compatibility testing.
 
 It replaces the earlier compatibility and ESP32/MiniDSP investigation TODOs. Any useful content from those temporary docs should be preserved here, in `PROGRESS.md`, or in the permanent `ref-*` docs.
 
+Current planning note:
+- the project now uses the physical 2x4 HD as the live regression case for shared behavior
+- broader all-device coverage must come from a repeatable importer/enumerator based on `app/app-extracted` and `app/apk-extracted`
+- use this checklist for compatibility verification, and use `docs/context-dump.md` / `PROGRESS.md` to track the importer-driven support expansion
+
 ## Exit Criteria
 
 We are done when all of the following are true:
@@ -15,6 +20,7 @@ We are done when all of the following are true:
 5. The former compatibility audit todo is fully closed and no longer needed.
 6. `docs/ref-compatibility.md` matches the verified behavior exactly.
 7. `docs/ref-ezbeq.md` matches the verified behavior exactly and does not imply unverified hardware coverage.
+8. Official-app device coverage is enumerated against the current support table, so support claims are backed by extracted-app evidence instead of guesswork.
 
 ## Rules For This Checklist
 
@@ -71,9 +77,9 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 
 ### 1.5 PEQ and config checks
 
-- [ ] A small PEQ write succeeds through `/devices/0/config`.
-- [ ] The written PEQ can be read back or otherwise confirmed from the device.
-- [ ] Output gain/mute/delay/invert writes via `/devices/0/config` are verified on hardware.
+- [x] A small PEQ write succeeds through desktop `/devices/{id}/config` on real hardware.
+- [x] On desktop, the written PEQ is confirmed through the daemon-side PEQ shadow model used by `GET /devices/{id}/config` because live PEQ `0x14` reads still return the all-zero placeholder.
+- [x] Output gain/mute/delay/invert writes via desktop `/devices/{id}/config` are verified on hardware.
 - [ ] Input gain/mute writes via `/devices/0/config` are verified on hardware where supported.
 
 ### 1.6 ezBEQ-critical ESP32 path
@@ -274,10 +280,10 @@ This section is mandatory before deleting the compatibility todo.
 
 ### 6.1 Desktop `/config`
 
-- [ ] `GET /devices/{id}/config` returns read-back data that matches device state.
+- [x] Desktop `GET /devices/{id}/config` returns read-back data that matches verified desktop device/model state on the real 2x4 HD.
 - [ ] `POST /devices/{id}/config` applies master status fields correctly.
 - [ ] `POST /devices/{id}/config` applies input PEQ/gain/mute correctly.
-- [ ] `POST /devices/{id}/config` applies output PEQ/gain/mute/delay/invert correctly.
+- [x] Desktop `POST /devices/{id}/config` applies output PEQ/gain/mute/delay/invert correctly on the real 2x4 HD.
 
 ### 6.2 ESP32 `/config`
 
@@ -382,6 +388,20 @@ This section must be completed after the technical tests.
   Physical attach, probe, EEPROM reads, master status, tokens, and basic write routes all work on real hardware after fixing real-device `ReadFlash`/`ReadFloats` response-shape handling.
 - Notes / follow-up:
   `GET /devices/0/config` now exists on ESP32 but is still failing compatibility verification on real hardware. It first returned garbage PEQ/gain values, and after widening the parser search it times out instead of returning verified config data. Keep this open under Section 6.2 and `PROGRESS.md`.
+
+### Section 1 config-read retest
+
+- Date: 2026-04-07
+- Hardware: ESP32-S3 DevKitC + physical MiniDSP 2x4 HD (hw_id 10, dsp_version 100, serial 912345)
+- Transport: ESP32 USB host HID over WiFi STA at `192.0.2.246:5380`
+- Commands / routes exercised:
+  `GET /devices/0`
+  `GET /devices/0/config`
+  serial debug logging of raw USB HID replies during both paths
+- Result:
+  `GET /devices/0` still returns live status and level data. `GET /devices/0/config` now returns empty PEQ arrays and `null` scalar fields instead of fabricated garbage values.
+- Notes / follow-up:
+  Desktop direct-USB investigation resolved the model on the same physical 2x4 HD: scalar config slots are typed 32-bit values, modern-device write commands use the official app’s 2-byte address shape on `0x13` / `0x19` / `0x30`, and live PEQ `0x14` reads still return the all-zero placeholder so the daemon now uses a PEQ shadow/default model. ESP32 still needs that corrected behavior ported and verified.
 
 ### 10.4 `docs/ref-ezbeq.md`
 

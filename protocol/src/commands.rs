@@ -132,26 +132,50 @@ pub fn write_flash(addr_hi: u8, addr_lo: u8, data: &[u8]) -> Vec<u8> {
 pub fn write_dsp(addr: u16, value: f32, save: bool, dialect: &Dialect) -> Vec<u8> {
     let mut cmd = vec![CMD_WRITE_DSP];
     cmd.push(if save { 0x80 } else { 0xA0 });
-    cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+    if dialect.value_format == crate::dialect::ValueFormat::Float32 {
+        cmd.extend_from_slice(&[(addr >> 8) as u8, addr as u8]);
+    } else {
+        cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+    }
     cmd.extend_from_slice(&dialect::encode_value(value, dialect));
     cmd
+}
+
+/// Build a WriteDSP command with a raw little-endian 32-bit payload.
+///
+/// This is used for config slots modeled by the official app as typed 32-bit
+/// values (`integer`, `samplecnt`, etc.) rather than DSP coefficient floats.
+pub fn write_dsp_u32(addr: u16, value: u32, save: bool) -> Vec<u8> {
+    let bytes = value.to_le_bytes();
+    vec![
+        CMD_WRITE_DSP,
+        if save { 0x80 } else { 0xA0 },
+        (addr >> 8) as u8,
+        addr as u8,
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+    ]
 }
 
 /// Build a ReadFloats command. Reads `count` float values starting at `addr`.
 /// Maximum count is 14 per request.
 pub fn read_floats(addr: u16, count: u8, dialect: &Dialect) -> Vec<u8> {
-    let mut cmd = vec![CMD_READ_FLOATS];
-    let addr_bytes = dialect::encode_addr(addr, false, dialect);
-    cmd.extend_from_slice(&addr_bytes);
-    cmd.push(count.min(14));
-    cmd
+    let _ = dialect;
+    vec![CMD_READ_FLOATS, (addr >> 8) as u8, addr as u8, count.min(14)]
 }
 
 /// Build a WriteBiquad command. Writes 5 biquad coefficients at the given address.
 pub fn write_biquad(addr: u16, coeffs: &[f32; 5], dialect: &Dialect) -> Vec<u8> {
     let mut cmd = vec![CMD_WRITE_BIQUAD, 0x80];
-    cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
-    cmd.extend_from_slice(&[0x00, 0x00]); // padding
+    if dialect.value_format == crate::dialect::ValueFormat::Float32 {
+        cmd.extend_from_slice(&[(addr >> 8) as u8, addr as u8]);
+        cmd.extend_from_slice(&[0x00, 0x00]);
+    } else {
+        cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+        cmd.extend_from_slice(&[0x00, 0x00]); // padding
+    }
     for &c in coeffs {
         cmd.extend_from_slice(&dialect::encode_value(c, dialect));
     }
@@ -162,7 +186,11 @@ pub fn write_biquad(addr: u16, coeffs: &[f32; 5], dialect: &Dialect) -> Vec<u8> 
 pub fn bypass_filter(addr: u16, bypass: bool, dialect: &Dialect) -> Vec<u8> {
     let mut cmd = vec![CMD_BYPASS_FILTER];
     cmd.push(if bypass { 0x80 } else { 0x00 });
-    cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+    if dialect.value_format == crate::dialect::ValueFormat::Float32 {
+        cmd.extend_from_slice(&[(addr >> 8) as u8, addr as u8, 0x00, 0x00]);
+    } else {
+        cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+    }
     cmd
 }
 
@@ -318,12 +346,51 @@ pub fn parse_response_for_request(
     }
 
     if request.first() == Some(&CMD_READ_FLOATS) && data.first() == Some(&CMD_READ_FLOATS) {
+        if request.len() >= 4
+            && data.len() >= 5
+            && data[1] == request[1]
+            && data[2] == request[2]
+            && data[3] == 0x00
+            && data[4] == request[3]
+        {
+            let count = request[3] as usize;
+            let remaining = &data[5..];
+
+            if remaining.len() > count.saturating_mul(4) + 8
+                && remaining.len() >= 6
+                && remaining[..6] == [0, 0, 0, 0, 0, 0]
+            {
+                return Response::Unknown(data.to_vec());
+            }
+
+            if let Some(values) =
+                decode_float_block_with_offset(remaining, count, dialect, request)
+            {
+                return Response::Floats(values);
+            }
+
+            return Response::Unknown(data.to_vec());
+        }
+
         if data.starts_with(request) && request.len() < data.len() {
             let count = request.last().copied().unwrap_or(0) as usize;
             let remaining = &data[request.len()..];
-            if let Some(values) = decode_float_block_with_offset(remaining, count, dialect) {
+            let needed = count.saturating_mul(4);
+
+            if remaining.len() > needed + 8
+                && remaining.len() >= 6
+                && remaining[..6] == [0, 0, 0, 0, 0, 0]
+            {
+                return Response::Unknown(data.to_vec());
+            }
+
+            if let Some(values) =
+                decode_float_block_with_offset(remaining, count, dialect, request)
+            {
                 return Response::Floats(values);
             }
+
+            return Response::Unknown(data.to_vec());
         }
     }
 
@@ -331,13 +398,24 @@ pub fn parse_response_for_request(
 }
 
 /// Parse a ReadFloats response into float values.
-/// Response format: [0x14, float_data...] — command echo followed by float bytes.
-/// Verified against miniDSP 2x4 HD simulator: NO address echo in response.
+///
+/// Upstream `minidsp-rs` treats these as `[0x14, addr_hi, addr_lo, float_data...]`.
+/// Some local simulator paths have also emitted `[0x14, float_data...]`, so keep a
+/// fallback for that older assumption.
 fn parse_floats_response(data: &[u8], dialect: &Dialect) -> Response {
     if data.len() <= 1 {
         return Response::Floats(vec![]);
     }
-    let float_data = &data[1..]; // skip command echo byte
+
+    if data.len() >= 3 {
+        let float_data = &data[3..];
+        if float_data.len() % 4 == 0 {
+            let floats = decode_float_chunks(float_data, float_data.len() / 4, dialect);
+            return Response::Floats(floats);
+        }
+    }
+
+    let float_data = &data[1..];
     let floats = decode_float_chunks(float_data, float_data.len() / 4, dialect);
     Response::Floats(floats)
 }
@@ -353,7 +431,59 @@ fn decode_float_chunks(data: &[u8], count: usize, dialect: &Dialect) -> Vec<f32>
     floats
 }
 
-fn decode_float_block_with_offset(data: &[u8], count: usize, dialect: &Dialect) -> Option<Vec<f32>> {
+fn decode_word_chunks(data: &[u8], count: usize) -> Vec<u32> {
+    let mut words = Vec::new();
+    for chunk in data.chunks(4).take(count) {
+        if chunk.len() == 4 {
+            words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+    }
+    words
+}
+
+/// Parse a raw `ReadFloats` reply into typed 32-bit words instead of float32.
+pub fn parse_param_words_response_for_request(request: &[u8], data: &[u8]) -> Option<Vec<u32>> {
+    if request.first().copied() != Some(CMD_READ_FLOATS) {
+        return None;
+    }
+
+    let count = request.last().copied().unwrap_or(0) as usize;
+    if count == 0 {
+        return Some(vec![]);
+    }
+
+    let needed = count * 4;
+
+    if data.len() >= 3
+        && data.first().copied() == Some(CMD_READ_FLOATS)
+        && request.len() >= 3
+        && data.get(1) == request.get(1)
+        && data.get(2) == request.get(2)
+        && data.len() >= 3 + needed
+    {
+        return Some(decode_word_chunks(&data[3..3 + needed], count));
+    }
+
+    if data.starts_with(request) && data.len() >= request.len() + needed {
+        return Some(decode_word_chunks(
+            &data[request.len()..request.len() + needed],
+            count,
+        ));
+    }
+
+    if data.first().copied() == Some(CMD_READ_FLOATS) && data.len() >= 1 + needed {
+        return Some(decode_word_chunks(&data[1..1 + needed], count));
+    }
+
+    None
+}
+
+fn decode_float_block_with_offset(
+    data: &[u8],
+    count: usize,
+    dialect: &Dialect,
+    request: &[u8],
+) -> Option<Vec<f32>> {
     if count == 0 {
         return Some(vec![]);
     }
@@ -370,7 +500,7 @@ fn decode_float_block_with_offset(data: &[u8], count: usize, dialect: &Dialect) 
             continue;
         }
 
-        if let Some(score) = score_float_candidate(&values) {
+        if let Some(score) = score_float_candidate(&values, offset, data, request) {
             let replace = match &best {
                 Some((best_score, best_offset, _)) => {
                     score > *best_score || (score == *best_score && offset < *best_offset)
@@ -383,15 +513,17 @@ fn decode_float_block_with_offset(data: &[u8], count: usize, dialect: &Dialect) 
         }
     }
 
-    if let Some((_, _, values)) = best {
-        return Some(values);
-    }
-
-    Some(decode_float_chunks(&data[..needed], count, dialect))
+    best.map(|(_, _, values)| values)
 }
 
-fn score_float_candidate(values: &[f32]) -> Option<usize> {
+fn score_float_candidate(
+    values: &[f32],
+    offset: usize,
+    raw_data: &[u8],
+    request: &[u8],
+) -> Option<usize> {
     let mut score = 0usize;
+    let mut zero_count = 0usize;
 
     for value in values {
         if !value.is_finite() {
@@ -400,7 +532,10 @@ fn score_float_candidate(values: &[f32]) -> Option<usize> {
 
         let abs = value.abs();
         if abs == 0.0 {
+            zero_count += 1;
             score += 5;
+        } else if abs < 1e-8 {
+            return None;
         } else if !value.is_normal() {
             return None;
         } else if abs <= 10.0 {
@@ -410,6 +545,18 @@ fn score_float_candidate(values: &[f32]) -> Option<usize> {
         } else if abs <= 50_000.0 {
             score += 1;
         } else {
+            return None;
+        }
+    }
+
+    if values.len() == 1 && zero_count == 1 {
+        if raw_data.len() >= 2
+            && raw_data[0] == 0x16
+            && raw_data[1] == 0x01
+            && raw_data.len() > 6
+            && offset <= 4
+            && request.first() == Some(&CMD_READ_FLOATS)
+        {
             return None;
         }
     }
@@ -470,11 +617,16 @@ mod tests {
         let cmd = write_dsp(0x0042, 1.0, true, &Dialect::NEW);
         assert_eq!(cmd[0], CMD_WRITE_DSP);
         assert_eq!(cmd[1], 0x80); // save flag
-        assert_eq!(cmd[2], 0x80); // addr hi with write bit
+        assert_eq!(cmd[2], 0x00); // addr hi
         assert_eq!(cmd[3], 0x42); // addr lo
-        assert_eq!(cmd[4], 0x00); // addr third byte
-        let value_bytes = &cmd[5..9];
+        let value_bytes = &cmd[4..8];
         assert_eq!(value_bytes, &1.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn write_dsp_u32_new_dialect() {
+        let cmd = write_dsp_u32(0x0042, 2, true);
+        assert_eq!(cmd, vec![CMD_WRITE_DSP, 0x80, 0x00, 0x42, 0x02, 0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -483,19 +635,18 @@ mod tests {
         let cmd = write_biquad(0x0100, &coeffs, &Dialect::NEW);
         assert_eq!(cmd[0], CMD_WRITE_BIQUAD);
         assert_eq!(cmd[1], 0x80);
-        // After addr (3 bytes) + padding (2 bytes) = 5 coeffs × 4 bytes = 20 bytes
-        assert_eq!(cmd.len(), 1 + 1 + 3 + 2 + 20);
+        // After addr (2 bytes) + optional/padding (2 bytes) = 5 coeffs × 4 bytes = 20 bytes
+        assert_eq!(cmd.len(), 1 + 1 + 2 + 2 + 20);
     }
 
     #[test]
     fn read_floats_cmd() {
         let cmd = read_floats(0x0030, 4, &Dialect::NEW);
         assert_eq!(cmd[0], CMD_READ_FLOATS);
-        // addr: 3 bytes (no write bit)
+        // ReadFloats uses a 2-byte address on the wire.
         assert_eq!(cmd[1], 0x00);
         assert_eq!(cmd[2], 0x30);
-        assert_eq!(cmd[3], 0x00);
-        assert_eq!(cmd[4], 4); // count
+        assert_eq!(cmd[3], 4); // count
     }
 
     #[test]
@@ -514,8 +665,9 @@ mod tests {
 
     #[test]
     fn parse_floats_response_new() {
-        // Response: [0x14, float_data...] — no address echo
+        // Response: [0x14, addr_hi, addr_lo, float_data...]
         let mut data = vec![CMD_READ_FLOATS];
+        data.extend_from_slice(&[0x00, 0x30]);
         data.extend_from_slice(&1.0f32.to_le_bytes());
         data.extend_from_slice(&(-3.5f32).to_le_bytes());
         let resp = parse_response(&data, &Dialect::NEW);
@@ -533,6 +685,7 @@ mod tests {
     fn parse_floats_response_simulator() {
         // Simulator returns all zeros for unwritten DSP params
         let mut data = vec![CMD_READ_FLOATS];
+        data.extend_from_slice(&[0x00, 0x30]);
         data.extend_from_slice(&0.0f32.to_le_bytes());
         data.extend_from_slice(&0.0f32.to_le_bytes());
         data.extend_from_slice(&0.0f32.to_le_bytes());
@@ -659,6 +812,51 @@ mod tests {
             }
             _ => panic!("expected Floats response"),
         }
+    }
+
+    #[test]
+    fn parse_read_floats_rejects_live_config_junk_for_single_value() {
+        let req = read_floats(0x0fc2, 1, &Dialect::NEW);
+        let data = [
+            0x14, 0x0f, 0xc2, 0x00, 0x01, 0x16, 0x01, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6,
+            0x08, 0x5b, 0x01, 0xdc, 0x5b, 0x01,
+        ];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert!(matches!(resp, Response::Unknown(_)));
+    }
+
+    #[test]
+    fn parse_read_floats_rejects_live_config_junk_for_peq_read() {
+        let req = read_floats(0x0fcc, 5, &Dialect::NEW);
+        let data = [
+            0x14, 0x0f, 0xcc, 0x00, 0x05, 0x16, 0x01, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6,
+            0x08, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc,
+            0x5b, 0x01, 0xdc, 0x5b, 0x01,
+        ];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert!(matches!(resp, Response::Unknown(_)));
+    }
+
+    #[test]
+    fn parse_read_floats_rejects_echoed_zero_header_junk() {
+        let req = read_floats(0x0fc2, 1, &Dialect::NEW);
+        let data = [
+            0x14, 0x0f, 0xc2, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6,
+            0x08, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdb, 0x30, 0x96, 0xdb,
+            0x10, 0x78, 0xdb, 0x10, 0x5a, 0x5b, 0x3c, 0x5b, 0x9e, 0xf6, 0x3f, 0xf6, 0x21,
+            0xf6, 0x08, 0x5b, 0x01, 0xcd, 0xd8,
+        ];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert!(matches!(resp, Response::Unknown(_)));
+    }
+
+    #[test]
+    fn parse_param_words_response_for_integer_slot() {
+        let req = read_floats(0x0002, 1, &Dialect::NEW);
+        let data = [0x14, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00];
+
+        let words = parse_param_words_response_for_request(&req, &data).unwrap();
+        assert_eq!(words, vec![2]);
     }
 
     #[test]

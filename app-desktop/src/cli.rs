@@ -553,7 +553,7 @@ async fn execute_line(client: &MiniDspClient, line: &str) -> Result<(), Box<dyn 
                         .ok_or("device does not support channel delay")?;
                     let ch_def = table.outputs.get(ch as usize)
                         .ok_or_else(|| format!("output channel {ch} out of range"))?;
-                    client.write_dsp(ch_def.delay, samples, true).await?;
+                    client.set_channel_delay_samples(ch_def.delay, samples as u32).await?;
                 }
                 "invert" => {
                     if is_input {
@@ -669,7 +669,7 @@ pub async fn channel_command(
             };
             let sample_rate = client.profile().sample_rate as f32;
             let samples = (ms * sample_rate / 1000.0).round().clamp(0.0, 48000.0);
-            client.write_dsp(ch_def.delay, samples, true).await?;
+            client.set_channel_delay_samples(ch_def.delay, samples as u32).await?;
         }
         ChannelCommand::Invert { state } => {
             let table = client.profile().dsp_table

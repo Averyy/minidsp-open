@@ -157,45 +157,40 @@ fn set_config_wire_format() {
 
 #[test]
 fn write_dsp_new_dialect_wire_format() {
-    // WriteDSP new dialect: [0x13, 0x80(save), addr_hi|0x80, addr_lo, 0x00, value_le_4bytes]
+    // Official app write shape: [0x13, mode, addr_hi, addr_lo, value_le_4bytes]
     let cmd = write_dsp(0x0042, 1.0, true, &Dialect::NEW);
     assert_eq!(cmd[0], 0x13); // command
     assert_eq!(cmd[1], 0x80); // save flag
-    assert_eq!(cmd[2], 0x80); // addr_hi with write bit
+    assert_eq!(cmd[2], 0x00); // addr_hi
     assert_eq!(cmd[3], 0x42); // addr_lo
-    assert_eq!(cmd[4], 0x00); // addr byte 3
-    assert_eq!(&cmd[5..9], &1.0f32.to_le_bytes()); // value as float32 LE
+    assert_eq!(&cmd[4..8], &1.0f32.to_le_bytes()); // value as float32 LE
 }
 
 #[test]
 fn write_biquad_wire_format() {
-    // WriteBiquad: [0x30, 0x80, addr(3 bytes), 0x00, 0x00, 5×float32]
+    // Official app write shape: [0x30, 0x80, addr_hi, addr_lo, 0x00, 0x00, 5xfloat32]
     let bypass_coeffs = [1.0, 0.0, 0.0, 0.0, 0.0];
     let cmd = write_biquad(0x0100, &bypass_coeffs, &Dialect::NEW);
     assert_eq!(cmd[0], 0x30); // command
     assert_eq!(cmd[1], 0x80); // flag
-    // addr: 0x0100 with write bit
-    assert_eq!(cmd[2], 0x81); // addr_hi | 0x80
+    assert_eq!(cmd[2], 0x01); // addr_hi
     assert_eq!(cmd[3], 0x00); // addr_lo
-    assert_eq!(cmd[4], 0x00); // addr byte 3
-    // padding
-    assert_eq!(cmd[5], 0x00);
-    assert_eq!(cmd[6], 0x00);
-    // 5 coefficients × 4 bytes = 20 bytes
-    assert_eq!(cmd.len(), 7 + 20);
+    assert_eq!(cmd[4], 0x00); // optional/padding hi
+    assert_eq!(cmd[5], 0x00); // optional/padding lo
+    // 5 coefficients x 4 bytes = 20 bytes
+    assert_eq!(cmd.len(), 6 + 20);
     // First coeff (b0=1.0) in LE
-    assert_eq!(&cmd[7..11], &1.0f32.to_le_bytes());
+    assert_eq!(&cmd[6..10], &1.0f32.to_le_bytes());
 }
 
 #[test]
 fn read_floats_wire_format() {
-    // ReadFloats: [0x14, addr_hi, addr_lo, addr_byte3, count]
+    // ReadFloats: [0x14, addr_hi, addr_lo, count]
     let cmd = read_floats(0x0FC0, 4, &Dialect::NEW);
     assert_eq!(cmd[0], 0x14);
     assert_eq!(cmd[1], 0x0F); // addr_hi (no write bit for reads)
     assert_eq!(cmd[2], 0xC0); // addr_lo
-    assert_eq!(cmd[3], 0x00); // byte 3
-    assert_eq!(cmd[4], 4);    // count
+    assert_eq!(cmd[3], 4);    // count
 }
 
 #[test]
@@ -450,17 +445,28 @@ fn dsp_100_address_table_verified() {
     assert_eq!(DSP_100.inputs.len(), 2);
     assert_eq!(DSP_100.outputs.len(), 4);
 
-    // Input 0: mute at 4032 (from ref-address-tables.md)
-    assert_eq!(DSP_100.inputs[0].mute, Some(4032));
+    // Input 0: gate enable at 0, gain at 26, PEQ block at 8280
+    assert_eq!(DSP_100.inputs[0].mute, Some(0));
+    assert_eq!(DSP_100.inputs[0].gain, Some(26));
+    assert_eq!(DSP_100.inputs[0].peq[0].addr, 8280);
     assert_eq!(DSP_100.inputs[0].peq.len(), 10);
 
-    // Output 0: mute at 4144
-    assert_eq!(DSP_100.outputs[0].mute, 4144);
+    // Output 0: gate enable at 2, gain at 28, PEQ block at 8380
+    assert_eq!(DSP_100.outputs[0].mute, 2);
+    assert_eq!(DSP_100.outputs[0].gain, 28);
+    assert_eq!(DSP_100.outputs[0].peq[0].addr, 8380);
     assert_eq!(DSP_100.outputs[0].peq.len(), 10);
 
-    // Routing matrix: 2x4
+    // Routing matrix: 2x4 with status block at 6 and gain block at 32
+    assert_eq!(DSP_100.routing.status_base, 6);
+    assert_eq!(DSP_100.routing.gain_base, 32);
     assert_eq!(DSP_100.routing.rows, 2);
     assert_eq!(DSP_100.routing.cols, 4);
+
+    // Meter blocks match the DSP 100 XML / upstream 2x4 HD definition
+    assert_eq!(DSP_100.meters.input, &[68, 69]);
+    assert_eq!(DSP_100.meters.output, &[74, 75, 76, 77]);
+    assert_eq!(DSP_100.meters.compressor, &[70, 71, 72, 73]);
 }
 
 #[test]

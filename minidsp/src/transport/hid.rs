@@ -138,6 +138,8 @@ impl Transport for HidTransport {
     fn send_frame(&self, payload: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
         let device = self.device.clone();
         let hid_report = packet::encode_hid(payload);
+        tracing::debug!("HID OUT payload: {:02x?}", payload);
+        tracing::trace!("HID OUT report: {:02x?}", hid_report);
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let dev = device.lock().map_err(|e| TransportError::Hid(e.to_string()))?;
@@ -171,7 +173,12 @@ impl Transport for HidTransport {
                 if n == 0 {
                     return Err(TransportError::Timeout);
                 }
-                packet::decode_hid_response(&buf[..n])
+                tracing::debug!("HID IN raw ({}): {:02x?}", n, &buf[..n]);
+                let decoded = packet::decode_hid_response(&buf[..n]);
+                if let Some(ref payload) = decoded {
+                    tracing::debug!("HID IN payload: {:02x?}", payload);
+                }
+                decoded
                     .ok_or_else(|| TransportError::Hid("failed to decode HID response".into()))
             })
             .await

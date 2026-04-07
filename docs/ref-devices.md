@@ -6,6 +6,26 @@ Sources:
 - `app/apk-extracted/assets/www/js/controllers.js` (miniDSP Controller Android app — confirms source maps, adds legacy devices)
 - minidsp-rs source code (legacy device definitions)
 
+This file is a registry and planning reference, not a blanket claim that every listed device is already fully implemented and hardware-verified in `minidsp-open`.
+
+## Coverage Policy
+
+We do not have physical access to the full MiniDSP product line. Full device-family coverage therefore has to be driven by a repeatable import/enumeration workflow using the official app assets:
+
+1. extract authoritative device metadata from `app/app-extracted` and `app/apk-extracted`
+2. map each official-app device to probe identity, sources, capabilities, and config typing
+3. compare that inventory against the current Rust support table
+4. implement missing definitions systematically, using the 2x4 HD as the live regression case for shared protocol behavior
+
+Verification tiers used in practice:
+- `Hardware verified`: behavior confirmed on the physical 2x4 HD we have
+- `Data modeled`: device definition/capabilities imported from official app assets, but not physically tested here
+- `Basic support`: probe/master-status style support only
+
+Current reality:
+- 2x4 HD is the only device with direct live hardware validation in this workspace
+- broader support claims must stay tied to extracted official-app evidence until more hardware exists
+
 ## Dirac-Capable DSP Versions
 
 From miniDSP Controller app: `[61, 94, 95, 101, 105, 111, 113]`

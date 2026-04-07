@@ -6,11 +6,13 @@ use minidsp_protocol::commands::{self, HardwareId, Response};
 use minidsp_protocol::device::DeviceProfile;
 use minidsp_protocol::device::probe;
 use minidsp_protocol::eeprom;
+use minidsp_protocol::dialect::ValueFormat;
 use minidsp_protocol::status::{
     MasterStatusView, StatusSummary, DeviceInfo, DeviceVersion,
     BiquadCoeffs, PeqBandConfig, InputChannelConfig, OutputChannelConfig,
     CompressorConfig, DeviceConfig,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -36,6 +38,12 @@ pub struct SavedPeqState {
     pub bands: Vec<(u16, [f32; 5], bool)>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PeqShadow {
+    coeffs: [f32; 5],
+    bypass: bool,
+}
+
 /// Connected MiniDSP device client.
 pub struct MiniDspClient {
     queue: Arc<CommandQueue>,
@@ -46,6 +54,31 @@ pub struct MiniDspClient {
     serial: u32,
     /// Saved PEQ state from measurement mode entry, for later restore.
     saved_peq: Mutex<Option<SavedPeqState>>,
+    /// Shadow state for PEQ bands when the device does not expose live coeff readback.
+    peq_shadow: Mutex<HashMap<u16, PeqShadow>>,
+}
+
+fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
+    let mut shadow = HashMap::new();
+    if let Some(table) = profile.dsp_table {
+        for input in table.inputs {
+            for band in input.peq {
+                shadow.insert(band.addr, PeqShadow {
+                    coeffs: minidsp_protocol::biquad::BYPASS,
+                    bypass: false,
+                });
+            }
+        }
+        for output in table.outputs {
+            for band in output.peq {
+                shadow.insert(band.addr, PeqShadow {
+                    coeffs: minidsp_protocol::biquad::BYPASS,
+                    bypass: false,
+                });
+            }
+        }
+    }
+    shadow
 }
 
 impl MiniDspClient {
@@ -93,6 +126,8 @@ impl MiniDspClient {
         // Step 5: Set dialect on queue so responses are parsed correctly
         queue.set_dialect(profile.dialect).await;
 
+        let peq_shadow = build_peq_shadow(&profile);
+
         Ok(Self {
             queue,
             transport_url,
@@ -101,6 +136,7 @@ impl MiniDspClient {
             dsp_version,
             serial,
             saved_peq: Mutex::new(None),
+            peq_shadow: Mutex::new(peq_shadow),
         })
     }
 
@@ -260,13 +296,13 @@ impl MiniDspClient {
 
     /// Set channel mute using dialect-aware encoding.
     pub async fn set_channel_mute(&self, addr: u16, muted: bool) -> Result<(), ClientError> {
-        use minidsp_protocol::dialect::{ValueFormat, encode_mute};
+        use minidsp_protocol::dialect::encode_mute;
         let mute_bytes = encode_mute(muted, &self.profile.dialect);
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => {
-                // New dialect: mute value is 2.0 (muted) or 1.0 (unmuted)
-                let val = if muted { 2.0 } else { 1.0 };
-                self.write_dsp(addr, val, true).await?;
+                // Official app models modern-device mute slots as integer words.
+                let val = if muted { 2 } else { 1 };
+                self.write_dsp_u32(addr, val, false).await?;
             }
             ValueFormat::FixedPoint => {
                 // Old dialect: mute is raw 4-byte fixed-point via WriteDSP
@@ -280,8 +316,13 @@ impl MiniDspClient {
 
     /// Set channel gain using dialect-aware encoding.
     pub async fn set_channel_gain(&self, addr: u16, db: f32) -> Result<(), ClientError> {
-        let gain_linear = 10.0f32.powf(db / 20.0);
-        self.write_dsp(addr, gain_linear, true).await
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp(addr, db, false).await,
+            ValueFormat::FixedPoint => {
+                let gain_linear = 10.0f32.powf(db / 20.0);
+                self.write_dsp(addr, gain_linear, true).await
+            }
+        }
     }
 
     /// Write biquad coefficients to a PEQ band.
@@ -303,6 +344,12 @@ impl MiniDspClient {
                 Priority::High,
             )
             .await?;
+        let mut shadow = self.peq_shadow.lock().await;
+        let entry = shadow.entry(addr).or_insert(PeqShadow {
+            coeffs: minidsp_protocol::biquad::BYPASS,
+            bypass: false,
+        });
+        entry.coeffs = *coeffs;
         Ok(())
     }
 
@@ -314,13 +361,24 @@ impl MiniDspClient {
                 Priority::High,
             )
             .await?;
+        let mut shadow = self.peq_shadow.lock().await;
+        let entry = shadow.entry(addr).or_insert(PeqShadow {
+            coeffs: minidsp_protocol::biquad::BYPASS,
+            bypass: false,
+        });
+        entry.bypass = bypass;
         Ok(())
     }
 
     /// Set channel polarity inversion using dialect-aware encoding.
     pub async fn set_invert(&self, addr: u16, inverted: bool) -> Result<(), ClientError> {
-        let val = minidsp_protocol::dialect::polarity_value(inverted, &self.profile.dialect);
-        self.write_dsp(addr, val, true).await
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp_u32(addr, if inverted { 1 } else { 0 }, false).await,
+            ValueFormat::FixedPoint => {
+                let val = minidsp_protocol::dialect::polarity_value(inverted, &self.profile.dialect);
+                self.write_dsp(addr, val, true).await
+            }
+        }
     }
 
     /// Write DSP parameter.
@@ -330,6 +388,14 @@ impl MiniDspClient {
                 commands::write_dsp(addr, value, save, &self.profile.dialect),
                 Priority::High,
             )
+            .await?;
+        Ok(())
+    }
+
+    /// Write a raw 32-bit DSP/config parameter word.
+    pub async fn write_dsp_u32(&self, addr: u16, value: u32, save: bool) -> Result<(), ClientError> {
+        self.queue
+            .execute(commands::write_dsp_u32(addr, value, save), Priority::High)
             .await?;
         Ok(())
     }
@@ -346,6 +412,83 @@ impl MiniDspClient {
         match resp {
             Response::Floats(values) => Ok(values),
             _ => Err(ClientError::Protocol("unexpected response to ReadFloats".into())),
+        }
+    }
+
+    /// Read typed 32-bit DSP/config parameter words.
+    pub async fn read_param_words(&self, addr: u16, count: u8) -> Result<Vec<u32>, ClientError> {
+        let req = commands::read_floats(addr, count, &self.profile.dialect);
+        let raw = self.queue.execute_raw(req.clone(), Priority::Normal).await?;
+        commands::parse_param_words_response_for_request(&req, &raw)
+            .ok_or_else(|| ClientError::Protocol("unexpected raw response to typed ReadFloats".into()))
+    }
+
+    pub async fn set_channel_delay_samples(&self, addr: u16, samples: u32) -> Result<(), ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp_u32(addr, samples, false).await,
+            ValueFormat::FixedPoint => self.write_dsp(addr, samples as f32, true).await,
+        }
+    }
+
+    async fn read_param_word(&self, addr: u16) -> Result<u32, ClientError> {
+        self.read_param_words(addr, 1).await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ClientError::Protocol("empty typed param response".into()))
+    }
+
+    async fn read_config_gain_db(&self, addr: u16) -> Result<f32, ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => Ok(f32::from_bits(self.read_param_word(addr).await?)),
+            ValueFormat::FixedPoint => {
+                let linear = self.read_floats(addr, 1).await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| ClientError::Protocol("empty gain response".into()))?;
+                Ok(20.0 * linear.max(1e-10).log10())
+            }
+        }
+    }
+
+    async fn read_config_mute(&self, addr: u16) -> Result<bool, ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => Ok(self.read_param_word(addr).await? >= 2),
+            ValueFormat::FixedPoint => {
+                let value = self.read_floats(addr, 1).await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| ClientError::Protocol("empty mute response".into()))?;
+                Ok(value == 0.0)
+            }
+        }
+    }
+
+    async fn read_config_delay_ms(&self, addr: u16) -> Result<f32, ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
+                let samples = self.read_param_word(addr).await? as f32;
+                Ok(samples * 1000.0 / self.profile.sample_rate as f32)
+            }
+            ValueFormat::FixedPoint => {
+                let samples = self.read_floats(addr, 1).await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| ClientError::Protocol("empty delay response".into()))?;
+                Ok(samples * 1000.0 / self.profile.sample_rate as f32)
+            }
+        }
+    }
+
+    pub async fn read_channel_invert(&self, addr: u16) -> Result<bool, ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => Ok(self.read_param_word(addr).await? != 0),
+            ValueFormat::FixedPoint => {
+                let value = self.read_floats(addr, 1).await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| ClientError::Protocol("empty invert response".into()))?;
+                Ok(value < 0.0)
+            }
         }
     }
 
@@ -465,22 +608,21 @@ impl MiniDspClient {
 
     /// Read 5 biquad coefficients from a PEQ band address.
     async fn read_peq_coeffs(&self, addr: u16) -> Result<[f32; 5], ClientError> {
-        let values = self.read_floats(addr, 5).await?;
+        let values = self.read_floats(addr, 5).await.unwrap_or_default();
         if values.len() >= 5 {
-            Ok([values[0], values[1], values[2], values[3], values[4]])
-        } else {
-            // Return bypass coefficients if we can't read the band
-            Ok(minidsp_protocol::biquad::BYPASS)
+            let coeffs = [values[0], values[1], values[2], values[3], values[4]];
+            if coeffs != [0.0; 5] {
+                return Ok(coeffs);
+            }
         }
+        let shadow = self.peq_shadow.lock().await;
+        Ok(shadow.get(&addr).map(|s| s.coeffs).unwrap_or(minidsp_protocol::biquad::BYPASS))
     }
 
     /// Read PEQ bypass state. Bypass is stored at addr+5 on SHARC devices.
     /// Returns None if the read fails or the device doesn't support bypass readback.
-    async fn read_peq_bypass(&self, _addr: u16) -> Option<bool> {
-        // On SHARC devices, the bypass state for a biquad at base_addr is not directly
-        // readable via a simple ReadFloats. We default to false (not bypassed) when
-        // we can't determine the state.
-        None
+    async fn read_peq_bypass(&self, addr: u16) -> Option<bool> {
+        self.peq_shadow.lock().await.get(&addr).map(|s| s.bypass)
     }
 
     /// Read the full device config including all PEQ coefficients.
@@ -518,14 +660,12 @@ impl MiniDspClient {
             // Read input channels
             for (ch_idx, input) in table.inputs.iter().enumerate() {
                 let gain = if let Some(addr) = input.gain {
-                    self.read_floats(addr, 1).await.ok().and_then(|v| v.first().copied())
+                    self.read_config_gain_db(addr).await.ok()
                 } else {
                     None
                 };
                 let mute = if let Some(addr) = input.mute {
-                    self.read_floats(addr, 1).await.ok().and_then(|v| {
-                        v.first().map(|&val| val >= 1.5) // 2.0 = muted, 1.0 = unmuted
-                    })
+                    self.read_config_mute(addr).await.ok()
                 } else {
                     None
                 };
@@ -535,7 +675,7 @@ impl MiniDspClient {
                         peq.push(PeqBandConfig {
                             index: band_idx as u8,
                             coeff: BiquadCoeffs::from_array(&coeffs),
-                            bypass: false,
+                            bypass: self.read_peq_bypass(band.addr).await.unwrap_or(false),
                         });
                     }
                 }
@@ -549,12 +689,9 @@ impl MiniDspClient {
 
             // Read output channels
             for (ch_idx, output) in table.outputs.iter().enumerate() {
-                let gain_val = self.read_floats(output.gain, 1).await
-                    .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
-                let mute_val = self.read_floats(output.mute, 1).await
-                    .ok().and_then(|v| v.first().copied()).unwrap_or(1.0);
-                let delay_val = self.read_floats(output.delay, 1).await
-                    .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
+                let gain_val = self.read_config_gain_db(output.gain).await.unwrap_or(0.0);
+                let mute_val = self.read_config_mute(output.mute).await.unwrap_or(false);
+                let delay_val = self.read_config_delay_ms(output.delay).await.unwrap_or(0.0);
 
                 let mut peq = Vec::new();
                 for (band_idx, band) in output.peq.iter().enumerate() {
@@ -562,28 +699,21 @@ impl MiniDspClient {
                         peq.push(PeqBandConfig {
                             index: band_idx as u8,
                             coeff: BiquadCoeffs::from_array(&coeffs),
-                            bypass: false,
+                            bypass: self.read_peq_bypass(band.addr).await.unwrap_or(false),
                         });
                     }
                 }
 
                 let compressor = if let Some(comp) = &output.compressor {
-                    let bypass = self.read_floats(comp.bypass, 1).await
-                        .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
-                    let threshold = self.read_floats(comp.threshold, 1).await
-                        .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
-                    let comp_gain = self.read_floats(comp.gain, 1).await
-                        .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
-                    let ratio = self.read_floats(comp.ratio, 1).await
-                        .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
-                    let knee = self.read_floats(comp.knee, 1).await
-                        .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
-                    let attack = self.read_floats(comp.attack, 1).await
-                        .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
-                    let release = self.read_floats(comp.release, 1).await
-                        .ok().and_then(|v| v.first().copied()).unwrap_or(0.0);
+                    let bypass = self.read_config_mute(comp.bypass).await.unwrap_or(false);
+                    let threshold = self.read_config_gain_db(comp.threshold).await.unwrap_or(0.0);
+                    let comp_gain = self.read_config_gain_db(comp.gain).await.unwrap_or(0.0);
+                    let ratio = self.read_config_gain_db(comp.ratio).await.unwrap_or(0.0);
+                    let knee = self.read_config_gain_db(comp.knee).await.unwrap_or(0.0);
+                    let attack = self.read_config_gain_db(comp.attack).await.unwrap_or(0.0);
+                    let release = self.read_config_gain_db(comp.release).await.unwrap_or(0.0);
                     Some(CompressorConfig {
-                        bypass: bypass >= 1.5,
+                        bypass,
                         threshold,
                         gain: comp_gain,
                         ratio,
@@ -598,7 +728,7 @@ impl MiniDspClient {
                 outputs.push(OutputChannelConfig {
                     index: ch_idx as u8,
                     gain: gain_val,
-                    mute: mute_val >= 1.5,
+                    mute: mute_val,
                     delay: delay_val,
                     peq,
                     compressor,

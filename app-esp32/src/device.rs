@@ -8,11 +8,19 @@ use log::{debug, warn};
 use minidsp_protocol::commands::{self, HardwareId, Response};
 use minidsp_protocol::device::probe;
 use minidsp_protocol::device::DeviceProfile;
-use minidsp_protocol::dialect::Dialect;
+use minidsp_protocol::dialect::{Dialect, ValueFormat};
 use minidsp_protocol::eeprom;
 use minidsp_protocol::status::*;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy)]
+struct PeqShadow {
+    coeffs: [f32; 5],
+    bypass: bool,
+}
 
 /// Device state — holds the USB bus, device profile, and identification info.
 pub struct DeviceState {
@@ -21,6 +29,7 @@ pub struct DeviceState {
     hw_id: HardwareId,
     dsp_version: u8,
     serial: u32,
+    peq_shadow: Mutex<HashMap<u16, PeqShadow>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +61,29 @@ pub struct PeqConfigRead {
     pub index: u8,
     pub coeff: Option<BiquadCoeffs>,
     pub bypass: Option<bool>,
+}
+
+fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
+    let mut shadow = HashMap::new();
+    if let Some(table) = profile.dsp_table {
+        for input in table.inputs {
+            for band in input.peq {
+                shadow.insert(band.addr, PeqShadow {
+                    coeffs: minidsp_protocol::biquad::BYPASS,
+                    bypass: false,
+                });
+            }
+        }
+        for output in table.outputs {
+            for band in output.peq {
+                shadow.insert(band.addr, PeqShadow {
+                    coeffs: minidsp_protocol::biquad::BYPASS,
+                    bypass: false,
+                });
+            }
+        }
+    }
+    shadow
 }
 
 impl DeviceState {
@@ -112,6 +144,7 @@ impl DeviceState {
             hw_id,
             dsp_version,
             serial,
+            peq_shadow: Mutex::new(build_peq_shadow(&profile)),
         })
     }
 
@@ -207,54 +240,27 @@ impl DeviceState {
             .profile
             .dsp_table
             .ok_or_else(|| UsbHidError::Protocol("config read unsupported".into()))?;
-        let sample_rate = self.profile.sample_rate as f32;
-        let is_fixed_point = self.profile.dialect.value_format
-            == minidsp_protocol::dialect::ValueFormat::FixedPoint;
-
-        let decode_mute = |v: f32| -> bool {
-            if is_fixed_point {
-                v == 0.0
-            } else {
-                v >= 2.0
-            }
-        };
-        let decode_invert = |v: f32| -> bool {
-            if is_fixed_point {
-                v < 0.0
-            } else {
-                v != 0.0
-            }
-        };
-        let decode_gain_db = |linear: f32| -> f32 { 20.0 * linear.max(1e-10).log10() };
 
         let mut inputs = Vec::new();
         for (ch_idx, input) in table.inputs.iter().enumerate() {
             let mut peqs = Vec::new();
             for (band_idx, band) in input.peq.iter().enumerate() {
-                match self.read_floats(band.addr, 5) {
-                    Ok(coeffs) if coeffs.len() == 5 => {
+                match self.read_peq_coeffs(band.addr) {
+                    Ok(coeffs) => {
                         peqs.push(PeqConfigRead {
                             index: band_idx as u8,
                             coeff: Some(BiquadCoeffs::from_array(&[
                                 coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
                             ])),
-                            bypass: None,
+                            bypass: self.read_peq_bypass(band.addr),
                         });
                     }
                     _ => {}
                 }
             }
 
-            let gain = input
-                .gain
-                .and_then(|addr| self.read_floats(addr, 1).ok())
-                .and_then(|v| v.first().copied())
-                .map(decode_gain_db);
-            let mute = input
-                .mute
-                .and_then(|addr| self.read_floats(addr, 1).ok())
-                .and_then(|v| v.first().copied())
-                .map(decode_mute);
+            let gain = input.gain.and_then(|addr| self.read_config_gain_db(addr).ok());
+            let mute = input.mute.and_then(|addr| self.read_config_mute(addr).ok());
 
             inputs.push(InputConfigRead {
                 index: ch_idx as u8,
@@ -268,40 +274,24 @@ impl DeviceState {
         for (ch_idx, output) in table.outputs.iter().enumerate() {
             let mut peqs = Vec::new();
             for (band_idx, band) in output.peq.iter().enumerate() {
-                match self.read_floats(band.addr, 5) {
-                    Ok(coeffs) if coeffs.len() == 5 => {
+                match self.read_peq_coeffs(band.addr) {
+                    Ok(coeffs) => {
                         peqs.push(PeqConfigRead {
                             index: band_idx as u8,
                             coeff: Some(BiquadCoeffs::from_array(&[
                                 coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
                             ])),
-                            bypass: None,
+                            bypass: self.read_peq_bypass(band.addr),
                         });
                     }
                     _ => {}
                 }
             }
 
-            let gain = self
-                .read_floats(output.gain, 1)
-                .ok()
-                .and_then(|v| v.first().copied())
-                .map(decode_gain_db);
-            let mute = self
-                .read_floats(output.mute, 1)
-                .ok()
-                .and_then(|v| v.first().copied())
-                .map(decode_mute);
-            let delay = self
-                .read_floats(output.delay, 1)
-                .ok()
-                .and_then(|v| v.first().copied())
-                .map(|samples| std::time::Duration::from_secs_f32(samples / sample_rate));
-            let invert = self
-                .read_floats(output.polarity, 1)
-                .ok()
-                .and_then(|v| v.first().copied())
-                .map(decode_invert);
+            let gain = self.read_config_gain_db(output.gain).ok();
+            let mute = self.read_config_mute(output.mute).ok();
+            let delay = self.read_config_delay(output.delay).ok();
+            let invert = self.read_config_invert(output.polarity).ok();
 
             outputs.push(OutputConfigRead {
                 index: ch_idx as u8,
@@ -325,6 +315,89 @@ impl DeviceState {
             other => Err(UsbHidError::Protocol(format!(
                 "read_floats: {other:?}"
             ))),
+        }
+    }
+
+    fn read_param_words(&self, addr: u16, count: u8) -> Result<Vec<u32>, UsbHidError> {
+        let req = commands::read_floats(addr, count, self.dialect());
+        let resp = self.bus.command(&req)?;
+        commands::parse_param_words_response_for_request(&req, &resp)
+            .ok_or_else(|| UsbHidError::Protocol("typed read_floats parse failed".into()))
+    }
+
+    fn read_param_word(&self, addr: u16) -> Result<u32, UsbHidError> {
+        self.read_param_words(addr, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| UsbHidError::Protocol("empty typed param response".into()))
+    }
+
+    fn read_peq_coeffs(&self, addr: u16) -> Result<[f32; 5], UsbHidError> {
+        let values = self.read_floats(addr, 5).unwrap_or_default();
+        if values.len() >= 5 {
+            let coeffs = [values[0], values[1], values[2], values[3], values[4]];
+            if coeffs != [0.0; 5] {
+                return Ok(coeffs);
+            }
+        }
+        Ok(self.peq_shadow.lock()
+            .map_err(|_| UsbHidError::Protocol("peq shadow poisoned".into()))?
+            .get(&addr)
+            .map(|s| s.coeffs)
+            .unwrap_or(minidsp_protocol::biquad::BYPASS))
+    }
+
+    fn read_peq_bypass(&self, addr: u16) -> Option<bool> {
+        self.peq_shadow.lock().ok()?.get(&addr).map(|s| s.bypass)
+    }
+
+    fn read_config_gain_db(&self, addr: u16) -> Result<f32, UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => Ok(f32::from_bits(self.read_param_word(addr)?)),
+            ValueFormat::FixedPoint => {
+                let linear = self.read_floats(addr, 1)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| UsbHidError::Protocol("empty gain response".into()))?;
+                Ok(20.0 * linear.max(1e-10).log10())
+            }
+        }
+    }
+
+    fn read_config_mute(&self, addr: u16) -> Result<bool, UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => Ok(self.read_param_word(addr)? >= 2),
+            ValueFormat::FixedPoint => {
+                let value = self.read_floats(addr, 1)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| UsbHidError::Protocol("empty mute response".into()))?;
+                Ok(value == 0.0)
+            }
+        }
+    }
+
+    fn read_config_delay(&self, addr: u16) -> Result<std::time::Duration, UsbHidError> {
+        let samples = match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.read_param_word(addr)? as f32,
+            ValueFormat::FixedPoint => self.read_floats(addr, 1)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| UsbHidError::Protocol("empty delay response".into()))?,
+        };
+        Ok(std::time::Duration::from_secs_f32(samples / self.profile.sample_rate as f32))
+    }
+
+    fn read_config_invert(&self, addr: u16) -> Result<bool, UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => Ok(self.read_param_word(addr)? != 0),
+            ValueFormat::FixedPoint => {
+                let value = self.read_floats(addr, 1)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| UsbHidError::Protocol("empty invert response".into()))?;
+                Ok(value < 0.0)
+            }
         }
     }
 
@@ -436,6 +509,13 @@ impl DeviceState {
     pub fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), UsbHidError> {
         self.bus
             .command(&commands::write_biquad(addr, coeffs, self.dialect()))?;
+        if let Ok(mut shadow) = self.peq_shadow.lock() {
+            let entry = shadow.entry(addr).or_insert(PeqShadow {
+                coeffs: minidsp_protocol::biquad::BYPASS,
+                bypass: false,
+            });
+            entry.coeffs = *coeffs;
+        }
         Ok(())
     }
 
@@ -443,6 +523,13 @@ impl DeviceState {
     pub fn bypass_filter(&self, addr: u16, bypass: bool) -> Result<(), UsbHidError> {
         self.bus
             .command(&commands::bypass_filter(addr, bypass, self.dialect()))?;
+        if let Ok(mut shadow) = self.peq_shadow.lock() {
+            let entry = shadow.entry(addr).or_insert(PeqShadow {
+                coeffs: minidsp_protocol::biquad::BYPASS,
+                bypass: false,
+            });
+            entry.bypass = bypass;
+        }
         Ok(())
     }
 
@@ -453,11 +540,50 @@ impl DeviceState {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub fn write_dsp_u32(&self, addr: u16, value: u32, save: bool) -> Result<(), UsbHidError> {
+        self.bus
+            .command(&commands::write_dsp_u32(addr, value, save))?;
+        Ok(())
+    }
+
     /// Set channel polarity inversion using dialect-aware encoding.
     #[allow(dead_code)]
     pub fn set_invert(&self, addr: u16, inverted: bool) -> Result<(), UsbHidError> {
-        let val = minidsp_protocol::dialect::polarity_value(inverted, self.dialect());
-        self.write_dsp(addr, val, true)
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp_u32(addr, if inverted { 1 } else { 0 }, false),
+            ValueFormat::FixedPoint => {
+                let val = minidsp_protocol::dialect::polarity_value(inverted, self.dialect());
+                self.write_dsp(addr, val, true)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_channel_gain(&self, addr: u16, db: f32) -> Result<(), UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp(addr, db, false),
+            ValueFormat::FixedPoint => self.write_dsp(addr, 10.0f32.powf(db / 20.0), true),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_channel_mute(&self, addr: u16, muted: bool) -> Result<(), UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp_u32(addr, if muted { 2 } else { 1 }, false),
+            ValueFormat::FixedPoint => {
+                let val = if muted { 0.0 } else { 1.0 };
+                self.write_dsp(addr, val, true)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_channel_delay_samples(&self, addr: u16, samples: u32) -> Result<(), UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp_u32(addr, samples, false),
+            ValueFormat::FixedPoint => self.write_dsp(addr, samples as f32, true),
+        }
     }
 
     // -- Flash reads --

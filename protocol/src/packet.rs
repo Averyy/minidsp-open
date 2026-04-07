@@ -107,9 +107,13 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
     // the logical MiniDSP response still begins at the next byte.
     if data.first() == Some(&0x00) {
         // Real hardware may return an unframed payload with a leading report ID
-        // byte for ReadFloats responses: `[0x00, 0x14, ...]`. Handle this
-        // before trying to interpret `0x14` as a length byte.
-        if data.get(1) == Some(&crate::commands::CMD_READ_FLOATS) {
+        // byte for command-specific responses like ReadFloats / DSP Read:
+        // `[0x00, 0x14, ...]` or `[0x00, 0x02, ...]`. Handle these before
+        // trying to interpret the command byte as a length byte.
+        if matches!(
+            data.get(1),
+            Some(&crate::commands::CMD_READ_FLOATS) | Some(&crate::commands::RESP_EVENT)
+        ) {
             return Some(data[1..].to_vec());
         }
 
@@ -231,6 +235,16 @@ mod tests {
             decoded,
             vec![0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn hid_unframed_read_response_with_leading_zero_report_id() {
+        let mut report = [0u8; HID_DATA_SIZE];
+        report[..8].copy_from_slice(&[0x00, 0x02, 0xa0, 0x58, 0x05, 0x71, 0x00, 0x00]);
+
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(&decoded[..7], &[0x02, 0xa0, 0x58, 0x05, 0x71, 0x00, 0x00]);
+        assert_eq!(decoded.len(), HID_DATA_SIZE - 1);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use log::{error, info, warn};
 use std::time::Duration;
 
 /// Base URL for catalogue data on GitHub Pages.
-const BASE_URL: &str = "https://minidsp-open.github.io/minidsp-open";
+const BASE_URL: &str = "https://averyy.github.io/minidsp-open";
 
 /// NVS namespace and key for tracking installed catalogue version.
 const NVS_NAMESPACE: &str = "beq";

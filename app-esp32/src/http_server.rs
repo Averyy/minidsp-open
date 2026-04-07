@@ -289,8 +289,7 @@ pub fn start(
                                 return send_error(req, 400, "gain out of range (must be finite, |gain| <= 120 dB)");
                             }
                             if let Some(gain_addr) = input_ch.gain {
-                                let linear = 10.0f32.powf(gain as f32 / 20.0);
-                                if let Err(e) = dev.write_dsp(gain_addr, linear, true) {
+                                if let Err(e) = dev.set_channel_gain(gain_addr, gain as f32) {
                                     return send_error(req, 500, &format!("set_gain: {e}"));
                                 }
                             }
@@ -298,8 +297,7 @@ pub fn start(
                         // Per-channel mute
                         if let Some(mute) = input.get("mute").and_then(|v| v.as_bool()) {
                             if let Some(mute_addr) = input_ch.mute {
-                                let val = if mute { 2.0 } else { 1.0 };
-                                if let Err(e) = dev.write_dsp(mute_addr, val, true) {
+                                if let Err(e) = dev.set_channel_mute(mute_addr, mute) {
                                     return send_error(req, 500, &format!("set_mute: {e}"));
                                 }
                             }
@@ -352,15 +350,13 @@ pub fn start(
                             if !gain.is_finite() || gain.abs() > 120.0 {
                                 return send_error(req, 400, "gain out of range (must be finite, |gain| <= 120 dB)");
                             }
-                            let linear = 10.0f32.powf(gain as f32 / 20.0);
-                            if let Err(e) = dev.write_dsp(output_ch.gain, linear, true) {
+                            if let Err(e) = dev.set_channel_gain(output_ch.gain, gain as f32) {
                                 return send_error(req, 500, &format!("set_gain: {e}"));
                             }
                         }
                         // Per-channel mute
                         if let Some(mute) = output.get("mute").and_then(|v| v.as_bool()) {
-                            let val = if mute { 2.0 } else { 1.0 };
-                            if let Err(e) = dev.write_dsp(output_ch.mute, val, true) {
+                            if let Err(e) = dev.set_channel_mute(output_ch.mute, mute) {
                                 return send_error(req, 500, &format!("set_mute: {e}"));
                             }
                         }
@@ -374,7 +370,7 @@ pub fn start(
                             };
                             let sample_rate = dev.profile().sample_rate as f32;
                             let samples = (secs as f32 * sample_rate).round().clamp(0.0, 48000.0);
-                            if let Err(e) = dev.write_dsp(output_ch.delay, samples, true) {
+                            if let Err(e) = dev.set_channel_delay_samples(output_ch.delay, samples as u32) {
                                 return send_error(req, 500, &format!("set_delay: {e}"));
                             }
                         }

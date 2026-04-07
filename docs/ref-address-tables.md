@@ -1,7 +1,15 @@
 # minidsp-open: Complete DSP Address Tables
 
 All addresses extracted from MiniDSP Device Console v2.10.6 `DSP_default_parameters.xml` files.
-Each address is a u16 index into DSP memory (4 bytes per index, float32 LE for new dialect devices).
+Each address is a u16 index into DSP memory (4 bytes per index).
+
+Important: do not assume every new-dialect config slot is float32.
+Official app assets and live hardware show newer devices use typed 32-bit config words:
+- `rep="float"` slots are float32 LE
+- `rep="integer"` slots are integer words
+- `rep="samplecnt"` slots are sample-count integer words
+
+This file is the address source of truth, not the value-decoding source of truth.
 
 Source: `app/MiniDSP Device Console.app/Contents/Resources/device_support_package/DSP_Structures/{dsp_id}/DSP_default_parameters.xml`
 
@@ -13,13 +21,13 @@ Cross-verified against minidsp-rs address tables for DSP 100 (2x4 HD) — all ad
 |--------|--------|-------------------|---------------|--------|
 | 100 | 2x4 HD / Flex | Yes | Yes | Verified match |
 | 101 | DDRC-24 / Flex DL | Yes | Yes | Verified match |
-| 105 | SHD / SHD Studio / SHD Power | Yes | Yes (SHD only) | Add hw_id 21 + source map |
-| **110** | **Flex Eight** | **Yes** | **No** | **NEW — ready to implement** |
-| **111** | **Flex Eight DL** | **Yes** | **No** | **NEW — ready to implement** |
-| **113** | **Flex HT/HTx old FW** | **Yes** | **Partial (HTx only)** | **NEW for Flex HT (hw_id 31)** |
-| **115** | **Flex HT/HTx new FW** | **Yes** | **No** | **NEW — ready to implement** |
+| 105 | SHD / SHD Studio / SHD Power | Yes | Yes (SHD only) | Implemented in minidsp-open for hw_id 14/17/21 |
+| **110** | **Flex Eight** | **Yes** | **No** | **Implemented in minidsp-open** |
+| **111** | **Flex Eight DL** | **Yes** | **No** | **Implemented in minidsp-open** |
+| **113** | **Flex HT/HTx old FW** | **Yes** | **Partial (HTx only)** | **Implemented in minidsp-open for Flex HT and Flex HTx** |
+| **115** | **Flex HT/HTx new FW** | **Yes** | **No** | **Implemented in minidsp-open** |
 
-All 7 DSP structures are fully decoded. No hardware access needed. We can generate device definitions for every missing device right now.
+All 7 DSP structures are fully decoded and are implemented in `minidsp-open`. This file remains the canonical address reference; hardware verification status is tracked separately in `PROGRESS.md` and `docs/todo-checker.md`.
 
 ## DSP 110 — Flex Eight (2 in / 8 out, 96kHz, FIR on input)
 

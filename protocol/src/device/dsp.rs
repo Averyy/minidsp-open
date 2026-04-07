@@ -120,89 +120,89 @@ pub struct DspTable {
 // DSP 100 — 2x4 HD / Flex (2 in / 4 out, 96kHz, FIR on output)
 // ========================================================================
 
-static DSP100_INPUT_PEQ_0: [PeqBand; 10] = peq_bands_10(4044);
-static DSP100_INPUT_PEQ_1: [PeqBand; 10] = peq_bands_10(4094);
+static DSP100_INPUT_PEQ_0: [PeqBand; 10] = peq_bands_10(8280);
+static DSP100_INPUT_PEQ_1: [PeqBand; 10] = peq_bands_10(8330);
 
 static DSP100_INPUT_0: InputChannel = InputChannel {
-    mute: Some(4032),
-    gain: Some(4034),
-    polarity: Some(4036),
+    mute: Some(0),
+    gain: Some(26),
+    polarity: Some(78),
     peq: &DSP100_INPUT_PEQ_0,
     fir: None,
 };
 
 static DSP100_INPUT_1: InputChannel = InputChannel {
-    mute: Some(4082),
-    gain: Some(4084),
-    polarity: Some(4086),
+    mute: Some(1),
+    gain: Some(27),
+    polarity: Some(79),
     peq: &DSP100_INPUT_PEQ_1,
     fir: None,
 };
 
 static DSP100_INPUTS: [InputChannel; 2] = [DSP100_INPUT_0, DSP100_INPUT_1];
 
-// Output channels: stride ~2024 (addresses from ref-address-tables.md for DSP 100)
-// We define output PEQ for each of 4 outputs × 10 bands
-static DSP100_OUT0_PEQ: [PeqBand; 10] = peq_bands_10(4157);
-static DSP100_OUT1_PEQ: [PeqBand; 10] = peq_bands_10(6181);
-static DSP100_OUT2_PEQ: [PeqBand; 10] = peq_bands_10(8205);
-static DSP100_OUT3_PEQ: [PeqBand; 10] = peq_bands_10(10229);
+// DSP 100 is defined in Device Console XML / upstream minidsp-rs with the
+// compact register map below, not the older 4xxx/6xxx/8xxx synthetic table.
+static DSP100_OUT0_PEQ: [PeqBand; 10] = peq_bands_10(8380);
+static DSP100_OUT1_PEQ: [PeqBand; 10] = peq_bands_10(8430);
+static DSP100_OUT2_PEQ: [PeqBand; 10] = peq_bands_10(8480);
+static DSP100_OUT3_PEQ: [PeqBand; 10] = peq_bands_10(8530);
 
 static DSP100_OUTPUTS: [OutputChannel; 4] = [
     OutputChannel {
-        mute: 4144,
-        gain: 4146,
-        delay: 4153,
-        polarity: 4156,
+        mute: 2,
+        gain: 28,
+        delay: 64,
+        polarity: 80,
         peq: &DSP100_OUT0_PEQ,
-        crossover: Some(Crossover { lpf_addr: 4207, hpf_addr: 4227 }),
+        crossover: Some(Crossover { lpf_addr: 8580, hpf_addr: 8600 }),
         compressor: Some(Compressor {
-            bypass: 4145, threshold: 4147, gain: 4148,
-            ratio: 4149, knee: 4150, attack: 4151, release: 4152,
+            bypass: 22, threshold: 40, gain: 41,
+            ratio: 42, knee: 43, attack: 44, release: 45,
         }),
     },
     OutputChannel {
-        mute: 6168,
-        gain: 6170,
-        delay: 6177,
-        polarity: 6180,
+        mute: 3,
+        gain: 29,
+        delay: 65,
+        polarity: 81,
         peq: &DSP100_OUT1_PEQ,
-        crossover: Some(Crossover { lpf_addr: 6231, hpf_addr: 6251 }),
+        crossover: Some(Crossover { lpf_addr: 8620, hpf_addr: 8640 }),
         compressor: Some(Compressor {
-            bypass: 6169, threshold: 6171, gain: 6172,
-            ratio: 6173, knee: 6174, attack: 6175, release: 6176,
+            bypass: 23, threshold: 46, gain: 47,
+            ratio: 48, knee: 49, attack: 50, release: 51,
         }),
     },
     OutputChannel {
-        mute: 8192,
-        gain: 8194,
-        delay: 8201,
-        polarity: 8204,
+        mute: 4,
+        gain: 30,
+        delay: 66,
+        polarity: 82,
         peq: &DSP100_OUT2_PEQ,
-        crossover: Some(Crossover { lpf_addr: 8255, hpf_addr: 8275 }),
+        crossover: Some(Crossover { lpf_addr: 8660, hpf_addr: 8680 }),
         compressor: Some(Compressor {
-            bypass: 8193, threshold: 8195, gain: 8196,
-            ratio: 8197, knee: 8198, attack: 8199, release: 8200,
+            bypass: 24, threshold: 52, gain: 53,
+            ratio: 54, knee: 55, attack: 56, release: 57,
         }),
     },
     OutputChannel {
-        mute: 10216,
-        gain: 10218,
-        delay: 10225,
-        polarity: 10228,
+        mute: 5,
+        gain: 31,
+        delay: 67,
+        polarity: 83,
         peq: &DSP100_OUT3_PEQ,
-        crossover: Some(Crossover { lpf_addr: 10279, hpf_addr: 10299 }),
+        crossover: Some(Crossover { lpf_addr: 8700, hpf_addr: 8720 }),
         compressor: Some(Compressor {
-            bypass: 10217, threshold: 10219, gain: 10220,
-            ratio: 10221, knee: 10222, attack: 10223, release: 10224,
+            bypass: 25, threshold: 58, gain: 59,
+            ratio: 60, knee: 61, attack: 62, release: 63,
         }),
     },
 ];
 
 static DSP100_METERS: Meters = Meters {
-    input: &[4040, 4090],
-    output: &[4143, 6167, 8191, 10215],
-    compressor: &[4142, 6166, 8190, 10214],
+    input: &[68, 69],
+    output: &[74, 75, 76, 77],
+    compressor: &[70, 71, 72, 73],
     dirac_in: &[],
     dirac_out: &[],
 };
@@ -211,9 +211,9 @@ pub static DSP_100: DspTable = DspTable {
     inputs: &DSP100_INPUTS,
     outputs: &DSP100_OUTPUTS,
     routing: RoutingMatrix {
-        status_base: 0,
-        gain_base: 8,
-        polarity_base: Some(16),
+        status_base: 6,
+        gain_base: 32,
+        polarity_base: None,
         rows: 2,
         cols: 4,
     },

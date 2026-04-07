@@ -389,9 +389,9 @@ impl UsbHidBus {
         // Log raw response for debugging
         if resp_buf.len() >= 4 {
             debug!(
-                "USB IN: {} bytes, first 32: {:02x?}",
+                "USB IN: {} bytes, full packet: {:02x?}",
                 resp_buf.len(),
-                &resp_buf[..resp_buf.len().min(32)]
+                &resp_buf[..resp_buf.len().min(USB_REPORT_SIZE)]
             );
         }
 
@@ -427,6 +427,7 @@ impl UsbHidBus {
         }
         *self.dev_hdl.lock().unwrap() = ptr::null_mut();
     }
+
 }
 
 impl Drop for UsbHidBus {

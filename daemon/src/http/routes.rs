@@ -464,7 +464,7 @@ async fn write_config(
                 if let Some(delay) = output.delay {
                     let sample_rate = client.profile().sample_rate as f32;
                     let samples = (delay.as_secs_f32() * sample_rate).round().clamp(0.0, 48000.0);
-                    client.write_dsp(output_ch.delay, samples, true).await
+                    client.set_channel_delay_samples(output_ch.delay, samples as u32).await
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
                 // Polarity inversion (dialect-aware encoding)
@@ -485,100 +485,48 @@ async fn read_config(
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
     let table = client.profile().dsp_table.ok_or(StatusCode::NOT_IMPLEMENTED)?;
-    let sample_rate = client.profile().sample_rate as f32;
-    let is_fixed_point = client.profile().dialect.value_format
-        == minidsp_protocol::dialect::ValueFormat::FixedPoint;
+    let config = client.read_device_config().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Dialect-aware decoders for readback values
-    let decode_mute = |v: f32| -> bool {
-        if is_fixed_point { v == 0.0 } else { v >= 2.0 } // Old: 0.0=muted, 1.0=unmuted; New: 2.0=muted, 1.0=unmuted
-    };
-    let decode_invert = |v: f32| -> bool {
-        if is_fixed_point { v < 0.0 } else { v != 0.0 } // Old: -1.0=inverted, 1.0=normal; New: 1.0=inverted, 0.0=normal
-    };
-    let decode_gain_db = |linear: f32| -> f32 {
-        20.0 * linear.max(1e-10).log10() // Guard against log10(0) = -Infinity
-    };
+    let inputs = config.inputs.into_iter().map(|input| InputConfigJson {
+        index: input.index,
+        peq: Some(input.peq.into_iter().map(|peq| PeqConfigJson {
+            index: peq.index,
+            coeff: Some(BiquadCoeffJson {
+                b0: peq.coeff.b0,
+                b1: peq.coeff.b1,
+                b2: peq.coeff.b2,
+                a1: peq.coeff.a1,
+                a2: peq.coeff.a2,
+            }),
+            bypass: Some(peq.bypass),
+        }).collect()),
+        gain: input.gain,
+        mute: input.mute,
+    }).collect::<Vec<_>>();
 
-    // Read input channels
-    let mut inputs = Vec::new();
-    for (ch_idx, input) in table.inputs.iter().enumerate() {
-        let mut peqs = Vec::new();
-        for (band_idx, band) in input.peq.iter().enumerate() {
-            match client.read_floats(band.addr, 5).await {
-                Ok(coeffs) if coeffs.len() == 5 => {
-                    peqs.push(PeqConfigJson {
-                        index: band_idx as u8,
-                        coeff: Some(BiquadCoeffJson {
-                            b0: coeffs[0], b1: coeffs[1], b2: coeffs[2],
-                            a1: coeffs[3], a2: coeffs[4],
-                        }),
-                        bypass: None,
-                    });
-                }
-                _ => {}
-            }
-        }
-        let gain = if let Some(gain_addr) = input.gain {
-            client.read_floats(gain_addr, 1).await.ok()
-                .and_then(|v| v.first().copied())
-                .map(decode_gain_db)
-        } else {
-            None
-        };
-        let mute = if let Some(mute_addr) = input.mute {
-            client.read_floats(mute_addr, 1).await.ok()
-                .and_then(|v| v.first().copied())
-                .map(decode_mute)
-        } else {
-            None
-        };
-        inputs.push(InputConfigJson {
-            index: ch_idx as u8,
-            peq: Some(peqs),
-            gain,
-            mute,
-        });
-    }
-
-    // Read output channels
     let mut outputs = Vec::new();
-    for (ch_idx, output) in table.outputs.iter().enumerate() {
-        let mut peqs = Vec::new();
-        for (band_idx, band) in output.peq.iter().enumerate() {
-            match client.read_floats(band.addr, 5).await {
-                Ok(coeffs) if coeffs.len() == 5 => {
-                    peqs.push(PeqConfigJson {
-                        index: band_idx as u8,
-                        coeff: Some(BiquadCoeffJson {
-                            b0: coeffs[0], b1: coeffs[1], b2: coeffs[2],
-                            a1: coeffs[3], a2: coeffs[4],
-                        }),
-                        bypass: None,
-                    });
-                }
-                _ => {}
-            }
-        }
-        let gain = client.read_floats(output.gain, 1).await.ok()
-            .and_then(|v| v.first().copied())
-            .map(decode_gain_db);
-        let mute = client.read_floats(output.mute, 1).await.ok()
-            .and_then(|v| v.first().copied())
-            .map(decode_mute);
-        let delay = client.read_floats(output.delay, 1).await.ok()
-            .and_then(|v| v.first().copied())
-            .map(|samples| std::time::Duration::from_secs_f32(samples / sample_rate));
-        let invert = client.read_floats(output.polarity, 1).await.ok()
-            .and_then(|v| v.first().copied())
-            .map(decode_invert);
-
+    for (idx, output) in config.outputs.into_iter().enumerate() {
+        let invert = if let Some(ch) = table.outputs.get(idx) {
+            client.read_channel_invert(ch.polarity).await.ok()
+        } else {
+            None
+        };
         outputs.push(OutputConfigJson {
-            index: ch_idx as u8,
-            peq: Some(peqs),
-            gain,
-            mute,
-            delay,
+            index: output.index,
+            peq: Some(output.peq.into_iter().map(|peq| PeqConfigJson {
+                index: peq.index,
+                coeff: Some(BiquadCoeffJson {
+                    b0: peq.coeff.b0,
+                    b1: peq.coeff.b1,
+                    b2: peq.coeff.b2,
+                    a1: peq.coeff.a1,
+                    a2: peq.coeff.a2,
+                }),
+                bypass: Some(peq.bypass),
+            }).collect()),
+            gain: Some(output.gain),
+            mute: Some(output.mute),
+            delay: Some(std::time::Duration::from_secs_f32(output.delay / 1000.0)),
             invert,
         });
     }

@@ -1,10 +1,10 @@
 # minidsp-open
 
-Open-source MiniDSP controller. Clean-room implementation (not a fork). All devices, runs on Linux AND ESP32-S3 from one Rust codebase. Replaces both minidsp-rs (desktop) and the $75 WI-DG (WiFi bridge) with a single project. Protocol knowledge from minidsp-rs (credited) + MiniDSP Device Console XML extraction.
+Open-source MiniDSP controller. Clean-room implementation (not a fork). Runs on Linux AND ESP32-S3 from one Rust codebase. The long-term target is support for every device defined by MiniDSP's own desktop and Android app assets, not just the subset currently modeled by minidsp-rs. Replaces both minidsp-rs (desktop) and the $75 WI-DG (WiFi bridge) with a single project. Protocol knowledge from minidsp-rs (credited) + MiniDSP official app extraction.
 
 ## Why Build This (not a fork of minidsp-rs)
 
-We need a dual-target architecture (Linux + ESP32) from day one, and we have complete device data extracted directly from MiniDSP's Device Console XMLs. Clean-room implementation was simpler than retrofitting an existing codebase for a different platform target. Protocol knowledge from minidsp-rs (great project, credited in README).
+We need a dual-target architecture (Linux + ESP32) from day one, and we have authoritative device data extracted from MiniDSP's own desktop and Android app assets. Clean-room implementation was simpler than retrofitting an existing codebase for a different platform target. Protocol knowledge from minidsp-rs (great project, credited in README).
 
 minidsp-open adds:
 - ESP32-S3 target (WiFi MiniDSP controller, no computer needed)
@@ -40,6 +40,23 @@ minidsp-rs is an upstream protocol reference (one maintainer, 10 stale dependabo
 Also: MiniDSP's WI-DG WiFi module is $75 for a MediaTek SoC running OpenWrt that just bridges TCP↔USB HID. Our ESP32-S3 target does the same thing (and more — full HTTP API, plus ezBEQ UI in phase 2) on a $10 dev board.
 
 Plus features minidsp-rs never had: config read-back, measurement mode, display control, DRE, modification tokens, ESP32 target, ezBEQ integration, `llms.txt` for AI discoverability. Preset import/export, per-source volume offsets deferred to post-v1.
+
+## Current Delivery Strategy
+
+We only have one physical MiniDSP on hand for live validation, so the project cannot rely on physically bench-testing every model.
+
+The 2x4 HD is the worked example for the shared implementation pattern:
+- validate protocol behavior on the real device we do have
+- compare that behavior against the extracted official desktop/Android app logic
+- turn the result into shared protocol rules plus data-driven device metadata
+
+Broader device coverage therefore has to be repeatable and importer-driven:
+1. normalize official app assets from `app/app-extracted` and `app/apk-extracted`
+2. enumerate every official-app device against the current Rust support table
+3. import missing device definitions, source maps, typed config metadata, and capability flags systematically
+4. use the physical 2x4 HD as the live regression case for shared protocol behavior
+
+When the extracted official app and `minidsp-rs` disagree, the official app assets win.
 
 
 ## Architecture
@@ -147,7 +164,7 @@ Offset  Len  Field
 36+     N    Hostname string
 ```
 
-### Complete HID command table (extracted from Device Console)
+### Complete HID command table (extracted from official app assets)
 
 **Core DSP commands (minidsp-rs has these):**
 | Byte | Command | Payload |
@@ -155,12 +172,12 @@ Offset  Len  Field
 | 0x03 | Reset | (none) → response 0xAA when complete |
 | 0x04 | WriteFlash | addr_hi:u8, addr_lo:u8, data:bytes |
 | 0x05 | ReadFlash | addr_hi:u8, addr_lo:u8, count:u8 |
-| 0x13 | WriteDSP | 0x80 (save) or 0xA0 (RAM-only), addr:2-or-3-byte, value:4-byte |
+| 0x13 | WriteDSP | 0x80 (save) or 0xA0 (RAM-only), addr_hi:u8, addr_lo:u8, value:4-byte |
 | 0x14 | ReadFloats | addr_hi:u8, addr_lo:u8, count:u8 (max 14) |
 | 0x17 | SetMute | value:u8 (0x00=unmute, 0x01=mute) |
-| 0x19 | BypassFilter | 0x80/0x00:bypass_bit, addr:2-or-3-byte |
+| 0x19 | BypassFilter | 0x80/0x00:bypass_bit, addr_hi:u8, addr_lo:u8, 0x00, 0x00 |
 | 0x25 | SetConfig | config:u8, reset:u8 → response 0xAB when complete |
-| 0x30 | WriteBiquad | 0x80, addr:2-or-3-byte, 0x0000, 5×f32 coefficients |
+| 0x30 | WriteBiquad | 0x80, addr_hi:u8, addr_lo:u8, 0x00, 0x00, 5×f32 coefficients |
 | 0x31 | ReadHardwareId | (none) → `[0x31, fw_major, fw_minor, hw_id]` |
 | 0x34 | SetSource | source:u8 |
 | 0x39 | FirLoadStart | index:u8 → returns max coeff count |

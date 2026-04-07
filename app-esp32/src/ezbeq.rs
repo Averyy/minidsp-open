@@ -4,7 +4,7 @@
 //! writes them to MiniDSP input PEQ bands via USB HID.
 //!
 //! Entry lookup uses digest-based binary search (BEQ\x02 format).
-//! The browser fetches the full catalogue directly from beqcatalogue;
+//! The browser fetches the full catalogue from our GitHub Pages mirror;
 //! the ESP32 only stores catalogue.bin for biquad coefficient lookup.
 
 use crate::device::DeviceState;
