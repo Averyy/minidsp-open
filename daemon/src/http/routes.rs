@@ -462,15 +462,19 @@ async fn write_config(
                 }
                 // Delay (Duration format: secs + nanos → sample count)
                 if let Some(delay) = output.delay {
-                    let sample_rate = client.profile().sample_rate as f32;
-                    let samples = (delay.as_secs_f32() * sample_rate).round().clamp(0.0, 48000.0);
-                    client.set_channel_delay_samples(output_ch.delay, samples as u32).await
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    if let Some(delay_addr) = output_ch.delay {
+                        let sample_rate = client.profile().sample_rate as f32;
+                        let samples = (delay.as_secs_f32() * sample_rate).round().clamp(0.0, 48000.0);
+                        client.set_channel_delay_samples(delay_addr, samples as u32).await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    }
                 }
                 // Polarity inversion (dialect-aware encoding)
                 if let Some(invert) = output.invert {
-                    client.set_invert(output_ch.polarity, invert).await
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    if let Some(polarity_addr) = output_ch.polarity {
+                        client.set_invert(polarity_addr, invert).await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    }
                 }
             }
         }
@@ -507,7 +511,10 @@ async fn read_config(
     let mut outputs = Vec::new();
     for (idx, output) in config.outputs.into_iter().enumerate() {
         let invert = if let Some(ch) = table.outputs.get(idx) {
-            client.read_channel_invert(ch.polarity).await.ok()
+            match ch.polarity {
+                Some(addr) => client.read_channel_invert(addr).await.ok(),
+                None => None,
+            }
         } else {
             None
         };

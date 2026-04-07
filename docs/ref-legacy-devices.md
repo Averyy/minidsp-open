@@ -3,15 +3,15 @@
 Research date: 2026-03-30. All data from minidsp-rs `dev` branch source code, MiniDSP Device Console, and miniDSP Controller Android APK.
 
 Important status note:
-- this document shows what legacy-device source data exists and how to turn it into support
-- it does not mean legacy full support is already complete
-- the required next step is a repeatable clean-room importer from the extracted official app assets plus legacy `config.xml` sources
+- this document shows what legacy-device source data exists and how it maps into support
+- legacy full support for the cached `config.xml` families is now implemented in the protocol crate
+- the remaining next step is not more known legacy table ports; it is exact runtime identity for the remaining official USB-only aliases, if stronger official evidence than the current extracted corpus can be found
 
 ## Executive Summary
 
 Complete address tables for every legacy device exist in SigmaStudio config.xml exports (the same files minidsp-rs uses as source data). These config.xml files are MiniDSP device data (SigmaStudio project exports), not minidsp-rs code. We use them as source data for our own device definitions, same as we use Device Console XML for SHARC devices.
 
-**Status:** Source data exists for full legacy support, but `minidsp-open` currently ships legacy devices at `DspKnown` or basic-support tiers until the clean-room importer and `config.xml` extraction path are implemented. Treat this file as source-data and planning reference, not as a claim that full legacy parity is already shipped.
+**Status:** Source data exists locally in this repo under `third_party/legacy-configs/`, and the repeatable extractor now emits generated legacy runtime metadata into `docs/generated/device-support-matrix.json`, `docs/ref-device-coverage.md`, and `protocol/src/device/generated_official.rs`. `miniSHARC 4x8`, `DDRC-88BM`, `C-DSP 8x12 v2`, `10x10 HD`, `4x10 HD`, `miniDSP 2x4`, and `NanoDigi 2x8` are now promoted to source-backed runtime tables in `minidsp-open`. Treat this file as source-data and planning reference, not as a blanket claim that all-device parity is already shipped.
 
 **Clean-room note:** We reference minidsp-rs's protocol knowledge (credited) and use the same public source data (SigmaStudio config.xml exports). All code — extraction, device definitions, dialect handling — is written from scratch. We do NOT copy minidsp-rs's generated Rust files or their codegen pipeline.
 
@@ -87,13 +87,15 @@ This is already fully implemented in minidsp-rs `dev` and works correctly for al
 |--------|-------|-------------|---------|-----|------------|------------|---------------|
 | **4x10 HD** | 1 | other | Old | 4in/10out | 5 in, 5 out | 42KB | 38KB |
 | **10x10 HD** | 1 | 51 | Old | 10in/10out | 6 in, 5 out | 76KB | 63KB |
-| **miniDSP 2x4** | 2 | 22 | Old | 0in/4out | 0 in, 6 out* | 51KB | 34KB |
-| **NanoDigi 2x8** | 2 | 54 | Old | 2in/8out | 5 in, 5 out | 46KB | 33KB |
+| **miniDSP 2x4** | 2 | 22 | Old | 2in/4out | 6 in, 6 out | 51KB | 34KB |
+| **NanoDigi 2x8** | 2 | 54 | Old | 4in/10out* | 5 in, 5 out | 46KB | 33KB |
 | **miniSHARC 4x8** | 4 | any | New** | 4in/8out | 10 in, 10 out | 239KB | 44KB |
 | **DDRC-88BM** | 6 | 95 | New** | 8in/8out | 0 in, 10 out | 80KB | 62KB |
 | **C-DSP 8x12 v2** | 11 | 97 | New** | 8in/12out | varies | 115KB | 79KB |
 
-*miniDSP 2x4: minidsp-rs has symbols extracted but the `inputs` and `outputs` arrays are empty in the codegen mod.rs. The symbols ARE there (PEQ, mute, gain, delay, invert, crossover addresses all present). The codegen just never wired them up. This means the 2x4 currently only gets basic support (volume/mute/source/preset). Full PEQ support would require writing the input/output mapping in the codegen mod.rs using the existing symbols.
+*miniDSP 2x4: the cached `config.xml` exposes two input PEQ banks plus four output PEQ/crossover/gain/mute/invert/delay groups. Our extractor now infers a real `2 in / 4 out` topology from the old `EQ_ch*` naming family, and `minidsp-open` now ships a source-backed runtime table for it. The older `0 in / 4 out` notes reflected incomplete upstream generated metadata, not the actual SigmaStudio source data.
+
+*NanoDigi 2x8: the cached `config.xml` exposes four input PEQ banks, ten output PEQ/crossover/gain/mute/invert groups, and eight delay slots. `minidsp-open` now follows that wider source-backed internal topology instead of the older `2 / 8` assumption derived from the product name alone.
 
 **miniSHARC 4x8, DDRC-88BM, C-DSP 8x12 v2: These use the DEFAULT dialect (3-byte addr, float32) despite being listed as "legacy" in some docs. They use ADI SHARC processors, not ADAU1445.
 
@@ -134,22 +136,27 @@ Legacy device support adds **one `if/else` in the dialect layer** (already desig
 
 ### For devices with config.xml source data (4x10HD, 10x10HD, NanoDigi 2x8, miniSHARC, DDRC-88BM, C-DSP 8x12):
 
-1. **Obtain config.xml files** -- SigmaStudio project exports. Available in minidsp-rs `dev` branch at `devtools/src/codegen/{device}/config.xml`. These are device data files (MiniDSP's SigmaStudio exports), not minidsp-rs source code.
-2. **Write our own extraction** -- parse config.xml `<item name="..." addr="...">` entries to build symbol→address maps. Simple XML parsing, ~100 lines.
+1. **Obtain config.xml files** -- SigmaStudio project exports. These are now cached locally in `third_party/legacy-configs/{device}/config.xml`. The original public source is the minidsp-rs `dev` branch at `devtools/src/codegen/{device}/config.xml`. These are device data files (MiniDSP's SigmaStudio exports), not minidsp-rs source code.
+2. **Write our own extraction** -- parse config.xml `<item name="..." addr="...">` entries plus `<filter>` / `<fir>` / `<label>` blocks to build symbol→address maps and runtime metadata. This now exists in first pass inside `tools/extract_device_support_matrix.py`.
 3. **Build our own device definitions** -- map extracted addresses into our Device struct format. Same approach as SHARC devices (where we extract from Device Console XML).
 
-Estimated effort per device: **30-60 minutes** extraction + definition, plus ~2 hours for the shared config.xml parser.
+Current generated guardrails from the cached legacy corpus:
+- `protocol/tests/legacy_assets.rs` keeps the expected source-backed legacy families present in the generated matrix
+- `protocol/tests/legacy_profile_metadata.rs` keeps legacy probe names/dialects/core dimensions/FIR flags aligned with generated source-backed metadata
+
+This stage is complete for the cached corpus. Remaining work is no longer per-device table extraction; it is broader official-app identity coverage outside the exact XML/config.xml matrix.
 
 **We do NOT copy minidsp-rs's generated Rust files or codegen pipeline.** We use the same source data (SigmaStudio XML exports) and write our own code, consistent with the clean-room approach used for all SHARC devices.
 
 ### For miniDSP 2x4 (non-HD):
 
-The config.xml and symbols exist but the codegen mod.rs has `inputs: vec![], outputs: vec![]`. The symbols clearly show the device structure:
-- 2 outputs (ch 1-2) with 6 PEQ each + 8 crossover biquads + delay + invert
-- 4 additional sub-outputs (ch 3-6) with similar structure
-- No input channels exposed (stereo input, no input PEQ)
+The cached `config.xml` is sufficient to infer a real runtime table:
+- 2 input PEQ banks (`EQ_ch1_1_*`, `EQ_ch2_1_*`)
+- 4 output PEQ banks (`EQ_ch1_2_*`, `EQ_ch1_3_*`, `EQ_ch2_2_*`, `EQ_ch2_3_*`)
+- 4 output crossover banks (`EQ_ch1_4/5_*`, `EQ_ch2_4/5_*`)
+- output gain/mute/invert/delay at the old-dialect scalar slots near `352..367`
 
-Effort to complete: **1-2 hours** to write the input/output mapping using existing symbol names, then generate.
+This is now implemented in `minidsp-open`, and the generated coverage artifacts infer the same `2 in / 4 out` topology from the source XML.
 
 ### For nanoAVR / nanoAVR HDA:
 
@@ -192,39 +199,45 @@ Our additions:
 ### Implemented today
 
 - SHARC-era devices covered by `docs/ref-address-tables.md` are implemented in `minidsp-open`.
-- Legacy 4x10 HD, 10x10 HD, NanoDigi 2x8, miniSHARC 4x8, DDRC-88BM, and C-DSP 8x12 v2 are identified and supported at `DspKnown` tier in current code.
-- miniDSP 2x4 non-HD, nanoAVR, and nanoAVR HDA remain basic-support devices.
+- Legacy `miniSHARC 4x8`, `DDRC-88BM`, and `C-DSP 8x12 v2` now have source-backed runtime tables and `Full` tier.
+- Legacy `NanoDigi 2x8` is now source-backed `Full`, but its internal channel map follows the extracted `config.xml` (`4 / 10`) rather than the older product-name shorthand (`2x8`).
+- miniDSP 2x4 non-HD is now source-backed `Full`.
+- nanoAVR and nanoAVR HDA remain basic-support devices.
+- The import work also fixed two shared runtime-model bugs:
+  - FIR is no longer treated as input-only in the CLI/runtime path
+  - output polarity is now optional in `DspTable`, matching source-backed devices that do not expose polarity on every output
 
 ### Still deferred or incomplete
 
 - **PWR-ICE125/250** (hw_id 3) -- already deferred per FUTURE-pwr-ice.md
-- **CDSP 8x12DL** -- need probe from device owner
+- **CDSP 8x12DL / CDSP-8x12-DL** -- still only a USB product hint from official app assets; exact probe/runtime mapping still needed
 - **hw_id 5** (10x10HD variant) -- probably shares address table with hw_id 1/dsp 51, but unconfirmed
+- **HA-DSP** and **DDRC-22** -- still only USB-product hints from official app assets; exact probe/runtime mapping still needed
+- **DDRC-88** -- still a family candidate for the same legacy 8x8 Dirac family as `DDRC-88BM`, but exact probe/runtime mapping is still missing
+- **CDSP-8x12/DL** -- still a family candidate for the same 8x12 custom-install family as `C-DSP 8x12 v2`; the packaged Dirac helper also contains `PADSP-8x12-DL`
+- **Harmony DSP** -- now a stronger family candidate than before because the packaged Dirac helper contains `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, and `dsp id is 115`, but exact probe/runtime mapping is still missing
 
 ### Follow-on work to reach full legacy parity
 
-- Build the repeatable importer/enumeration pipeline from `app/app-extracted`, `app/apk-extracted`, and legacy `config.xml` sources
-- Implement the clean-room SigmaStudio `config.xml` parser
-- Extract and wire full address tables for Tier 1 legacy devices
-- Promote legacy devices from `DspKnown`/basic support to full support as each device family is verified
+- Keep the repeatable importer/enumeration pipeline current across `app/app-extracted`, `app/apk-extracted`, and the cached legacy `config.xml` sources in `third_party/legacy-configs/`
+- Resolve the remaining USB-hint product families into exact probe/runtime definitions only if stronger official evidence than the current extracted asset set is found
+  - `HA-DSP`
+  - `DDRC-22`
+  - `DDRC-88`
+  - `CDSP-8x12/DL`
+  - `Harmony DSP`
+- Do not treat the desktop fallback-model list as an unresolved source of extra identities; decoded bundle logic shows it is just `deviceSupportPkg.deviceIdList` grouped by `dspId`
+- Do treat the exact HW directory list, exact DSP directory list, and desktop `product-HW-DSP` image rows as proof that the current packaged desktop assets do not contain hidden exact runtime rows for these aliases
 
-### Effort estimate for legacy devices:
+### Effort estimate for remaining legacy-adjacent work:
 
 | Task | Effort |
 |------|--------|
-| Port dialect system (fixed_point.rs, 2-byte addr encoding) | 2-3 hours |
-| Port 4x10HD address table | 30-60 min |
-| Port 10x10HD address table | 30-60 min |
-| Port NanoDigi 2x8 address table | 30-60 min |
-| Port miniSHARC 4x8 address table | 30-60 min |
-| Port DDRC-88BM address table | 30-60 min |
-| Port C-DSP 8x12 v2 address table | 30-60 min |
-| Wire up miniDSP 2x4 non-HD (basic -> full) | 1-2 hours |
-| Add nanoAVR/HDA basic support stubs | 30 min |
-| Add probe entries for all hw_ids | 30 min |
-| **Total** | **~8-12 hours** |
+| Resolve USB-hint product families (`HA-DSP`, `DDRC-22`, `DDRC-88`, `CDSP-8x12/DL`, `Harmony DSP`) | partially narrowed: `DDRC-88`, `CDSP-8x12/DL`, and `Harmony DSP` now have source-backed family-level hints; `HA-DSP` and `DDRC-22` are still alias-only |
+| Desktop fallback-model catalog follow-up | no longer a blocker; decoded bundle logic shows it is just `deviceSupportPkg.deviceIdList` grouped by `dspId` |
+| Revalidate shared-model changes on ESP32 after importer work | modest once shared identity boundary is stable |
 
-This is entirely realistic for launch. The dialect layer is the only real engineering work; everything else is mechanical address table porting.
+The mechanical legacy-table promotion work is effectively done for the cached corpus. The remaining uncertainty is in official-app runtime identity extraction, not old-dialect address mapping.
 
 ## Key Source Files to Port From
 
@@ -236,12 +249,12 @@ All from minidsp-rs `dev` branch (`https://github.com/mrene/minidsp-rs/tree/dev/
 | `protocol/src/fixed_point.rs` | 5.23 fixed-point codec with tests | 4KB |
 | `protocol/src/commands.rs` | Addr struct, Value enum with FixedPoint | 34KB |
 | `protocol/src/device/probe.rs` | hw_id -> device mapping | 3.8KB |
-| `devtools/src/codegen/m4x10hd/config.xml` | 4x10HD SigmaStudio XML | 42KB |
-| `devtools/src/codegen/m10x10hd/config.xml` | 10x10HD SigmaStudio XML | 76KB |
-| `devtools/src/codegen/nanodigi2x8/config.xml` | NanoDigi 2x8 SigmaStudio XML | 46KB |
-| `devtools/src/codegen/msharc4x8/config.xml` | miniSHARC 4x8 SigmaStudio XML | 239KB |
-| `devtools/src/codegen/ddrc88bm/config.xml` | DDRC-88BM SigmaStudio XML | 80KB |
-| `devtools/src/codegen/c8x12v2/config.xml` | C-DSP 8x12 v2 SigmaStudio XML | 115KB |
-| `devtools/src/codegen/m2x4/config.xml` | miniDSP 2x4 SigmaStudio XML | 51KB |
+| `third_party/legacy-configs/m4x10hd/config.xml` | 4x10HD SigmaStudio XML | 42KB |
+| `third_party/legacy-configs/m10x10hd/config.xml` | 10x10HD SigmaStudio XML | 76KB |
+| `third_party/legacy-configs/nanodigi2x8/config.xml` | NanoDigi 2x8 SigmaStudio XML | 46KB |
+| `third_party/legacy-configs/msharc4x8/config.xml` | miniSHARC 4x8 SigmaStudio XML | 239KB |
+| `third_party/legacy-configs/ddrc88bm/config.xml` | DDRC-88BM SigmaStudio XML | 80KB |
+| `third_party/legacy-configs/c8x12v2/config.xml` | C-DSP 8x12 v2 SigmaStudio XML | 115KB |
+| `third_party/legacy-configs/m2x4/config.xml` | miniDSP 2x4 SigmaStudio XML | 51KB |
 
 The generated .rs files (in `protocol/src/device/`) can be used directly as address references even if we don't replicate the codegen pipeline.

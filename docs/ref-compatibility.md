@@ -533,7 +533,7 @@ Additive rule:
 
 Current verification note:
 - Desktop config read-back is implemented.
-- ESP32 `GET /devices/0/config` now exists, but physical-hardware verification is still open because real 2x4 HD config-register `ReadFloats` replies are not yet decoding into valid PEQ/gain state. That route must not be treated as parity-complete until `docs/todo-checker.md` closes Section 6.2.
+- ESP32 `/devices/0/config` is now verified on the physical 2x4 HD for typed scalar read/write behavior and PEQ write/readback through the same PEQ shadow/default model used on desktop when live PEQ `0x14` reads return the all-zero placeholder.
 
 ## Canonical Ownership
 

@@ -4,9 +4,21 @@ All data extracted from MiniDSP Device Console v2.10.6 (2026-03-29).
 Sources:
 - `app/MiniDSP Device Console.app/Contents/Resources/device_support_package/` (primary — SHARC devices)
 - `app/apk-extracted/assets/www/js/controllers.js` (miniDSP Controller Android app — confirms source maps, adds legacy devices)
-- minidsp-rs source code (legacy device definitions)
+- `third_party/legacy-configs/*.xml` (primary for legacy address tables and metadata)
+- minidsp-rs source code (secondary reference only when interpreting the public source data)
 
 This file is a registry and planning reference, not a blanket claim that every listed device is already fully implemented and hardware-verified in `minidsp-open`.
+
+Generated companion artifacts:
+- `docs/ref-device-coverage.md` — repeatable official-app coverage snapshot versus the current Rust support table
+- `docs/generated/device-support-matrix.json` — machine-readable version of that snapshot
+- `protocol/src/device/generated_official.rs` — generated Rust mirror used by protocol tests
+- `protocol/tests/official_assets.rs` — validates modern official HW/DSP coverage against `probe.rs`
+- `protocol/tests/official_dsp_tables.rs` — validates modern DSP tables against extracted official XML indexes
+- `third_party/legacy-configs/` — cached SigmaStudio `config.xml` corpus for legacy families
+- `protocol/tests/legacy_assets.rs` — validates the cached legacy source inventory against the current legacy profile set
+- `protocol/tests/legacy_profile_metadata.rs` — validates generated legacy runtime metadata against the shipped legacy probe profiles
+- `protocol/tests/legacy_dsp_tables.rs` — validates promoted legacy runtime tables against cached `config.xml` indexes
 
 ## Coverage Policy
 
@@ -17,6 +29,9 @@ We do not have physical access to the full MiniDSP product line. Full device-fam
 3. compare that inventory against the current Rust support table
 4. implement missing definitions systematically, using the 2x4 HD as the live regression case for shared protocol behavior
 
+Regeneration command:
+- `uv run python tools/extract_device_support_matrix.py`
+
 Verification tiers used in practice:
 - `Hardware verified`: behavior confirmed on the physical 2x4 HD we have
 - `Data modeled`: device definition/capabilities imported from official app assets, but not physically tested here
@@ -25,6 +40,18 @@ Verification tiers used in practice:
 Current reality:
 - 2x4 HD is the only device with direct live hardware validation in this workspace
 - broader support claims must stay tied to extracted official-app evidence until more hardware exists
+- all 13 exact modern Device Console HW/DSP pairs are currently represented in `probe.rs`
+- the importer-backed protocol tests already caught and corrected DSP 100 and DSP 101/105 table mistakes, so the generated artifacts are now an active guardrail rather than passive notes
+- the generated legacy metadata now captures source-backed FIR/compressor/meter/PEQ coverage plus inferred old-dialect topology from cached `config.xml` files
+- `miniSHARC 4x8`, `DDRC-88BM`, `C-DSP 8x12 v2`, `10x10 HD`, `4x10 HD`, `miniDSP 2x4`, and `NanoDigi 2x8` are now promoted from placeholders to source-backed runtime tables in the protocol crate
+- `NanoDigi 2x8` is the clearest example of why extracted app assets have to override product-name assumptions: its cached `config.xml` exposes a wider internal `4 / 10` map and the promoted runtime table now follows that source-backed topology
+- desktop HID enumeration and ESP32 USB-host attach now both accept devices using the generated official USB PID metadata before `hw_id`/`dsp_version` probing
+- that shared USB acceptance policy is now exact-PID, matching the extracted official package, instead of broadly accepting every `0x2752:*` device
+- the extracted desktop app also exposes a fallback-model picker for blank devices, but decoded bundle logic shows it is built from `deviceSupportPkg.deviceIdList` grouped by `dspId`; it is not a separate alias-identity catalog
+- the generated coverage report now proves the exact modern package boundary in three independent ways: exact HW directories, exact DSP directories, and desktop `product-HW-DSP` image rows
+- `HA-DSP`, `DDRC-22`, and `DDRC-88` still do not appear as exact `hw_id`/`dsp_version` rows in those assets
+- `CDSP-8x12/DL` still does not have an exact runtime row either, but the packaged Dirac helper contains `PADSP-8x12-DL`, which strengthens the 8x12 custom-install family link already suggested by the name
+- `Harmony DSP` also still lacks an exact runtime row, but it is no longer only a USB PID hint: the packaged Dirac helper contains `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, and `dsp id is 115`, which makes it a source-backed 8x12 family candidate tied to the same DSP-113/115 structures used by the HT family
 
 ## Dirac-Capable DSP Versions
 

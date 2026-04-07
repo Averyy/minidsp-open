@@ -22,15 +22,11 @@
 
 use esp_idf_sys::*;
 use log::{debug, error, info, warn};
+use minidsp_protocol::device::probe::is_official_usb_device;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
-
-/// MiniDSP USB VID.
-const MINIDSP_VID: u16 = 0x2752;
-/// Legacy MiniDSP USB VID (older devices).
-const LEGACY_VID: u16 = 0x04D8;
 /// USB HID class code.
 const USB_CLASS_HID: u8 = 0x03;
 /// USB descriptor types.
@@ -158,6 +154,38 @@ unsafe impl Send for UsbHidBus {}
 unsafe impl Sync for UsbHidBus {}
 
 impl UsbHidBus {
+    fn submit_out_transfer(
+        &self,
+        out_xfer: *mut usb_transfer_t,
+        out_buf: &[u8; USB_REPORT_SIZE],
+        payload: &[u8],
+    ) -> Result<(), UsbHidError> {
+        self.out_sync.reset();
+        unsafe {
+            ptr::copy_nonoverlapping(
+                out_buf.as_ptr(),
+                (*out_xfer).data_buffer,
+                USB_REPORT_SIZE,
+            );
+            (*out_xfer).num_bytes = USB_REPORT_SIZE as i32;
+            (*out_xfer).context =
+                &self.out_sync as *const XferSync as *mut core::ffi::c_void;
+            esp_ok(usb_host_transfer_submit(out_xfer))
+                .map_err(|e| UsbHidError::Transfer(format!("submit OUT: {e}")))?;
+        }
+        debug!("USB OUT submitted for payload: {:02x?}", payload);
+        let status = self.out_sync.wait(XFER_TIMEOUT).map_err(|e| {
+            warn!("USB OUT wait failed for {:02x?}: {}", payload, e);
+            e
+        })?;
+        if status != 0 {
+            warn!("USB OUT completion status {} for {:02x?}", status, payload);
+            return Err(UsbHidError::Transfer(format!("OUT status: {status}")));
+        }
+        debug!("USB OUT completed for payload: {:02x?}", payload);
+        Ok(())
+    }
+
     /// Initialize USB host stack and background threads. Always succeeds even
     /// without a device connected. Call `wait_for_device()` to detect a device.
     pub fn init() -> Result<Self, UsbHidError> {
@@ -324,9 +352,11 @@ impl UsbHidBus {
     /// This method handles frame encoding, USB transfer, and frame decoding.
     pub fn command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
         let _lock = self.lock.lock().unwrap();
+        debug!("USB command start: {:02x?}", payload);
 
         // Check connection under lock to avoid TOCTOU race
         if !self.is_connected() {
+            warn!("USB command rejected while disconnected: {:02x?}", payload);
             return Err(UsbHidError::Disconnected);
         }
 
@@ -342,24 +372,7 @@ impl UsbHidBus {
         let copy_len = frame.len().min(USB_REPORT_SIZE);
         out_buf[..copy_len].copy_from_slice(&frame[..copy_len]);
 
-        // Submit OUT transfer with dedicated sync
-        self.out_sync.reset();
-        unsafe {
-            ptr::copy_nonoverlapping(
-                out_buf.as_ptr(),
-                (*out_xfer).data_buffer,
-                USB_REPORT_SIZE,
-            );
-            (*out_xfer).num_bytes = USB_REPORT_SIZE as i32;
-            (*out_xfer).context =
-                &self.out_sync as *const XferSync as *mut core::ffi::c_void;
-            esp_ok(usb_host_transfer_submit(out_xfer))
-                .map_err(|e| UsbHidError::Transfer(format!("submit OUT: {e}")))?;
-        }
-        let status = self.out_sync.wait(XFER_TIMEOUT)?;
-        if status != 0 {
-            return Err(UsbHidError::Transfer(format!("OUT status: {status}")));
-        }
+        self.submit_out_transfer(out_xfer, &out_buf, payload)?;
 
         // Submit IN transfer with dedicated sync
         self.in_sync.reset();
@@ -370,10 +383,16 @@ impl UsbHidBus {
             esp_ok(usb_host_transfer_submit(in_xfer))
                 .map_err(|e| UsbHidError::Transfer(format!("submit IN: {e}")))?;
         }
-        let status = self.in_sync.wait(XFER_TIMEOUT)?;
+        debug!("USB IN submitted for payload: {:02x?}", payload);
+        let status = self.in_sync.wait(XFER_TIMEOUT).map_err(|e| {
+            warn!("USB IN wait failed for {:02x?}: {}", payload, e);
+            e
+        })?;
         if status != 0 {
+            warn!("USB IN completion status {} for {:02x?}", status, payload);
             return Err(UsbHidError::Transfer(format!("IN status: {status}")));
         }
+        debug!("USB IN completed for payload: {:02x?}", payload);
 
         // Read response from IN transfer buffer
         let actual_len = unsafe { (*in_xfer).actual_num_bytes as usize };
@@ -399,11 +418,37 @@ impl UsbHidBus {
         // frame boundary in the 64-byte interrupt packet may be arbitrary.
         let data = &resp_buf;
         if let Some(payload) = minidsp_protocol::packet::decode_hid_response(data) {
+            debug!("USB command decoded response: {:02x?}", payload);
             return Ok(payload);
         }
 
         let hex: String = data.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
         Err(UsbHidError::Protocol(format!("invalid response frame ({} bytes): {hex}", data.len())))
+    }
+
+    /// Send a command payload without waiting for a reply packet.
+    pub fn command_no_reply(&self, payload: &[u8]) -> Result<(), UsbHidError> {
+        let _lock = self.lock.lock().unwrap();
+        debug!("USB send-only command start: {:02x?}", payload);
+
+        if !self.is_connected() {
+            warn!("USB send-only rejected while disconnected: {:02x?}", payload);
+            return Err(UsbHidError::Disconnected);
+        }
+
+        let out_xfer = *self.out_xfer.lock().unwrap();
+        if out_xfer.is_null() {
+            return Err(UsbHidError::Disconnected);
+        }
+
+        let frame = minidsp_protocol::packet::encode_frame(payload);
+        let mut out_buf = [0xFF_u8; USB_REPORT_SIZE];
+        let copy_len = frame.len().min(USB_REPORT_SIZE);
+        out_buf[..copy_len].copy_from_slice(&frame[..copy_len]);
+
+        self.submit_out_transfer(out_xfer, &out_buf, payload)?;
+        debug!("USB send-only command completed: {:02x?}", payload);
+        Ok(())
     }
 
     /// Best-effort cleanup of the current device (release interface, close).
@@ -453,7 +498,7 @@ fn wait_and_open_device(
     client_hdl: usb_host_client_handle_t,
     timeout: Duration,
 ) -> Result<(usb_device_handle_t, u16, u16, u8, u8, u8), UsbHidError> {
-    info!("waiting for MiniDSP device (VID 0x{MINIDSP_VID:04X})...");
+    info!("waiting for official MiniDSP USB HID device...");
 
     let cb = cb_state();
     let deadline = std::time::Instant::now() + timeout;
@@ -508,10 +553,10 @@ fn wait_and_open_device(
         (desc.idVendor, desc.idProduct)
     };
 
-    if vid != MINIDSP_VID && vid != LEGACY_VID {
-        // Not a MiniDSP — close and try the next device
+    if !is_official_usb_device(vid, pid) {
+        // Not an officially-supported MiniDSP HID candidate — close and try the next device
         unsafe { usb_host_device_close(client_hdl, dev_hdl) };
-        warn!("skipping non-MiniDSP device VID=0x{vid:04X}");
+        warn!("skipping non-MiniDSP device VID=0x{vid:04X} PID=0x{pid:04X}");
         continue;
     }
     info!("MiniDSP device: VID=0x{vid:04X} PID=0x{pid:04X}");

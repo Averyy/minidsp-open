@@ -4,7 +4,7 @@
 //! All methods are blocking and thread-safe (via Arc<UsbHidBus>).
 
 use crate::usb_hid::{UsbHidBus, UsbHidError};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use minidsp_protocol::commands::{self, HardwareId, Response};
 use minidsp_protocol::device::probe;
 use minidsp_protocol::device::DeviceProfile;
@@ -137,6 +137,7 @@ impl DeviceState {
 
         // Identify device
         let profile = probe::identify(hw_id.hw_id, dsp_version);
+        let peq_shadow = build_peq_shadow(&profile);
 
         Ok(DeviceState {
             bus,
@@ -144,7 +145,7 @@ impl DeviceState {
             hw_id,
             dsp_version,
             serial,
-            peq_shadow: Mutex::new(build_peq_shadow(&profile)),
+            peq_shadow: Mutex::new(peq_shadow),
         })
     }
 
@@ -290,8 +291,10 @@ impl DeviceState {
 
             let gain = self.read_config_gain_db(output.gain).ok();
             let mute = self.read_config_mute(output.mute).ok();
-            let delay = self.read_config_delay(output.delay).ok();
-            let invert = self.read_config_invert(output.polarity).ok();
+            let delay = output.delay.and_then(|addr| self.read_config_delay(addr).ok());
+            let invert = output
+                .polarity
+                .and_then(|addr| self.read_config_invert(addr).ok());
 
             outputs.push(OutputConfigRead {
                 index: ch_idx as u8,
@@ -507,8 +510,12 @@ impl DeviceState {
 
     #[allow(dead_code)]
     pub fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), UsbHidError> {
-        self.bus
-            .command(&commands::write_biquad(addr, coeffs, self.dialect()))?;
+        info!("write_biquad start addr=0x{addr:04x}");
+        let save = matches!(self.profile.dialect.value_format, ValueFormat::FixedPoint);
+        for (offset, coeff) in coeffs.iter().enumerate() {
+            self.write_dsp(addr + offset as u16, *coeff, save)?;
+        }
+        info!("write_biquad done addr=0x{addr:04x}");
         if let Ok(mut shadow) = self.peq_shadow.lock() {
             let entry = shadow.entry(addr).or_insert(PeqShadow {
                 coeffs: minidsp_protocol::biquad::BYPASS,
@@ -521,8 +528,10 @@ impl DeviceState {
 
     #[allow(dead_code)]
     pub fn bypass_filter(&self, addr: u16, bypass: bool) -> Result<(), UsbHidError> {
+        info!("bypass_filter start addr=0x{addr:04x} bypass={bypass}");
         self.bus
-            .command(&commands::bypass_filter(addr, bypass, self.dialect()))?;
+            .command_no_reply(&commands::bypass_filter(addr, bypass, self.dialect()))?;
+        info!("bypass_filter done addr=0x{addr:04x} bypass={bypass}");
         if let Ok(mut shadow) = self.peq_shadow.lock() {
             let entry = shadow.entry(addr).or_insert(PeqShadow {
                 coeffs: minidsp_protocol::biquad::BYPASS,

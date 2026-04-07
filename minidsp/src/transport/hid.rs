@@ -1,7 +1,7 @@
 //! USB HID transport using hidapi.
 
 use super::{Transport, TransportError};
-use minidsp_protocol::device::probe::{USB_VID_MINIDSP, USB_VID_LEGACY, USB_PID_LEGACY};
+use minidsp_protocol::device::probe::is_official_usb_device;
 use minidsp_protocol::packet;
 use std::future::Future;
 use std::pin::Pin;
@@ -24,11 +24,12 @@ pub fn enumerate() -> Result<Vec<HidDeviceInfo>, TransportError> {
 
     for info in api.device_list() {
         let vid = info.vendor_id();
-        if vid == USB_VID_MINIDSP || (vid == USB_VID_LEGACY && info.product_id() == USB_PID_LEGACY) {
+        let pid = info.product_id();
+        if is_official_usb_device(vid, pid) {
             devices.push(HidDeviceInfo {
                 path: info.path().to_string_lossy().into_owned(),
                 vendor_id: vid,
-                product_id: info.product_id(),
+                product_id: pid,
                 serial_number: info.serial_number().map(|s| s.to_string()),
                 product_string: info.product_string().map(|s| s.to_string()),
             });

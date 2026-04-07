@@ -553,7 +553,9 @@ async fn execute_line(client: &MiniDspClient, line: &str) -> Result<(), Box<dyn 
                         .ok_or("device does not support channel delay")?;
                     let ch_def = table.outputs.get(ch as usize)
                         .ok_or_else(|| format!("output channel {ch} out of range"))?;
-                    client.set_channel_delay_samples(ch_def.delay, samples as u32).await?;
+                    let delay_addr = ch_def.delay
+                        .ok_or("output channel does not have delay control")?;
+                    client.set_channel_delay_samples(delay_addr, samples as u32).await?;
                 }
                 "invert" => {
                     if is_input {
@@ -564,7 +566,9 @@ async fn execute_line(client: &MiniDspClient, line: &str) -> Result<(), Box<dyn 
                         .ok_or("device does not support polarity inversion")?;
                     let ch_def = table.outputs.get(ch as usize)
                         .ok_or_else(|| format!("output channel {ch} out of range"))?;
-                    client.set_invert(ch_def.polarity, state).await?;
+                    let polarity = ch_def.polarity
+                        .ok_or("output channel does not have polarity inversion")?;
+                    client.set_invert(polarity, state).await?;
                 }
                 _ => return Err(format!("unknown channel command '{subcmd}'").into()),
             }
@@ -667,9 +671,11 @@ pub async fn channel_command(
                 table.outputs.get(channel as usize)
                     .ok_or_else(|| format!("output channel {channel} out of range"))?
             };
+            let delay_addr = ch_def.delay
+                .ok_or("output channel does not have delay control")?;
             let sample_rate = client.profile().sample_rate as f32;
             let samples = (ms * sample_rate / 1000.0).round().clamp(0.0, 48000.0);
-            client.set_channel_delay_samples(ch_def.delay, samples as u32).await?;
+            client.set_channel_delay_samples(delay_addr, samples as u32).await?;
         }
         ChannelCommand::Invert { state } => {
             let table = client.profile().dsp_table
@@ -680,7 +686,9 @@ pub async fn channel_command(
                 table.outputs.get(channel as usize)
                     .ok_or_else(|| format!("output channel {channel} out of range"))?
             };
-            client.set_invert(ch_def.polarity, state).await?;
+            let polarity = ch_def.polarity
+                .ok_or("output channel does not have polarity inversion")?;
+            client.set_invert(polarity, state).await?;
         }
         ChannelCommand::Peq { ref index, ref cmd } => {
             if index == "all" {
@@ -796,15 +804,19 @@ pub async fn channel_command(
             }
         }
         ChannelCommand::Fir { ref cmd } => {
-            if !is_input {
-                return Err("FIR only available on input channels".into());
-            }
             let table = client.profile().dsp_table
                 .ok_or("device does not support FIR")?;
-            let input_ch = table.inputs.get(channel as usize)
-                .ok_or_else(|| format!("input channel {channel} out of range"))?;
-            let fir = input_ch.fir
-                .ok_or("input channel does not have FIR filter")?;
+            let fir = if is_input {
+                table.inputs.get(channel as usize)
+                    .ok_or_else(|| format!("input channel {channel} out of range"))?
+                    .fir
+                    .ok_or("input channel does not have FIR filter")?
+            } else {
+                table.outputs.get(channel as usize)
+                    .ok_or_else(|| format!("output channel {channel} out of range"))?
+                    .fir
+                    .ok_or("output channel does not have FIR filter")?
+            };
             match cmd {
                 FirCommand::Bypass { state } => {
                     let val = if *state { 1.0 } else { 0.0 };

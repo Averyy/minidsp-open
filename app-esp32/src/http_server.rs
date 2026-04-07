@@ -14,7 +14,7 @@ use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::io::Write;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use log::info;
+use log::{debug, info};
 use minidsp_protocol::status::StatusSummary;
 use std::sync::{Arc, Mutex};
 
@@ -189,9 +189,20 @@ pub fn start(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let mut buf = [0u8; 8192];
-            let len = req.read(&mut buf).unwrap_or(0);
-            let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
+            let declared_len = req
+                .header("Content-Length")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if declared_len > 8192 {
+                return send_error(req, 413, "request body too large");
+            }
+
+            let mut body = vec![0u8; declared_len.max(1)];
+            let read = req.read(&mut body[..declared_len.max(1)]).unwrap_or(0);
+            body.truncate(read);
+
+            info!("POST /devices/0/config start: {} bytes", body.len());
+            let json: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
@@ -322,6 +333,7 @@ pub fn start(
                                     None => return send_error(req, 400, "peq missing 'index' field"),
                                 };
                                 if let Some(band) = output_ch.peq.get(band_idx) {
+                                    info!("config write output[{idx}] peq[{band_idx}] addr=0x{:04x}", band.addr);
                                     if let Some(coeff) = peq.get("coeff") {
                                         let c = [
                                             coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
@@ -347,6 +359,7 @@ pub fn start(
                         }
                         // Per-channel gain
                         if let Some(gain) = output.get("gain").and_then(|v| v.as_f64()) {
+                            debug!("config write output[{idx}] gain -> {gain}");
                             if !gain.is_finite() || gain.abs() > 120.0 {
                                 return send_error(req, 400, "gain out of range (must be finite, |gain| <= 120 dB)");
                             }
@@ -356,6 +369,7 @@ pub fn start(
                         }
                         // Per-channel mute
                         if let Some(mute) = output.get("mute").and_then(|v| v.as_bool()) {
+                            debug!("config write output[{idx}] mute -> {mute}");
                             if let Err(e) = dev.set_channel_mute(output_ch.mute, mute) {
                                 return send_error(req, 500, &format!("set_mute: {e}"));
                             }
@@ -368,23 +382,30 @@ pub fn start(
                             } else {
                                 delay.as_f64().unwrap_or(0.0)
                             };
-                            let sample_rate = dev.profile().sample_rate as f32;
-                            let samples = (secs as f32 * sample_rate).round().clamp(0.0, 48000.0);
-                            if let Err(e) = dev.set_channel_delay_samples(output_ch.delay, samples as u32) {
-                                return send_error(req, 500, &format!("set_delay: {e}"));
+                            debug!("config write output[{idx}] delay_secs -> {secs}");
+                            if let Some(delay_addr) = output_ch.delay {
+                                let sample_rate = dev.profile().sample_rate as f32;
+                                let samples = (secs as f32 * sample_rate).round().clamp(0.0, 48000.0);
+                                if let Err(e) = dev.set_channel_delay_samples(delay_addr, samples as u32) {
+                                    return send_error(req, 500, &format!("set_delay: {e}"));
+                                }
                             }
                         }
                         // Polarity inversion (dialect-aware encoding)
                         if let Some(invert) = output.get("invert").and_then(|v| v.as_bool()) {
-                            if let Err(e) = dev.set_invert(output_ch.polarity, invert) {
-                                return send_error(req, 500, &format!("set_polarity: {e}"));
+                            debug!("config write output[{idx}] invert -> {invert}");
+                            if let Some(polarity_addr) = output_ch.polarity {
+                                if let Err(e) = dev.set_invert(polarity_addr, invert) {
+                                    return send_error(req, 500, &format!("set_polarity: {e}"));
+                                }
                             }
                         }
                     }
                 }
             }
 
-            send_empty_200(req)
+            info!("POST /devices/0/config completed");
+            send_json(req, 200, r#"{"status":"ok"}"#)
         })?;
     }
 

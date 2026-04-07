@@ -58,6 +58,55 @@ Broader device coverage therefore has to be repeatable and importer-driven:
 
 When the extracted official app and `minidsp-rs` disagree, the official app assets win.
 
+First repeatable coverage pass:
+- `uv run python tools/extract_device_support_matrix.py`
+- `docs/ref-device-coverage.md`
+- `docs/generated/device-support-matrix.json`
+- `protocol/src/device/generated_official.rs`
+- `third_party/legacy-configs/*/config.xml`
+- importer-backed protocol tests:
+  - `protocol/tests/official_assets.rs`
+  - `protocol/tests/official_dsp_tables.rs`
+  - `protocol/tests/legacy_assets.rs`
+  - `protocol/tests/legacy_profile_metadata.rs`
+  - `protocol/tests/legacy_dsp_tables.rs`
+
+This is no longer only a reporting step. The generated coverage artifacts now gate the protocol crate:
+- modern official HW/DSP pairs must stay mapped in `probe.rs`
+- modern DSP address tables must keep referencing indexes that exist in the extracted official XML
+- cached legacy families with local `config.xml` sources must stay represented in the generated matrix
+- generated legacy metadata must keep matching the shipped legacy probe names/dialects/core dimensions and FIR capability flags
+- promoted legacy runtime tables must keep referencing indexes that exist in the cached `config.xml` corpus
+- extractor drift is treated as a bug, not documentation noise
+
+Current importer-backed promotions:
+- `miniSHARC 4x8`, `DDRC-88BM`, `C-DSP 8x12 v2`, `10x10 HD`, `4x10 HD`, `miniDSP 2x4`, and `NanoDigi 2x8` now ship real source-backed runtime tables instead of placeholders
+- the import work also fixed two shared runtime-model bugs:
+  - FIR is no longer treated as input-only in the CLI/runtime path
+  - output polarity is now optional in `DspTable`, matching source-backed devices that do not expose polarity on every output
+- the extractor now also infers old-dialect topology from `PEQ_*` and `EQ_ch*` naming families, which is how `miniDSP 2x4` graduated from fake `0/0` generated metadata to a source-backed `2 in / 4 out` runtime table
+- desktop HID enumeration and ESP32 USB-host attach now share an official-asset-backed USB acceptance helper instead of duplicated local VID/PID checks
+
+Current remaining importer scope:
+- USB-only official product hints still need exact probe/runtime mapping from app assets:
+  - `HA-DSP`
+  - `DDRC-22`
+  - `DDRC-88`
+  - `CDSP-8x12/DL`
+  - `Harmony DSP`
+- for those labels, USB discovery is no longer the blocker; the missing piece is exact runtime identity from official app assets
+- the generated coverage report now also captures the package boundary directly:
+  - exact HW directories present in the Device Console package
+  - exact DSP directories present in the Device Console package
+  - desktop product-image rows keyed by `product-HW-DSP`
+  - packaged Dirac-helper alias strings
+- the generated USB acceptance helper now follows the exact official VID/PID list instead of accepting every `0x2752:*` device
+- the extracted desktop app does expose a blank-device fallback-model catalog path (`get-dspid-fallback-models`), but decoded bundle logic shows it is just `deviceSupportPkg.deviceIdList` grouped by `dspId`, not a separate alias-identity catalog
+- package inventory, product-image rows, and fallback-model logic now all agree that the exact modern runtime matrix is still just the 13 enumerated HW/DSP pairs
+- `Harmony DSP` is no longer only a top-level USB comment: the packaged Dirac helper contains `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, and `dsp id is 115`, which makes it a source-backed 8x12 family candidate even though the exact `hw_id` is still unresolved
+- `CDSP-8x12/DL` is also slightly stronger than before because the same Dirac helper contains `PADSP-8x12-DL`, reinforcing the 8x12 custom-install family connection without exposing an exact `hw_id`
+- `NanoDigi 2x8` now follows the wider `4 / 10` internal topology inferred from its cached `config.xml`; keep treating the extracted app assets as source of truth when product names and internal channel maps disagree
+
 
 ## Architecture
 
@@ -260,6 +309,7 @@ One `if/else`, not per-device logic.
 
 Canonical source:
 - `docs/ref-devices.md` — full hw_id / dsp_version registry, source maps, USB VID/PID, capabilities
+- `docs/ref-device-coverage.md` — generated official-app coverage snapshot versus the current Rust support table
 - `docs/ref-address-tables.md` — canonical SHARC address tables
 - `docs/ref-legacy-devices.md` — canonical legacy inventory and probe mapping
 
@@ -283,7 +333,7 @@ No high-level read function exists in minidsp-rs, but the primitives are there:
 
 Verification note:
 - Desktop config read-back is implemented.
-- ESP32 physical-hardware config read-back is not yet verified end to end; current live 2x4 HD testing shows status/meter/control working, but config-register `ReadFloats` still need additional real-device decoding work.
+- ESP32 physical-hardware config read-back is now verified end to end on the live 2x4 HD for typed scalar reads/writes and PEQ write/readback through the shared PEQ shadow/default model.
 
 ### Config write constraints
 - **Cannot write to non-active preset.** All DSP writes go to currently active state. Must switch preset first (causes brief audio interruption).
@@ -436,7 +486,7 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 | 4 | ARM .deb broken on Bookworm (glibc mismatch) | COMMON | We ship native static binaries for all platforms | Solved |
 | 5 | Multi-device setup extremely difficult (#662) | COMMON | Per-device connection isolation, no global lock | Planned |
 | 6 | HTx firmware update breaks minidsp-rs (#701) | MODERATE | DSP 115 definition, auto-detect hw_id, `--force-kind` escape hatch | Planned |
-| 7 | Cannot read config back from device | VERY COMMON | Full config read-back via cmd 0x14 (`ReadFloats`) | Implemented, still being verified on real ESP32 hardware |
+| 7 | Cannot read config back from device | VERY COMMON | Full config read-back via cmd 0x14 (`ReadFloats`) plus PEQ shadow/default fallback where live PEQ reads are zero-placeholder only | Implemented and verified on desktop + ESP32 for the physical 2x4 HD |
 | 8 | HID error on newer platforms (RPi5, newer kernels) | MODERATE | Test hidapi on RPi5 + newer kernels during dev | **NEW — needs testing** |
 | 9 | Version upgrade breaks config / bind defaults | COMMON | Design config format from scratch, sane defaults (bind 0.0.0.0) | Planned |
 | 10 | Windows config file location undocumented | MODERATE | Unified config across platforms, XDG/well-known paths | Planned |
@@ -463,6 +513,7 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 
 Planning/research is complete enough to begin implementation. Canonical reference docs:
 - `docs/ref-devices.md` — device registry and extracted app data
+- `docs/ref-device-coverage.md` — generated official-app coverage and DSP typing snapshot
 - `docs/ref-compatibility.md` — canonical external compatibility contract
 - `docs/ref-address-tables.md` — SHARC address tables
 - `docs/ref-legacy-devices.md` — legacy address sourcing and probe mapping
@@ -475,6 +526,9 @@ Extracted assets referenced by those docs live in:
 - `app/MiniDSP Device Console.app/`
 - `app/app-extracted/`
 - `app/apk-extracted/`
+
+Coverage snapshot regeneration:
+- `uv run python tools/extract_device_support_matrix.py`
 
 Do not restate detailed extracted tables or reverse-engineering status in this file. Update the `docs/ref-*` files instead.
 

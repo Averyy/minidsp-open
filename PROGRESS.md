@@ -2,7 +2,8 @@
 
 Active restart note:
 - Ongoing `/devices/{id}/config` debugging is tracked in `docs/context-dump.md`.
-- Current state: desktop real-hardware `/devices/{id}/config` is fixed on the 2x4 HD by combining typed scalar reads, official-app write-command shapes, and a PEQ shadow/default model. ESP32 parity is still pending. The broader next objective is the repeatable official-app extractor/import pipeline tracked in `docs/context-dump.md`. Keep that document updated until all-device support is data-driven and stable.
+- Current state: desktop and ESP32 real-hardware `/devices/{id}/config` are fixed on the 2x4 HD by combining typed scalar reads, official-app write-command shapes, and a PEQ shadow/default model. The final ESP32 blockers were both in our code: the POST handler body/response path in `app-esp32/src/http_server.rs` and the PEQ write sequencing path in `app-esp32/src/device.rs`. The broader next objective is the repeatable official-app extractor/import pipeline tracked in `docs/context-dump.md`. Keep that document updated until all-device support is data-driven and stable.
+- The importer now covers every exact modern Device Console HW/DSP pair plus every cached legacy `config.xml` family. The remaining all-device gap is no longer address tables for known families; it is exact runtime identity for a handful of official USB-only aliases. Package inventory, product-image rows, and desktop fallback-model logic prove those aliases are not hidden extra rows in the exact modern matrix, while the packaged Dirac helper now gives a stronger family hint for `Harmony DSP`.
 
 ## Phase 0: Project Setup
 - [x] Cargo workspace (protocol, minidsp, daemon, app-desktop, app-esp32)
@@ -30,20 +31,48 @@ Active restart note:
 - [x] SHARC DSP 111 (Flex Eight DL) — + Dirac block
 - [x] SHARC DSP 113 (Flex HT/HTx old FW) — 8 in / 8 out, bass management, Dirac capable
 - [x] SHARC DSP 115 (Flex HT/HTx new FW) — + input PEQ (mute/gain/polarity marked None — not in XML)
-- [ ] Legacy config.xml parser (SigmaStudio format) — BLOCKED: need to write XML parser for address extraction. Legacy devices work at DspKnown tier (volume/mute/source/preset).
-- [x] Legacy 4x10 HD (old dialect) — probe entry, DspKnown tier
-- [x] Legacy 10x10 HD (old dialect) — probe entry, DspKnown tier
-- [x] Legacy NanoDigi 2x8 (old dialect) — probe entry, DspKnown tier
-- [x] Legacy miniSHARC 4x8 — probe entry, DspKnown tier
-- [x] Legacy DDRC-88BM — probe entry, DspKnown tier
-- [x] Legacy C-DSP 8x12 v2 — probe entry, DspKnown tier
+- [ ] Legacy config.xml parser/codegen (SigmaStudio format) — source files are cached locally under `third_party/legacy-configs/`; new-dialect legacy SHARC families now have source-backed runtime tables, while old-dialect legacy families still need systematic import/codegen.
+- [x] Legacy 4x10 HD (old dialect) — promoted from probe-only placeholder to source-backed Full runtime table
+- [x] Legacy 10x10 HD (old dialect) — promoted from probe-only placeholder to source-backed Full runtime table
+- [x] Legacy NanoDigi 2x8 (old dialect) — promoted from probe-only placeholder to source-backed Full runtime table
+- [x] Legacy miniSHARC 4x8 — source-backed runtime table, Full tier
+- [x] Legacy DDRC-88BM — source-backed runtime table, Full tier
+- [x] Legacy C-DSP 8x12 v2 — source-backed runtime table, Full tier
 - [x] Basic support stubs: 2x4 non-HD, nanoAVR, nanoAVR HDA (volume/mute/preset only)
 - [x] Two-stage device identification (dsp_version → address table, hw_id → profile)
 - [x] Capability tiers (Universal / DspKnown / Full)
 - [x] Per-device delay limits, sample rates, source mappings
-- [ ] Repeatable official-app device importer/enumerator from `app/app-extracted` and `app/apk-extracted`
-- [ ] Enumerate every official-app device against the current support table
+- [x] First-pass official-app device enumerator/report from `app/app-extracted` and `app/apk-extracted` (`tools/extract_device_support_matrix.py`)
+- [x] Enumerate every exact Device Console HW/DSP pair against the current support table (`docs/ref-device-coverage.md`)
+- [x] Close first extractor-found app-backed gap: `hw_id 18` now maps to SHD Studio in `probe.rs`
+- [x] Generate a Rust mirror of the official modern-device matrix (`protocol/src/device/generated_official.rs`) from the extractor output
+- [x] Add importer-backed protocol tests that validate modern `probe.rs` coverage and DSP table addresses against extracted official-app metadata
+- [x] Fix extractor/report drift so parameterized profiles such as `hw_id 17/18` SHD Studio are counted correctly
+- [x] Fix extractor-found DSP table mismatches:
+  - DSP 100 no longer claims nonexistent input polarity slots
+  - DSP 101/105 output address table now matches the extracted XML instead of the older synthetic layout
+- [x] Cache the public legacy SigmaStudio `config.xml` corpus locally under `third_party/legacy-configs/`
+- [x] Extend the coverage generator to inventory cached legacy source files alongside the modern official matrix
+- [x] Add protocol-side legacy source guardrails (`protocol/tests/legacy_assets.rs`) so the known legacy profiles stay tied to real source data
+- [x] Extend the generated coverage artifacts with legacy runtime metadata (labels, meter counts, FIR/compressor presence, PEQ coverage) from the cached `config.xml` corpus
+- [x] Add protocol-side legacy metadata guardrails (`protocol/tests/legacy_profile_metadata.rs`) so probe names/dialects/core dimensions stay anchored to generated legacy source metadata
+- [x] Promote source-backed legacy SHARC families into real runtime tables (`miniSHARC 4x8`, `DDRC-88BM`, `C-DSP 8x12 v2`)
+- [x] Add source-backed legacy table guardrails (`protocol/tests/legacy_dsp_tables.rs`) so imported legacy runtime tables keep referencing real `config.xml` indexes
+- [x] Fix shared runtime-model gaps exposed by legacy import work:
+  - FIR is no longer hardcoded as input-only in the CLI/runtime model
+  - output polarity is now optional in `DspTable`, matching source-backed devices that do not expose a polarity slot on every output
+- [x] Promote source-backed old-dialect legacy runtime tables for `10x10 HD`, `4x10 HD`, `miniDSP 2x4`, and `NanoDigi 2x8`
+- [x] Extend the legacy extractor to infer old-dialect topology from `PEQ_*` and `EQ_ch*` naming patterns, so generated metadata no longer reports fake `0/0` dimensions for `miniDSP 2x4`
+- [x] Move shared USB acceptance policy to generated official PID metadata so desktop HID enumeration and ESP32 USB-host attach follow the same official USB surface
 - [ ] Systematically import missing device definitions, source maps, config typing, and capability flags from official app assets
+- [ ] Extend the enumerator into importer/codegen outputs for missing devices and typed config metadata
+- [ ] Resolve the remaining official USB-only aliases into exact probe/runtime definitions if stronger official evidence than the current extracted corpus is found:
+  - `HA-DSP` and `DDRC-22` are still alias-only
+  - `DDRC-88` remains a family candidate for `DDRC-88BM`
+  - `CDSP-8x12/DL` remains a family candidate for `C-DSP 8x12 v2`, now reinforced by the packaged Dirac helper string `PADSP-8x12-DL`
+  - `Harmony DSP` is now a family candidate rather than alias-only: the packaged Dirac helper references `Harmony DSP 8x12` and DSP IDs `113`/`115`, but still does not expose an exact `hw_id`
+  - the desktop fallback-model picker is derived from `deviceSupportPkg.deviceIdList` grouped by DSP ID and does not resolve these aliases
+- [x] Tighten shared USB acceptance to the exact official VID/PID list generated from the extracted package instead of accepting every `0x2752:*` PID
 
 ## Phase 1c: Transport & Connection
 - [x] Transport trait (send_frame/recv_frame — transport handles wire encoding)
@@ -70,7 +99,7 @@ Active restart note:
 - [x] Measurement mode: save state → bypass all PEQ → restore (enter_measurement_mode / restore_measurement_mode)
 - [x] Modification tokens (read/write EEPROM 0xFFC8) — GET /devices/:id/tokens
 - [x] Typed config read-back model from official app assets on desktop — direct USB and extracted app analysis confirmed config slots are not uniformly float32; desktop `/config` now uses typed scalar decoding plus a PEQ shadow/default model for live hardware.
-- [ ] Port the fixed typed config model + official-app write shapes to ESP32 and verify on physical hardware.
+- [x] Port the fixed typed config model + official-app write shapes to ESP32 and verify on physical hardware.
 
 ## Phase 1f: Partial Write Recovery
 - [x] Bypass-first write ordering for batch PEQ writes (write_peq_batch: bypass all → write coeffs → set final bypass)
@@ -204,6 +233,7 @@ Active restart note:
 - [x] Test: `probe --net` against live ESP32 with no MiniDSP attached (2026-04-07) — fixed ESP32 fallback UDP advertisement, desktop CLI now discovers `minidsp-bridge-*` over UDP 3999
 - [x] Test: ESP32 with physical MiniDSP 2x4 HD attached (2026-04-07) — flashed via `esptool.py`, fixed real-hardware `ReadFlash` and `ReadFloats` response-shape handling enough for live probe, `/devices`, `/devices/0`, `/debug/info`, `/devices/0/tokens`, and basic write routes (`POST /devices/0`, `/volume/toggle_mute`, `/source/toslink`, `/preset/1`)
 - [x] Test: typed config read-back parity on direct USB — PASSED 2026-04-07 on physical 2x4 HD. Desktop daemon `/devices/0/config` now round-trips scalar writes on hardware and returns PEQ/default state via the daemon-side shadow model when live PEQ reads return the all-zero placeholder.
+- [x] Test: ESP32 `/devices/0/config` parity on physical 2x4 HD — PASSED 2026-04-07. Verified malformed JSON handling, empty config POST, scalar output writes (`gain`, `mute`, `invert`, `delay`), and PEQ writes/readback via the ESP32-side PEQ shadow model. Root causes were an ESP32 HTTP POST body/empty-response bug and a larger-body `/config` POST read bug in our code.
 - [ ] Device-family matrix tests — NEEDS REAL HARDWARE (each device type)
 - [ ] Release artifacts: .deb (armhf, arm64, amd64), macOS (x86_64, aarch64), Windows .exe/.msi
 - [ ] .deb includes: udev rules, systemd unit, default config
@@ -243,7 +273,13 @@ Active restart note:
 - Active investigation restart point: `docs/context-dump.md` tracks the current real-hardware `/config` debugging state, confirmed protocol findings, and next steps until this work is fully resolved and folded back into the permanent docs.
 - We only have one physical MiniDSP for validation. The long-term support plan must therefore be repeatable from extracted official app assets, with the 2x4 HD used as the shared live regression case rather than pretending we can bench-test every model.
 - Primary next blocker: live ESP32 validation with a real MiniDSP attached. The no-MiniDSP appliance path is now verified; remaining risk is real USB-host command I/O and ezBEQ filter application against hardware.
-- Legacy device config.xml address table extraction not implemented — devices work at DspKnown tier (basic support)
+- Legacy importer/codegen work is only partially complete:
+  - `miniSHARC 4x8`, `DDRC-88BM`, `C-DSP 8x12 v2`, `10x10 HD`, `4x10 HD`, `miniDSP 2x4`, and `NanoDigi 2x8` now have source-backed runtime tables and Full tier
+  - generated legacy metadata now infers `miniDSP 2x4` as `2 in / 4 out`, matching the promoted runtime table
+  - generated legacy metadata also infers `NanoDigi 2x8` as a wider `4 / 10` internal map, and the promoted runtime table now follows that source-backed topology instead of the older `2 / 8` assumption
+  - USB-only official product hints still need exact probe/runtime mapping from app assets:
+    - `HA-DSP` and `DDRC-22` are still alias-only
+    - `DDRC-88`, `CDSP-8x12/DL`, and `Harmony DSP` are now source-backed family candidates, but still not exact identities
 - DSP 115 input PEQ addresses confirmed but input mute/gain/polarity not in Device Console XML (marked Option::None)
 - Idempotent retry on reconnect deferred — requires persisting pending state
 - PWR-ICE TCP compat deferred — need device owner

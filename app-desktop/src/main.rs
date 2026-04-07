@@ -229,7 +229,7 @@ enum ChannelCommand {
         #[command(subcommand)]
         cmd: CompressorCommand,
     },
-    /// FIR filter (output channels only)
+    /// FIR filter
     Fir {
         #[command(subcommand)]
         cmd: FirCommand,

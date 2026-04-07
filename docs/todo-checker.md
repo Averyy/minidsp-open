@@ -80,6 +80,10 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 - [x] A small PEQ write succeeds through desktop `/devices/{id}/config` on real hardware.
 - [x] On desktop, the written PEQ is confirmed through the daemon-side PEQ shadow model used by `GET /devices/{id}/config` because live PEQ `0x14` reads still return the all-zero placeholder.
 - [x] Output gain/mute/delay/invert writes via desktop `/devices/{id}/config` are verified on hardware.
+- [x] On ESP32, `GET /devices/0/config` returns sane typed scalar state plus PEQ shadow/default state on the physical 2x4 HD.
+- [x] On ESP32, malformed JSON and empty config POSTs are handled correctly on `/devices/0/config`.
+- [x] On ESP32, output gain/mute/delay/invert writes via `/devices/0/config` are verified on hardware.
+- [x] On ESP32, output PEQ writes via `/devices/0/config` succeed and are confirmed through the ESP32-side PEQ shadow model used by `GET /devices/0/config`.
 - [ ] Input gain/mute writes via `/devices/0/config` are verified on hardware where supported.
 
 ### 1.6 ezBEQ-critical ESP32 path

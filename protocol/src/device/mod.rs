@@ -7,6 +7,7 @@
 //! Together they identify the exact device profile.
 
 pub mod dsp;
+pub mod generated_official;
 pub mod probe;
 
 use crate::dialect::Dialect;

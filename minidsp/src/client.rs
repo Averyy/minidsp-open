@@ -691,7 +691,11 @@ impl MiniDspClient {
             for (ch_idx, output) in table.outputs.iter().enumerate() {
                 let gain_val = self.read_config_gain_db(output.gain).await.unwrap_or(0.0);
                 let mute_val = self.read_config_mute(output.mute).await.unwrap_or(false);
-                let delay_val = self.read_config_delay_ms(output.delay).await.unwrap_or(0.0);
+                let delay_val = if let Some(delay_addr) = output.delay {
+                    self.read_config_delay_ms(delay_addr).await.unwrap_or(0.0)
+                } else {
+                    0.0
+                };
 
                 let mut peq = Vec::new();
                 for (band_idx, band) in output.peq.iter().enumerate() {

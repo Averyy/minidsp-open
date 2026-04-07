@@ -1,7 +1,8 @@
 //! Device identification: (hw_id, dsp_version) → DeviceProfile.
 
-use crate::device::{CapabilityTier, DeviceProfile};
 use crate::device::dsp::*;
+use crate::device::generated_official;
+use crate::device::{CapabilityTier, DeviceProfile};
 use crate::dialect::Dialect;
 use crate::source::*;
 
@@ -13,6 +14,14 @@ pub const USB_VID_LEGACY: u16 = 0x04D8;
 
 /// USB PID for legacy devices.
 pub const USB_PID_LEGACY: u16 = 0x003F;
+
+/// Returns true when a USB VID/PID pair is treated as a MiniDSP candidate by
+/// the official extracted app assets.
+pub fn is_official_usb_device(vid: u16, pid: u16) -> bool {
+    generated_official::OFFICIAL_USB_PRODUCT_HINTS
+        .iter()
+        .any(|entry| entry.vid == vid && entry.pid == pid)
+}
 
 /// Identify a device from its hardware ID and DSP version.
 ///
@@ -27,7 +36,8 @@ pub fn identify(hw_id: u8, dsp_version: u8) -> DeviceProfile {
         (27, 100) => profile_flex(),
         (27, 101) => profile_flex_dl(),
         (14, _) => profile_shd(),
-        (17, _) => profile_shd_studio(),
+        (17, _) => profile_shd_studio(17),
+        (18, _) => profile_shd_studio(18),
         (21, _) => profile_shd_power(),
         (30, 110) => profile_flex_eight(),
         (30, 111) => profile_flex_eight_dl(),
@@ -66,6 +76,7 @@ pub fn product_name(hw_id: u8, dsp_version: u8) -> &'static str {
         (27, 101) => "Flex (DL)",
         (14, _) => "SHD",
         (17, _) => "SHD Studio",
+        (18, _) => "SHD Studio",
         (21, _) => "SHD Power",
         (30, 110) => "Flex Eight",
         (30, 111) => "Flex Eight (DL)",
@@ -148,9 +159,9 @@ fn profile_shd() -> DeviceProfile {
     }
 }
 
-fn profile_shd_studio() -> DeviceProfile {
+fn profile_shd_studio(hw_id: u8) -> DeviceProfile {
     DeviceProfile {
-        name: "SHD Studio", hw_id: 17, dsp_version: 105,
+        name: "SHD Studio", hw_id, dsp_version: 105,
         dialect: Dialect::NEW, sources: &SOURCES_SHD_STUDIO,
         inputs: 2, outputs: 4, presets: 4,
         dsp_table: Some(&DSP_105),
@@ -251,8 +262,8 @@ fn profile_4x10hd() -> DeviceProfile {
         name: "4x10 HD", hw_id: 1, dsp_version: 0,
         dialect: Dialect::OLD, sources: &SOURCES_4X10HD,
         inputs: 4, outputs: 10, presets: 4,
-        dsp_table: None, // TODO: extract from config.xml
-        tier: CapabilityTier::DspKnown,
+        dsp_table: Some(&LEGACY_4X10HD),
+        tier: CapabilityTier::Full,
         sample_rate: 48_000, has_dirac: false, has_fir: false,
         has_display: false, has_dre: false, has_volume_offsets: false,
     }
@@ -263,8 +274,8 @@ fn profile_10x10hd() -> DeviceProfile {
         name: "10x10 HD", hw_id: 1, dsp_version: 51,
         dialect: Dialect::OLD, sources: &SOURCES_4X10HD,
         inputs: 10, outputs: 10, presets: 4,
-        dsp_table: None, // TODO: extract from config.xml
-        tier: CapabilityTier::DspKnown,
+        dsp_table: Some(&LEGACY_10X10HD),
+        tier: CapabilityTier::Full,
         sample_rate: 48_000, has_dirac: false, has_fir: false,
         has_display: false, has_dre: false, has_volume_offsets: false,
     }
@@ -274,9 +285,9 @@ fn profile_nanodigi_2x8() -> DeviceProfile {
     DeviceProfile {
         name: "NanoDigi 2x8", hw_id: 2, dsp_version: 54,
         dialect: Dialect::OLD, sources: &SOURCES_LEGACY_2,
-        inputs: 2, outputs: 8, presets: 4,
-        dsp_table: None, // TODO: extract from config.xml
-        tier: CapabilityTier::DspKnown,
+        inputs: 4, outputs: 10, presets: 4,
+        dsp_table: Some(&LEGACY_NANODIGI_2X8),
+        tier: CapabilityTier::Full,
         sample_rate: 48_000, has_dirac: false, has_fir: false,
         has_display: false, has_dre: false, has_volume_offsets: false,
     }
@@ -286,9 +297,9 @@ fn profile_2x4_nonhd() -> DeviceProfile {
     DeviceProfile {
         name: "miniDSP 2x4", hw_id: 2, dsp_version: 22,
         dialect: Dialect::OLD, sources: &SOURCES_LEGACY_2,
-        inputs: 0, outputs: 4, presets: 4,
-        dsp_table: None,
-        tier: CapabilityTier::Universal,
+        inputs: 2, outputs: 4, presets: 4,
+        dsp_table: Some(&LEGACY_M2X4),
+        tier: CapabilityTier::Full,
         sample_rate: 48_000, has_dirac: false, has_fir: false,
         has_display: false, has_dre: false, has_volume_offsets: false,
     }
@@ -299,8 +310,8 @@ fn profile_msharc_4x8() -> DeviceProfile {
         name: "miniSHARC 4x8", hw_id: 4, dsp_version: 0,
         dialect: Dialect::NEW, sources: &SOURCES_4X10HD,
         inputs: 4, outputs: 8, presets: 4,
-        dsp_table: None, // TODO: extract from config.xml
-        tier: CapabilityTier::DspKnown,
+        dsp_table: Some(&LEGACY_MSHARC_4X8),
+        tier: CapabilityTier::Full,
         sample_rate: 96_000, has_dirac: false, has_fir: true,
         has_display: false, has_dre: false, has_volume_offsets: false,
     }
@@ -311,8 +322,8 @@ fn profile_ddrc_88bm() -> DeviceProfile {
         name: "DDRC-88BM", hw_id: 6, dsp_version: 95,
         dialect: Dialect::NEW, sources: &SOURCES_LEGACY_2,
         inputs: 8, outputs: 8, presets: 4,
-        dsp_table: None, // TODO: extract from config.xml
-        tier: CapabilityTier::DspKnown,
+        dsp_table: Some(&LEGACY_DDRC_88BM),
+        tier: CapabilityTier::Full,
         sample_rate: 48_000, has_dirac: true, has_fir: false,
         has_display: false, has_dre: false, has_volume_offsets: false,
     }
@@ -323,8 +334,8 @@ fn profile_cdsp_8x12v2() -> DeviceProfile {
         name: "C-DSP 8x12 v2", hw_id: 11, dsp_version: 97,
         dialect: Dialect::NEW, sources: &SOURCES_LEGACY_2,
         inputs: 8, outputs: 12, presets: 4,
-        dsp_table: None, // TODO: extract from config.xml
-        tier: CapabilityTier::DspKnown,
+        dsp_table: Some(&LEGACY_CDSP_8X12_V2),
+        tier: CapabilityTier::Full,
         sample_rate: 96_000, has_dirac: false, has_fir: false,
         has_display: false, has_dre: false, has_volume_offsets: false,
     }
@@ -413,6 +424,14 @@ mod tests {
     }
 
     #[test]
+    fn identify_shd_studio_variant_18() {
+        let p = identify(18, 105);
+        assert_eq!(p.name, "SHD Studio");
+        assert_eq!(p.sources.count(), 5);
+        assert_eq!(p.hw_id, 18);
+    }
+
+    #[test]
     fn identify_unknown() {
         let p = identify(99, 99);
         assert_eq!(p.name, "Unknown MiniDSP");
@@ -423,7 +442,7 @@ mod tests {
     fn all_sharc_devices_have_full_tier() {
         let sharc_devices = [
             (10, 100), (10, 101), (27, 100), (27, 101),
-            (14, 105), (17, 105), (21, 105),
+            (14, 105), (17, 105), (18, 105), (21, 105),
             (30, 110), (30, 111),
             (31, 113), (31, 115), (32, 113), (32, 115),
         ];

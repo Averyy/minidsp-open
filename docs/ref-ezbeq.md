@@ -395,7 +395,7 @@ The ezBEQ docs warn:
 
 > "Bear in mind that, so far, settings cannot be read back from the MiniDSP 2x4HD. This means that no applications are able to show your currently loaded configs."
 
-**This is still the architectural direction, but it is not fully verified across all transports yet.** The MiniDSP protocol has command `0x14` (`ReadFloats`) that reads DSP registers, and minidsp-open uses that mechanism for config read-back. However, current real-hardware verification shows that ESP32 config-register reads on a physical 2x4 HD still need additional parser work before they can be claimed as working parity behavior. Even MiniDSP's own Device Console doesn't read config back — it uses modification tokens and local XML cache.
+**This is now verified on the live 2x4 HD across desktop and ESP32 for the implemented path.** The MiniDSP protocol has command `0x14` (`ReadFloats`) that reads DSP registers, and minidsp-open uses that mechanism for typed scalar config read-back. PEQ state on the physical 2x4 HD still requires the shadow/default model because live PEQ `0x14` reads return the all-zero placeholder even though writes succeed. Even MiniDSP's own Device Console doesn't read config back — it uses modification tokens and local XML cache.
 
 Implemented target behavior:
 - Read every biquad coefficient, gain, delay, mute state, compressor param, mixer routing
@@ -405,6 +405,4 @@ Implemented target behavior:
 Verified reality today:
 - Desktop still tracks this as implemented behavior.
 - ESP32 physical-hardware validation has only closed status/meter/basic-control paths so far.
-- ESP32 config read-back remains an active bug under `PROGRESS.md` and `docs/todo-checker.md`.
-
-Once the remaining ESP32 config read-back bug is fixed, this removes ezBEQ's "periodically reload" workaround by letting us verify what is actually loaded on the device instead of guessing from local state files.
+- This removes the previous ESP32 config-route parity blocker on the physical 2x4 HD. Broader device-matrix coverage still depends on the importer/codegen work tracked in `PROGRESS.md` and `docs/context-dump.md`.
