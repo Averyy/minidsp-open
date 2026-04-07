@@ -421,7 +421,7 @@ pub fn start(
 
     // ezBEQ REST API + WebSocket (only in STA mode with beq_state)
     if let Some(ref beq) = beq_state {
-        crate::ezbeq::register_routes(&mut server, state.clone(), beq.clone())?;
+        crate::ezbeq::register_routes(&mut server, state.clone(), beq.clone(), nvs.clone())?;
         #[cfg(esp_idf_httpd_ws_support)]
         register_ezbeq_ws(&mut server, state.clone(), beq.clone())?;
     }
@@ -443,18 +443,29 @@ pub fn start(
             send_html(req, crate::wifi::PROVISION_HTML)
         })?;
     } else {
-        server.fn_handler("/", Method::Get, |req| {
+        let nvs_root = nvs.clone();
+        server.fn_handler("/", Method::Get, move |req| {
             // Serve ezBEQ UI index.html if available, otherwise redirect to API
             let index = crate::storage::full_path("ui/index.html");
             if std::path::Path::new(&index).exists() {
                 send_static_file(req, &index)
             } else {
-                send_redirect(req, "/devices")
+                let started = crate::updater::trigger_background_refresh(
+                    nvs_root.clone(),
+                    "ui/index.html missing",
+                );
+                let body = if started {
+                    r#"{"status":"initializing","error":"ui not ready; refresh started"}"#
+                } else {
+                    r#"{"status":"initializing","error":"ui not ready"}"#
+                };
+                send_json(req, 503, body)
             }
         })?;
     }
 
     // POST /api/wifi/connect — WiFi provisioning form handler
+    let nvs_wifi = nvs.clone();
     server.fn_handler("/api/wifi/connect", Method::Post, move |mut req| {
         let mut buf = [0u8; 256];
         let len = req.read(&mut buf).unwrap_or(0);
@@ -479,7 +490,7 @@ pub fn start(
         }
 
         // Save credentials to NVS (partition passed from main — not ::take())
-        if let Err(e) = crate::wifi::save_credentials(&nvs, &ssid, &password) {
+        if let Err(e) = crate::wifi::save_credentials(&nvs_wifi, &ssid, &password) {
             return send_provision_error(req, &format!("Save failed: {e}"));
         }
 
@@ -516,7 +527,8 @@ pub fn start(
             send_redirect(req, &portal_url)
         })?;
     } else {
-        server.fn_handler("/*", Method::Get, |req| {
+        let nvs_static = nvs.clone();
+        server.fn_handler("/*", Method::Get, move |req| {
             let uri = req.uri();
             // Strip query string for file path lookup
             let path = uri.split('?').next().unwrap_or(uri);
@@ -543,7 +555,16 @@ pub fn start(
                 if std::path::Path::new(&index).exists() {
                     send_static_file(req, &index)
                 } else {
-                    send_json(req, 404, r#"{"error":"not found"}"#)
+                    let started = crate::updater::trigger_background_refresh(
+                        nvs_static.clone(),
+                        "ui asset missing",
+                    );
+                    let body = if started {
+                        r#"{"status":"initializing","error":"ui assets missing; refresh started"}"#
+                    } else {
+                        r#"{"status":"initializing","error":"ui assets missing"}"#
+                    };
+                    send_json(req, 503, body)
                 }
             }
         })?;
@@ -640,6 +661,7 @@ fn register_debug_routes(
                 "baseUrl": crate::updater::base_url(&nvs),
                 "installedVersion": crate::updater::installed_version(&nvs),
                 "hasCatalogueData": crate::updater::has_catalogue_data(),
+                "isUpdating": crate::updater::is_updating(),
             }))
             .unwrap_or_default();
             send_json(req, 200, &body)
@@ -681,29 +703,39 @@ fn register_debug_routes(
     {
         let nvs = nvs.clone();
         server.fn_handler("/debug/updater/check", Method::Post, move |req| {
-            let result = crate::updater::check_and_update(&nvs);
-            let body = match result {
-                crate::updater::UpdateResult::Current => serde_json::json!({
-                    "status": "current",
-                    "baseUrl": crate::updater::base_url(&nvs),
-                }),
-                crate::updater::UpdateResult::Updated { version, files } => serde_json::json!({
-                    "status": "updated",
-                    "baseUrl": crate::updater::base_url(&nvs),
-                    "version": version,
-                    "files": files,
-                }),
-                crate::updater::UpdateResult::NoStorage => serde_json::json!({
-                    "status": "no_storage",
-                    "baseUrl": crate::updater::base_url(&nvs),
-                }),
-                crate::updater::UpdateResult::Error(error) => serde_json::json!({
-                    "status": "error",
-                    "baseUrl": crate::updater::base_url(&nvs),
-                    "error": error,
-                }),
-            };
-            send_json(req, 200, &serde_json::to_string(&body).unwrap_or_default())
+            match crate::updater::try_check_and_update(&nvs) {
+                crate::updater::UpdateAttempt::Busy => {
+                    let body = serde_json::json!({
+                        "status": "busy",
+                        "baseUrl": crate::updater::base_url(&nvs),
+                    });
+                    send_json(req, 409, &serde_json::to_string(&body).unwrap_or_default())
+                }
+                crate::updater::UpdateAttempt::Completed(result) => {
+                    let body = match result {
+                        crate::updater::UpdateResult::Current => serde_json::json!({
+                            "status": "current",
+                            "baseUrl": crate::updater::base_url(&nvs),
+                        }),
+                        crate::updater::UpdateResult::Updated { version, files } => serde_json::json!({
+                            "status": "updated",
+                            "baseUrl": crate::updater::base_url(&nvs),
+                            "version": version,
+                            "files": files,
+                        }),
+                        crate::updater::UpdateResult::NoStorage => serde_json::json!({
+                            "status": "no_storage",
+                            "baseUrl": crate::updater::base_url(&nvs),
+                        }),
+                        crate::updater::UpdateResult::Error(error) => serde_json::json!({
+                            "status": "error",
+                            "baseUrl": crate::updater::base_url(&nvs),
+                            "error": error,
+                        }),
+                    };
+                    send_json(req, 200, &serde_json::to_string(&body).unwrap_or_default())
+                }
+            }
         })?;
     }
 

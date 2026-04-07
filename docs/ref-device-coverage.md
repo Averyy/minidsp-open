@@ -18,14 +18,17 @@ This file is the repeatable coverage snapshot for comparing official-app device 
 - Android source-map groups parsed from APK logic: `11`
 - USB product hints in top-level Device Console package: `12`
 - USB product hints still lacking exact runtime identity: `6`
-- USB product hints with only alias labels and no family mapping: `2`
-- USB product hints with a source-backed family candidate but no exact identity: `3`
+- USB product hints with only alias labels and no family mapping: `1`
+- USB product hints with a source-backed family candidate but no exact identity: `4`
 - Desktop fallback-model catalog path present: `True`
 - Desktop fallback-model groups extracted from packaged app logic: `7`
 - Exact HW directories present in the packaged Device Console assets: `8`
 - Exact DSP directories present in the packaged Device Console assets: `7`
 - Product image rows in the extracted desktop assets: `13`
 - Product image rows matching exact modern HW/DSP pairs: `13`
+- Official XMOS firmware-upgrade USB PID pairs tracked: `26`
+- Firmware-upgrade USB PID pairs outside the clean desktop USB list: `20`
+- Hardware IDs with packaged DC migration bundles: `5`
 - `minidsp-rs` reference profiles checked: `13`
 - `minidsp-rs` reference profiles covered by `probe.rs`: `13`
 
@@ -146,6 +149,23 @@ These are not exact product definitions by themselves, but they are useful offic
 Android Dirac DSP versions: `[61, 94, 95, 101, 105, 111, 113]`
 
 Android select-index offset hw_ids: `[30, 31]`
+Android quick-controller explicit hw_ids: `[1, 2, 4, 5, 10, 11, 14, 17, 18, 27, 30, 31, 32]`
+Android HDMI-toggle hw_ids: `[7, 8]`
+
+Android quick-template historical hints:
+
+| Signal | Present |
+|--------|---------|
+| commented broad `90..99` Dirac band gate | `True` |
+| commented special-case `dspversion == 61` gate | `True` |
+| historical low-level-service comment `0x61 = 97 is DDRC should show DG` | `True` |
+| active `dirac_filter.visible` binding | `True` |
+
+The older APK quick-control template still carries commented UI gates for a broad `90..99` DSP-version band and a special-case `dspversion == 61`, while the active UI now defers to `checkDirac()` and `dirac_filter.visible`. Treat those comments as historical family hints rather than exact runtime identity.
+
+The older APK quick controller only special-cases a finite set of `hw_id` values for source lists and HDMI toggles. None of the unresolved USB-only product labels (`HA-DSP`, `DDRC-22`, `DDRC-88`, `CDSP-8x12/DL`, `Harmony DSP`) appear there as their own runtime `hw_id`, which is useful negative evidence that those labels are more likely aliases onto existing runtime buckets than missing standalone hardware rows in the old APK logic.
+
+The `0x61 = 97 is DDRC should show DG` comment in the old APK test stub is useful as evidence that the app historically carried rough DSP-family heuristics, but it is not strong enough to override better source data. In this repo, cached `config.xml` already proves DSP `97` is the `C-DSP 8x12 v2` family, so treat that APK comment as historical/noisy rather than an exact runtime mapping.
 
 ## Desktop Fallback-Model Catalog
 
@@ -161,6 +181,26 @@ The extracted desktop app exposes a user-facing blank-device fallback-model pick
 | Exact model list extracted into this report | `True` |
 
 The extracted desktop app builds the fallback-model picker from `deviceSupportPkg.deviceIdList`, grouped by `dspId` into `deviceModelsByDspIds`, then serves that through the `get-dspid-fallback-models` IPC handler. So the fallback picker is not an independent runtime-identity catalog and does not resolve the USB-only alias labels that are absent from `deviceIdList`.
+
+## Desktop Product-Path Map
+
+The packaged desktop app also ships `Contents/Resources/userdocs/product-path.json`. It is another independent exact-model catalog for user docs, and it only enumerates the same modern HW/DSP pairs already seen in the XML, image assets, and fallback-model grouping.
+
+| HW | DSP | Userdocs Slug |
+|----|-----|--------------|
+| `10` | `100` | 2x4-hd |
+| `10` | `101` | ddrc-24 |
+| `14` | `105` | shd |
+| `17` | `105` | shd-studio |
+| `21` | `105` | shd-power |
+| `27` | `100` | flex |
+| `27` | `101` | flex-dl |
+| `30` | `110` | flex-eight |
+| `30` | `111` | flex-eight-dl |
+| `31` | `113` | flex-ht |
+| `31` | `115` | flex-ht |
+| `32` | `113` | flex-htx |
+| `32` | `115` | flex-htx |
 
 | DSP | Desktop Fallback Models |
 |-----|-------------------------|
@@ -182,27 +222,77 @@ These strings come from `Contents/Resources/dirac/minidsp_dirac`. They do not pr
 | `PADSP-8x12-DL` | `True` |
 | `Failed to get dsp id, assume it is 113` | `True` |
 | `dsp id is 115` | `True` |
+| native `PID 0x0013` scan path | `False` |
+| native `PID 0x0040` scan path | `True` |
+| native `PID 0x0040` -> `create_default_dirac_info(1, 2, 1, ...)` | `True` |
+| native `PID 0x0043` scan path | `True` |
+| native `PID 0x0043` -> `create_default_dirac_info(1, 8, 1, ...)` | `True` |
+| native `PID 0x004b` scan path | `True` |
+| `Harmony DSP 8x12` normalized to `PADSP-8x12-DL` | `True` |
 
-The packaged Dirac helper binary includes `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, `dsp id is 115`, and `PADSP-8x12-DL`. That is stronger official evidence than the top-level XML for Harmony / 8x12-DL family hints, but it still does not expose an exact `hw_id` mapping.
+The packaged Dirac helper binary probes `PID 0x0040`, `0x0043`, `0x0046`, `0x0047`, `0x0048`, and `0x004b`, but does not probe `PID 0x0013`. Static disassembly shows `PID 0x0040` falling back to `create_default_dirac_info(1, 2, 1, ...)`, while `PID 0x0043`, `0x0046`, `0x0047`, and `0x0048` all fall back to `create_default_dirac_info(1, 8, 1, ...)`. The dedicated `PID 0x004b` path rewrites the USB product string `Harmony DSP 8x12` to `PADSP-8x12-DL` before runtime model handling continues. The same helper also contains `Failed to get dsp id, assume it is 113` and `dsp id is 115`. That is much stronger official evidence than the top-level XML for the remaining Dirac-family aliases, but it still does not expose an exact `hw_id` mapping.
+
+## Firmware Upgrade Bundle USB Surface
+
+The separate XMOS firmware-upgrade bundle under `app/minidsp-firmware/` is not a clean runtime identity catalog, but it does provide a second official USB support surface. That surface is broader than the top-level desktop USB XML and helps distinguish products the official tooling knows how to upgrade from products that are only present in the clean app matrix.
+
+| Source | VID | PID |
+|--------|-----|-----|
+| `license.ini only` | `0000` | `0000` |
+| `license.ini only` | `0000` | `0001` |
+| `license.ini only` | `0000` | `0010` |
+| `license.ini only` | `0000` | `010c` |
+| `license.ini only` | `0002` | `001e` |
+| `license.ini only` | `2752` | `0008` |
+| `license.ini only` | `2752` | `0010` |
+| `license.ini only` | `2752` | `0011` |
+| `license.ini only` | `2752` | `0012` |
+| `license.ini only` | `2752` | `0013` |
+| `license.ini only` | `2752` | `0014` |
+| `license.ini only` | `2752` | `0016` |
+| `license.ini only` | `2752` | `0017` |
+| `license.ini only` | `2752` | `0019` |
+| `license.ini only` | `2752` | `001a` |
+| `license.ini only` | `2752` | `001c` |
+| `license.ini only` | `2752` | `001d` |
+| `license.ini only` | `2752` | `0026` |
+| `license.ini only` | `2752` | `0029` |
+| `license.ini only` | `2752` | `002a` |
+| `license.ini only` | `2752` | `002b` |
+| `license.ini only` | `2752` | `0030` |
+| `license.ini only` | `2752` | `0044` |
+| `license.ini only` | `2752` | `0045` |
+| `license.ini only` | `2752` | `0048` |
+| `license.ini only` | `2752` | `0049` |
+
+Firmware-upgrade PID pairs only seen outside the clean desktop USB XML: `[('0x0000', '0x0000'), ('0x0000', '0x0001'), ('0x0000', '0x0010'), ('0x0000', '0x010c'), ('0x0002', '0x001e'), ('0x2752', '0x0008'), ('0x2752', '0x0010'), ('0x2752', '0x0011'), ('0x2752', '0x0012'), ('0x2752', '0x0013'), ('0x2752', '0x0014'), ('0x2752', '0x0016'), ('0x2752', '0x0017'), ('0x2752', '0x0019'), ('0x2752', '0x001a'), ('0x2752', '0x001c'), ('0x2752', '0x001d'), ('0x2752', '0x0026'), ('0x2752', '0x0029'), ('0x2752', '0x002a'), ('0x2752', '0x002b'), ('0x2752', '0x0030'), ('0x2752', '0x0044'), ('0x2752', '0x0045'), ('0x2752', '0x0048'), ('0x2752', '0x0049')]`
+
+The separate XMOS firmware-upgrade bundle exposes a broader official USB PID surface than the clean desktop HW/DSP matrix. It is useful for tracking which MiniDSP USB products the official upgrade tooling knows about, but the XML/license data still do not attach product names or exact runtime `hw_id`/`dsp_id` identities by themselves. String extraction from the DFU app binary and `libtlusbdfuapi.dylib` only exposed generic DFU plumbing and VID/PID licensing, not richer product-family names.
+
+## Packaged DC Migration Boundary
+
+The desktop bundle only ships migration packages for a subset of the exact modern hardware IDs. This is useful negative evidence that migration/update support is not a hidden second product matrix either.
+
+Packaged DC migration hardware IDs: `[10, 14, 17, 21, 27]`
 
 ## USB Product Hints Present In Official Package
 
 These come from the top-level Device Console package USB list. Some appear in the USB PID list even when they do not have a full HW/DSP definition in the packaged XML set.
 
-| VID | PID | Official Label | Status | Exact Runtime Known | Candidate Profiles | Resolution |
-|-----|-----|----------------|--------|---------------------|--------------------|------------|
-| `0x04D8` | `0x003F` | all PIC base product without DIRAC | covered | `false` | - | legacy-family USB surface is accepted; runtime identity still comes from hardware probing |
-| `0x2752` | `0x0011` | 2x4 HD / Flex | covered | `true` | - | covered by existing 2x4 HD / Flex runtime profiles after hw_id/dsp_version probing |
-| `0x2752` | `0x0013` | HA-DSP | alias_only | `false` | - | official assets currently expose only the USB PID label; no exact or family-level runtime mapping has been verified yet |
-| `0x2752` | `0x0040` | DDRC-22 | alias_only | `false` | - | official assets currently expose only the USB PID label; no exact or family-level runtime mapping has been verified yet |
-| `0x2752` | `0x0043` | DDRC-88 | family_candidate | `false` | DDRC-88BM | name strongly suggests the same 8x8 Dirac legacy family as the cached DDRC-88BM profile, but the extracted assets still do not expose an exact hw_id/dsp_id mapping |
-| `0x2752` | `0x0044` | DDRC-24 / Flex (DL) | covered | `true` | - | covered by existing DDRC-24 / Flex (DL) runtime profiles after hw_id/dsp_version probing |
-| `0x2752` | `0x0045` | SHD | covered | `true` | - | covered by existing SHD-family runtime profiles after hw_id/dsp_version probing |
-| `0x2752` | `0x0047` | CDSP-8x12/DL | family_candidate | `false` | C-DSP 8x12 v2 | name strongly suggests the same 8x12 custom-install family as the cached C-DSP 8x12 v2 profile, and the packaged Dirac helper also contains `PADSP-8x12-DL`, but the extracted assets still do not expose an exact hw_id/dsp_id mapping |
-| `0x2752` | `0x0048` | Harmony DSP | family_candidate | `false` | Flex HT, Flex HTx | official packaged assets still do not expose an exact hw_id/dsp_id row, but the Dirac helper binary explicitly references `Harmony DSP 8x12` and DSP IDs `113`/`115`, which strongly suggests the same 8x12 HT-family DSP structures as Flex HT / Flex HTx |
-| `0x2752` | `0x0012` | miniDSP Flex Eight | covered | `true` | - | covered by existing Flex Eight runtime profile after hw_id/dsp_version probing |
-| `0x2752` | `0x004A` | miniDSP Flex Eight (DL) | covered | `true` | - | covered by existing Flex Eight (DL) runtime profile after hw_id/dsp_version probing |
-| `0x2752` | `0x004B` | miniDSP Flex HT / Flex HTx | covered | `true` | - | covered by existing Flex HT / Flex HTx runtime profiles after hw_id/dsp_version probing |
+| VID | PID | Official Label | Public Family | Public Software | Public Product | Public Manual | Status | Exact Runtime Known | Runtime Bucket | Nearest Runtime Profiles | Resolution |
+|-----|-----|----------------|---------------|-----------------|----------------|---------------|--------|---------------------|----------------|--------------------------|------------|
+| `0x04D8` | `0x003F` | all PIC base product without DIRAC | legacy PIC product family | - | - | - | covered | `false` | - | - | legacy-family USB surface is accepted; runtime identity still comes from hardware probing |
+| `0x2752` | `0x0011` | 2x4 HD / Flex | 2x4 HD / Flex family | - | - | - | covered | `true` | - | - | covered by existing 2x4 HD / Flex runtime profiles after hw_id/dsp_version probing |
+| `0x2752` | `0x0013` | HA-DSP | HA-DSP headphone processor family | HA-DSP-CF plugin family | [product](https://www.minidsp.com/images/documents/Product%20Brief%20-%20HA-DSP.pdf) | [manual](https://www.minidsp.com/images/documents/HA-DSP%20User%20Manual.pdf) | alias_only | `false` | - | - | official assets currently expose only the USB PID label, and the packaged Dirac helper does not probe `PID 0x0013`; the public manual does show a dedicated `HA-DSP-CF` software/plugin family, but no exact or family-level runtime mapping has been verified yet from extracted assets |
+| `0x2752` | `0x0040` | DDRC-22 | DDRC-22 family | DDRC-22 Utility family | [product](https://www.minidsp.com/products/dirac-series) | [manual](https://www.minidsp.com/images/documents/Dirac%20Series%20-%20DDRC-22%20User%20Manual.pdf) | family_candidate | `false` | small Dirac family (2 channels, 1 zone) | - | the packaged Dirac helper actively probes `PID 0x0040` and falls back to `create_default_dirac_info(1, 2, 1, ...)`, while the public manual also confirms a dedicated `DDRC-22 Utility` software line. That is stronger than a label-only hint and places `DDRC-22` in the small legacy Dirac family, but still does not expose an exact hw_id/dsp_id mapping |
+| `0x2752` | `0x0043` | DDRC-88 | DDRC-88A / DDRC-88D family | DDRC-88BM plugin family | [product](https://www.minidsp.com/products/accessories/ddrc-88bm) | [manual](https://www.minidsp.com/images/documents/DDRC-88A%20User%20Manual.pdf) | family_candidate | `false` | legacy Dirac family (8 channels, 1 zone) | DDRC-88BM | the public product naming and native `PID 0x0043` helper path both place this label in the older 8-channel Dirac family, and the public product/manual pages explicitly route DDRC-88A / DDRC-88D through the `DDRC-88BM` plugin family, but the extracted assets still do not expose an exact hw_id/dsp_id mapping |
+| `0x2752` | `0x0044` | DDRC-24 / Flex (DL) | DDRC-24 / Flex (DL) family | - | - | - | covered | `true` | - | - | covered by existing DDRC-24 / Flex (DL) runtime profiles after hw_id/dsp_version probing |
+| `0x2752` | `0x0045` | SHD | SHD family | - | - | - | covered | `true` | - | - | covered by existing SHD-family runtime profiles after hw_id/dsp_version probing |
+| `0x2752` | `0x0047` | CDSP-8x12/DL | C-DSP 8x12 DL | C-DSP 8x12 DL plugin family | [product](https://www.minidsp.com/products/car-audio-dsp/cdsp-8x12-dl) | [manual](https://www.minidsp.com/images/documents/C-DSP%208x12%20DL%20User%20Manual.pdf) | family_candidate | `false` | custom-install 8x12 Dirac family | C-DSP 8x12 v2 | the official label and the native `Harmony DSP 8x12` -> `PADSP-8x12-DL` normalization path both place this in the 8x12 custom-install Dirac family, and the public Harmony manual confirms that the same `C-DSP 8x12 DL` plugin works with both Harmony DSP 8x12 and C-DSP 8x12 DL, but the extracted assets still do not expose an exact hw_id/dsp_id mapping |
+| `0x2752` | `0x0048` | Harmony DSP | Harmony DSP 8x12 | C-DSP 8x12 DL plugin family | [product](https://www.minidsp.com/products/car-audio-dsp/harmony-8x12) | [manual](https://www.minidsp.com/images/documents/Harmony%20DSP%208x12%20User%20Manual.pdf) | family_candidate | `false` | HT-family 8x12 Dirac family | Flex HT, Flex HTx | official packaged assets still do not expose an exact hw_id/dsp_id row, but the native Dirac helper has a dedicated `PID 0x004b` path that rewrites `Harmony DSP 8x12` to `PADSP-8x12-DL` and uses DSP-ID fallback around `113`/`115`; the public Harmony manual then closes the loop by stating that the `C-DSP 8x12 DL` plugin works with both Harmony DSP 8x12 and C-DSP 8x12 DL. Together that strongly suggests the same 8x12 HT-family DSP structures as Flex HT / Flex HTx rather than a separate exact runtime family |
+| `0x2752` | `0x0012` | miniDSP Flex Eight | Flex Eight family | - | - | - | covered | `true` | - | - | covered by existing Flex Eight runtime profile after hw_id/dsp_version probing |
+| `0x2752` | `0x004A` | miniDSP Flex Eight (DL) | Flex Eight (DL) family | - | - | - | covered | `true` | - | - | covered by existing Flex Eight (DL) runtime profile after hw_id/dsp_version probing |
+| `0x2752` | `0x004B` | miniDSP Flex HT / Flex HTx | Flex HT / Flex HTx family | - | - | - | covered | `true` | - | - | covered by existing Flex HT / Flex HTx runtime profiles after hw_id/dsp_version probing |
 
 ## minidsp-rs Reference Cross-Check
 
@@ -244,7 +334,7 @@ These are mostly legacy/basic-support definitions and app-derived additions that
 ## Immediate Gaps To Close
 
 - Keep the importer/report pipeline generated from official assets instead of hand-maintained notes.
-- Treat the remaining unresolved USB-only labels conservatively: `HA-DSP` and `DDRC-22` are still alias-only, while `DDRC-88`, `CDSP-8x12/DL`, and `Harmony DSP` are family candidates without exact identities.
+- Treat the remaining unresolved USB-only labels conservatively: all five now have stable public-family naming, and four also have source-backed runtime-bucket evidence, but none of them have an exact generated runtime identity yet.
 - Do not treat the desktop fallback-model picker as a hidden alias-identity catalog; it is sourced from `deviceSupportPkg.deviceIdList` grouped by DSP ID.
 - Keep checking against `minidsp-rs`, but treat it as a secondary reference rather than the contract source when it diverges from the official assets.
 - Keep this report regenerated as the source of truth before claiming new device coverage in permanent docs.

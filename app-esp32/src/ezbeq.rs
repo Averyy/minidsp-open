@@ -311,6 +311,7 @@ pub fn register_routes(
     server: &mut esp_idf_svc::http::server::EspHttpServer<'static>,
     device_state: SharedDeviceState,
     beq_state: SharedEzBeqState,
+    nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     use crate::http_server::{get_device, send_error, send_json};
     use esp_idf_svc::http::Method;
@@ -352,6 +353,7 @@ pub fn register_routes(
     for slot_idx in 0..NUM_SLOTS {
         let st = device_state.clone();
         let beq = beq_state.clone();
+        let nvs = nvs.clone();
         let path = format!("/api/1/devices/master/filter/{}", slot_idx + 1);
         server.fn_handler(&path, Method::Put, move |mut req| {
             let dev = match get_device(&st) {
@@ -403,7 +405,15 @@ pub fn register_routes(
                 }
                 Err(e) => {
                     if e.contains("not found") {
-                        send_error(req, 404, &e)
+                        let started = crate::updater::trigger_background_refresh(
+                            nvs.clone(),
+                            "catalogue entry missing during filter load",
+                        );
+                        let body = serde_json::json!({
+                            "error": e,
+                            "refreshStarted": started,
+                        });
+                        send_json(req, 404, &serde_json::to_string(&body).unwrap_or_default())
                     } else {
                         send_error(req, 500, &e)
                     }

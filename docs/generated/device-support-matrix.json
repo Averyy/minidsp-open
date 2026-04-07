@@ -9,6 +9,33 @@
       111,
       113
     ],
+    "explicit_hw_ids": [
+      1,
+      2,
+      4,
+      5,
+      10,
+      11,
+      14,
+      17,
+      18,
+      27,
+      30,
+      31,
+      32
+    ],
+    "hdmi_toggle_hw_ids": [
+      7,
+      8
+    ],
+    "notes": "The older APK quick controller only special-cases a finite set of `hw_id` values for source lists and HDMI toggles. None of the unresolved USB-only product labels (`HA-DSP`, `DDRC-22`, `DDRC-88`, `CDSP-8x12/DL`, `Harmony DSP`) appear there as their own runtime `hw_id`, which is useful negative evidence that those labels are more likely aliases onto existing runtime buckets than missing standalone hardware rows in the old APK logic.",
+    "quick_template_hints": {
+      "active_dirac_filter_binding": true,
+      "commented_dirac_band_90s": true,
+      "commented_dsp_61_gate": true,
+      "historical_dsp97_ddrc_comment": true,
+      "notes": "The older APK quick-control template still carries commented UI gates for a broad `90..99` DSP-version band and a special-case `dspversion == 61`, while the active UI now defers to `checkDirac()` and `dirac_filter.visible`. Treat those comments as historical family hints rather than exact runtime identity."
+    },
     "select_index_offset_hw_ids": [
       30,
       31
@@ -271,6 +298,13 @@
       }
     ]
   },
+  "dc_migration_hardware_ids": [
+    10,
+    14,
+    17,
+    21,
+    27
+  ],
   "desktop_fallback_hints": {
     "all_supported_devices_exports_device_id_list": true,
     "device_models_by_dsp_ids_present": true,
@@ -409,7 +443,20 @@
     "contains_dsp_id_115": true,
     "contains_harmony_dsp_8x12": true,
     "contains_padsp_8x12_dl": true,
-    "notes": "The packaged Dirac helper binary includes `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, `dsp id is 115`, and `PADSP-8x12-DL`. That is stronger official evidence than the top-level XML for Harmony / 8x12-DL family hints, but it still does not expose an exact `hw_id` mapping."
+    "contains_pid_0013_scan": false,
+    "contains_pid_0040_fallback_2x1": true,
+    "contains_pid_0040_scan": true,
+    "contains_pid_0043_fallback_8x1": true,
+    "contains_pid_0043_scan": true,
+    "contains_pid_0046_fallback_8x1": true,
+    "contains_pid_0046_scan": true,
+    "contains_pid_0047_fallback_8x1": true,
+    "contains_pid_0047_scan": true,
+    "contains_pid_0048_fallback_8x1": true,
+    "contains_pid_0048_scan": true,
+    "contains_pid_004b_scan": true,
+    "harmony_normalized_to_padsp": true,
+    "notes": "The packaged Dirac helper binary probes `PID 0x0040`, `0x0043`, `0x0046`, `0x0047`, `0x0048`, and `0x004b`, but does not probe `PID 0x0013`. Static disassembly shows `PID 0x0040` falling back to `create_default_dirac_info(1, 2, 1, ...)`, while `PID 0x0043`, `0x0046`, `0x0047`, and `0x0048` all fall back to `create_default_dirac_info(1, 8, 1, ...)`. The dedicated `PID 0x004b` path rewrites the USB product string `Harmony DSP 8x12` to `PADSP-8x12-DL` before runtime model handling continues. The same helper also contains `Failed to get dsp id, assume it is 113` and `dsp id is 115`. That is much stronger official evidence than the top-level XML for the remaining Dirac-family aliases, but it still does not expose an exact `hw_id` mapping."
   },
   "extra_rust_profiles": [
     {
@@ -473,6 +520,329 @@
       "tier": "Full"
     }
   ],
+  "firmware_upgrade_bundle": {
+    "combined_pairs": [
+      {
+        "pid": 0,
+        "vid": 0
+      },
+      {
+        "pid": 1,
+        "vid": 0
+      },
+      {
+        "pid": 16,
+        "vid": 0
+      },
+      {
+        "pid": 268,
+        "vid": 0
+      },
+      {
+        "pid": 30,
+        "vid": 2
+      },
+      {
+        "pid": 8,
+        "vid": 10066
+      },
+      {
+        "pid": 16,
+        "vid": 10066
+      },
+      {
+        "pid": 17,
+        "vid": 10066
+      },
+      {
+        "pid": 18,
+        "vid": 10066
+      },
+      {
+        "pid": 19,
+        "vid": 10066
+      },
+      {
+        "pid": 20,
+        "vid": 10066
+      },
+      {
+        "pid": 22,
+        "vid": 10066
+      },
+      {
+        "pid": 23,
+        "vid": 10066
+      },
+      {
+        "pid": 25,
+        "vid": 10066
+      },
+      {
+        "pid": 26,
+        "vid": 10066
+      },
+      {
+        "pid": 28,
+        "vid": 10066
+      },
+      {
+        "pid": 29,
+        "vid": 10066
+      },
+      {
+        "pid": 38,
+        "vid": 10066
+      },
+      {
+        "pid": 41,
+        "vid": 10066
+      },
+      {
+        "pid": 42,
+        "vid": 10066
+      },
+      {
+        "pid": 43,
+        "vid": 10066
+      },
+      {
+        "pid": 48,
+        "vid": 10066
+      },
+      {
+        "pid": 68,
+        "vid": 10066
+      },
+      {
+        "pid": 69,
+        "vid": 10066
+      },
+      {
+        "pid": 72,
+        "vid": 10066
+      },
+      {
+        "pid": 73,
+        "vid": 10066
+      }
+    ],
+    "config_only_pairs": [],
+    "config_pairs": [],
+    "license_only_pairs": [
+      {
+        "pid": 0,
+        "vid": 0
+      },
+      {
+        "pid": 1,
+        "vid": 0
+      },
+      {
+        "pid": 16,
+        "vid": 0
+      },
+      {
+        "pid": 268,
+        "vid": 0
+      },
+      {
+        "pid": 30,
+        "vid": 2
+      },
+      {
+        "pid": 8,
+        "vid": 10066
+      },
+      {
+        "pid": 16,
+        "vid": 10066
+      },
+      {
+        "pid": 17,
+        "vid": 10066
+      },
+      {
+        "pid": 18,
+        "vid": 10066
+      },
+      {
+        "pid": 19,
+        "vid": 10066
+      },
+      {
+        "pid": 20,
+        "vid": 10066
+      },
+      {
+        "pid": 22,
+        "vid": 10066
+      },
+      {
+        "pid": 23,
+        "vid": 10066
+      },
+      {
+        "pid": 25,
+        "vid": 10066
+      },
+      {
+        "pid": 26,
+        "vid": 10066
+      },
+      {
+        "pid": 28,
+        "vid": 10066
+      },
+      {
+        "pid": 29,
+        "vid": 10066
+      },
+      {
+        "pid": 38,
+        "vid": 10066
+      },
+      {
+        "pid": 41,
+        "vid": 10066
+      },
+      {
+        "pid": 42,
+        "vid": 10066
+      },
+      {
+        "pid": 43,
+        "vid": 10066
+      },
+      {
+        "pid": 48,
+        "vid": 10066
+      },
+      {
+        "pid": 68,
+        "vid": 10066
+      },
+      {
+        "pid": 69,
+        "vid": 10066
+      },
+      {
+        "pid": 72,
+        "vid": 10066
+      },
+      {
+        "pid": 73,
+        "vid": 10066
+      }
+    ],
+    "license_pairs": [
+      {
+        "pid": 0,
+        "vid": 0
+      },
+      {
+        "pid": 1,
+        "vid": 0
+      },
+      {
+        "pid": 16,
+        "vid": 0
+      },
+      {
+        "pid": 268,
+        "vid": 0
+      },
+      {
+        "pid": 30,
+        "vid": 2
+      },
+      {
+        "pid": 8,
+        "vid": 10066
+      },
+      {
+        "pid": 16,
+        "vid": 10066
+      },
+      {
+        "pid": 17,
+        "vid": 10066
+      },
+      {
+        "pid": 18,
+        "vid": 10066
+      },
+      {
+        "pid": 19,
+        "vid": 10066
+      },
+      {
+        "pid": 20,
+        "vid": 10066
+      },
+      {
+        "pid": 22,
+        "vid": 10066
+      },
+      {
+        "pid": 23,
+        "vid": 10066
+      },
+      {
+        "pid": 25,
+        "vid": 10066
+      },
+      {
+        "pid": 26,
+        "vid": 10066
+      },
+      {
+        "pid": 28,
+        "vid": 10066
+      },
+      {
+        "pid": 29,
+        "vid": 10066
+      },
+      {
+        "pid": 38,
+        "vid": 10066
+      },
+      {
+        "pid": 41,
+        "vid": 10066
+      },
+      {
+        "pid": 42,
+        "vid": 10066
+      },
+      {
+        "pid": 43,
+        "vid": 10066
+      },
+      {
+        "pid": 48,
+        "vid": 10066
+      },
+      {
+        "pid": 68,
+        "vid": 10066
+      },
+      {
+        "pid": 69,
+        "vid": 10066
+      },
+      {
+        "pid": 72,
+        "vid": 10066
+      },
+      {
+        "pid": 73,
+        "vid": 10066
+      }
+    ],
+    "notes": "The separate XMOS firmware-upgrade bundle exposes a broader official USB PID surface than the clean desktop HW/DSP matrix. It is useful for tracking which MiniDSP USB products the official upgrade tooling knows about, but the XML/license data still do not attach product names or exact runtime `hw_id`/`dsp_id` identities by themselves. String extraction from the DFU app binary and `libtlusbdfuapi.dylib` only exposed generic DFU plumbing and VID/PID licensing, not richer product-family names."
+  },
   "legacy_configs": [
     {
       "compressor_count": 0,
@@ -46974,6 +47344,75 @@
       32
     ]
   },
+  "product_path_map": {
+    "pairs": [
+      {
+        "dsp_version": 100,
+        "hw_id": 10,
+        "slug": "2x4-hd"
+      },
+      {
+        "dsp_version": 101,
+        "hw_id": 10,
+        "slug": "ddrc-24"
+      },
+      {
+        "dsp_version": 105,
+        "hw_id": 14,
+        "slug": "shd"
+      },
+      {
+        "dsp_version": 105,
+        "hw_id": 17,
+        "slug": "shd-studio"
+      },
+      {
+        "dsp_version": 105,
+        "hw_id": 21,
+        "slug": "shd-power"
+      },
+      {
+        "dsp_version": 100,
+        "hw_id": 27,
+        "slug": "flex"
+      },
+      {
+        "dsp_version": 101,
+        "hw_id": 27,
+        "slug": "flex-dl"
+      },
+      {
+        "dsp_version": 110,
+        "hw_id": 30,
+        "slug": "flex-eight"
+      },
+      {
+        "dsp_version": 111,
+        "hw_id": 30,
+        "slug": "flex-eight-dl"
+      },
+      {
+        "dsp_version": 113,
+        "hw_id": 31,
+        "slug": "flex-ht"
+      },
+      {
+        "dsp_version": 115,
+        "hw_id": 31,
+        "slug": "flex-ht"
+      },
+      {
+        "dsp_version": 113,
+        "hw_id": 32,
+        "slug": "flex-htx"
+      },
+      {
+        "dsp_version": 115,
+        "hw_id": 32,
+        "slug": "flex-htx"
+      }
+    ]
+  },
   "rust_profiles": [
     {
       "dsp_version": 0,
@@ -47116,10 +47555,13 @@
   ],
   "summary": {
     "android_source_group_count": 11,
+    "dc_migration_hardware_id_count": 5,
     "desktop_fallback_catalog_present": true,
     "desktop_fallback_model_count": 7,
     "device_type_product_asset_count": 13,
     "device_type_product_asset_exact_match_count": 13,
+    "firmware_upgrade_extra_usb_pid_count": 20,
+    "firmware_upgrade_usb_pid_count": 26,
     "legacy_config_count": 7,
     "minidsp_rs_reference_count": 13,
     "minidsp_rs_reference_covered_count": 13,
@@ -47128,10 +47570,12 @@
     "modern_missing_count": 0,
     "package_exact_dsp_count": 7,
     "package_exact_hw_count": 8,
+    "product_path_pair_count": 13,
+    "product_path_pair_exact_match_count": 13,
     "rust_profile_count": 23,
-    "usb_product_hint_alias_only_count": 2,
+    "usb_product_hint_alias_only_count": 1,
     "usb_product_hint_count": 12,
-    "usb_product_hint_family_candidate_count": 3,
+    "usb_product_hint_family_candidate_count": 4,
     "usb_product_hint_unresolved_exact_count": 6
   },
   "usb_product_hints": [
@@ -47139,6 +47583,7 @@
       "exact_runtime_known": "false",
       "label": "all PIC base product without DIRAC",
       "pid": "0x003F",
+      "public_product_family": "legacy PIC product family",
       "resolution": "legacy-family USB surface is accepted; runtime identity still comes from hardware probing",
       "status": "covered",
       "vid": "0x04D8"
@@ -47147,6 +47592,7 @@
       "exact_runtime_known": "true",
       "label": "2x4 HD / Flex",
       "pid": "0x0011",
+      "public_product_family": "2x4 HD / Flex family",
       "resolution": "covered by existing 2x4 HD / Flex runtime profiles after hw_id/dsp_version probing",
       "status": "covered",
       "vid": "0x2752"
@@ -47155,25 +47601,42 @@
       "exact_runtime_known": "false",
       "label": "HA-DSP",
       "pid": "0x0013",
-      "resolution": "official assets currently expose only the USB PID label; no exact or family-level runtime mapping has been verified yet",
+      "public_manual_url": "https://www.minidsp.com/images/documents/HA-DSP%20User%20Manual.pdf",
+      "public_product_family": "HA-DSP headphone processor family",
+      "public_product_url": "https://www.minidsp.com/images/documents/Product%20Brief%20-%20HA-DSP.pdf",
+      "public_software_family": "HA-DSP-CF plugin family",
+      "resolution": "official assets currently expose only the USB PID label, and the packaged Dirac helper does not probe `PID 0x0013`; the public manual does show a dedicated `HA-DSP-CF` software/plugin family, but no exact or family-level runtime mapping has been verified yet from extracted assets",
       "status": "alias_only",
       "vid": "0x2752"
     },
     {
+      "candidate_source_basis": "official Dirac helper: PID 0x0040 scan -> create_default_dirac_info(1, 2, 1, ...)",
       "exact_runtime_known": "false",
       "label": "DDRC-22",
       "pid": "0x0040",
-      "resolution": "official assets currently expose only the USB PID label; no exact or family-level runtime mapping has been verified yet",
-      "status": "alias_only",
+      "public_manual_url": "https://www.minidsp.com/images/documents/Dirac%20Series%20-%20DDRC-22%20User%20Manual.pdf",
+      "public_product_family": "DDRC-22 family",
+      "public_product_url": "https://www.minidsp.com/products/dirac-series",
+      "public_software_family": "DDRC-22 Utility family",
+      "resolution": "the packaged Dirac helper actively probes `PID 0x0040` and falls back to `create_default_dirac_info(1, 2, 1, ...)`, while the public manual also confirms a dedicated `DDRC-22 Utility` software line. That is stronger than a label-only hint and places `DDRC-22` in the small legacy Dirac family, but still does not expose an exact hw_id/dsp_id mapping",
+      "runtime_family_bucket": "small Dirac family (2 channels, 1 zone)",
+      "status": "family_candidate",
       "vid": "0x2752"
     },
     {
-      "candidate_runtime_profiles": "DDRC-88BM",
-      "candidate_source_basis": "official USB PID label + source-backed cached legacy DDRC-88BM family",
+      "candidate_runtime_profiles": [
+        "DDRC-88BM"
+      ],
+      "candidate_source_basis": "official USB PID label + source-backed cached legacy DDRC-88BM family + Dirac helper PID 0x0043 -> create_default_dirac_info(1, 8, 1, ...)",
       "exact_runtime_known": "false",
       "label": "DDRC-88",
       "pid": "0x0043",
-      "resolution": "name strongly suggests the same 8x8 Dirac legacy family as the cached DDRC-88BM profile, but the extracted assets still do not expose an exact hw_id/dsp_id mapping",
+      "public_manual_url": "https://www.minidsp.com/images/documents/DDRC-88A%20User%20Manual.pdf",
+      "public_product_family": "DDRC-88A / DDRC-88D family",
+      "public_product_url": "https://www.minidsp.com/products/accessories/ddrc-88bm",
+      "public_software_family": "DDRC-88BM plugin family",
+      "resolution": "the public product naming and native `PID 0x0043` helper path both place this label in the older 8-channel Dirac family, and the public product/manual pages explicitly route DDRC-88A / DDRC-88D through the `DDRC-88BM` plugin family, but the extracted assets still do not expose an exact hw_id/dsp_id mapping",
+      "runtime_family_bucket": "legacy Dirac family (8 channels, 1 zone)",
       "status": "family_candidate",
       "vid": "0x2752"
     },
@@ -47181,6 +47644,7 @@
       "exact_runtime_known": "true",
       "label": "DDRC-24 / Flex (DL)",
       "pid": "0x0044",
+      "public_product_family": "DDRC-24 / Flex (DL) family",
       "resolution": "covered by existing DDRC-24 / Flex (DL) runtime profiles after hw_id/dsp_version probing",
       "status": "covered",
       "vid": "0x2752"
@@ -47189,27 +47653,43 @@
       "exact_runtime_known": "true",
       "label": "SHD",
       "pid": "0x0045",
+      "public_product_family": "SHD family",
       "resolution": "covered by existing SHD-family runtime profiles after hw_id/dsp_version probing",
       "status": "covered",
       "vid": "0x2752"
     },
     {
-      "candidate_runtime_profiles": "C-DSP 8x12 v2",
-      "candidate_source_basis": "official USB PID label + source-backed cached legacy C-DSP 8x12 v2 family + Dirac helper string PADSP-8x12-DL",
+      "candidate_runtime_profiles": [
+        "C-DSP 8x12 v2"
+      ],
+      "candidate_source_basis": "official USB PID label + source-backed cached legacy C-DSP 8x12 v2 family + Dirac helper PID 0x004b Harmony DSP 8x12 -> PADSP-8x12-DL normalization",
       "exact_runtime_known": "false",
       "label": "CDSP-8x12/DL",
       "pid": "0x0047",
-      "resolution": "name strongly suggests the same 8x12 custom-install family as the cached C-DSP 8x12 v2 profile, and the packaged Dirac helper also contains `PADSP-8x12-DL`, but the extracted assets still do not expose an exact hw_id/dsp_id mapping",
+      "public_manual_url": "https://www.minidsp.com/images/documents/C-DSP%208x12%20DL%20User%20Manual.pdf",
+      "public_product_family": "C-DSP 8x12 DL",
+      "public_product_url": "https://www.minidsp.com/products/car-audio-dsp/cdsp-8x12-dl",
+      "public_software_family": "C-DSP 8x12 DL plugin family",
+      "resolution": "the official label and the native `Harmony DSP 8x12` -> `PADSP-8x12-DL` normalization path both place this in the 8x12 custom-install Dirac family, and the public Harmony manual confirms that the same `C-DSP 8x12 DL` plugin works with both Harmony DSP 8x12 and C-DSP 8x12 DL, but the extracted assets still do not expose an exact hw_id/dsp_id mapping",
+      "runtime_family_bucket": "custom-install 8x12 Dirac family",
       "status": "family_candidate",
       "vid": "0x2752"
     },
     {
-      "candidate_runtime_profiles": "Flex HT, Flex HTx",
-      "candidate_source_basis": "official Dirac helper strings: Harmony DSP 8x12 + assume dsp 113 + dsp id 115",
+      "candidate_runtime_profiles": [
+        "Flex HT",
+        "Flex HTx"
+      ],
+      "candidate_source_basis": "official Dirac helper: PID 0x004b scan + Harmony DSP 8x12 -> PADSP-8x12-DL normalization + assume dsp 113 + dsp id 115",
       "exact_runtime_known": "false",
       "label": "Harmony DSP",
       "pid": "0x0048",
-      "resolution": "official packaged assets still do not expose an exact hw_id/dsp_id row, but the Dirac helper binary explicitly references `Harmony DSP 8x12` and DSP IDs `113`/`115`, which strongly suggests the same 8x12 HT-family DSP structures as Flex HT / Flex HTx",
+      "public_manual_url": "https://www.minidsp.com/images/documents/Harmony%20DSP%208x12%20User%20Manual.pdf",
+      "public_product_family": "Harmony DSP 8x12",
+      "public_product_url": "https://www.minidsp.com/products/car-audio-dsp/harmony-8x12",
+      "public_software_family": "C-DSP 8x12 DL plugin family",
+      "resolution": "official packaged assets still do not expose an exact hw_id/dsp_id row, but the native Dirac helper has a dedicated `PID 0x004b` path that rewrites `Harmony DSP 8x12` to `PADSP-8x12-DL` and uses DSP-ID fallback around `113`/`115`; the public Harmony manual then closes the loop by stating that the `C-DSP 8x12 DL` plugin works with both Harmony DSP 8x12 and C-DSP 8x12 DL. Together that strongly suggests the same 8x12 HT-family DSP structures as Flex HT / Flex HTx rather than a separate exact runtime family",
+      "runtime_family_bucket": "HT-family 8x12 Dirac family",
       "status": "family_candidate",
       "vid": "0x2752"
     },
@@ -47217,6 +47697,7 @@
       "exact_runtime_known": "true",
       "label": "miniDSP Flex Eight",
       "pid": "0x0012",
+      "public_product_family": "Flex Eight family",
       "resolution": "covered by existing Flex Eight runtime profile after hw_id/dsp_version probing",
       "status": "covered",
       "vid": "0x2752"
@@ -47225,6 +47706,7 @@
       "exact_runtime_known": "true",
       "label": "miniDSP Flex Eight (DL)",
       "pid": "0x004A",
+      "public_product_family": "Flex Eight (DL) family",
       "resolution": "covered by existing Flex Eight (DL) runtime profile after hw_id/dsp_version probing",
       "status": "covered",
       "vid": "0x2752"
@@ -47233,6 +47715,7 @@
       "exact_runtime_known": "true",
       "label": "miniDSP Flex HT / Flex HTx",
       "pid": "0x004B",
+      "public_product_family": "Flex HT / Flex HTx family",
       "resolution": "covered by existing Flex HT / Flex HTx runtime profiles after hw_id/dsp_version probing",
       "status": "covered",
       "vid": "0x2752"

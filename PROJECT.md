@@ -95,16 +95,26 @@ Current remaining importer scope:
   - `CDSP-8x12/DL`
   - `Harmony DSP`
 - for those labels, USB discovery is no longer the blocker; the missing piece is exact runtime identity from official app assets
+- the current best classification is now explicit:
+- `HA-DSP` = public product family known, exact runtime identity unresolved
+- `DDRC-22` = public family known + small Dirac runtime bucket known, exact runtime identity unresolved
+- `DDRC-88` = public `DDRC-88A / DDRC-88D` family known + legacy 8-channel Dirac bucket known, exact runtime identity unresolved
+- `CDSP-8x12/DL` = public `C-DSP 8x12 DL` family known + 8x12 custom-install bucket known, exact runtime identity unresolved
+- `Harmony DSP` = public `Harmony DSP 8x12` family known + HT-family 8x12 bucket known, exact runtime identity unresolved
+- the older Android quick controller only branches on source-list `hw_id` values `[1, 2, 4, 5, 10, 11, 14, 17, 18, 27, 30, 31, 32]`, with `7/8` used only for a separate HDMI toggle; none of the unresolved USB-only labels appear there as standalone runtime `hw_id` families, which is useful negative evidence for alias reuse rather than missing hidden rows in the old APK logic
 - the generated coverage report now also captures the package boundary directly:
   - exact HW directories present in the Device Console package
   - exact DSP directories present in the Device Console package
   - desktop product-image rows keyed by `product-HW-DSP`
+  - desktop userdocs rows keyed by `Contents/Resources/userdocs/product-path.json`
+  - sparse desktop manual-topic rows keyed by `Contents/Resources/userdocs/file-index.json`
   - packaged Dirac-helper alias strings
 - the generated USB acceptance helper now follows the exact official VID/PID list instead of accepting every `0x2752:*` device
 - the extracted desktop app does expose a blank-device fallback-model catalog path (`get-dspid-fallback-models`), but decoded bundle logic shows it is just `deviceSupportPkg.deviceIdList` grouped by `dspId`, not a separate alias-identity catalog
-- package inventory, product-image rows, and fallback-model logic now all agree that the exact modern runtime matrix is still just the 13 enumerated HW/DSP pairs
+- package inventory, product-image rows, sparse userdocs rows, and fallback-model logic now all agree that the exact modern runtime matrix is still just the 13 enumerated HW/DSP pairs
 - `Harmony DSP` is no longer only a top-level USB comment: the packaged Dirac helper contains `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, and `dsp id is 115`, which makes it a source-backed 8x12 family candidate even though the exact `hw_id` is still unresolved
 - `CDSP-8x12/DL` is also slightly stronger than before because the same Dirac helper contains `PADSP-8x12-DL`, reinforcing the 8x12 custom-install family connection without exposing an exact `hw_id`
+- for the unresolved families, the generated metadata now also carries supporting public product/manual URLs so public product naming and sibling-family organization stay explicit without being confused for exact runtime identity
 - `NanoDigi 2x8` now follows the wider `4 / 10` internal topology inferred from its cached `config.xml`; keep treating the extracted app assets as source of truth when product names and internal channel maps disagree
 
 

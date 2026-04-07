@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -24,10 +25,16 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "app" / "MiniDSP Device Console.app" / "Contents" / "Resources" / "device_support_package"
 APK_CONTROLLERS = REPO_ROOT / "app" / "apk-extracted" / "assets" / "www" / "js" / "controllers.js"
+APK_QUICK_TEMPLATE = REPO_ROOT / "app" / "apk-extracted" / "assets" / "www" / "templates" / "quick.html"
+APK_LOW_LEVEL_SERVICES = REPO_ROOT / "app" / "apk-extracted" / "assets" / "www" / "js" / "services" / "low_level_services.js"
 DESKTOP_MAIN_BUNDLE = REPO_ROOT / "app" / "app-extracted" / "build" / "src" / "index.js"
 DESKTOP_USERSETTINGS_BUNDLE = REPO_ROOT / "app" / "app-extracted" / "app" / "src_app_usersettings_usersettings_module_ts.e0768996ea536a9d.js"
 DESKTOP_DEVICE_TYPE_ASSET_DIR = REPO_ROOT / "app" / "app-extracted" / "app" / "assets" / "img" / "device-types"
+DESKTOP_PRODUCT_PATHS = REPO_ROOT / "app" / "MiniDSP Device Console.app" / "Contents" / "Resources" / "userdocs" / "product-path.json"
 DIRAC_BINARY = REPO_ROOT / "app" / "MiniDSP Device Console.app" / "Contents" / "Resources" / "dirac" / "minidsp_dirac"
+FIRMWARE_UPGRADE_CONFIG_XML = REPO_ROOT / "app" / "minidsp-firmware" / "XMOS Firmware" / "Firmware_Upgrade_Tools" / "miniDSP USB DFU.app" / "Contents" / "Resources" / "Config.xml"
+FIRMWARE_UPGRADE_LICENSE_INI = REPO_ROOT / "app" / "minidsp-firmware" / "XMOS Firmware" / "Firmware_Upgrade_Tools" / "miniDSP USB DFU.app" / "Contents" / "Resources" / "libtlusbdfuapi.dylib.license.ini"
+DC_MIGRATION_URLS = REPO_ROOT / "app" / "MiniDSP Device Console.app" / "Contents" / "Resources" / "dc_migrations" / "package-url.json"
 PROBE_RS = REPO_ROOT / "protocol" / "src" / "device" / "probe.rs"
 LEGACY_CONFIG_ROOT = REPO_ROOT / "third_party" / "legacy-configs"
 OUTPUT_MD = REPO_ROOT / "docs" / "ref-device-coverage.md"
@@ -72,66 +79,100 @@ USB_HINT_RESOLUTION: dict[str, dict[str, str]] = {
     "all PIC base product without DIRAC": {
         "status": "covered",
         "exact_runtime_known": "false",
+        "public_product_family": "legacy PIC product family",
         "resolution": "legacy-family USB surface is accepted; runtime identity still comes from hardware probing",
     },
     "2x4 HD / Flex": {
         "status": "covered",
         "exact_runtime_known": "true",
+        "public_product_family": "2x4 HD / Flex family",
         "resolution": "covered by existing 2x4 HD / Flex runtime profiles after hw_id/dsp_version probing",
     },
     "DDRC-24 / Flex (DL)": {
         "status": "covered",
         "exact_runtime_known": "true",
+        "public_product_family": "DDRC-24 / Flex (DL) family",
         "resolution": "covered by existing DDRC-24 / Flex (DL) runtime profiles after hw_id/dsp_version probing",
     },
     "SHD": {
         "status": "covered",
         "exact_runtime_known": "true",
+        "public_product_family": "SHD family",
         "resolution": "covered by existing SHD-family runtime profiles after hw_id/dsp_version probing",
     },
     "miniDSP Flex Eight": {
         "status": "covered",
         "exact_runtime_known": "true",
+        "public_product_family": "Flex Eight family",
         "resolution": "covered by existing Flex Eight runtime profile after hw_id/dsp_version probing",
     },
     "miniDSP Flex Eight (DL)": {
         "status": "covered",
         "exact_runtime_known": "true",
+        "public_product_family": "Flex Eight (DL) family",
         "resolution": "covered by existing Flex Eight (DL) runtime profile after hw_id/dsp_version probing",
     },
     "miniDSP Flex HT / Flex HTx": {
         "status": "covered",
         "exact_runtime_known": "true",
+        "public_product_family": "Flex HT / Flex HTx family",
         "resolution": "covered by existing Flex HT / Flex HTx runtime profiles after hw_id/dsp_version probing",
     },
     "HA-DSP": {
         "status": "alias_only",
         "exact_runtime_known": "false",
-        "resolution": "official assets currently expose only the USB PID label; no exact or family-level runtime mapping has been verified yet",
+        "public_product_family": "HA-DSP headphone processor family",
+        "public_product_url": "https://www.minidsp.com/images/documents/Product%20Brief%20-%20HA-DSP.pdf",
+        "public_manual_url": "https://www.minidsp.com/images/documents/HA-DSP%20User%20Manual.pdf",
+        "public_software_family": "HA-DSP-CF plugin family",
+        "resolution": "official assets currently expose only the USB PID label, and the packaged Dirac helper does not probe `PID 0x0013`; the older APK quick controller also has no standalone `hw_id` branch for this product family. The public website/manuals do show a dedicated `HA-DSP-CF` software/plugin family, but no exact or family-level runtime mapping has been verified yet from extracted assets",
     },
     "DDRC-22": {
-        "status": "alias_only",
+        "status": "family_candidate",
         "exact_runtime_known": "false",
-        "resolution": "official assets currently expose only the USB PID label; no exact or family-level runtime mapping has been verified yet",
+        "public_product_family": "DDRC-22 family",
+        "runtime_family_bucket": "small Dirac family (2 channels, 1 zone)",
+        "public_product_url": "https://www.minidsp.com/products/dirac-series",
+        "public_manual_url": "https://www.minidsp.com/images/documents/Dirac%20Series%20-%20DDRC-22%20User%20Manual.pdf",
+        "public_software_family": "DDRC-22 Utility family",
+        "resolution": "the packaged Dirac helper actively probes `PID 0x0040` and falls back to `create_default_dirac_info(1, 2, 1, ...)`, while the older APK quick controller has no standalone `hw_id` branch for a separate DDRC-22 family. The public manual also confirms a dedicated `DDRC-22 Utility` software line. That is stronger than a label-only hint and supports a reused small Dirac runtime bucket, but still does not expose an exact hw_id/dsp_id mapping",
+        "candidate_source_basis": "official USB PID label + native `minidsp_dirac` `PID 0x0040` -> `create_default_dirac_info(1, 2, 1, ...)` path + old APK quick controller with no standalone DDRC-22 `hw_id` branch",
     },
     "DDRC-88": {
         "status": "family_candidate",
         "exact_runtime_known": "false",
-        "resolution": "name strongly suggests the same 8x8 Dirac legacy family as the cached DDRC-88BM profile, but the extracted assets still do not expose an exact hw_id/dsp_id mapping",
-        "candidate_runtime_profiles": "DDRC-88BM",
-        "candidate_source_basis": "official USB PID label + source-backed cached legacy DDRC-88BM family",
+        "public_product_family": "DDRC-88A / DDRC-88D family",
+        "runtime_family_bucket": "legacy Dirac family (8 channels, 1 zone)",
+        "candidate_runtime_profiles": ["DDRC-88BM"],
+        "public_product_url": "https://www.minidsp.com/products/accessories/ddrc-88bm",
+        "public_manual_url": "https://www.minidsp.com/images/documents/DDRC-88A%20User%20Manual.pdf",
+        "public_software_family": "DDRC-88BM plugin family",
+        "resolution": "the public product naming and native `PID 0x0043` helper path both place this label in the older 8-channel Dirac family, and the older APK quick controller has no standalone `hw_id` branch for a distinct DDRC-88 runtime family. The public product/manual pages also explicitly route DDRC-88A / DDRC-88D through the `DDRC-88BM` plugin family. That supports alias reuse into an existing 8-channel bucket, but the extracted assets still do not expose an exact hw_id/dsp_id mapping",
+        "candidate_source_basis": "official USB PID label + source-backed cached legacy DDRC-88BM family + Dirac helper PID 0x0043 -> create_default_dirac_info(1, 8, 1, ...) + old APK quick controller with no standalone DDRC-88 `hw_id` branch",
     },
     "CDSP-8x12/DL": {
         "status": "family_candidate",
         "exact_runtime_known": "false",
-        "resolution": "name strongly suggests the same 8x12 custom-install family as the cached C-DSP 8x12 v2 profile, but the extracted assets still do not expose an exact hw_id/dsp_id mapping",
-        "candidate_runtime_profiles": "C-DSP 8x12 v2",
-        "candidate_source_basis": "official USB PID label + source-backed cached legacy C-DSP 8x12 v2 family",
+        "public_product_family": "C-DSP 8x12 DL",
+        "runtime_family_bucket": "custom-install 8x12 Dirac family",
+        "candidate_runtime_profiles": ["C-DSP 8x12 v2"],
+        "public_product_url": "https://www.minidsp.com/products/car-audio-dsp/cdsp-8x12-dl",
+        "public_manual_url": "https://www.minidsp.com/images/documents/C-DSP%208x12%20DL%20User%20Manual.pdf",
+        "public_software_family": "C-DSP 8x12 DL plugin family",
+        "resolution": "the official label and the native `Harmony DSP 8x12` -> `PADSP-8x12-DL` normalization path both place this in the 8x12 custom-install Dirac family, and the older APK quick controller has no standalone `hw_id` branch for a distinct CDSP-8x12/DL runtime family. The public product/manual pages also show the same `C-DSP 8x12 DL` plugin family as the control surface for this branch. That supports alias reuse into an existing 8x12 bucket, but the extracted assets still do not expose an exact hw_id/dsp_id mapping",
+        "candidate_source_basis": "official USB PID label + source-backed cached legacy C-DSP 8x12 v2 family + Dirac helper PID 0x004b Harmony DSP 8x12 -> PADSP-8x12-DL normalization + old APK quick controller with no standalone CDSP-8x12/DL `hw_id` branch",
     },
     "Harmony DSP": {
-        "status": "alias_only",
+        "status": "family_candidate",
         "exact_runtime_known": "false",
-        "resolution": "official assets currently expose only the USB PID label; no exact or family-level runtime mapping has been verified yet",
+        "public_product_family": "Harmony DSP 8x12",
+        "runtime_family_bucket": "HT-family 8x12 Dirac family",
+        "public_product_url": "https://www.minidsp.com/products/car-audio-dsp/harmony-8x12",
+        "public_manual_url": "https://www.minidsp.com/images/documents/Harmony%20DSP%208x12%20User%20Manual.pdf",
+        "public_software_family": "C-DSP 8x12 DL plugin family",
+        "resolution": "official packaged assets still do not expose an exact hw_id/dsp_id row, but the native Dirac helper has a dedicated `PID 0x004b` path that rewrites `Harmony DSP 8x12` to `PADSP-8x12-DL` and uses DSP-ID fallback around `113`/`115`; the older APK quick controller also has no standalone `hw_id` branch for a distinct Harmony family. The public Harmony manual then closes the loop by stating that the `C-DSP 8x12 DL` plugin works with both Harmony DSP 8x12 and C-DSP 8x12 DL. Together those signals strongly suggest the same 8x12 HT-family DSP structures as Flex HT / Flex HTx rather than a separate exact runtime family",
+        "candidate_runtime_profiles": ["Flex HT", "Flex HTx"],
+        "candidate_source_basis": "official Dirac helper: PID 0x004b scan + Harmony DSP 8x12 -> PADSP-8x12-DL normalization + assume dsp 113 + dsp id 115 + old APK quick controller with no standalone Harmony `hw_id` branch",
     },
 }
 
@@ -377,25 +418,192 @@ def parse_device_type_assets() -> dict[str, Any]:
     }
 
 
+def parse_product_path_map() -> dict[str, Any]:
+    raw = json.loads(DESKTOP_PRODUCT_PATHS.read_text())
+    pairs = []
+    for hw_id, dsp_map in raw.items():
+        for dsp_version, slug in dsp_map.items():
+            pairs.append(
+                {
+                    "hw_id": int(hw_id),
+                    "dsp_version": int(dsp_version),
+                    "slug": str(slug),
+                }
+            )
+    pairs.sort(key=lambda row: (row["hw_id"], row["dsp_version"]))
+    return {
+        "pairs": pairs,
+    }
+
+
 def parse_dirac_binary_hints() -> dict[str, Any]:
     raw = DIRAC_BINARY.read_bytes()
     strings = {
         match.group(0).decode("utf-8", errors="ignore")
         for match in re.finditer(rb"[\x20-\x7e]{4,}", raw)
     }
+    disassembly = subprocess.check_output(["otool", "-tvV", str(DIRAC_BINARY)], text=True)
+
+    def branch_window(pid: int, length: int = 6000) -> str:
+        pattern = re.compile(
+            rf"movl\s+\$0x{pid:x}, %esi.*?callq\s+__Z7USBScanttRi",
+            re.S,
+        )
+        match = pattern.search(disassembly)
+        if match is None:
+            return ""
+        return disassembly[match.start(): match.start() + length]
+
+    pid_0x0013_window = branch_window(0x13)
+    pid_0x0040_window = branch_window(0x40)
+    pid_0x0043_window = branch_window(0x43)
+    pid_0x0046_window = branch_window(0x46)
+    pid_0x0047_window = branch_window(0x47)
+    pid_0x0048_window = branch_window(0x48)
+    pid_0x004b_window = branch_window(0x4B, length=10000)
+    pid_0x004b_scan = bool(pid_0x004b_window)
+    pid_0x0040_fallback_2x1 = bool(
+        pid_0x0040_window
+        and re.search(
+            r"movl\s+\$0x2, %esi.*?movl\s+\$0x1, %edx.*?callq\s+__Z25create_default_dirac_infoiiiR9DiracInfo",
+            pid_0x0040_window,
+            re.S,
+        )
+    )
+    pid_0x0043_fallback_8x1 = bool(
+        pid_0x0043_window
+        and re.search(
+            r"movl\s+\$0x8, %esi.*?movl\s+\$0x1, %edx.*?callq\s+__Z25create_default_dirac_infoiiiR9DiracInfo",
+            pid_0x0043_window,
+            re.S,
+        )
+    )
+    pid_0x0046_fallback_8x1 = bool(
+        pid_0x0046_window
+        and re.search(
+            r"movl\s+\$0x8, %esi.*?movl\s+\$0x1, %edx.*?callq\s+__Z25create_default_dirac_infoiiiR9DiracInfo",
+            pid_0x0046_window,
+            re.S,
+        )
+    )
+    pid_0x0047_fallback_8x1 = bool(
+        pid_0x0047_window
+        and re.search(
+            r"movl\s+\$0x8, %esi.*?movl\s+\$0x1, %edx.*?callq\s+__Z25create_default_dirac_infoiiiR9DiracInfo",
+            pid_0x0047_window,
+            re.S,
+        )
+    )
+    pid_0x0048_fallback_8x1 = bool(
+        pid_0x0048_window
+        and re.search(
+            r"movl\s+\$0x8, %esi.*?movl\s+\$0x1, %edx.*?callq\s+__Z25create_default_dirac_infoiiiR9DiracInfo",
+            pid_0x0048_window,
+            re.S,
+        )
+    )
     return {
         "contains_harmony_dsp_8x12": "Harmony DSP 8x12" in strings,
         "contains_padsp_8x12_dl": "PADSP-8x12-DL" in strings,
         "contains_assume_dsp_113": "Failed to get dsp id, assume it is 113" in strings,
         "contains_dsp_id_115": "dsp id is 115" in strings,
+        "contains_pid_0013_scan": bool(pid_0x0013_window),
+        "contains_pid_0040_scan": bool(pid_0x0040_window),
+        "contains_pid_0040_fallback_2x1": pid_0x0040_fallback_2x1,
+        "contains_pid_0043_scan": bool(pid_0x0043_window),
+        "contains_pid_0043_fallback_8x1": pid_0x0043_fallback_8x1,
+        "contains_pid_0046_scan": bool(pid_0x0046_window),
+        "contains_pid_0046_fallback_8x1": pid_0x0046_fallback_8x1,
+        "contains_pid_0047_scan": bool(pid_0x0047_window),
+        "contains_pid_0047_fallback_8x1": pid_0x0047_fallback_8x1,
+        "contains_pid_0048_scan": bool(pid_0x0048_window),
+        "contains_pid_0048_fallback_8x1": pid_0x0048_fallback_8x1,
+        "contains_pid_004b_scan": pid_0x004b_scan,
+        "harmony_normalized_to_padsp": (
+            "Harmony DSP 8x12" in strings
+            and "PADSP-8x12-DL" in strings
+            and pid_0x004b_scan
+        ),
         "notes": (
-            "The packaged Dirac helper binary includes `Harmony DSP 8x12`, "
-            "`Failed to get dsp id, assume it is 113`, `dsp id is 115`, and "
-            "`PADSP-8x12-DL`. That is stronger official evidence than the top-level XML "
-            "for Harmony / 8x12-DL family hints, but it still does not expose an exact "
+            "The packaged Dirac helper binary probes `PID 0x0040`, `0x0043`, `0x0046`, `0x0047`, "
+            "`0x0048`, and `0x004b`, but does not probe `PID 0x0013`. Static disassembly shows "
+            "`PID 0x0040` falling back to `create_default_dirac_info(1, 2, 1, ...)`, while "
+            "`PID 0x0043`, `0x0046`, `0x0047`, and `0x0048` all fall back to "
+            "`create_default_dirac_info(1, 8, 1, ...)`. The dedicated `PID 0x004b` path rewrites "
+            "the USB product string `Harmony DSP 8x12` to `PADSP-8x12-DL` before runtime model "
+            "handling continues. The same helper also contains `Failed to get dsp id, assume it is "
+            "113` and `dsp id is 115`. That is much stronger official evidence than the top-level "
+            "XML for the remaining Dirac-family aliases, but it still does not expose an exact "
             "`hw_id` mapping."
         ),
     }
+
+
+def parse_firmware_upgrade_bundle() -> dict[str, Any]:
+    root = load_xml(FIRMWARE_UPGRADE_CONFIG_XML)
+    config_pairs = []
+    for device in root.findall(".//DEVICE"):
+        app_mode = device.find("AppMode")
+        if app_mode is None:
+            continue
+        config_pairs.append(
+            {
+                "vid": int(app_mode.get("VID"), 16),
+                "pid": int(app_mode.get("PID"), 16),
+            }
+        )
+
+    license_pairs = []
+    for match in re.finditer(
+        r"0x(?P<vid>[0-9A-Fa-f]{4})(?P<pid>[0-9A-Fa-f]{4})",
+        FIRMWARE_UPGRADE_LICENSE_INI.read_text(),
+    ):
+        license_pairs.append(
+            {
+                "vid": int(match.group("vid"), 16),
+                "pid": int(match.group("pid"), 16),
+            }
+        )
+
+    def unique_pairs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped = {(entry["vid"], entry["pid"]) for entry in entries}
+        return [
+            {"vid": vid, "pid": pid}
+            for vid, pid in sorted(deduped)
+        ]
+
+    config_pairs = unique_pairs(config_pairs)
+    license_pairs = unique_pairs(license_pairs)
+    config_set = {(entry["vid"], entry["pid"]) for entry in config_pairs}
+    license_set = {(entry["vid"], entry["pid"]) for entry in license_pairs}
+    combined_pairs = unique_pairs(config_pairs + license_pairs)
+
+    return {
+        "config_pairs": config_pairs,
+        "license_pairs": license_pairs,
+        "combined_pairs": combined_pairs,
+        "config_only_pairs": [
+            {"vid": vid, "pid": pid}
+            for vid, pid in sorted(config_set - license_set)
+        ],
+        "license_only_pairs": [
+            {"vid": vid, "pid": pid}
+            for vid, pid in sorted(license_set - config_set)
+        ],
+        "notes": (
+            "The separate XMOS firmware-upgrade bundle exposes a broader official USB PID surface "
+            "than the clean desktop HW/DSP matrix. It is useful for tracking which MiniDSP USB "
+            "products the official upgrade tooling knows about, but the XML/license data still do "
+            "not attach product names or exact runtime `hw_id`/`dsp_id` identities by themselves. "
+            "String extraction from the DFU app binary and `libtlusbdfuapi.dylib` only exposed "
+            "generic DFU plumbing and VID/PID licensing, not richer product-family names."
+        ),
+    }
+
+
+def parse_dc_migration_hardware_ids() -> list[int]:
+    rows = json.loads(DC_MIGRATION_URLS.read_text())
+    return sorted({int(row["hardwareid"]) for row in rows})
 
 
 def parse_legacy_configs() -> list[dict[str, Any]]:
@@ -592,6 +800,8 @@ def parse_js_source_array(array_body: str) -> list[dict[str, Any]]:
 
 def parse_android_hints() -> dict[str, Any]:
     text = APK_CONTROLLERS.read_text()
+    quick_text = APK_QUICK_TEMPLATE.read_text()
+    low_level_text = APK_LOW_LEVEL_SERVICES.read_text()
 
     dirac_match = re.search(r"dirac_dsp_version\s*=\s*\[([^\]]+)\]", text)
     dirac_versions = []
@@ -660,10 +870,49 @@ def parse_android_hints() -> dict[str, Any]:
     if select_match:
         select_index_offset = [30, 31]
 
+    explicit_hw_ids = sorted(
+        {
+            int(value)
+            for value in re.findall(r"hw_id\s*==\s*(\d+)", text)
+        }
+    )
+    hdmi_toggle_hw_ids = sorted(
+        {
+            int(value)
+            for value in re.findall(r"\$scope\.hwid\s*==\s*(\d+)", text)
+        }
+    )
+
+    quick_template_hints = {
+        "commented_dirac_band_90s": 'flash_data[quickaddr.dspversion].value<90 || flash_data[quickaddr.dspversion].value>99' in quick_text,
+        "commented_dsp_61_gate": 'flash_data[quickaddr.dspversion].value!=61' in quick_text,
+        "active_dirac_filter_binding": 'ng-hide="!dirac_filter.visible"' in quick_text,
+        "historical_dsp97_ddrc_comment": bool(
+            re.search(r"0x61\s*=\s*97\s+is\s+DDRC\s+should\s+show\s+DG", low_level_text)
+        ),
+        "notes": (
+            "The older APK quick-control template still carries commented UI gates for a broad "
+            "`90..99` DSP-version band and a special-case `dspversion == 61`, while the active "
+            "UI now defers to `checkDirac()` and `dirac_filter.visible`. Treat those comments as "
+            "historical family hints rather than exact runtime identity."
+        ),
+    }
+
     return {
         "dirac_dsp_versions": dirac_versions,
         "source_groups": groups,
         "select_index_offset_hw_ids": select_index_offset,
+        "explicit_hw_ids": explicit_hw_ids,
+        "hdmi_toggle_hw_ids": hdmi_toggle_hw_ids,
+        "quick_template_hints": quick_template_hints,
+        "notes": (
+            "The older APK quick controller only special-cases a finite set of `hw_id` values "
+            "for source lists and HDMI toggles. None of the unresolved USB-only product labels "
+            "(`HA-DSP`, `DDRC-22`, `DDRC-88`, `CDSP-8x12/DL`, `Harmony DSP`) appear there as "
+            "their own runtime `hw_id`, which is useful negative evidence that those labels are "
+            "more likely aliases onto existing runtime buckets than missing standalone hardware "
+            "rows in the old APK logic."
+        ),
     }
 
 
@@ -759,7 +1008,10 @@ def build_matrix() -> dict[str, Any]:
     desktop_fallback_hints = parse_desktop_fallback_hints()
     package_inventory = parse_package_inventory()
     device_type_assets = parse_device_type_assets()
+    product_path_map = parse_product_path_map()
     dirac_binary_hints = parse_dirac_binary_hints()
+    firmware_upgrade_bundle = parse_firmware_upgrade_bundle()
+    dc_migration_hardware_ids = parse_dc_migration_hardware_ids()
     rust_profiles = parse_rust_profiles()
 
     enriched_usb_entries = []
@@ -776,28 +1028,76 @@ def build_matrix() -> dict[str, Any]:
             enriched.update(
                 {
                     "status": "family_candidate",
-                    "candidate_runtime_profiles": "Flex HT, Flex HTx",
+                    "public_product_family": "Harmony DSP 8x12",
+                    "runtime_family_bucket": "HT-family 8x12 Dirac family",
+                    "candidate_runtime_profiles": ["Flex HT", "Flex HTx"],
                     "candidate_source_basis": (
-                        "official Dirac helper strings: Harmony DSP 8x12 + assume dsp 113 + dsp id 115"
+                        "official Dirac helper: PID 0x004b scan + Harmony DSP 8x12 -> "
+                        "PADSP-8x12-DL normalization + assume dsp 113 + dsp id 115"
                     ),
                     "resolution": (
                         "official packaged assets still do not expose an exact hw_id/dsp_id row, "
-                        "but the Dirac helper binary explicitly references `Harmony DSP 8x12` and "
-                        "DSP IDs `113`/`115`, which strongly suggests the same 8x12 HT-family DSP "
-                        "structures as Flex HT / Flex HTx"
+                        "but the native Dirac helper has a dedicated `PID 0x004b` path that rewrites "
+                        "`Harmony DSP 8x12` to `PADSP-8x12-DL` and uses DSP-ID fallback around "
+                        "`113`/`115`; the public Harmony manual then closes the loop by stating that "
+                        "the `C-DSP 8x12 DL` plugin works with both Harmony DSP 8x12 and C-DSP 8x12 "
+                        "DL. Together that strongly suggests the same 8x12 HT-family DSP structures "
+                        "as Flex HT / Flex HTx rather than a separate exact runtime family"
                     ),
                 }
             )
-        if entry["label"] == "CDSP-8x12/DL" and dirac_binary_hints["contains_padsp_8x12_dl"]:
+        if entry["label"] == "DDRC-22" and dirac_binary_hints["contains_pid_0040_fallback_2x1"]:
+            enriched.update(
+                {
+                    "status": "family_candidate",
+                    "public_product_family": "DDRC-22 family",
+                    "runtime_family_bucket": "small Dirac family (2 channels, 1 zone)",
+                    "candidate_source_basis": (
+                        "official Dirac helper: PID 0x0040 scan -> "
+                        "create_default_dirac_info(1, 2, 1, ...)"
+                    ),
+                    "resolution": (
+                        "the packaged Dirac helper actively probes `PID 0x0040` and falls back to "
+                        "`create_default_dirac_info(1, 2, 1, ...)`, while the public manual also "
+                        "confirms a dedicated `DDRC-22 Utility` software line. That is stronger than "
+                        "a label-only hint and places `DDRC-22` in the small legacy Dirac family, "
+                        "but still does not expose an exact hw_id/dsp_id mapping"
+                    ),
+                }
+            )
+        if entry["label"] == "HA-DSP" and not dirac_binary_hints["contains_pid_0013_scan"]:
+            enriched["resolution"] = (
+                "official assets currently expose only the USB PID label, and the packaged Dirac "
+                "helper does not probe `PID 0x0013`; the public manual does show a dedicated "
+                "`HA-DSP-CF` software/plugin family, but no exact or family-level runtime mapping "
+                "has been verified yet from extracted assets"
+            )
+        if entry["label"] == "DDRC-88" and dirac_binary_hints["contains_pid_0043_fallback_8x1"]:
+            enriched["public_product_family"] = "DDRC-88A / DDRC-88D family"
+            enriched["runtime_family_bucket"] = "legacy Dirac family (8 channels, 1 zone)"
             enriched["candidate_source_basis"] = (
-                "official USB PID label + source-backed cached legacy C-DSP 8x12 v2 family + "
-                "Dirac helper string PADSP-8x12-DL"
+                "official USB PID label + source-backed cached legacy DDRC-88BM family + "
+                "Dirac helper PID 0x0043 -> create_default_dirac_info(1, 8, 1, ...)"
             )
             enriched["resolution"] = (
-                "name strongly suggests the same 8x12 custom-install family as the cached "
-                "C-DSP 8x12 v2 profile, and the packaged Dirac helper also contains "
-                "`PADSP-8x12-DL`, but the extracted assets still do not expose an exact "
-                "hw_id/dsp_id mapping"
+                "the public product naming and native `PID 0x0043` helper path both place this "
+                "label in the older 8-channel Dirac family, and the public product/manual pages "
+                "explicitly route DDRC-88A / DDRC-88D through the `DDRC-88BM` plugin family, but "
+                "the extracted assets still do not expose an exact hw_id/dsp_id mapping"
+            )
+        if entry["label"] == "CDSP-8x12/DL" and dirac_binary_hints["contains_padsp_8x12_dl"]:
+            enriched["public_product_family"] = "C-DSP 8x12 DL"
+            enriched["runtime_family_bucket"] = "custom-install 8x12 Dirac family"
+            enriched["candidate_source_basis"] = (
+                "official USB PID label + source-backed cached legacy C-DSP 8x12 v2 family + "
+                "Dirac helper PID 0x004b Harmony DSP 8x12 -> PADSP-8x12-DL normalization"
+            )
+            enriched["resolution"] = (
+                "the official label and the native `Harmony DSP 8x12` -> `PADSP-8x12-DL` "
+                "normalization path both place this in the 8x12 custom-install Dirac family, and "
+                "the public Harmony manual confirms that the same `C-DSP 8x12 DL` plugin works "
+                "with both Harmony DSP 8x12 and C-DSP 8x12 DL, but the extracted assets still do "
+                "not expose an exact hw_id/dsp_id mapping"
             )
         enriched_usb_entries.append(enriched)
 
@@ -819,6 +1119,9 @@ def build_matrix() -> dict[str, Any]:
     modern_pairs = {(d["hw_id"], d["dsp_version"]) for d in modern_devices}
     asset_pairs = {
         (entry["hw_id"], entry["dsp_version"]) for entry in device_type_assets["product_assets"]
+    }
+    product_path_pairs = {
+        (entry["hw_id"], entry["dsp_version"]) for entry in product_path_map["pairs"]
     }
     extra_rust_profiles = [
         asdict(p) for p in rust_profiles if (p.hw_id, p.dsp_version) not in modern_pairs
@@ -855,7 +1158,10 @@ def build_matrix() -> dict[str, Any]:
         "desktop_fallback_models": desktop_fallback_models,
         "package_inventory": package_inventory,
         "device_type_assets": device_type_assets,
+        "product_path_map": product_path_map,
         "dirac_binary_hints": dirac_binary_hints,
+        "firmware_upgrade_bundle": firmware_upgrade_bundle,
+        "dc_migration_hardware_ids": dc_migration_hardware_ids,
         "minidsp_rs_reference_profiles": minidsp_rs_reference_rows,
         "rust_profiles": [asdict(p) for p in rust_profiles],
         "extra_rust_profiles": extra_rust_profiles,
@@ -883,6 +1189,22 @@ def build_matrix() -> dict[str, Any]:
             "device_type_product_asset_exact_match_count": sum(
                 1 for pair in asset_pairs if pair in modern_pairs
             ),
+            "product_path_pair_count": len(product_path_map["pairs"]),
+            "product_path_pair_exact_match_count": sum(
+                1 for pair in product_path_pairs if pair in modern_pairs
+            ),
+            "firmware_upgrade_usb_pid_count": len(firmware_upgrade_bundle["combined_pairs"]),
+            "firmware_upgrade_extra_usb_pid_count": len(
+                [
+                    pair
+                    for pair in firmware_upgrade_bundle["combined_pairs"]
+                    if pair not in [
+                        {"vid": int(entry["vid"], 16), "pid": int(entry["pid"], 16)}
+                        for entry in enriched_usb_entries
+                    ]
+                ]
+            ),
+            "dc_migration_hardware_id_count": len(dc_migration_hardware_ids),
             "minidsp_rs_reference_count": len(minidsp_rs_reference_rows),
             "minidsp_rs_reference_covered_count": sum(
                 1 for row in minidsp_rs_reference_rows if row["covered_by_rust"]
@@ -902,6 +1224,10 @@ def format_sources(sources: list[dict[str, Any]]) -> str:
 
 
 def render_markdown(matrix: dict[str, Any]) -> str:
+    license_only_pairs_fmt = [
+        (f'0x{entry["vid"]:04x}', f'0x{entry["pid"]:04x}')
+        for entry in matrix["firmware_upgrade_bundle"]["license_only_pairs"]
+    ]
     lines = [
         "# Official App Device Coverage",
         "",
@@ -931,6 +1257,9 @@ def render_markdown(matrix: dict[str, Any]) -> str:
         f'- Exact DSP directories present in the packaged Device Console assets: `{matrix["summary"]["package_exact_dsp_count"]}`',
         f'- Product image rows in the extracted desktop assets: `{matrix["summary"]["device_type_product_asset_count"]}`',
         f'- Product image rows matching exact modern HW/DSP pairs: `{matrix["summary"]["device_type_product_asset_exact_match_count"]}`',
+        f'- Official XMOS firmware-upgrade USB PID pairs tracked: `{matrix["summary"]["firmware_upgrade_usb_pid_count"]}`',
+        f'- Firmware-upgrade USB PID pairs outside the clean desktop USB list: `{matrix["summary"]["firmware_upgrade_extra_usb_pid_count"]}`',
+        f'- Hardware IDs with packaged DC migration bundles: `{matrix["summary"]["dc_migration_hardware_id_count"]}`',
         f'- `minidsp-rs` reference profiles checked: `{matrix["summary"]["minidsp_rs_reference_count"]}`',
         f'- `minidsp-rs` reference profiles covered by `probe.rs`: `{matrix["summary"]["minidsp_rs_reference_covered_count"]}`',
         "",
@@ -1091,6 +1420,23 @@ def render_markdown(matrix: dict[str, Any]) -> str:
             f'Android Dirac DSP versions: `{matrix["android_hints"]["dirac_dsp_versions"]}`',
             "",
             f'Android select-index offset hw_ids: `{matrix["android_hints"]["select_index_offset_hw_ids"]}`',
+            f'Android quick-controller explicit hw_ids: `{matrix["android_hints"]["explicit_hw_ids"]}`',
+            f'Android HDMI-toggle hw_ids: `{matrix["android_hints"]["hdmi_toggle_hw_ids"]}`',
+            "",
+            "Android quick-template historical hints:",
+            "",
+            f'| Signal | Present |',
+            f'|--------|---------|',
+            f'| commented broad `90..99` Dirac band gate | `{matrix["android_hints"]["quick_template_hints"]["commented_dirac_band_90s"]}` |',
+            f'| commented special-case `dspversion == 61` gate | `{matrix["android_hints"]["quick_template_hints"]["commented_dsp_61_gate"]}` |',
+            f'| historical low-level-service comment `0x61 = 97 is DDRC should show DG` | `{matrix["android_hints"]["quick_template_hints"]["historical_dsp97_ddrc_comment"]}` |',
+            f'| active `dirac_filter.visible` binding | `{matrix["android_hints"]["quick_template_hints"]["active_dirac_filter_binding"]}` |',
+            "",
+            matrix["android_hints"]["quick_template_hints"]["notes"],
+            "",
+            matrix["android_hints"]["notes"],
+            "",
+            "The `0x61 = 97 is DDRC should show DG` comment in the old APK test stub is useful as evidence that the app historically carried rough DSP-family heuristics, but it is not strong enough to override better source data. In this repo, cached `config.xml` already proves DSP `97` is the `C-DSP 8x12 v2` family, so treat that APK comment as historical/noisy rather than an exact runtime mapping.",
             "",
             "## Desktop Fallback-Model Catalog",
             "",
@@ -1106,6 +1452,20 @@ def render_markdown(matrix: dict[str, Any]) -> str:
             f'| Exact model list extracted into this report | `{matrix["desktop_fallback_hints"]["exact_model_list_extracted"]}` |',
             "",
             matrix["desktop_fallback_hints"]["notes"],
+            "",
+            "## Desktop Product-Path Map",
+            "",
+            "The packaged desktop app also ships `Contents/Resources/userdocs/product-path.json`. It is another independent exact-model catalog for user docs, and it only enumerates the same modern HW/DSP pairs already seen in the XML, image assets, and fallback-model grouping.",
+            "",
+            "| HW | DSP | Userdocs Slug |",
+            "|----|-----|--------------|",
+        ]
+    )
+    for row in matrix["product_path_map"]["pairs"]:
+        lines.append(f'| `{row["hw_id"]}` | `{row["dsp_version"]}` | {row["slug"]} |')
+
+    lines.extend(
+        [
             "",
             "| DSP | Desktop Fallback Models |",
             "|-----|-------------------------|",
@@ -1127,21 +1487,60 @@ def render_markdown(matrix: dict[str, Any]) -> str:
             f'| `PADSP-8x12-DL` | `{matrix["dirac_binary_hints"]["contains_padsp_8x12_dl"]}` |',
             f'| `Failed to get dsp id, assume it is 113` | `{matrix["dirac_binary_hints"]["contains_assume_dsp_113"]}` |',
             f'| `dsp id is 115` | `{matrix["dirac_binary_hints"]["contains_dsp_id_115"]}` |',
+            f'| native `PID 0x0013` scan path | `{matrix["dirac_binary_hints"]["contains_pid_0013_scan"]}` |',
+            f'| native `PID 0x0040` scan path | `{matrix["dirac_binary_hints"]["contains_pid_0040_scan"]}` |',
+            f'| native `PID 0x0040` -> `create_default_dirac_info(1, 2, 1, ...)` | `{matrix["dirac_binary_hints"]["contains_pid_0040_fallback_2x1"]}` |',
+            f'| native `PID 0x0043` scan path | `{matrix["dirac_binary_hints"]["contains_pid_0043_scan"]}` |',
+            f'| native `PID 0x0043` -> `create_default_dirac_info(1, 8, 1, ...)` | `{matrix["dirac_binary_hints"]["contains_pid_0043_fallback_8x1"]}` |',
+            f'| native `PID 0x004b` scan path | `{matrix["dirac_binary_hints"]["contains_pid_004b_scan"]}` |',
+            f'| `Harmony DSP 8x12` normalized to `PADSP-8x12-DL` | `{matrix["dirac_binary_hints"]["harmony_normalized_to_padsp"]}` |',
             "",
             matrix["dirac_binary_hints"]["notes"],
+            "",
+            "## Firmware Upgrade Bundle USB Surface",
+            "",
+            "The separate XMOS firmware-upgrade bundle under `app/minidsp-firmware/` is not a clean runtime identity catalog, but it does provide a second official USB support surface. That surface is broader than the top-level desktop USB XML and helps distinguish products the official tooling knows how to upgrade from products that are only present in the clean app matrix.",
+            "",
+            "| Source | VID | PID |",
+            "|--------|-----|-----|",
+        ]
+    )
+    for entry in matrix["firmware_upgrade_bundle"]["config_pairs"]:
+        lines.append(f'| `Config.xml` | `{entry["vid"]:04x}` | `{entry["pid"]:04x}` |')
+    for entry in matrix["firmware_upgrade_bundle"]["license_only_pairs"]:
+        lines.append(f'| `license.ini only` | `{entry["vid"]:04x}` | `{entry["pid"]:04x}` |')
+
+    lines.extend(
+        [
+            "",
+            f"Firmware-upgrade PID pairs only seen outside the clean desktop USB XML: `{license_only_pairs_fmt}`",
+            "",
+            matrix["firmware_upgrade_bundle"]["notes"],
+            "",
+            "## Packaged DC Migration Boundary",
+            "",
+            "The desktop bundle only ships migration packages for a subset of the exact modern hardware IDs. This is useful negative evidence that migration/update support is not a hidden second product matrix either.",
+            "",
+            f'Packaged DC migration hardware IDs: `{matrix["dc_migration_hardware_ids"]}`',
             "",
             "## USB Product Hints Present In Official Package",
             "",
             "These come from the top-level Device Console package USB list. Some appear in the USB PID list even when they do not have a full HW/DSP definition in the packaged XML set.",
             "",
-            "| VID | PID | Official Label | Status | Exact Runtime Known | Candidate Profiles | Resolution |",
-            "|-----|-----|----------------|--------|---------------------|--------------------|------------|",
+            "| VID | PID | Official Label | Public Family | Public Software | Public Product | Public Manual | Status | Exact Runtime Known | Runtime Bucket | Nearest Runtime Profiles | Resolution |",
+            "|-----|-----|----------------|---------------|-----------------|----------------|---------------|--------|---------------------|----------------|--------------------------|------------|",
         ]
     )
     for entry in matrix["usb_product_hints"]:
         lines.append(
-            f'| `{entry["vid"]}` | `{entry["pid"]}` | {entry["label"]} | {entry["status"]} | '
-            f'`{entry.get("exact_runtime_known", "false")}` | {entry.get("candidate_runtime_profiles", "-")} | {entry["resolution"]} |'
+            f'| `{entry["vid"]}` | `{entry["pid"]}` | {entry["label"]} | '
+            f'{entry.get("public_product_family", "-")} | '
+            f'{entry.get("public_software_family", "-")} | '
+            f'{format_link_cell(entry.get("public_product_url"), "product")} | '
+            f'{format_link_cell(entry.get("public_manual_url"), "manual")} | '
+            f'{entry["status"]} | '
+            f'`{entry.get("exact_runtime_known", "false")}` | {entry.get("runtime_family_bucket", "-")} | '
+            f'{format_cell_list(entry.get("candidate_runtime_profiles"))} | {entry["resolution"]} |'
         )
 
     lines.extend(
@@ -1181,7 +1580,7 @@ def render_markdown(matrix: dict[str, Any]) -> str:
             "## Immediate Gaps To Close",
             "",
             "- Keep the importer/report pipeline generated from official assets instead of hand-maintained notes.",
-            "- Treat the remaining unresolved USB-only labels conservatively: `HA-DSP` and `DDRC-22` are still alias-only, while `DDRC-88`, `CDSP-8x12/DL`, and `Harmony DSP` are family candidates without exact identities.",
+            "- Treat the remaining unresolved USB-only labels conservatively: all five now have stable public-family naming, and four also have source-backed runtime-bucket evidence, but none of them have an exact generated runtime identity yet.",
             "- Do not treat the desktop fallback-model picker as a hidden alias-identity catalog; it is sourced from `deviceSupportPkg.deviceIdList` grouped by DSP ID.",
             "- Keep checking against `minidsp-rs`, but treat it as a secondary reference rather than the contract source when it diverges from the official assets.",
             "- Keep this report regenerated as the source of truth before claiming new device coverage in permanent docs.",
@@ -1193,6 +1592,30 @@ def render_markdown(matrix: dict[str, Any]) -> str:
 
 def rust_bool(value: bool) -> str:
     return "true" if value else "false"
+
+
+def normalize_candidate_profiles(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value is None:
+        return []
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def format_cell_list(value: Any) -> str:
+    items = normalize_candidate_profiles(value)
+    return ", ".join(items) if items else "-"
+
+
+def format_rust_option_str(value: Any) -> str:
+    text = None if value is None else str(value).strip()
+    return f"Some({json.dumps(text)})" if text else "None"
+
+
+def format_link_cell(url: Any, label: str) -> str:
+    text = None if url is None else str(url).strip()
+    return f"[{label}]({text})" if text else "-"
 
 
 def render_rust(matrix: dict[str, Any]) -> str:
@@ -1217,8 +1640,13 @@ def render_rust(matrix: dict[str, Any]) -> str:
         "    pub vid: u16,",
         "    pub pid: u16,",
         "    pub label: &'static str,",
+        "    pub public_product_family: &'static str,",
+        "    pub public_software_family: Option<&'static str>,",
+        "    pub public_product_url: Option<&'static str>,",
+        "    pub public_manual_url: Option<&'static str>,",
         "    pub status: &'static str,",
         "    pub exact_runtime_known: bool,",
+        "    pub runtime_family_bucket: Option<&'static str>,",
         "    pub candidate_runtime_profiles: &'static [&'static str],",
         "}",
         "",
@@ -1226,6 +1654,12 @@ def render_rust(matrix: dict[str, Any]) -> str:
         "pub struct OfficialDesktopFallbackModel {",
         "    pub dsp_id: u8,",
         "    pub models: &'static [&'static str],",
+        "}",
+        "",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+        "pub struct OfficialFirmwareUpgradeUsbPid {",
+        "    pub vid: u16,",
+        "    pub pid: u16,",
         "}",
         "",
         "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
@@ -1280,24 +1714,54 @@ def render_rust(matrix: dict[str, Any]) -> str:
         )
     lines.extend(["];", "", "pub static OFFICIAL_USB_PRODUCT_HINTS: &[OfficialUsbProductHint] = &["])
     for entry in matrix["usb_product_hints"]:
+        candidate_profiles = normalize_candidate_profiles(entry.get("candidate_runtime_profiles"))
         lines.extend(
             [
                 "    OfficialUsbProductHint {",
                 f'        vid: {int(entry["vid"], 16)},',
                 f'        pid: {int(entry["pid"], 16)},',
                 f'        label: {json.dumps(entry["label"])},',
+                f'        public_product_family: {json.dumps(entry.get("public_product_family", entry["label"]))},',
+                f'        public_software_family: {format_rust_option_str(entry.get("public_software_family"))},',
+                f'        public_product_url: {format_rust_option_str(entry.get("public_product_url"))},',
+                f'        public_manual_url: {format_rust_option_str(entry.get("public_manual_url"))},',
                 f'        status: {json.dumps(entry["status"])},',
                 f'        exact_runtime_known: {rust_bool(entry.get("exact_runtime_known") == "true")},',
+                f'        runtime_family_bucket: {format_rust_option_str(entry.get("runtime_family_bucket"))},',
                 "        candidate_runtime_profiles: &["
                 + ", ".join(
-                    json.dumps(candidate.strip())
-                    for candidate in entry.get("candidate_runtime_profiles", "").split(",")
-                    if candidate.strip()
+                    json.dumps(candidate)
+                    for candidate in candidate_profiles
                 )
                 + "],",
                 "    },",
             ]
         )
+    lines.extend(
+        [
+            "];",
+            "",
+            "pub static OFFICIAL_FIRMWARE_UPGRADE_USB_PIDS: &[OfficialFirmwareUpgradeUsbPid] = &[",
+        ]
+    )
+    for entry in matrix["firmware_upgrade_bundle"]["combined_pairs"]:
+        lines.extend(
+            [
+                "    OfficialFirmwareUpgradeUsbPid {",
+                f'        vid: {entry["vid"]},',
+                f'        pid: {entry["pid"]},',
+                "    },",
+            ]
+        )
+    lines.extend(
+        [
+            "];",
+            "",
+            "pub static OFFICIAL_MIGRATION_HARDWARE_IDS: &[u8] = &[",
+        ]
+    )
+    for hw_id in matrix["dc_migration_hardware_ids"]:
+        lines.append(f"    {hw_id},")
     lines.extend(
         [
             "];",

@@ -7,7 +7,7 @@ It replaces the earlier compatibility and ESP32/MiniDSP investigation TODOs. Any
 Current planning note:
 - the project now uses the physical 2x4 HD as the live regression case for shared behavior
 - broader all-device coverage must come from a repeatable importer/enumerator based on `app/app-extracted` and `app/apk-extracted`
-- use this checklist for compatibility verification, and use `docs/context-dump.md` / `PROGRESS.md` to track the importer-driven support expansion
+- use this checklist for compatibility verification, and use `PROGRESS.md`, `docs/ref-device-coverage.md`, `docs/ref-devices.md`, and `docs/ref-legacy-devices.md` to track importer-driven support expansion
 
 ## Exit Criteria
 

@@ -29,7 +29,7 @@ ESP-IDF does **not** auto-reconnect. The WiFi driver is event-driven. When `esp_
 - manifest.json fetch returns HTTP 502/503/504 or times out
 - **This is the most common "degraded but fine" state**
 - Device has WiFi, has IP, has internet — just can't reach our CDN
-- Serve HTTP API + stale ezBEQ data from flash. Log the failure. Retry on next boot or periodically
+- Serve HTTP API + stale ezBEQ data from flash. Log the failure. Retry on the next scheduled check
 
 ### Scenario: First boot — no WiFi configured
 
@@ -181,6 +181,14 @@ POWER ON
     │
     ▼
 [READY] Serving current data
+
+Background policy in the current implementation:
+
+- Initial update check runs about 5 seconds after STA WiFi becomes stable
+- After that, the updater sleeps for 24 hours and checks again
+- Failed/offline checks are non-fatal and simply defer to the next 24-hour interval
+- Manual `POST /debug/updater/check` uses the same updater path
+- Only one update run is allowed at a time; overlapping manual/scheduled checks return `busy`
 ```
 
 ### What should be blocking vs non-blocking
@@ -201,9 +209,7 @@ POWER ON
 | WiFi connect attempt | ~1.6s (scan) + 5s (auth/assoc) | Built into ESP-IDF. We control the retry |
 | WiFi "give up blocking" | 30 seconds | If WiFi isn't up in 30s, start serving locally and keep retrying |
 | manifest.json fetch | 3 seconds | Tiny file (~100 bytes). If GitHub Pages is this slow, skip the update |
-| catalogue-meta.bin download | 15 seconds | ~2 MB file. Should take 2-3s on typical WiFi |
-| catalogue-biquads.bin download | 15 seconds | ~1 MB file |
-| ui.tar.gz download | 15 seconds | ~1 MB file |
+| catalogue/data download | Non-blocking | Current implementation downloads published files listed in `manifest.json` while API stays up |
 | DNS resolution | 5 seconds | System default, but worth enforcing explicitly |
 
 ### How to handle first-boot-with-no-data
@@ -449,6 +455,7 @@ NVS has its own page-based wear leveling:
 3. Connect WiFi with exponential backoff (1s base, 60s max, 20 retries)
 4. Start HTTP API the moment we get IP (serve stale/empty data)
 5. Check manifest.json in background (3s timeout)
+6. Repeat the background check every 24 hours while the device remains powered
 6. Download updates if needed (15s timeout per file, non-blocking for API)
 
 ### WiFi provisioning (implemented and tested 2026-04-06)

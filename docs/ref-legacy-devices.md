@@ -212,10 +212,12 @@ Our additions:
 - **PWR-ICE125/250** (hw_id 3) -- already deferred per FUTURE-pwr-ice.md
 - **CDSP 8x12DL / CDSP-8x12-DL** -- still only a USB product hint from official app assets; exact probe/runtime mapping still needed
 - **hw_id 5** (10x10HD variant) -- probably shares address table with hw_id 1/dsp 51, but unconfirmed
-- **HA-DSP** and **DDRC-22** -- still only USB-product hints from official app assets; exact probe/runtime mapping still needed
-- **DDRC-88** -- still a family candidate for the same legacy 8x8 Dirac family as `DDRC-88BM`, but exact probe/runtime mapping is still missing
-- **CDSP-8x12/DL** -- still a family candidate for the same 8x12 custom-install family as `C-DSP 8x12 v2`; the packaged Dirac helper also contains `PADSP-8x12-DL`
-- **Harmony DSP** -- now a stronger family candidate than before because the packaged Dirac helper contains `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, and `dsp id is 115`, but exact probe/runtime mapping is still missing
+- **HA-DSP** -- public product family is confirmed, and the public manual shows a dedicated `HA-DSP-CF` software family, but the extracted app assets still expose only the USB-product hint; native `minidsp_dirac` does not probe `PID 0x0013`, so exact probe/runtime mapping is still missing
+- **DDRC-22** -- public `DDRC-22` family is confirmed, the public manual shows a dedicated `DDRC-22 Utility` software family, and native `minidsp_dirac` groups `PID 0x0040` into a `create_default_dirac_info(1, 2, 1, ...)` path shared with other small Dirac products; exact probe/runtime mapping is still missing
+- **DDRC-88** -- public `DDRC-88A / DDRC-88D` family is confirmed, the public product/manual pages route it through the `DDRC-88BM` plugin family, and native `minidsp_dirac` groups `PID 0x0043` into a `create_default_dirac_info(1, 8, 1, ...)` path; `DDRC-88BM` is only the nearest implemented runtime profile, not the official identity
+- **CDSP-8x12/DL** -- public `C-DSP 8x12 DL` family is confirmed; native `minidsp_dirac` disassembly shows the `PID 0x004b` Harmony path rewriting `Harmony DSP 8x12` to `PADSP-8x12-DL`, and the public Harmony manual confirms that both products share the `C-DSP 8x12 DL` plugin family, which keeps this in the same 8x12 custom-install bucket as `C-DSP 8x12 v2`
+- **Harmony DSP** -- public `Harmony DSP 8x12` family is confirmed, native `minidsp_dirac` disassembly shows a dedicated `PID 0x004b` path that compares the HID product string against `Harmony DSP 8x12`, rewrites it to `PADSP-8x12-DL`, and later uses DSP-ID fallback around `113` / `115`, and the public manual explicitly says the `C-DSP 8x12 DL` plugin works with both Harmony DSP 8x12 and C-DSP 8x12 DL; exact probe/runtime mapping is still missing
+- The older APK quick controller only branches on source-list `hw_id` values `[1, 2, 4, 5, 10, 11, 14, 17, 18, 27, 30, 31, 32]`, with `7/8` reserved for HDMI toggling. None of the unresolved USB-only labels appear there as standalone runtime `hw_id` families, which is useful negative evidence that they likely alias onto existing runtime buckets rather than missing hidden hardware rows in that older app logic.
 
 ### Follow-on work to reach full legacy parity
 
@@ -227,13 +229,14 @@ Our additions:
   - `CDSP-8x12/DL`
   - `Harmony DSP`
 - Do not treat the desktop fallback-model list as an unresolved source of extra identities; decoded bundle logic shows it is just `deviceSupportPkg.deviceIdList` grouped by `dspId`
-- Do treat the exact HW directory list, exact DSP directory list, and desktop `product-HW-DSP` image rows as proof that the current packaged desktop assets do not contain hidden exact runtime rows for these aliases
+- Do treat the exact HW directory list, exact DSP directory list, desktop `product-HW-DSP` image rows, and the exact desktop `userdocs/product-path.json` map as proof that the current packaged desktop assets do not contain hidden exact runtime rows for these aliases
+- Do treat `userdocs/file-index.json` as a documentation-topic router only; it is sparse even for known modern products and is not a usable identity catalog
 
 ### Effort estimate for remaining legacy-adjacent work:
 
 | Task | Effort |
 |------|--------|
-| Resolve USB-hint product families (`HA-DSP`, `DDRC-22`, `DDRC-88`, `CDSP-8x12/DL`, `Harmony DSP`) | partially narrowed: `DDRC-88`, `CDSP-8x12/DL`, and `Harmony DSP` now have source-backed family-level hints; `HA-DSP` and `DDRC-22` are still alias-only |
+| Resolve USB-hint product families (`HA-DSP`, `DDRC-22`, `DDRC-88`, `CDSP-8x12/DL`, `Harmony DSP`) | partially narrowed: all five now have stable public-family naming, and four also have source-backed runtime-bucket hints; exact runtime identity is still unresolved |
 | Desktop fallback-model catalog follow-up | no longer a blocker; decoded bundle logic shows it is just `deviceSupportPkg.deviceIdList` grouped by `dspId` |
 | Revalidate shared-model changes on ESP32 after importer work | modest once shared identity boundary is stable |
 

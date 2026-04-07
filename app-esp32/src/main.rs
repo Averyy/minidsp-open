@@ -187,28 +187,8 @@ fn main() {
             let wifi_mutex = Arc::new(std::sync::Mutex::new(handle.wifi));
             wifi::start_monitor(wifi_mutex);
 
-            // Background catalogue update (after WiFi is stable)
-            let nvs_update = nvs.clone();
-            if let Err(e) = std::thread::Builder::new()
-                .name("beq_update".into())
-                .stack_size(32768)
-                .spawn(move || {
-                    // Wait for WiFi to stabilize before hitting the network
-                    std::thread::sleep(Duration::from_secs(5));
-                    match updater::check_and_update(&nvs_update) {
-                        updater::UpdateResult::Current => {}
-                        updater::UpdateResult::Updated { version, files } => {
-                            info!("catalogue updated to {version} ({files} files)");
-                        }
-                        updater::UpdateResult::NoStorage => {
-                            warn!("catalogue update skipped: no data partition");
-                        }
-                        updater::UpdateResult::Error(e) => {
-                            warn!("catalogue update failed: {e}");
-                        }
-                    }
-                })
-            {
+            // Background catalogue update (initial check after WiFi is stable, then every 24h)
+            if let Err(e) = updater::start_background_updater(nvs.clone()) {
                 error!("failed to spawn update thread: {e}");
             }
         } else {

@@ -223,6 +223,25 @@ These are point-in-time metrics, not log events. Serve at `GET /debug/info`:
 }
 ```
 
+For updater-specific diagnostics, the ESP32 also exposes `GET /debug/updater` with:
+
+```json
+{
+  "baseUrl": "https://averyy.github.io/minidsp-open",
+  "installedVersion": "9e063dff704eff2519317e737cde6d346ff2da06+ui2.6.0",
+  "hasCatalogueData": true,
+  "isUpdating": false
+}
+```
+
+And `POST /debug/updater/check` returns one of:
+
+- `{"status":"current"}`
+- `{"status":"updated","version":"...","files":33}`
+- `{"status":"no_storage"}`
+- `{"status":"error","error":"..."}`
+- HTTP `409` with `{"status":"busy"}` if another update is already running
+
 This endpoint is cheap (no buffering, just read current values) and extremely useful for remote diagnosis. WLED's `/json/info` pattern.
 
 ## 5. Production vs Debug Builds

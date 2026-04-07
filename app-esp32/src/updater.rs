@@ -3,6 +3,7 @@
 //! On boot (after WiFi connects), checks manifest.json for new versions.
 //! Downloads catalogue.bin (biquad index) and UI files in 4KB streaming chunks.
 //! Tracks installed version in NVS to skip redundant downloads.
+//! Owns the background scheduling policy for periodic update checks.
 
 #![allow(dead_code)] // Public API — used by main.rs and future modules
 
@@ -11,10 +12,13 @@ use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::sys;
 use log::{error, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Base URL for catalogue data on GitHub Pages.
 const BASE_URL: &str = "https://averyy.github.io/minidsp-open";
+const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(5);
+const PERIODIC_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// NVS namespace and key for tracking installed catalogue version.
 const NVS_NAMESPACE: &str = "beq";
@@ -23,6 +27,7 @@ const NVS_BASE_URL_KEY: &str = "base_url";
 
 /// Chunk size for streaming downloads to flash (4KB).
 const DOWNLOAD_CHUNK: usize = 4096;
+static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Result of an update check.
 #[derive(Debug)]
@@ -35,6 +40,29 @@ pub enum UpdateResult {
     NoStorage,
     /// Network or parse error (non-fatal).
     Error(String),
+}
+
+#[derive(Debug)]
+pub enum UpdateAttempt {
+    Completed(UpdateResult),
+    Busy,
+}
+
+struct UpdateRunGuard;
+
+impl UpdateRunGuard {
+    fn acquire() -> Option<Self> {
+        UPDATE_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for UpdateRunGuard {
+    fn drop(&mut self) {
+        UPDATE_RUNNING.store(false, Ordering::Release);
+    }
 }
 
 /// Manifest from the catalogue server.
@@ -128,6 +156,98 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
     UpdateResult::Updated {
         version: new_version,
         files: downloaded,
+    }
+}
+
+/// Try to run an update check, skipping if another update is already in progress.
+pub fn try_check_and_update(
+    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
+) -> UpdateAttempt {
+    let _guard = match UpdateRunGuard::acquire() {
+        Some(guard) => guard,
+        None => {
+        return UpdateAttempt::Busy;
+        }
+    };
+
+    let result = check_and_update(nvs);
+    UpdateAttempt::Completed(result)
+}
+
+/// Return whether an update check is currently running.
+pub fn is_updating() -> bool {
+    UPDATE_RUNNING.load(Ordering::Acquire)
+}
+
+/// Kick off a one-shot background refresh if no update is currently running.
+///
+/// Returns true if a new refresh task was started, false if an update was already running
+/// or the thread could not be spawned.
+pub fn trigger_background_refresh(
+    nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
+    reason: &'static str,
+) -> bool {
+    let guard = match UpdateRunGuard::acquire() {
+        Some(guard) => guard,
+        None => return false,
+    };
+
+    match std::thread::Builder::new()
+        .name("beq_refresh".into())
+        .stack_size(32768)
+        .spawn(move || {
+            info!("starting background catalogue refresh: {reason}");
+            let _guard = guard;
+            log_update_result(check_and_update(&nvs));
+        }) {
+        Ok(_) => true,
+        Err(e) => {
+            warn!("failed to spawn background catalogue refresh: {e}");
+            false
+        }
+    }
+}
+
+/// Start the background updater thread.
+pub fn start_background_updater(
+    nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
+) -> Result<(), std::io::Error> {
+    std::thread::Builder::new()
+        .name("beq_update".into())
+        .stack_size(32768)
+        .spawn(move || {
+            // Wait for WiFi to stabilize before hitting the network.
+            std::thread::sleep(INITIAL_CHECK_DELAY);
+
+            loop {
+                run_scheduled_check(&nvs);
+                std::thread::sleep(PERIODIC_CHECK_INTERVAL);
+            }
+        })
+        .map(|_| ())
+}
+
+fn run_scheduled_check(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) {
+    match try_check_and_update(nvs) {
+        UpdateAttempt::Busy => {
+            info!("scheduled catalogue check skipped: another update is already running");
+        }
+        UpdateAttempt::Completed(result) => log_update_result(result),
+    }
+}
+
+fn log_update_result(result: UpdateResult) {
+    match result {
+        UpdateResult::Current => {}
+        UpdateResult::Updated { version, files } => {
+            info!("catalogue updated to {version} ({files} files)");
+        }
+        UpdateResult::NoStorage => {
+            warn!("catalogue update skipped: no data partition");
+        }
+        UpdateResult::Error(e) => {
+            warn!("catalogue update failed: {e}");
+        }
     }
 }
 

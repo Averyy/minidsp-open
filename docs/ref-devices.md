@@ -48,28 +48,36 @@ Current reality:
 - desktop HID enumeration and ESP32 USB-host attach now both accept devices using the generated official USB PID metadata before `hw_id`/`dsp_version` probing
 - that shared USB acceptance policy is now exact-PID, matching the extracted official package, instead of broadly accepting every `0x2752:*` device
 - the extracted desktop app also exposes a fallback-model picker for blank devices, but decoded bundle logic shows it is built from `deviceSupportPkg.deviceIdList` grouped by `dspId`; it is not a separate alias-identity catalog
-- the generated coverage report now proves the exact modern package boundary in three independent ways: exact HW directories, exact DSP directories, and desktop `product-HW-DSP` image rows
-- `HA-DSP`, `DDRC-22`, and `DDRC-88` still do not appear as exact `hw_id`/`dsp_version` rows in those assets
-- `CDSP-8x12/DL` still does not have an exact runtime row either, but the packaged Dirac helper contains `PADSP-8x12-DL`, which strengthens the 8x12 custom-install family link already suggested by the name
-- `Harmony DSP` also still lacks an exact runtime row, but it is no longer only a USB PID hint: the packaged Dirac helper contains `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, and `dsp id is 115`, which makes it a source-backed 8x12 family candidate tied to the same DSP-113/115 structures used by the HT family
+- the desktop template-device path is not a separate alias-identity catalog either: `deviceSupportPkg.deviceIdList`, `deviceSupportPkg.getDeviceName(hwId, dspId)`, and `DiscoveredDevices.findTemplateDevice()` all terminate in the same exact `HW`/`DSP` matrix loaded from `device_support_package/info.xml`
+- the generated coverage report now proves the exact modern package boundary in four independent ways: exact HW directories, exact DSP directories, desktop `product-HW-DSP` image rows, and the exact desktop userdocs `product-path.json` map
+- desktop `Contents/Resources/userdocs/file-index.json` is even sparser and only includes topic keys for `2x4-hd`, `ddrc-24`, `flex`, `flex-dl`, `flex-eight`, and `flex-eight-dl`; it does not add hidden identity rows for `shd`, `shd-studio`, `shd-power`, `flex-ht`, or `flex-htx`
+- the older APK quick controller only branches on source-list `hw_id` values `[1, 2, 4, 5, 10, 11, 14, 17, 18, 27, 30, 31, 32]`, with `7/8` only used for the separate HDMI-toggle path; none of the unresolved USB-only labels appear there as their own runtime `hw_id`, which is useful negative evidence for alias reuse rather than hidden standalone hardware rows
+- `HA-DSP` still does not appear as an exact `hw_id`/`dsp_version` row in the extracted assets, but the public miniDSP docs confirm it is a real headphone-processor product family with a dedicated `HA-DSP-CF` software family; native `minidsp_dirac` still does not probe `PID 0x0013`, so exact runtime identity remains unresolved
+- `DDRC-22` still does not appear as an exact runtime row either; treat it as the public `DDRC-22` family plus a dedicated `DDRC-22 Utility` software family and a source-backed small Dirac runtime bucket (`create_default_dirac_info(1, 2, 1, ...)`), not as a solved exact mapping
+- `DDRC-88` still does not appear as an exact runtime row; treat it as the public `DDRC-88A / DDRC-88D` family plus a source-backed legacy 8-channel Dirac runtime bucket, with the public `DDRC-88BM` plugin family recorded separately and `DDRC-88BM` only as the nearest implemented runtime profile rather than as the official identity
+- `CDSP-8x12/DL` still does not have an exact runtime row either, but the packaged Dirac helper contains `PADSP-8x12-DL`, and the public product/manual pages keep it in the same `C-DSP 8x12 DL` plugin family as Harmony DSP 8x12, which strengthens the same 8x12 custom-install family suggested by the product name
+- `Harmony DSP` also still lacks an exact runtime row, but it is no longer only a USB PID hint: the packaged Dirac helper contains `Harmony DSP 8x12`, `Failed to get dsp id, assume it is 113`, and `dsp id is 115`, and the public manual explicitly says the `C-DSP 8x12 DL` plugin works with both Harmony DSP 8x12 and C-DSP 8x12 DL. That makes it a source-backed 8x12 HT-family candidate aligned with the public `Harmony DSP 8x12` product family
+- the generated USB-hint metadata now keeps supporting public product/manual URLs for these unresolved families so public naming and sibling-family relationships stay explicit without being confused for solved runtime identity
 
 ## Dirac-Capable DSP Versions
 
 From miniDSP Controller app: `[61, 94, 95, 101, 105, 111, 113]`
 
-| dsp_version | Device |
-|-------------|--------|
-| 61 | Legacy (unknown, pre-HD) |
-| 94 | Legacy (unknown, pre-HD) |
-| 95 | Legacy (unknown, pre-HD) |
-| 101 | DDRC-24 |
-| 105 | SHD / SHD Studio / SHD Power |
-| 111 | Flex Eight DL |
-| 113 | Flex HT / Flex HTx (old FW) |
+| dsp_version | Current best mapping | Evidence level |
+|-------------|----------------------|----------------|
+| 61 | Legacy Dirac family, distinct older bucket | APK `checkDirac()` includes it, and the old APK quick template carried a special `dspversion == 61` comment. Exact runtime identity is still unresolved. |
+| 94 | Legacy Dirac family, likely small-channel bucket | APK `checkDirac()` includes it, and the same APK historically hinted at a broader `90..99` Dirac band. This likely aligns with the same smaller legacy Dirac family as `DDRC-22`, but that is still inference rather than an exact mapping. |
+| 95 | DDRC-88BM family | Source-backed by cached `third_party/legacy-configs/ddrc88bm/config.xml` and current `probe.rs` mapping `(6, 95) -> DDRC-88BM`. |
+| 101 | DDRC-24 / Flex (DL) | Exact modern Device Console HW/DSP rows. |
+| 105 | SHD / SHD Studio / SHD Power | Exact modern Device Console HW/DSP rows plus the APK `17/18` source-map group. |
+| 111 | Flex Eight DL | Exact modern Device Console HW/DSP rows. |
+| 113 | Flex HT / Flex HTx (old FW) | Exact modern Device Console HW/DSP rows; also reinforced by native `minidsp_dirac` fallback strings around Harmony / HT-family handling. |
 
 Note: DSP 115 (Flex HT/HTx new FW with input PEQ) is NOT in the Dirac list — the firmware replaced Dirac with input PEQ. The Device Console XML still contains Dirac address blocks for DSP 115 (layout artifact from the shared structure), but the firmware does not activate them.
 
 Dirac capability here means the firmware has the code path and valid DSP addresses. Whether Dirac is actually active depends on product licensing — not all products shipping with a Dirac-capable DSP version have Dirac enabled.
+
+Important caveat: the old APK also contains a low-level test comment `0x61 = 97 is DDRC should show DG`, but that is weaker evidence than the real source corpus. In this repo, cached `config.xml` already proves DSP `97` maps to `C-DSP 8x12 v2`, so that APK comment is treated as historical/noisy rather than as a trustworthy identity mapping.
 
 ## Legacy Devices (Not in Device Console)
 
@@ -373,3 +381,7 @@ Current status:
 - SHARC address tables needed for launch are already documented in `docs/ref-address-tables.md`
 - SHD Power reuses DSP 105 with a different source map
 - CDSP 8x12DL remains deferred pending a device owner probe
+- Official Mac app support needs to be read at two levels:
+  - product admission: USB PIDs listed in `device_support_package/info.xml`
+  - exact runtime identity: modeled `HW`/`DSP` rows loaded into `deviceIdList`
+- For `HA-DSP`, `DDRC-22`, `DDRC-88`, `CDSP-8x12/DL`, and `Harmony DSP`, the extracted Mac app proves product admission, but not separate exact runtime identities. Those products are accepted and then handled through shared family/probe buckets.

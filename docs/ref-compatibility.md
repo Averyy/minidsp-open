@@ -24,7 +24,7 @@ Rule: compatibility behavior is frozen. New features are additive and must use n
 Scope note:
 - this file defines the external contract once a device family is supported
 - it does not imply that every device in MiniDSP's official apps is already fully implemented in this repo
-- coverage progress and importer work are tracked in `PROGRESS.md` and `docs/context-dump.md`
+- coverage progress is tracked in `PROGRESS.md`, with importer/device-matrix detail in `docs/ref-device-coverage.md`, `docs/ref-devices.md`, and `docs/ref-legacy-devices.md`
 - when protocol details differ between `minidsp-rs` and MiniDSP's own extracted app assets, the official app assets are the source of truth
 
 ## Surface Areas

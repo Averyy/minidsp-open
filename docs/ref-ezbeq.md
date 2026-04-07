@@ -405,4 +405,4 @@ Implemented target behavior:
 Verified reality today:
 - Desktop still tracks this as implemented behavior.
 - ESP32 physical-hardware validation has only closed status/meter/basic-control paths so far.
-- This removes the previous ESP32 config-route parity blocker on the physical 2x4 HD. Broader device-matrix coverage still depends on the importer/codegen work tracked in `PROGRESS.md` and `docs/context-dump.md`.
+- This removes the previous ESP32 config-route parity blocker on the physical 2x4 HD. Broader device-matrix coverage still depends on the importer/codegen work tracked in `PROGRESS.md`, `docs/ref-device-coverage.md`, and the permanent device reference docs.
