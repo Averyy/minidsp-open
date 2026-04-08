@@ -3,5 +3,6 @@
 pub mod discovery;
 pub mod http;
 pub mod mdns;
+pub mod playback;
 pub mod state;
 pub mod tcp;

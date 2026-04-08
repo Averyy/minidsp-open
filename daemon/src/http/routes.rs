@@ -1,8 +1,10 @@
 //! Axum route definitions and handlers.
 
 use crate::http::json::*;
+use crate::playback;
 use crate::state::DaemonState;
 use axum::{
+    body::Bytes,
     Json, Router,
     extract::{
         FromRequest, Path, Query, State, WebSocketUpgrade,
@@ -12,10 +14,11 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use minidsp_protocol::playback::{SyncRequest, SyncResponse};
+use minidsp_protocol::playback::{PlayRequest, PlaybackPlan, SyncRequest, SyncResponse};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
 /// JSON error response — minidsp-rs compatible format: `{"error": "message"}`.
@@ -41,6 +44,32 @@ impl ApiError {
 
 /// Result type alias for handlers returning JSON errors.
 type ApiResult<T> = Result<T, (StatusCode, Json<ApiError>)>;
+
+struct PlaybackGuard {
+    state: Arc<DaemonState>,
+    active: bool,
+}
+
+impl PlaybackGuard {
+    fn new(state: Arc<DaemonState>) -> Self {
+        Self {
+            state,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PlaybackGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.state.finish_playback();
+        }
+    }
+}
 
 /// Get device or return JSON 404.
 async fn get_device_or_404(
@@ -352,6 +381,7 @@ async fn sync_clock(Json(body): Json<SyncRequest>) -> impl IntoResponse {
 async fn play_device(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
+    body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     let client = get_device_or_404(&state, id).await?;
     if !client.profile().has_usb_audio {
@@ -359,10 +389,83 @@ async fn play_device(
             "device does not support USB audio playback",
         ));
     }
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "desktop playback backend not implemented",
-    ))
+    if !state.try_begin_playback() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "playback already in progress",
+        ));
+    }
+    let mut playback_guard = PlaybackGuard::new(state.clone());
+
+    let request = if body.is_empty() {
+        PlayRequest::default()
+    } else {
+        serde_json::from_slice::<PlayRequest>(&body)
+            .map_err(|_| ApiError::bad_request("invalid JSON"))?
+    };
+    let plan = PlaybackPlan::build(request).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let current_source = client
+        .get_master_status()
+        .await
+        .map_err(|e| ApiError::internal(format!("read source: {e}")))?;
+    let current_source = client
+        .profile()
+        .sources
+        .source_for_index(current_source.source)
+        .ok_or_else(|| ApiError::internal("current source unavailable"))?;
+    let usb_index = client
+        .profile()
+        .sources
+        .index_for_source(minidsp_protocol::source::Source::Usb)
+        .ok_or_else(|| ApiError::internal("USB source missing from device profile"))?;
+
+    let mut source_changed = false;
+    let mut previous_source = None;
+    let mut restore_source = None;
+    if current_source != minidsp_protocol::source::Source::Usb {
+        client
+            .set_source(usb_index)
+            .await
+            .map_err(|e| ApiError::internal(format!("set_source: {e}")))?;
+        source_changed = true;
+        previous_source = Some(current_source.to_string());
+        restore_source = Some(current_source);
+    }
+
+    let client_for_task = client.clone();
+    let state_for_task = state.clone();
+    let (tx, rx) = oneshot::channel::<Result<minidsp_protocol::playback::PlayResponse, String>>();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            playback::run_playback(plan, source_changed, previous_source, tx)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!("desktop playback failed: {err}");
+            }
+            Err(err) => {
+                tracing::warn!("desktop playback task failed: {err}");
+            }
+        }
+
+        if let Some(source) = restore_source
+            && let Some(index) = client_for_task.profile().sources.index_for_source(source)
+            && let Err(err) = client_for_task.set_source(index).await
+        {
+            tracing::warn!("failed to restore source after desktop playback: {err}");
+        }
+        state_for_task.finish_playback();
+    });
+
+    playback_guard.disarm();
+    let response = rx
+        .await
+        .map_err(|_| ApiError::internal("playback thread ended unexpectedly"))?
+        .map_err(ApiError::internal)?;
+    Ok(Json(serde_json::to_value(response).expect("play response serializes")))
 }
 
 async fn volume_direction(

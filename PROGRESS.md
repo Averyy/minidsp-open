@@ -14,6 +14,8 @@ Permanent technical detail belongs in:
 
 - Desktop `/devices/{id}/config` is fixed and verified on the physical 2x4 HD.
 - ESP32 `/devices/{id}/config` parity is fixed and verified on the physical 2x4 HD.
+- Desktop `/devices/{id}/play` is now implemented with the shared `PlaybackPlan` / `PlaybackGenerator` path used by ESP32.
+- Desktop playback backend is smoke-tested on local speakers: the default sweep plays audibly through the CPAL path and reports a real `startedAtUs` timestamp.
 - Desktop queue reconnect now re-acquires transports on disconnect and replays idempotent pending PEQ batch writes after reconnect.
 - Measurement-mode saved PEQ state now persists in daemon state so restore survives client rebuild/reconnect.
 - ESP32 WiFi monitor now records disconnect reason codes, distinguishes credential failures from transient AP loss, and exposes `lastWifiDisconnectReason` in `/debug/info`.
@@ -64,6 +66,16 @@ Permanent technical detail belongs in:
   - DSP100/2x4 HD mixer status readback via `0x14` is boolean-collapsed: any non-zero value reads as `1`, so `2` (enabled) and `1` (disabled) are indistinguishable
   - fixed `client.rs` readback to use `status != 0` instead of `status == 2` (the old check always returned false since readback never returns 2)
   - for authoritative routing state, the API should eventually read from saved preset flash data rather than runtime DSP parameter readback
+- The current live CLI verification findings are consolidated in `docs/NOTES-cli-verification.md` and should drive the next debugging pass.
+- The strongest remaining likely compatibility drifts from known-working minidsp-rs behavior are:
+  - output delay writes on DSP100 / 2x4 HD
+  - compressor parameter writes beyond threshold on DSP100 / 2x4 HD
+- The current delay path is especially suspect because:
+  - the CLI converts milliseconds to sample counts
+  - the shared client writes float32-device delay slots via the generic raw `write_dsp_u32()` path
+  - those raw `u32` writes are encoded big-endian today
+  - live readback on the 2x4 HD was wrong by a large factor (`0.5 ms` came back around `79.833336 ms`)
+- That means the top open question is no longer "does delay work at all?" but "why does our DSP100 delay write path drift from the known-working minidsp-rs behavior?"
 - All 13 exact modern Device Console `HW`/`DSP` pairs are implemented and test-gated.
 - All 7 cached legacy `config.xml` families are implemented as source-backed runtime tables and test-gated.
 - The repeatable official-app importer/report pipeline is in place:
@@ -74,6 +86,14 @@ Permanent technical detail belongs in:
 
 ## Active Work
 
+- [ ] Treat `docs/NOTES-cli-verification.md` as the top-priority investigation checklist until the remaining CLI compatibility drifts are explained or fixed.
+- [ ] Investigate DSP100 / 2x4 HD output delay drift from minidsp-rs:
+  - confirm the exact known-working minidsp-rs delay write path and on-wire encoding
+  - compare it directly to our current `set_channel_delay_samples()` -> `write_dsp_u32()` path
+  - determine whether the bug is unit conversion, address selection, endianness, opcode/control byte, or save/runtime semantics
+- [ ] Investigate DSP100 / 2x4 HD compressor parameter drift from minidsp-rs:
+  - threshold appears to write
+  - ratio / attack / release did not show the expected live readback changes during CLI verification
 - [ ] Capture or otherwise verify the physical output duration of ESP32 `/play` on the real 2x4 HD now that software timing and repeated-play stability are characterized.
 - [ ] Verify remaining `/play` compatibility edges on hardware where possible:
   - malformed request handling
@@ -135,7 +155,11 @@ Permanent technical detail belongs in:
 
 ## Deferred
 
-- [ ] Desktop `POST /play` and `POST /sync` — same API as ESP32, platform audio backend (see `docs/TODO-desktop-audio-sweep.md`)
+- [ ] Desktop `/play` hardware validation on the real MiniDSP USB-audio path:
+  - verify desktop `/devices/{id}/play` against the physical 2x4 HD
+  - verify source auto-switch to `Usb` and restore on real hardware
+  - verify the desktop timing/response behavior is useful for direct comparison with ESP32
+- [ ] Desktop `POST /sync` follow-up verification / cleanup
 - [ ] PWR-ICE compatibility verification
 - [ ] Multi-device live verification
 - [ ] CI for desktop targets

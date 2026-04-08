@@ -2,6 +2,7 @@
 
 use minidsp::client::{MiniDspClient, SavedPeqState};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -9,6 +10,7 @@ use tokio::sync::RwLock;
 pub struct DaemonState {
     pub devices: RwLock<HashMap<usize, Arc<MiniDspClient>>>,
     saved_peq: RwLock<HashMap<usize, SavedPeqState>>,
+    playback_active: AtomicBool,
 }
 
 impl DaemonState {
@@ -16,6 +18,7 @@ impl DaemonState {
         Self {
             devices: RwLock::new(HashMap::new()),
             saved_peq: RwLock::new(HashMap::new()),
+            playback_active: AtomicBool::new(false),
         }
     }
 
@@ -48,6 +51,16 @@ impl DaemonState {
 
     pub async fn clear_saved_peq(&self, id: usize) {
         self.saved_peq.write().await.remove(&id);
+    }
+
+    pub fn try_begin_playback(&self) -> bool {
+        self.playback_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn finish_playback(&self) {
+        self.playback_active.store(false, Ordering::SeqCst);
     }
 }
 
