@@ -110,7 +110,13 @@ mod tests {
     #[test]
     fn roundtrip() {
         let pkt = DiscoveryPacket::from_device(
-            [192, 168, 1, 100], 10, 1, 85, 100, 912345, "minidsp-2x4hd".into(),
+            [192, 168, 1, 100],
+            10,
+            1,
+            85,
+            100,
+            912345,
+            "minidsp-2x4hd".into(),
         );
         let encoded = pkt.encode();
         assert!(encoded.len() >= MIN_PACKET_SIZE);

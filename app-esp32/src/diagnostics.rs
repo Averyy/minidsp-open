@@ -164,10 +164,7 @@ pub fn log_snapshot() -> String {
 
 /// Return ring buffer usage stats.
 pub fn log_buffer_stats() -> (usize, usize) {
-    let used = ring_buffer()
-        .lock()
-        .map(|buf| buf.used())
-        .unwrap_or(0);
+    let used = ring_buffer().lock().map(|buf| buf.used()).unwrap_or(0);
     (used, LOG_BUFFER_CAPACITY)
 }
 
@@ -337,7 +334,10 @@ fn collect_wifi_info() -> WifiInfo {
 
         // SSID from ap_info (null-terminated bytes)
         let ssid_bytes = &ap_info.ssid;
-        let ssid_len = ssid_bytes.iter().position(|&b| b == 0).unwrap_or(ssid_bytes.len());
+        let ssid_len = ssid_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(ssid_bytes.len());
         let ssid = String::from_utf8_lossy(&ssid_bytes[..ssid_len]).into_owned();
 
         // IP from STA netif

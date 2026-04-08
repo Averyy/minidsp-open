@@ -53,7 +53,9 @@ impl HidTransport {
         let device = api
             .open_path(&std::ffi::CString::new(path).unwrap())
             .map_err(|e| TransportError::Hid(e.to_string()))?;
-        let info = device.get_device_info().map_err(|e| TransportError::Hid(e.to_string()))?;
+        let info = device
+            .get_device_info()
+            .map_err(|e| TransportError::Hid(e.to_string()))?;
         Ok(Self {
             vid: info.vendor_id(),
             pid: info.product_id(),
@@ -97,7 +99,10 @@ pub enum HotplugEvent {
 ///
 /// Returns a `tokio::sync::watch::Receiver` that receives `Vec<HotplugEvent>` on each change.
 /// The daemon can use this to add/remove devices from state.
-pub fn watch_hotplug() -> (tokio::sync::watch::Receiver<Vec<HotplugEvent>>, tokio::task::JoinHandle<()>) {
+pub fn watch_hotplug() -> (
+    tokio::sync::watch::Receiver<Vec<HotplugEvent>>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = tokio::sync::watch::channel(Vec::new());
 
     let handle = tokio::spawn(async move {
@@ -150,14 +155,19 @@ pub fn watch_hotplug() -> (tokio::sync::watch::Receiver<Vec<HotplugEvent>>, toki
 }
 
 impl Transport for HidTransport {
-    fn send_frame(&self, payload: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+    fn send_frame(
+        &self,
+        payload: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
         let device = self.device.clone();
         let hid_report = packet::encode_hid(payload);
         tracing::debug!("HID OUT payload: {:02x?}", payload);
         tracing::trace!("HID OUT report: {:02x?}", hid_report);
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let dev = device.lock().map_err(|e| TransportError::Hid(e.to_string()))?;
+                let dev = device
+                    .lock()
+                    .map_err(|e| TransportError::Hid(e.to_string()))?;
                 let mut retries = 10;
                 loop {
                     match dev.write(&hid_report) {
@@ -176,14 +186,20 @@ impl Transport for HidTransport {
         })
     }
 
-    fn recv_frame(&self, timeout_ms: u64) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+    fn recv_frame(
+        &self,
+        timeout_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
         let device = self.device.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let dev = device.lock().map_err(|e| TransportError::Hid(e.to_string()))?;
+                let dev = device
+                    .lock()
+                    .map_err(|e| TransportError::Hid(e.to_string()))?;
                 let mut buf = [0u8; packet::HID_REPORT_SIZE];
                 let timeout = timeout_ms.min(i32::MAX as u64) as i32;
-                let n = dev.read_timeout(&mut buf, timeout)
+                let n = dev
+                    .read_timeout(&mut buf, timeout)
                     .map_err(|e| map_hid_error(e.to_string()))?;
                 if n == 0 {
                     return Err(TransportError::Timeout);
@@ -193,8 +209,7 @@ impl Transport for HidTransport {
                 if let Some(ref payload) = decoded {
                     tracing::debug!("HID IN payload: {:02x?}", payload);
                 }
-                decoded
-                    .ok_or_else(|| TransportError::Hid("failed to decode HID response".into()))
+                decoded.ok_or_else(|| TransportError::Hid("failed to decode HID response".into()))
             })
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?

@@ -102,11 +102,17 @@ impl SourceMap {
     }
 
     pub fn source_for_index(&self, idx: u8) -> Option<Source> {
-        self.entries.iter().find(|(i, _)| *i == idx).map(|(_, s)| *s)
+        self.entries
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, s)| *s)
     }
 
     pub fn index_for_source(&self, source: Source) -> Option<u8> {
-        self.entries.iter().find(|(_, s)| *s == source).map(|(i, _)| *i)
+        self.entries
+            .iter()
+            .find(|(_, s)| *s == source)
+            .map(|(i, _)| *i)
     }
 
     pub fn sources(&self) -> &[(u8, Source)] {
@@ -120,11 +126,8 @@ impl SourceMap {
 
 // -- Per-device source maps --
 
-pub static SOURCES_2X4HD: SourceMap = SourceMap::new(&[
-    (0, Source::Analog),
-    (1, Source::Toslink),
-    (2, Source::Usb),
-]);
+pub static SOURCES_2X4HD: SourceMap =
+    SourceMap::new(&[(0, Source::Analog), (1, Source::Toslink), (2, Source::Usb)]);
 
 pub static SOURCES_FLEX: SourceMap = SourceMap::new(&[
     (0, Source::Analog),
@@ -189,7 +192,5 @@ pub static SOURCES_4X10HD: SourceMap = SourceMap::new(&[
     (2, Source::AesEbu),
 ]);
 
-pub static SOURCES_LEGACY_2: SourceMap = SourceMap::new(&[
-    (0, Source::Toslink),
-    (1, Source::Spdif),
-]);
+pub static SOURCES_LEGACY_2: SourceMap =
+    SourceMap::new(&[(0, Source::Toslink), (1, Source::Spdif)]);

@@ -17,6 +17,8 @@ Permanent technical detail belongs in:
 - Desktop queue reconnect now re-acquires transports on disconnect and replays idempotent pending PEQ batch writes after reconnect.
 - Measurement-mode saved PEQ state now persists in daemon state so restore survives client rebuild/reconnect.
 - ESP32 WiFi monitor now records disconnect reason codes, distinguishes credential failures from transient AP loss, and exposes `lastWifiDisconnectReason` in `/debug/info`.
+- ESP32 `/sync` and `/devices/{id}/play` are live on real 2x4 HD hardware in release firmware: `/play` responds before playback completes, streams the full sweep, and restores the previous source after auto-switching to USB.
+- ESP32 `/play` timing is now characterized on real hardware: the original `~13.6s` completion bug was fixed by half-ring chunking, and the remaining `~12.29-12.56s` enqueue-finish metric scales with byte volume at `TX_DONE=0`, which points to app-side enqueue/reporting semantics rather than a UAC2 driver clock defect.
 - All 13 exact modern Device Console `HW`/`DSP` pairs are implemented and test-gated.
 - All 7 cached legacy `config.xml` families are implemented as source-backed runtime tables and test-gated.
 - The repeatable official-app importer/report pipeline is in place:
@@ -82,6 +84,7 @@ Permanent technical detail belongs in:
 
 ## Deferred
 
+- [ ] Desktop `POST /play` and `POST /sync` — same API as ESP32, platform audio backend (see `docs/TODO-desktop-audio-sweep.md`)
 - [ ] PWR-ICE compatibility verification
 - [ ] Multi-device live verification
 - [ ] CI for desktop targets

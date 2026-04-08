@@ -59,4 +59,6 @@ pub struct DeviceProfile {
     pub has_dre: bool,
     /// Per-source volume offsets supported.
     pub has_volume_offsets: bool,
+    /// Device exposes USB audio playback in addition to HID control.
+    pub has_usb_audio: bool,
 }

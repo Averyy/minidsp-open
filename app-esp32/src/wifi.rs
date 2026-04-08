@@ -79,9 +79,7 @@ pub struct WifiHandle {
 
 /// Attempt to connect to saved WiFi, or start provisioning.
 /// Returns the WiFi handle (must be kept alive for WiFi to stay connected).
-pub fn connect_or_provision(
-    nvs: EspDefaultNvsPartition,
-) -> Result<WifiHandle, WifiError> {
+pub fn connect_or_provision(nvs: EspDefaultNvsPartition) -> Result<WifiHandle, WifiError> {
     let sysloop =
         EspSystemEventLoop::take().map_err(|e| WifiError::Init(format!("eventloop: {e}")))?;
     let modem = unsafe { Modem::steal() };
@@ -361,9 +359,7 @@ fn monitor_loop(
 fn is_credential_disconnect(reason: u32) -> bool {
     matches!(
         reason,
-        WIFI_REASON_AUTH_FAIL
-            | WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT
-            | WIFI_REASON_MIC_FAILURE
+        WIFI_REASON_AUTH_FAIL | WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT | WIFI_REASON_MIC_FAILURE
     )
 }
 
@@ -507,10 +503,7 @@ fn read_credentials(nvs: &EspDefaultNvsPartition) -> Option<(String, String)> {
     let mut pass_buf = [0u8; 65];
 
     let ssid = nvs.get_str(NVS_KEY_SSID, &mut ssid_buf).ok()??;
-    let pass = nvs
-        .get_str(NVS_KEY_PASS, &mut pass_buf)
-        .ok()?
-        .unwrap_or("");
+    let pass = nvs.get_str(NVS_KEY_PASS, &mut pass_buf).ok()?.unwrap_or("");
 
     if ssid.is_empty() {
         return None;
@@ -553,9 +546,8 @@ pub fn clear_credentials(nvs: &EspDefaultNvsPartition) -> Result<(), WifiError> 
 /// Falls back to 192.168.4.1 if the interface isn't available.
 pub fn get_softap_ip() -> std::net::Ipv4Addr {
     unsafe {
-        let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(
-            b"WIFI_AP_DEF\0".as_ptr() as _,
-        );
+        let netif =
+            esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(b"WIFI_AP_DEF\0".as_ptr() as _);
         if !netif.is_null() {
             let mut ip_info: esp_idf_svc::sys::esp_netif_ip_info_t = core::mem::zeroed();
             if esp_idf_svc::sys::esp_netif_get_ip_info(netif, &mut ip_info)
@@ -581,9 +573,8 @@ pub fn get_softap_ip() -> std::net::Ipv4Addr {
 /// - Option 114 (RFC 8910 captive portal URI) → http://<AP IP>
 pub fn configure_dhcp_for_captive_portal(ip: std::net::Ipv4Addr) {
     unsafe {
-        let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(
-            b"WIFI_AP_DEF\0".as_ptr() as _,
-        );
+        let netif =
+            esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(b"WIFI_AP_DEF\0".as_ptr() as _);
         if netif.is_null() {
             warn!("DHCP captive portal: netif not found");
             return;

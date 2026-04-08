@@ -21,7 +21,13 @@ pub async fn broadcast_loop(
     socket.set_broadcast(true)?;
 
     let packet = DiscoveryPacket::from_device(
-        ip.octets(), hw_id, fw_major, fw_minor, dsp_id, serial, hostname,
+        ip.octets(),
+        hw_id,
+        fw_major,
+        fw_minor,
+        dsp_id,
+        serial,
+        hostname,
     );
     let data = packet.encode();
 

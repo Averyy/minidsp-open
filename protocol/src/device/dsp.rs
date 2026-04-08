@@ -157,10 +157,18 @@ static DSP100_OUTPUTS: [OutputChannel; 4] = [
         polarity: Some(80),
         peq: &DSP100_OUT0_PEQ,
         fir: None,
-        crossover: Some(Crossover { lpf_addr: 8580, hpf_addr: 8600 }),
+        crossover: Some(Crossover {
+            lpf_addr: 8580,
+            hpf_addr: 8600,
+        }),
         compressor: Some(Compressor {
-            bypass: 22, threshold: 40, gain: 41,
-            ratio: 42, knee: 43, attack: 44, release: 45,
+            bypass: 22,
+            threshold: 40,
+            gain: 41,
+            ratio: 42,
+            knee: 43,
+            attack: 44,
+            release: 45,
         }),
     },
     OutputChannel {
@@ -170,10 +178,18 @@ static DSP100_OUTPUTS: [OutputChannel; 4] = [
         polarity: Some(81),
         peq: &DSP100_OUT1_PEQ,
         fir: None,
-        crossover: Some(Crossover { lpf_addr: 8620, hpf_addr: 8640 }),
+        crossover: Some(Crossover {
+            lpf_addr: 8620,
+            hpf_addr: 8640,
+        }),
         compressor: Some(Compressor {
-            bypass: 23, threshold: 46, gain: 47,
-            ratio: 48, knee: 49, attack: 50, release: 51,
+            bypass: 23,
+            threshold: 46,
+            gain: 47,
+            ratio: 48,
+            knee: 49,
+            attack: 50,
+            release: 51,
         }),
     },
     OutputChannel {
@@ -183,10 +199,18 @@ static DSP100_OUTPUTS: [OutputChannel; 4] = [
         polarity: Some(82),
         peq: &DSP100_OUT2_PEQ,
         fir: None,
-        crossover: Some(Crossover { lpf_addr: 8660, hpf_addr: 8680 }),
+        crossover: Some(Crossover {
+            lpf_addr: 8660,
+            hpf_addr: 8680,
+        }),
         compressor: Some(Compressor {
-            bypass: 24, threshold: 52, gain: 53,
-            ratio: 54, knee: 55, attack: 56, release: 57,
+            bypass: 24,
+            threshold: 52,
+            gain: 53,
+            ratio: 54,
+            knee: 55,
+            attack: 56,
+            release: 57,
         }),
     },
     OutputChannel {
@@ -196,10 +220,18 @@ static DSP100_OUTPUTS: [OutputChannel; 4] = [
         polarity: Some(83),
         peq: &DSP100_OUT3_PEQ,
         fir: None,
-        crossover: Some(Crossover { lpf_addr: 8700, hpf_addr: 8720 }),
+        crossover: Some(Crossover {
+            lpf_addr: 8700,
+            hpf_addr: 8720,
+        }),
         compressor: Some(Compressor {
-            bypass: 25, threshold: 58, gain: 59,
-            ratio: 60, knee: 61, attack: 62, release: 63,
+            bypass: 25,
+            threshold: 58,
+            gain: 59,
+            ratio: 60,
+            knee: 61,
+            attack: 62,
+            release: 63,
         }),
     },
 ];
@@ -239,43 +271,87 @@ static DSP101_OUT3_PEQ: [PeqBand; 10] = peq_bands_10(358);
 
 static DSP101_OUTPUTS: [OutputChannel; 4] = [
     OutputChannel {
-        mute: 32, gain: 34, delay: Some(41), polarity: Some(45),
+        mute: 32,
+        gain: 34,
+        delay: Some(41),
+        polarity: Some(45),
         peq: &DSP101_OUT0_PEQ,
         fir: None,
-        crossover: Some(Crossover { lpf_addr: 96, hpf_addr: 116 }),
+        crossover: Some(Crossover {
+            lpf_addr: 96,
+            hpf_addr: 116,
+        }),
         compressor: Some(Compressor {
-            bypass: 33, threshold: 35, gain: 36,
-            ratio: 37, knee: 38, attack: 39, release: 40,
+            bypass: 33,
+            threshold: 35,
+            gain: 36,
+            ratio: 37,
+            knee: 38,
+            attack: 39,
+            release: 40,
         }),
     },
     OutputChannel {
-        mute: 136, gain: 138, delay: Some(145), polarity: Some(149),
+        mute: 136,
+        gain: 138,
+        delay: Some(145),
+        polarity: Some(149),
         peq: &DSP101_OUT1_PEQ,
         fir: None,
-        crossover: Some(Crossover { lpf_addr: 200, hpf_addr: 220 }),
+        crossover: Some(Crossover {
+            lpf_addr: 200,
+            hpf_addr: 220,
+        }),
         compressor: Some(Compressor {
-            bypass: 137, threshold: 139, gain: 140,
-            ratio: 141, knee: 142, attack: 143, release: 144,
+            bypass: 137,
+            threshold: 139,
+            gain: 140,
+            ratio: 141,
+            knee: 142,
+            attack: 143,
+            release: 144,
         }),
     },
     OutputChannel {
-        mute: 240, gain: 242, delay: Some(249), polarity: Some(253),
+        mute: 240,
+        gain: 242,
+        delay: Some(249),
+        polarity: Some(253),
         peq: &DSP101_OUT2_PEQ,
         fir: None,
-        crossover: Some(Crossover { lpf_addr: 304, hpf_addr: 324 }),
+        crossover: Some(Crossover {
+            lpf_addr: 304,
+            hpf_addr: 324,
+        }),
         compressor: Some(Compressor {
-            bypass: 241, threshold: 243, gain: 244,
-            ratio: 245, knee: 246, attack: 247, release: 248,
+            bypass: 241,
+            threshold: 243,
+            gain: 244,
+            ratio: 245,
+            knee: 246,
+            attack: 247,
+            release: 248,
         }),
     },
     OutputChannel {
-        mute: 344, gain: 346, delay: Some(353), polarity: Some(357),
+        mute: 344,
+        gain: 346,
+        delay: Some(353),
+        polarity: Some(357),
         peq: &DSP101_OUT3_PEQ,
         fir: None,
-        crossover: Some(Crossover { lpf_addr: 408, hpf_addr: 428 }),
+        crossover: Some(Crossover {
+            lpf_addr: 408,
+            hpf_addr: 428,
+        }),
         compressor: Some(Compressor {
-            bypass: 345, threshold: 347, gain: 348,
-            ratio: 349, knee: 350, attack: 351, release: 352,
+            bypass: 345,
+            threshold: 347,
+            gain: 348,
+            ratio: 349,
+            knee: 350,
+            attack: 351,
+            release: 352,
         }),
     },
 ];
@@ -314,7 +390,7 @@ pub static DSP_101: DspTable = DspTable {
 // ========================================================================
 
 pub static DSP_105: DspTable = DspTable {
-    inputs: &[], // No input PEQ on SHD (Dirac handles input)
+    inputs: &[],              // No input PEQ on SHD (Dirac handles input)
     outputs: &DSP101_OUTPUTS, // Same output addresses as DSP 101
     routing: RoutingMatrix {
         status_base: 0,
@@ -342,14 +418,28 @@ static DSP110_INPUT_PEQ_1: [PeqBand; 10] = peq_bands_10(4224);
 
 static DSP110_INPUTS: [InputChannel; 2] = [
     InputChannel {
-        mute: Some(66), gain: Some(68), polarity: Some(70),
+        mute: Some(66),
+        gain: Some(68),
+        polarity: Some(70),
         peq: &DSP110_INPUT_PEQ_0,
-        fir: Some(FirFilter { bypass: 67, taps_count: 71, data_start: 72, max_taps: 2048 }),
+        fir: Some(FirFilter {
+            bypass: 67,
+            taps_count: 71,
+            data_start: 72,
+            max_taps: 2048,
+        }),
     },
     InputChannel {
-        mute: Some(2170), gain: Some(2172), polarity: Some(2174),
+        mute: Some(2170),
+        gain: Some(2172),
+        polarity: Some(2174),
         peq: &DSP110_INPUT_PEQ_1,
-        fir: Some(FirFilter { bypass: 2171, taps_count: 2175, data_start: 2176, max_taps: 2048 }),
+        fir: Some(FirFilter {
+            bypass: 2171,
+            taps_count: 2175,
+            data_start: 2176,
+            max_taps: 2048,
+        }),
     },
 ];
 
@@ -381,8 +471,14 @@ macro_rules! dsp110_output {
 }
 
 static DSP110_OUT_PEQ: [[PeqBand; 10]; 8] = [
-    peq_bands_10(4287), peq_bands_10(4390), peq_bands_10(4493), peq_bands_10(4596),
-    peq_bands_10(4699), peq_bands_10(4802), peq_bands_10(4905), peq_bands_10(5008),
+    peq_bands_10(4287),
+    peq_bands_10(4390),
+    peq_bands_10(4493),
+    peq_bands_10(4596),
+    peq_bands_10(4699),
+    peq_bands_10(4802),
+    peq_bands_10(4905),
+    peq_bands_10(5008),
 ];
 
 static DSP110_OUTPUTS: [OutputChannel; 8] = [
@@ -451,8 +547,14 @@ macro_rules! dsp111_output {
 }
 
 static DSP111_OUT_PEQ: [[PeqBand; 10]; 8] = [
-    peq_bands_10(74), peq_bands_10(178), peq_bands_10(282), peq_bands_10(386),
-    peq_bands_10(490), peq_bands_10(594), peq_bands_10(698), peq_bands_10(802),
+    peq_bands_10(74),
+    peq_bands_10(178),
+    peq_bands_10(282),
+    peq_bands_10(386),
+    peq_bands_10(490),
+    peq_bands_10(594),
+    peq_bands_10(698),
+    peq_bands_10(802),
 ];
 
 static DSP111_OUTPUTS: [OutputChannel; 8] = [
@@ -526,8 +628,14 @@ macro_rules! dsp113_output {
 }
 
 static DSP113_OUT_PEQ: [[PeqBand; 10]; 8] = [
-    peq_bands_10(838), peq_bands_10(942), peq_bands_10(1046), peq_bands_10(1150),
-    peq_bands_10(1254), peq_bands_10(1358), peq_bands_10(1462), peq_bands_10(1566),
+    peq_bands_10(838),
+    peq_bands_10(942),
+    peq_bands_10(1046),
+    peq_bands_10(1150),
+    peq_bands_10(1254),
+    peq_bands_10(1358),
+    peq_bands_10(1462),
+    peq_bands_10(1566),
 ];
 
 static DSP113_OUTPUTS: [OutputChannel; 8] = [
@@ -542,8 +650,14 @@ static DSP113_OUTPUTS: [OutputChannel; 8] = [
 ];
 
 static DSP113_BM_BPF: [(u16, u16); 8] = [
-    (272, 292), (312, 332), (352, 372), (392, 412),
-    (432, 452), (472, 492), (512, 532), (552, 572),
+    (272, 292),
+    (312, 332),
+    (352, 372),
+    (392, 412),
+    (432, 452),
+    (472, 492),
+    (512, 532),
+    (552, 572),
 ];
 
 static DSP113_BASS_MGMT: BassManagement = BassManagement {
@@ -588,19 +702,73 @@ pub static DSP_113: DspTable = DspTable {
 // ========================================================================
 
 static DSP115_INPUT_PEQS: [[PeqBand; 10]; 8] = [
-    peq_bands_10(1656), peq_bands_10(1706), peq_bands_10(1756), peq_bands_10(1806),
-    peq_bands_10(1856), peq_bands_10(1906), peq_bands_10(1956), peq_bands_10(2006),
+    peq_bands_10(1656),
+    peq_bands_10(1706),
+    peq_bands_10(1756),
+    peq_bands_10(1806),
+    peq_bands_10(1856),
+    peq_bands_10(1906),
+    peq_bands_10(1956),
+    peq_bands_10(2006),
 ];
 
 static DSP115_INPUTS: [InputChannel; 8] = [
-    InputChannel { mute: None, gain: None, polarity: None, peq: &DSP115_INPUT_PEQS[0], fir: None },
-    InputChannel { mute: None, gain: None, polarity: None, peq: &DSP115_INPUT_PEQS[1], fir: None },
-    InputChannel { mute: None, gain: None, polarity: None, peq: &DSP115_INPUT_PEQS[2], fir: None },
-    InputChannel { mute: None, gain: None, polarity: None, peq: &DSP115_INPUT_PEQS[3], fir: None },
-    InputChannel { mute: None, gain: None, polarity: None, peq: &DSP115_INPUT_PEQS[4], fir: None },
-    InputChannel { mute: None, gain: None, polarity: None, peq: &DSP115_INPUT_PEQS[5], fir: None },
-    InputChannel { mute: None, gain: None, polarity: None, peq: &DSP115_INPUT_PEQS[6], fir: None },
-    InputChannel { mute: None, gain: None, polarity: None, peq: &DSP115_INPUT_PEQS[7], fir: None },
+    InputChannel {
+        mute: None,
+        gain: None,
+        polarity: None,
+        peq: &DSP115_INPUT_PEQS[0],
+        fir: None,
+    },
+    InputChannel {
+        mute: None,
+        gain: None,
+        polarity: None,
+        peq: &DSP115_INPUT_PEQS[1],
+        fir: None,
+    },
+    InputChannel {
+        mute: None,
+        gain: None,
+        polarity: None,
+        peq: &DSP115_INPUT_PEQS[2],
+        fir: None,
+    },
+    InputChannel {
+        mute: None,
+        gain: None,
+        polarity: None,
+        peq: &DSP115_INPUT_PEQS[3],
+        fir: None,
+    },
+    InputChannel {
+        mute: None,
+        gain: None,
+        polarity: None,
+        peq: &DSP115_INPUT_PEQS[4],
+        fir: None,
+    },
+    InputChannel {
+        mute: None,
+        gain: None,
+        polarity: None,
+        peq: &DSP115_INPUT_PEQS[5],
+        fir: None,
+    },
+    InputChannel {
+        mute: None,
+        gain: None,
+        polarity: None,
+        peq: &DSP115_INPUT_PEQS[6],
+        fir: None,
+    },
+    InputChannel {
+        mute: None,
+        gain: None,
+        polarity: None,
+        peq: &DSP115_INPUT_PEQS[7],
+        fir: None,
+    },
 ];
 
 pub static DSP_115: DspTable = DspTable {
@@ -630,10 +798,34 @@ static LEGACY_MSHARC_IN_PEQ: [[PeqBand; 10]; 4] = [
 ];
 
 static LEGACY_MSHARC_INPUTS: [InputChannel; 4] = [
-    InputChannel { mute: Some(0), gain: Some(68), polarity: Some(188), peq: &LEGACY_MSHARC_IN_PEQ[0], fir: None },
-    InputChannel { mute: Some(1), gain: Some(69), polarity: Some(189), peq: &LEGACY_MSHARC_IN_PEQ[1], fir: None },
-    InputChannel { mute: Some(2), gain: Some(70), polarity: Some(190), peq: &LEGACY_MSHARC_IN_PEQ[2], fir: None },
-    InputChannel { mute: Some(3), gain: Some(71), polarity: Some(191), peq: &LEGACY_MSHARC_IN_PEQ[3], fir: None },
+    InputChannel {
+        mute: Some(0),
+        gain: Some(68),
+        polarity: Some(188),
+        peq: &LEGACY_MSHARC_IN_PEQ[0],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(1),
+        gain: Some(69),
+        polarity: Some(189),
+        peq: &LEGACY_MSHARC_IN_PEQ[1],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(2),
+        gain: Some(70),
+        polarity: Some(190),
+        peq: &LEGACY_MSHARC_IN_PEQ[2],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(3),
+        gain: Some(71),
+        polarity: Some(191),
+        peq: &LEGACY_MSHARC_IN_PEQ[3],
+        fir: None,
+    },
 ];
 
 static LEGACY_MSHARC_OUT_PEQ: [[PeqBand; 10]; 8] = [
@@ -649,52 +841,188 @@ static LEGACY_MSHARC_OUT_PEQ: [[PeqBand; 10]; 8] = [
 
 static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
     OutputChannel {
-        mute: 4, gain: 72, delay: Some(160), polarity: Some(193), peq: &LEGACY_MSHARC_OUT_PEQ[0],
-        fir: Some(FirFilter { bypass: 44, taps_count: 200, data_start: 201, max_taps: 2048 }),
+        mute: 4,
+        gain: 72,
+        delay: Some(160),
+        polarity: Some(193),
+        peq: &LEGACY_MSHARC_OUT_PEQ[0],
+        fir: Some(FirFilter {
+            bypass: 44,
+            taps_count: 200,
+            data_start: 201,
+            max_taps: 2048,
+        }),
         crossover: None,
-        compressor: Some(Compressor { bypass: 60, threshold: 112, gain: 113, ratio: 114, knee: 115, attack: 116, release: 117 }),
+        compressor: Some(Compressor {
+            bypass: 60,
+            threshold: 112,
+            gain: 113,
+            ratio: 114,
+            knee: 115,
+            attack: 116,
+            release: 117,
+        }),
     },
     OutputChannel {
-        mute: 5, gain: 73, delay: Some(161), polarity: Some(194), peq: &LEGACY_MSHARC_OUT_PEQ[1],
-        fir: Some(FirFilter { bypass: 45, taps_count: 2249, data_start: 2250, max_taps: 2048 }),
+        mute: 5,
+        gain: 73,
+        delay: Some(161),
+        polarity: Some(194),
+        peq: &LEGACY_MSHARC_OUT_PEQ[1],
+        fir: Some(FirFilter {
+            bypass: 45,
+            taps_count: 2249,
+            data_start: 2250,
+            max_taps: 2048,
+        }),
         crossover: None,
-        compressor: Some(Compressor { bypass: 61, threshold: 118, gain: 119, ratio: 120, knee: 121, attack: 122, release: 123 }),
+        compressor: Some(Compressor {
+            bypass: 61,
+            threshold: 118,
+            gain: 119,
+            ratio: 120,
+            knee: 121,
+            attack: 122,
+            release: 123,
+        }),
     },
     OutputChannel {
-        mute: 6, gain: 74, delay: Some(162), polarity: Some(195), peq: &LEGACY_MSHARC_OUT_PEQ[2],
-        fir: Some(FirFilter { bypass: 46, taps_count: 4298, data_start: 4299, max_taps: 2048 }),
+        mute: 6,
+        gain: 74,
+        delay: Some(162),
+        polarity: Some(195),
+        peq: &LEGACY_MSHARC_OUT_PEQ[2],
+        fir: Some(FirFilter {
+            bypass: 46,
+            taps_count: 4298,
+            data_start: 4299,
+            max_taps: 2048,
+        }),
         crossover: None,
-        compressor: Some(Compressor { bypass: 62, threshold: 124, gain: 125, ratio: 126, knee: 127, attack: 128, release: 129 }),
+        compressor: Some(Compressor {
+            bypass: 62,
+            threshold: 124,
+            gain: 125,
+            ratio: 126,
+            knee: 127,
+            attack: 128,
+            release: 129,
+        }),
     },
     OutputChannel {
-        mute: 7, gain: 75, delay: Some(163), polarity: Some(196), peq: &LEGACY_MSHARC_OUT_PEQ[3],
-        fir: Some(FirFilter { bypass: 47, taps_count: 6347, data_start: 6348, max_taps: 2048 }),
+        mute: 7,
+        gain: 75,
+        delay: Some(163),
+        polarity: Some(196),
+        peq: &LEGACY_MSHARC_OUT_PEQ[3],
+        fir: Some(FirFilter {
+            bypass: 47,
+            taps_count: 6347,
+            data_start: 6348,
+            max_taps: 2048,
+        }),
         crossover: None,
-        compressor: Some(Compressor { bypass: 63, threshold: 130, gain: 131, ratio: 132, knee: 133, attack: 134, release: 135 }),
+        compressor: Some(Compressor {
+            bypass: 63,
+            threshold: 130,
+            gain: 131,
+            ratio: 132,
+            knee: 133,
+            attack: 134,
+            release: 135,
+        }),
     },
     OutputChannel {
-        mute: 8, gain: 76, delay: Some(164), polarity: Some(197), peq: &LEGACY_MSHARC_OUT_PEQ[4],
-        fir: Some(FirFilter { bypass: 48, taps_count: 8396, data_start: 8397, max_taps: 2048 }),
+        mute: 8,
+        gain: 76,
+        delay: Some(164),
+        polarity: Some(197),
+        peq: &LEGACY_MSHARC_OUT_PEQ[4],
+        fir: Some(FirFilter {
+            bypass: 48,
+            taps_count: 8396,
+            data_start: 8397,
+            max_taps: 2048,
+        }),
         crossover: None,
-        compressor: Some(Compressor { bypass: 64, threshold: 136, gain: 137, ratio: 138, knee: 139, attack: 140, release: 141 }),
+        compressor: Some(Compressor {
+            bypass: 64,
+            threshold: 136,
+            gain: 137,
+            ratio: 138,
+            knee: 139,
+            attack: 140,
+            release: 141,
+        }),
     },
     OutputChannel {
-        mute: 9, gain: 77, delay: Some(165), polarity: Some(198), peq: &LEGACY_MSHARC_OUT_PEQ[5],
-        fir: Some(FirFilter { bypass: 49, taps_count: 10445, data_start: 10446, max_taps: 2048 }),
+        mute: 9,
+        gain: 77,
+        delay: Some(165),
+        polarity: Some(198),
+        peq: &LEGACY_MSHARC_OUT_PEQ[5],
+        fir: Some(FirFilter {
+            bypass: 49,
+            taps_count: 10445,
+            data_start: 10446,
+            max_taps: 2048,
+        }),
         crossover: None,
-        compressor: Some(Compressor { bypass: 65, threshold: 142, gain: 143, ratio: 144, knee: 145, attack: 146, release: 147 }),
+        compressor: Some(Compressor {
+            bypass: 65,
+            threshold: 142,
+            gain: 143,
+            ratio: 144,
+            knee: 145,
+            attack: 146,
+            release: 147,
+        }),
     },
     OutputChannel {
-        mute: 10, gain: 78, delay: Some(166), polarity: Some(199), peq: &LEGACY_MSHARC_OUT_PEQ[6],
-        fir: Some(FirFilter { bypass: 50, taps_count: 12494, data_start: 12495, max_taps: 2048 }),
+        mute: 10,
+        gain: 78,
+        delay: Some(166),
+        polarity: Some(199),
+        peq: &LEGACY_MSHARC_OUT_PEQ[6],
+        fir: Some(FirFilter {
+            bypass: 50,
+            taps_count: 12494,
+            data_start: 12495,
+            max_taps: 2048,
+        }),
         crossover: None,
-        compressor: Some(Compressor { bypass: 66, threshold: 148, gain: 149, ratio: 150, knee: 151, attack: 152, release: 153 }),
+        compressor: Some(Compressor {
+            bypass: 66,
+            threshold: 148,
+            gain: 149,
+            ratio: 150,
+            knee: 151,
+            attack: 152,
+            release: 153,
+        }),
     },
     OutputChannel {
-        mute: 11, gain: 79, delay: Some(167), polarity: None, peq: &LEGACY_MSHARC_OUT_PEQ[7],
-        fir: Some(FirFilter { bypass: 51, taps_count: 14543, data_start: 14544, max_taps: 2048 }),
+        mute: 11,
+        gain: 79,
+        delay: Some(167),
+        polarity: None,
+        peq: &LEGACY_MSHARC_OUT_PEQ[7],
+        fir: Some(FirFilter {
+            bypass: 51,
+            taps_count: 14543,
+            data_start: 14544,
+            max_taps: 2048,
+        }),
         crossover: None,
-        compressor: Some(Compressor { bypass: 67, threshold: 154, gain: 155, ratio: 156, knee: 157, attack: 158, release: 159 }),
+        compressor: Some(Compressor {
+            bypass: 67,
+            threshold: 154,
+            gain: 155,
+            ratio: 156,
+            knee: 157,
+            attack: 158,
+            release: 159,
+        }),
     },
 ];
 
@@ -722,14 +1050,62 @@ pub static LEGACY_MSHARC_4X8: DspTable = DspTable {
 };
 
 static LEGACY_DDRC88BM_INPUTS: [InputChannel; 8] = [
-    InputChannel { mute: Some(0), gain: Some(8), polarity: None, peq: &[], fir: None },
-    InputChannel { mute: Some(1), gain: Some(9), polarity: None, peq: &[], fir: None },
-    InputChannel { mute: Some(2), gain: Some(10), polarity: None, peq: &[], fir: None },
-    InputChannel { mute: Some(3), gain: Some(11), polarity: None, peq: &[], fir: None },
-    InputChannel { mute: Some(4), gain: Some(12), polarity: None, peq: &[], fir: None },
-    InputChannel { mute: Some(5), gain: Some(13), polarity: None, peq: &[], fir: None },
-    InputChannel { mute: Some(6), gain: Some(14), polarity: None, peq: &[], fir: None },
-    InputChannel { mute: Some(7), gain: Some(15), polarity: None, peq: &[], fir: None },
+    InputChannel {
+        mute: Some(0),
+        gain: Some(8),
+        polarity: None,
+        peq: &[],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(1),
+        gain: Some(9),
+        polarity: None,
+        peq: &[],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(2),
+        gain: Some(10),
+        polarity: None,
+        peq: &[],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(3),
+        gain: Some(11),
+        polarity: None,
+        peq: &[],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(4),
+        gain: Some(12),
+        polarity: None,
+        peq: &[],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(5),
+        gain: Some(13),
+        polarity: None,
+        peq: &[],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(6),
+        gain: Some(14),
+        polarity: None,
+        peq: &[],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(7),
+        gain: Some(15),
+        polarity: None,
+        peq: &[],
+        fir: None,
+    },
 ];
 
 static LEGACY_DDRC88BM_OUT_PEQ: [[PeqBand; 10]; 8] = [
@@ -752,7 +1128,10 @@ macro_rules! legacy_ddrc88bm_output {
             polarity: Some($base + 13),
             peq: $peq,
             fir: None,
-            crossover: Some(Crossover { lpf_addr: $lpf, hpf_addr: $hpf }),
+            crossover: Some(Crossover {
+                lpf_addr: $lpf,
+                hpf_addr: $hpf,
+            }),
             compressor: Some(Compressor {
                 bypass: $base + 1,
                 threshold: $base + 3,
@@ -831,14 +1210,62 @@ static LEGACY_CDSP_8X12_INPUT_PEQ: [[PeqBand; 10]; 8] = [
 ];
 
 static LEGACY_CDSP_8X12_INPUTS: [InputChannel; 8] = [
-    InputChannel { mute: Some(320), gain: Some(321), polarity: Some(323), peq: &LEGACY_CDSP_8X12_INPUT_PEQ[0], fir: None },
-    InputChannel { mute: Some(374), gain: Some(375), polarity: Some(377), peq: &LEGACY_CDSP_8X12_INPUT_PEQ[1], fir: None },
-    InputChannel { mute: Some(428), gain: Some(429), polarity: Some(431), peq: &LEGACY_CDSP_8X12_INPUT_PEQ[2], fir: None },
-    InputChannel { mute: Some(482), gain: Some(483), polarity: Some(485), peq: &LEGACY_CDSP_8X12_INPUT_PEQ[3], fir: None },
-    InputChannel { mute: Some(536), gain: Some(537), polarity: Some(539), peq: &LEGACY_CDSP_8X12_INPUT_PEQ[4], fir: None },
-    InputChannel { mute: Some(590), gain: Some(591), polarity: Some(593), peq: &LEGACY_CDSP_8X12_INPUT_PEQ[5], fir: None },
-    InputChannel { mute: Some(644), gain: Some(645), polarity: Some(647), peq: &LEGACY_CDSP_8X12_INPUT_PEQ[6], fir: None },
-    InputChannel { mute: Some(698), gain: Some(699), polarity: Some(701), peq: &LEGACY_CDSP_8X12_INPUT_PEQ[7], fir: None },
+    InputChannel {
+        mute: Some(320),
+        gain: Some(321),
+        polarity: Some(323),
+        peq: &LEGACY_CDSP_8X12_INPUT_PEQ[0],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(374),
+        gain: Some(375),
+        polarity: Some(377),
+        peq: &LEGACY_CDSP_8X12_INPUT_PEQ[1],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(428),
+        gain: Some(429),
+        polarity: Some(431),
+        peq: &LEGACY_CDSP_8X12_INPUT_PEQ[2],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(482),
+        gain: Some(483),
+        polarity: Some(485),
+        peq: &LEGACY_CDSP_8X12_INPUT_PEQ[3],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(536),
+        gain: Some(537),
+        polarity: Some(539),
+        peq: &LEGACY_CDSP_8X12_INPUT_PEQ[4],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(590),
+        gain: Some(591),
+        polarity: Some(593),
+        peq: &LEGACY_CDSP_8X12_INPUT_PEQ[5],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(644),
+        gain: Some(645),
+        polarity: Some(647),
+        peq: &LEGACY_CDSP_8X12_INPUT_PEQ[6],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(698),
+        gain: Some(699),
+        polarity: Some(701),
+        peq: &LEGACY_CDSP_8X12_INPUT_PEQ[7],
+        fir: None,
+    },
 ];
 
 static LEGACY_CDSP_8X12_OUT_PEQ: [[PeqBand; 10]; 12] = [
@@ -865,7 +1292,10 @@ macro_rules! legacy_cdsp_8x12_output {
             polarity: Some($base + 12),
             peq: $peq,
             fir: None,
-            crossover: Some(Crossover { lpf_addr: $lpf, hpf_addr: $hpf }),
+            crossover: Some(Crossover {
+                lpf_addr: $lpf,
+                hpf_addr: $hpf,
+            }),
             compressor: Some(Compressor {
                 bypass: $base + 1,
                 threshold: $base + 3,
@@ -935,16 +1365,76 @@ static LEGACY_10X10HD_INPUT_PEQ: [[PeqBand; 6]; 10] = [
 ];
 
 static LEGACY_10X10HD_INPUTS: [InputChannel; 10] = [
-    InputChannel { mute: Some(59), gain: Some(11), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[0], fir: None },
-    InputChannel { mute: Some(60), gain: Some(12), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[1], fir: None },
-    InputChannel { mute: Some(61), gain: Some(13), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[2], fir: None },
-    InputChannel { mute: Some(62), gain: Some(14), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[3], fir: None },
-    InputChannel { mute: Some(63), gain: Some(15), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[4], fir: None },
-    InputChannel { mute: Some(64), gain: Some(16), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[5], fir: None },
-    InputChannel { mute: Some(65), gain: Some(17), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[6], fir: None },
-    InputChannel { mute: Some(66), gain: Some(18), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[7], fir: None },
-    InputChannel { mute: Some(67), gain: Some(54), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[8], fir: None },
-    InputChannel { mute: Some(68), gain: Some(55), polarity: None, peq: &LEGACY_10X10HD_INPUT_PEQ[9], fir: None },
+    InputChannel {
+        mute: Some(59),
+        gain: Some(11),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[0],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(60),
+        gain: Some(12),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[1],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(61),
+        gain: Some(13),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[2],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(62),
+        gain: Some(14),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[3],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(63),
+        gain: Some(15),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[4],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(64),
+        gain: Some(16),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[5],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(65),
+        gain: Some(17),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[6],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(66),
+        gain: Some(18),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[7],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(67),
+        gain: Some(54),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[8],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(68),
+        gain: Some(55),
+        polarity: None,
+        peq: &LEGACY_10X10HD_INPUT_PEQ[9],
+        fir: None,
+    },
 ];
 
 static LEGACY_10X10HD_OUT_PEQ: [[PeqBand; 6]; 10] = [
@@ -969,7 +1459,10 @@ macro_rules! legacy_10x10hd_output {
             polarity: Some($polarity),
             peq: $peq,
             fir: None,
-            crossover: Some(Crossover { lpf_addr: $lpf, hpf_addr: $hpf }),
+            crossover: Some(Crossover {
+                lpf_addr: $lpf,
+                hpf_addr: $hpf,
+            }),
             compressor: None,
         }
     };
@@ -1019,10 +1512,34 @@ static LEGACY_4X10HD_INPUT_PEQ: [[PeqBand; 5]; 4] = [
 ];
 
 static LEGACY_4X10HD_INPUTS: [InputChannel; 4] = [
-    InputChannel { mute: Some(53), gain: Some(11), polarity: None, peq: &LEGACY_4X10HD_INPUT_PEQ[0], fir: None },
-    InputChannel { mute: Some(54), gain: Some(12), polarity: None, peq: &LEGACY_4X10HD_INPUT_PEQ[1], fir: None },
-    InputChannel { mute: Some(55), gain: Some(13), polarity: None, peq: &LEGACY_4X10HD_INPUT_PEQ[2], fir: None },
-    InputChannel { mute: Some(56), gain: Some(14), polarity: None, peq: &LEGACY_4X10HD_INPUT_PEQ[3], fir: None },
+    InputChannel {
+        mute: Some(53),
+        gain: Some(11),
+        polarity: None,
+        peq: &LEGACY_4X10HD_INPUT_PEQ[0],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(54),
+        gain: Some(12),
+        polarity: None,
+        peq: &LEGACY_4X10HD_INPUT_PEQ[1],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(55),
+        gain: Some(13),
+        polarity: None,
+        peq: &LEGACY_4X10HD_INPUT_PEQ[2],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(56),
+        gain: Some(14),
+        polarity: None,
+        peq: &LEGACY_4X10HD_INPUT_PEQ[3],
+        fir: None,
+    },
 ];
 
 static LEGACY_4X10HD_OUT_PEQ: [[PeqBand; 5]; 10] = [
@@ -1047,7 +1564,10 @@ macro_rules! legacy_4x10hd_output {
             polarity: Some($polarity),
             peq: $peq,
             fir: None,
-            crossover: Some(Crossover { lpf_addr: $lpf, hpf_addr: $hpf }),
+            crossover: Some(Crossover {
+                lpf_addr: $lpf,
+                hpf_addr: $hpf,
+            }),
             compressor: None,
         }
     };
@@ -1089,14 +1609,23 @@ pub static LEGACY_4X10HD: DspTable = DspTable {
     bass_management: None,
 };
 
-static LEGACY_M2X4_INPUT_PEQ: [[PeqBand; 6]; 2] = [
-    peq_bands_6(12),
-    peq_bands_6(42),
-];
+static LEGACY_M2X4_INPUT_PEQ: [[PeqBand; 6]; 2] = [peq_bands_6(12), peq_bands_6(42)];
 
 static LEGACY_M2X4_INPUTS: [InputChannel; 2] = [
-    InputChannel { mute: Some(7), gain: Some(10), polarity: Some(8), peq: &LEGACY_M2X4_INPUT_PEQ[0], fir: None },
-    InputChannel { mute: Some(6), gain: Some(11), polarity: Some(9), peq: &LEGACY_M2X4_INPUT_PEQ[1], fir: None },
+    InputChannel {
+        mute: Some(7),
+        gain: Some(10),
+        polarity: Some(8),
+        peq: &LEGACY_M2X4_INPUT_PEQ[0],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(6),
+        gain: Some(11),
+        polarity: Some(9),
+        peq: &LEGACY_M2X4_INPUT_PEQ[1],
+        fir: None,
+    },
 ];
 
 static LEGACY_M2X4_OUT_PEQ: [[PeqBand; 6]; 4] = [
@@ -1115,7 +1644,10 @@ macro_rules! legacy_m2x4_output {
             polarity: Some($polarity),
             peq: $peq,
             fir: None,
-            crossover: Some(Crossover { lpf_addr: $lpf, hpf_addr: $hpf }),
+            crossover: Some(Crossover {
+                lpf_addr: $lpf,
+                hpf_addr: $hpf,
+            }),
             compressor: None,
         }
     };
@@ -1159,10 +1691,34 @@ static LEGACY_NANODIGI_INPUT_PEQ: [[PeqBand; 5]; 4] = [
 ];
 
 static LEGACY_NANODIGI_INPUTS: [InputChannel; 4] = [
-    InputChannel { mute: Some(53), gain: Some(46), polarity: None, peq: &LEGACY_NANODIGI_INPUT_PEQ[0], fir: None },
-    InputChannel { mute: Some(54), gain: Some(47), polarity: None, peq: &LEGACY_NANODIGI_INPUT_PEQ[1], fir: None },
-    InputChannel { mute: Some(55), gain: Some(48), polarity: None, peq: &LEGACY_NANODIGI_INPUT_PEQ[2], fir: None },
-    InputChannel { mute: Some(56), gain: Some(49), polarity: None, peq: &LEGACY_NANODIGI_INPUT_PEQ[3], fir: None },
+    InputChannel {
+        mute: Some(53),
+        gain: Some(46),
+        polarity: None,
+        peq: &LEGACY_NANODIGI_INPUT_PEQ[0],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(54),
+        gain: Some(47),
+        polarity: None,
+        peq: &LEGACY_NANODIGI_INPUT_PEQ[1],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(55),
+        gain: Some(48),
+        polarity: None,
+        peq: &LEGACY_NANODIGI_INPUT_PEQ[2],
+        fir: None,
+    },
+    InputChannel {
+        mute: Some(56),
+        gain: Some(49),
+        polarity: None,
+        peq: &LEGACY_NANODIGI_INPUT_PEQ[3],
+        fir: None,
+    },
 ];
 
 static LEGACY_NANODIGI_OUT_PEQ: [[PeqBand; 5]; 10] = [
@@ -1187,21 +1743,88 @@ macro_rules! legacy_nanodigi_output {
             polarity: Some($polarity),
             peq: $peq,
             fir: None,
-            crossover: Some(Crossover { lpf_addr: $lpf, hpf_addr: $hpf }),
+            crossover: Some(Crossover {
+                lpf_addr: $lpf,
+                hpf_addr: $hpf,
+            }),
             compressor: None,
         }
     };
 }
 
 static LEGACY_NANODIGI_OUTPUTS: [OutputChannel; 10] = [
-    legacy_nanodigi_output!(879, 896, Some(859), 869, &LEGACY_NANODIGI_OUT_PEQ[0], 569, 589),
-    legacy_nanodigi_output!(880, 895, Some(866), 877, &LEGACY_NANODIGI_OUT_PEQ[1], 529, 549),
-    legacy_nanodigi_output!(881, 894, Some(860), 878, &LEGACY_NANODIGI_OUT_PEQ[2], 209, 229),
-    legacy_nanodigi_output!(888, 889, Some(861), 876, &LEGACY_NANODIGI_OUT_PEQ[3], 489, 509),
-    legacy_nanodigi_output!(882, 890, Some(862), 875, &LEGACY_NANODIGI_OUT_PEQ[4], 249, 269),
-    legacy_nanodigi_output!(883, 891, Some(863), 874, &LEGACY_NANODIGI_OUT_PEQ[5], 289, 309),
-    legacy_nanodigi_output!(884, 892, Some(864), 873, &LEGACY_NANODIGI_OUT_PEQ[6], 329, 349),
-    legacy_nanodigi_output!(885, 893, Some(865), 872, &LEGACY_NANODIGI_OUT_PEQ[7], 369, 389),
+    legacy_nanodigi_output!(
+        879,
+        896,
+        Some(859),
+        869,
+        &LEGACY_NANODIGI_OUT_PEQ[0],
+        569,
+        589
+    ),
+    legacy_nanodigi_output!(
+        880,
+        895,
+        Some(866),
+        877,
+        &LEGACY_NANODIGI_OUT_PEQ[1],
+        529,
+        549
+    ),
+    legacy_nanodigi_output!(
+        881,
+        894,
+        Some(860),
+        878,
+        &LEGACY_NANODIGI_OUT_PEQ[2],
+        209,
+        229
+    ),
+    legacy_nanodigi_output!(
+        888,
+        889,
+        Some(861),
+        876,
+        &LEGACY_NANODIGI_OUT_PEQ[3],
+        489,
+        509
+    ),
+    legacy_nanodigi_output!(
+        882,
+        890,
+        Some(862),
+        875,
+        &LEGACY_NANODIGI_OUT_PEQ[4],
+        249,
+        269
+    ),
+    legacy_nanodigi_output!(
+        883,
+        891,
+        Some(863),
+        874,
+        &LEGACY_NANODIGI_OUT_PEQ[5],
+        289,
+        309
+    ),
+    legacy_nanodigi_output!(
+        884,
+        892,
+        Some(864),
+        873,
+        &LEGACY_NANODIGI_OUT_PEQ[6],
+        329,
+        349
+    ),
+    legacy_nanodigi_output!(
+        885,
+        893,
+        Some(865),
+        872,
+        &LEGACY_NANODIGI_OUT_PEQ[7],
+        369,
+        389
+    ),
     legacy_nanodigi_output!(870, 886, None, 867, &LEGACY_NANODIGI_OUT_PEQ[8], 409, 429),
     legacy_nanodigi_output!(871, 887, None, 868, &LEGACY_NANODIGI_OUT_PEQ[9], 449, 469),
 ];

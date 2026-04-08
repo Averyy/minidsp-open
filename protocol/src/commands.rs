@@ -163,7 +163,12 @@ pub fn write_dsp_u32(addr: u16, value: u32, save: bool) -> Vec<u8> {
 /// Maximum count is 14 per request.
 pub fn read_floats(addr: u16, count: u8, dialect: &Dialect) -> Vec<u8> {
     let _ = dialect;
-    vec![CMD_READ_FLOATS, (addr >> 8) as u8, addr as u8, count.min(14)]
+    vec![
+        CMD_READ_FLOATS,
+        (addr >> 8) as u8,
+        addr as u8,
+        count.min(14),
+    ]
 }
 
 /// Build a WriteBiquad command. Writes 5 biquad coefficients at the given address.
@@ -278,13 +283,9 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
             }
         }
 
-        CMD_READ_FLOATS => {
-            parse_floats_response(data, dialect)
-        }
+        CMD_READ_FLOATS => parse_floats_response(data, dialect),
 
-        CMD_READ_FLASH => {
-            Response::FlashData(data[1..].to_vec())
-        }
+        CMD_READ_FLASH => Response::FlashData(data[1..].to_vec()),
 
         CMD_FIR_LOAD_START => {
             if data.len() >= 3 {
@@ -323,11 +324,7 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
 /// Real MiniDSP hardware may echo the flash address bytes in `ReadFlash`
 /// responses (`[0x05, addr_hi, addr_lo, data...]`), while the simulator and
 /// older assumptions use `[0x05, data...]`. This helper accepts both forms.
-pub fn parse_response_for_request(
-    request: &[u8],
-    data: &[u8],
-    dialect: &Dialect,
-) -> Response {
+pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect) -> Response {
     if request.first() == Some(&CMD_READ_FLASH) && data.first() == Some(&CMD_READ_FLASH) {
         if request.len() >= 4 && data.len() >= 2 {
             let addr_hi = request[1];
@@ -363,8 +360,7 @@ pub fn parse_response_for_request(
                 return Response::Unknown(data.to_vec());
             }
 
-            if let Some(values) =
-                decode_float_block_with_offset(remaining, count, dialect, request)
+            if let Some(values) = decode_float_block_with_offset(remaining, count, dialect, request)
             {
                 return Response::Floats(values);
             }
@@ -384,8 +380,7 @@ pub fn parse_response_for_request(
                 return Response::Unknown(data.to_vec());
             }
 
-            if let Some(values) =
-                decode_float_block_with_offset(remaining, count, dialect, request)
+            if let Some(values) = decode_float_block_with_offset(remaining, count, dialect, request)
             {
                 return Response::Floats(values);
             }
@@ -626,7 +621,10 @@ mod tests {
     #[test]
     fn write_dsp_u32_new_dialect() {
         let cmd = write_dsp_u32(0x0042, 2, true);
-        assert_eq!(cmd, vec![CMD_WRITE_DSP, 0x80, 0x00, 0x42, 0x02, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            cmd,
+            vec![CMD_WRITE_DSP, 0x80, 0x00, 0x42, 0x02, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -818,8 +816,8 @@ mod tests {
     fn parse_read_floats_rejects_live_config_junk_for_single_value() {
         let req = read_floats(0x0fc2, 1, &Dialect::NEW);
         let data = [
-            0x14, 0x0f, 0xc2, 0x00, 0x01, 0x16, 0x01, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6,
-            0x08, 0x5b, 0x01, 0xdc, 0x5b, 0x01,
+            0x14, 0x0f, 0xc2, 0x00, 0x01, 0x16, 0x01, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6, 0x08,
+            0x5b, 0x01, 0xdc, 0x5b, 0x01,
         ];
         let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
         assert!(matches!(resp, Response::Unknown(_)));
@@ -829,9 +827,9 @@ mod tests {
     fn parse_read_floats_rejects_live_config_junk_for_peq_read() {
         let req = read_floats(0x0fcc, 5, &Dialect::NEW);
         let data = [
-            0x14, 0x0f, 0xcc, 0x00, 0x05, 0x16, 0x01, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6,
-            0x08, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc,
-            0x5b, 0x01, 0xdc, 0x5b, 0x01,
+            0x14, 0x0f, 0xcc, 0x00, 0x05, 0x16, 0x01, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6, 0x08,
+            0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01,
+            0xdc, 0x5b, 0x01,
         ];
         let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
         assert!(matches!(resp, Response::Unknown(_)));
@@ -841,10 +839,10 @@ mod tests {
     fn parse_read_floats_rejects_echoed_zero_header_junk() {
         let req = read_floats(0x0fc2, 1, &Dialect::NEW);
         let data = [
-            0x14, 0x0f, 0xc2, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6,
-            0x08, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdb, 0x30, 0x96, 0xdb,
-            0x10, 0x78, 0xdb, 0x10, 0x5a, 0x5b, 0x3c, 0x5b, 0x9e, 0xf6, 0x3f, 0xf6, 0x21,
-            0xf6, 0x08, 0x5b, 0x01, 0xcd, 0xd8,
+            0x14, 0x0f, 0xc2, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6, 0x08,
+            0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdc, 0x5b, 0x01, 0xdb, 0x30, 0x96, 0xdb, 0x10, 0x78,
+            0xdb, 0x10, 0x5a, 0x5b, 0x3c, 0x5b, 0x9e, 0xf6, 0x3f, 0xf6, 0x21, 0xf6, 0x08, 0x5b,
+            0x01, 0xcd, 0xd8,
         ];
         let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
         assert!(matches!(resp, Response::Unknown(_)));
@@ -862,8 +860,15 @@ mod tests {
     #[test]
     fn parse_ack_responses() {
         // All write commands return [0x01] ACK
-        for &cmd in &[0x01, CMD_SET_VOLUME, CMD_SET_MUTE, CMD_SET_SOURCE,
-                       CMD_WRITE_DSP, CMD_WRITE_BIQUAD, CMD_BYPASS_FILTER] {
+        for &cmd in &[
+            0x01,
+            CMD_SET_VOLUME,
+            CMD_SET_MUTE,
+            CMD_SET_SOURCE,
+            CMD_WRITE_DSP,
+            CMD_WRITE_BIQUAD,
+            CMD_BYPASS_FILTER,
+        ] {
             let resp = parse_response(&[cmd], &Dialect::NEW);
             assert_eq!(resp, Response::Ack, "cmd 0x{:02x} should parse as Ack", cmd);
         }

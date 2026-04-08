@@ -32,7 +32,11 @@ pub const HID_DATA_SIZE: usize = 64;
 /// # Panics
 /// Panics if payload exceeds 254 bytes (length field is self-inclusive u8).
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    assert!(payload.len() <= 254, "payload too large for frame encoding: {} bytes", payload.len());
+    assert!(
+        payload.len() <= 254,
+        "payload too large for frame encoding: {} bytes",
+        payload.len()
+    );
     let len = (payload.len() + 1) as u8; // self-inclusive length
     let mut frame = Vec::with_capacity(payload.len() + 2);
     frame.push(len);
@@ -212,7 +216,12 @@ mod tests {
         report[12..16].copy_from_slice(&[0x21, 0xf6, 0x08, 0x5b]); // garbage after frame
 
         let decoded = decode_hid_response(&report).unwrap();
-        assert_eq!(decoded, vec![0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            decoded,
+            vec![
+                0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            ]
+        );
     }
 
     #[test]
@@ -226,14 +235,15 @@ mod tests {
     fn hid_response_with_leading_zero_report_id() {
         let mut report = [0u8; HID_DATA_SIZE];
         report[..13].copy_from_slice(&[
-            0x00, 0x0c, 0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,
+            0x00, 0x0c, 0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]);
 
         let decoded = decode_hid_response(&report).unwrap();
         assert_eq!(
             decoded,
-            vec![0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            vec![
+                0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            ]
         );
     }
 

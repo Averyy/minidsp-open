@@ -27,6 +27,7 @@ const NVS_BASE_URL_KEY: &str = "base_url";
 
 /// Chunk size for streaming downloads to flash (4KB).
 const DOWNLOAD_CHUNK: usize = 4096;
+const UPDATER_THREAD_STACK_BYTES: usize = 24 * 1024;
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Result of an update check.
@@ -160,13 +161,11 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
 }
 
 /// Try to run an update check, skipping if another update is already in progress.
-pub fn try_check_and_update(
-    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
-) -> UpdateAttempt {
+pub fn try_check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> UpdateAttempt {
     let _guard = match UpdateRunGuard::acquire() {
         Some(guard) => guard,
         None => {
-        return UpdateAttempt::Busy;
+            return UpdateAttempt::Busy;
         }
     };
 
@@ -194,7 +193,7 @@ pub fn trigger_background_refresh(
 
     match std::thread::Builder::new()
         .name("beq_refresh".into())
-        .stack_size(32768)
+        .stack_size(UPDATER_THREAD_STACK_BYTES)
         .spawn(move || {
             info!("starting background catalogue refresh: {reason}");
             let _guard = guard;
@@ -214,7 +213,7 @@ pub fn start_background_updater(
 ) -> Result<(), std::io::Error> {
     std::thread::Builder::new()
         .name("beq_update".into())
-        .stack_size(32768)
+        .stack_size(UPDATER_THREAD_STACK_BYTES)
         .spawn(move || {
             // Wait for WiFi to stabilize before hitting the network.
             std::thread::sleep(INITIAL_CHECK_DELAY);
@@ -328,14 +327,22 @@ fn download_file(
 
     if total != info.size {
         let _ = std::fs::remove_file(&path);
-        return Err(format!("size mismatch for {filename}: got {total}, expected {}", info.size).into());
+        return Err(format!(
+            "size mismatch for {filename}: got {total}, expected {}",
+            info.size
+        )
+        .into());
     }
 
     // Verify SHA-256 integrity
     let digest = hasher.finish_hex();
     if digest != info.sha256 {
         let _ = std::fs::remove_file(&path);
-        return Err(format!("SHA-256 mismatch for {filename}: got {digest}, expected {}", info.sha256).into());
+        return Err(format!(
+            "SHA-256 mismatch for {filename}: got {digest}, expected {}",
+            info.sha256
+        )
+        .into());
     }
 
     Ok(())
@@ -368,9 +375,7 @@ fn fetch_to_memory(url: &str, max_size: usize) -> Result<Vec<u8>, Box<dyn std::e
 }
 
 /// Create an HTTP connection with TLS cert bundle for HTTPS.
-fn create_connection(
-    timeout: Duration,
-) -> Result<EspHttpConnection, Box<dyn std::error::Error>> {
+fn create_connection(timeout: Duration) -> Result<EspHttpConnection, Box<dyn std::error::Error>> {
     let config = Configuration {
         buffer_size: Some(DOWNLOAD_CHUNK),
         timeout: Some(timeout),

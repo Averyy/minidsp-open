@@ -139,13 +139,9 @@ enum Command {
         state: String,
     },
     /// Set input source
-    Source {
-        name: String,
-    },
+    Source { name: String },
     /// Switch preset (0-3)
-    Config {
-        preset: u8,
-    },
+    Config { preset: u8 },
     /// Set Dirac Live bypass (on/off/toggle)
     Dirac {
         /// on, off, or toggle
@@ -204,9 +200,7 @@ enum ChannelCommand {
         state: bool,
     },
     /// Set channel delay in milliseconds
-    Delay {
-        ms: f32,
-    },
+    Delay { ms: f32 },
     /// Invert channel polarity
     Invert {
         #[arg(value_parser = parse_on_off)]
@@ -347,8 +341,7 @@ async fn main() {
     let filter = if let Some(ref f) = cli.log_filter {
         tracing_subscriber::EnvFilter::new(f)
     } else {
-        tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive(default_level.into())
+        tracing_subscriber::EnvFilter::from_default_env().add_directive(default_level.into())
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
@@ -370,7 +363,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Handle server mode
-    if let Some(Command::Server { ref bind, ref config, ref advertise, ref ip }) = cli.command {
+    if let Some(Command::Server {
+        ref bind,
+        ref config,
+        ref advertise,
+        ref ip,
+    }) = cli.command
+    {
         return cli::server(bind, config.as_deref(), advertise.as_deref(), ip.as_deref()).await;
     }
 
@@ -393,11 +392,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub(crate) async fn apply_force_kind(client: &mut MiniDspClient, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn apply_force_kind(
+    client: &mut MiniDspClient,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref kind) = cli.force_kind {
         if let Some((hw_id, dsp_version)) = resolve_force_kind(kind) {
             let profile = minidsp_protocol::device::probe::identify(hw_id, dsp_version);
-            tracing::info!("forcing device kind to {} (hw_id={}, dsp={})", profile.name, hw_id, dsp_version);
+            tracing::info!(
+                "forcing device kind to {} (hw_id={}, dsp={})",
+                profile.name,
+                hw_id,
+                dsp_version
+            );
             client.override_profile(profile).await;
         } else {
             return Err(format!("unknown device kind '{kind}'").into());
@@ -406,7 +413,10 @@ pub(crate) async fn apply_force_kind(client: &mut MiniDspClient, cli: &Cli) -> R
     Ok(())
 }
 
-async fn execute_command(client: &mut MiniDspClient, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn execute_command(
+    client: &mut MiniDspClient,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
         None | Some(Command::Status) => {
             cli::status(client, cli.output.as_deref()).await?;
@@ -433,7 +443,10 @@ async fn execute_command(client: &mut MiniDspClient, cli: &Cli) -> Result<(), Bo
         Some(Command::Source { name }) => {
             let src = Source::from_str_lowercase(name)
                 .ok_or_else(|| format!("unknown source '{name}'"))?;
-            let idx = client.profile().sources.index_for_source(src)
+            let idx = client
+                .profile()
+                .sources
+                .index_for_source(src)
                 .ok_or_else(|| format!("source '{name}' not available on this device"))?;
             client.set_source(idx).await?;
         }
@@ -456,50 +469,61 @@ async fn execute_command(client: &mut MiniDspClient, cli: &Cli) -> Result<(), Bo
         Some(Command::Output { channel, cmd }) => {
             cli::channel_command(client, false, *channel, cmd.clone()).await?;
         }
-        Some(Command::Debug { cmd }) => {
-            match cmd.clone() {
-                DebugCommand::Send { hex } => {
-                    if hex.len() % 2 != 0 {
-                        return Err("hex string must have even length".into());
-                    }
-                    let bytes: Vec<u8> = hex.as_bytes().chunks(2)
-                        .map(|c| {
-                            let s = std::str::from_utf8(c).map_err(|_| "invalid UTF-8 in hex")?;
-                            u8::from_str_radix(s, 16).map_err(|_| format!("invalid hex byte '{s}'"))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let resp = client.raw_command(bytes, minidsp::queue::Priority::Normal).await?;
-                    match resp {
-                        minidsp_protocol::commands::Response::Raw(data) => {
-                            let hex_str: String = data.iter().map(|b| format!("{b:02x}")).collect();
-                            println!("{hex_str}");
-                        }
-                        other => println!("{other:?}"),
-                    }
+        Some(Command::Debug { cmd }) => match cmd.clone() {
+            DebugCommand::Send { hex } => {
+                if hex.len() % 2 != 0 {
+                    return Err("hex string must have even length".into());
                 }
-                DebugCommand::Id => {
-                    let hw = client.hw_id();
-                    println!("hw_id={}, fw={}.{}, dsp={}, serial={}",
-                        hw.hw_id, hw.fw_major, hw.fw_minor,
-                        client.dsp_version(), client.serial());
-                }
-                DebugCommand::DumpFloat { addr, count } => {
-                    let count = count.min(14);
-                    let values = client.read_floats(addr, count).await?;
-                    for (i, v) in values.iter().enumerate() {
-                        println!("  [{:04X}+{}] = {v}", addr, i);
+                let bytes: Vec<u8> = hex
+                    .as_bytes()
+                    .chunks(2)
+                    .map(|c| {
+                        let s = std::str::from_utf8(c).map_err(|_| "invalid UTF-8 in hex")?;
+                        u8::from_str_radix(s, 16).map_err(|_| format!("invalid hex byte '{s}'"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let resp = client
+                    .raw_command(bytes, minidsp::queue::Priority::Normal)
+                    .await?;
+                match resp {
+                    minidsp_protocol::commands::Response::Raw(data) => {
+                        let hex_str: String = data.iter().map(|b| format!("{b:02x}")).collect();
+                        println!("{hex_str}");
                     }
+                    other => println!("{other:?}"),
                 }
             }
-        }
+            DebugCommand::Id => {
+                let hw = client.hw_id();
+                println!(
+                    "hw_id={}, fw={}.{}, dsp={}, serial={}",
+                    hw.hw_id,
+                    hw.fw_major,
+                    hw.fw_minor,
+                    client.dsp_version(),
+                    client.serial()
+                );
+            }
+            DebugCommand::DumpFloat { addr, count } => {
+                let count = count.min(14);
+                let values = client.read_floats(addr, count).await?;
+                for (i, v) in values.iter().enumerate() {
+                    println!("  [{:04X}+{}] = {v}", addr, i);
+                }
+            }
+        },
         Some(Command::Probe { .. }) | Some(Command::Server { .. }) => unreachable!(),
     }
     Ok(())
 }
 
-pub(crate) async fn connect_all_local(cli: &Cli) -> Result<Vec<MiniDspClient>, Box<dyn std::error::Error>> {
+pub(crate) async fn connect_all_local(
+    cli: &Cli,
+) -> Result<Vec<MiniDspClient>, Box<dyn std::error::Error>> {
     if has_non_local_transport(cli) {
-        return Err("--all-local-devices only supports local USB discovery in this implementation".into());
+        return Err(
+            "--all-local-devices only supports local USB discovery in this implementation".into(),
+        );
     }
 
     let devices = minidsp::transport::hid::enumerate()?;
@@ -518,7 +542,8 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
     let env_sock = std::env::var("MINIDSP_SOCK").ok();
     let env_tcp = std::env::var("MINIDSP_TCP").ok();
     let env_usb = std::env::var("MINIDSP_USB").ok();
-    let env_index: Option<usize> = std::env::var("MINIDSP_INDEX").ok()
+    let env_index: Option<usize> = std::env::var("MINIDSP_INDEX")
+        .ok()
         .and_then(|s| s.parse().ok());
     // MINIDSP_LOG sets the log filter (overrides -v/--log)
     if let Ok(log_env) = std::env::var("MINIDSP_LOG") {
@@ -543,7 +568,12 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
         {
             let devices = discover_daemon_unix(path).await?;
             if device_idx >= devices.len() {
-                return Err(format!("device index {device_idx} out of range (found {} device{})", devices.len(), if devices.len() == 1 { "" } else { "s" }).into());
+                return Err(format!(
+                    "device index {device_idx} out of range (found {} device{})",
+                    devices.len(),
+                    if devices.len() == 1 { "" } else { "s" }
+                )
+                .into());
             }
             let transport = WsTransport::connect_unix(path, device_idx).await?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
@@ -569,7 +599,12 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
             if !is_direct_ws_endpoint(url) {
                 let devices = discover_daemon_tcp(url).await?;
                 if device_idx >= devices.len() {
-                    return Err(format!("device index {device_idx} out of range (found {} device{})", devices.len(), if devices.len() == 1 { "" } else { "s" }).into());
+                    return Err(format!(
+                        "device index {device_idx} out of range (found {} device{})",
+                        devices.len(),
+                        if devices.len() == 1 { "" } else { "s" }
+                    )
+                    .into());
                 }
             }
             let transport = WsTransport::connect(url, device_idx).await?;
@@ -591,7 +626,12 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
     if let Some(url) = cli.daemon_url.as_deref().or(env_daemon_url.as_deref()) {
         let devices = discover_daemon_tcp(url).await?;
         if device_idx >= devices.len() {
-            return Err(format!("device index {device_idx} out of range (found {} device{})", devices.len(), if devices.len() == 1 { "" } else { "s" }).into());
+            return Err(format!(
+                "device index {device_idx} out of range (found {} device{})",
+                devices.len(),
+                if devices.len() == 1 { "" } else { "s" }
+            )
+            .into());
         }
         let transport = WsTransport::connect(url, device_idx).await?;
         return Ok(MiniDspClient::connect(Box::new(transport)).await?);
@@ -654,7 +694,10 @@ fn has_non_local_transport(cli: &Cli) -> bool {
     cli.daemon_sock.is_some()
         || cli.daemon_url.is_some()
         || cli.tcp.is_some()
-        || cli.url.as_deref().is_some_and(|u| !u.starts_with("usb://") && !u.starts_with("usb:"))
+        || cli
+            .url
+            .as_deref()
+            .is_some_and(|u| !u.starts_with("usb://") && !u.starts_with("usb:"))
 }
 
 fn normalize_http_addr(base: &str) -> String {
@@ -669,12 +712,12 @@ fn normalize_http_addr(base: &str) -> String {
     }
 }
 
-pub(crate) async fn discover_daemon_tcp(base: &str) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
+pub(crate) async fn discover_daemon_tcp(
+    base: &str,
+) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
     let addr = normalize_http_addr(base);
     let mut stream = tokio::net::TcpStream::connect(&addr).await?;
-    let request = format!(
-        "GET /devices HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    );
+    let request = format!("GET /devices HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
@@ -682,7 +725,9 @@ pub(crate) async fn discover_daemon_tcp(base: &str) -> Result<Vec<DeviceJson>, B
 }
 
 #[cfg(unix)]
-pub(crate) async fn discover_daemon_unix(path: &str) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
+pub(crate) async fn discover_daemon_unix(
+    path: &str,
+) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
     let mut stream = tokio::net::UnixStream::connect(path).await?;
     let request = "GET /devices HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     stream.write_all(request.as_bytes()).await?;
@@ -695,7 +740,11 @@ fn parse_device_list_response(data: &[u8]) -> Result<Vec<DeviceJson>, Box<dyn st
     let text = std::str::from_utf8(data)?;
     let (head, body) = text.split_once("\r\n\r\n").ok_or("invalid HTTP response")?;
     if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
-        return Err(format!("unexpected HTTP response: {}", head.lines().next().unwrap_or(head)).into());
+        return Err(format!(
+            "unexpected HTTP response: {}",
+            head.lines().next().unwrap_or(head)
+        )
+        .into());
     }
     let devices: Vec<DeviceJson> = serde_json::from_str(body)?;
     Ok(devices)
@@ -710,7 +759,9 @@ pub(crate) struct NetworkProbeDevice {
     serial: u32,
 }
 
-pub(crate) fn discover_network_devices(timeout: std::time::Duration) -> Result<Vec<NetworkProbeDevice>, Box<dyn std::error::Error>> {
+pub(crate) fn discover_network_devices(
+    timeout: std::time::Duration,
+) -> Result<Vec<NetworkProbeDevice>, Box<dyn std::error::Error>> {
     use std::collections::BTreeMap;
     use std::net::{Ipv4Addr, UdpSocket};
 
@@ -750,7 +801,9 @@ pub(crate) fn discover_network_devices(timeout: std::time::Duration) -> Result<V
                     eprintln!("discovery decode: dropped invalid packet");
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -771,7 +824,10 @@ mod tests {
 
     #[test]
     fn http_addr_normalization() {
-        assert_eq!(normalize_http_addr("http://localhost:5380"), "localhost:5380");
+        assert_eq!(
+            normalize_http_addr("http://localhost:5380"),
+            "localhost:5380"
+        );
         assert_eq!(normalize_http_addr("ws://example.com"), "example.com:5380");
         assert_eq!(normalize_http_addr("example.com:1234"), "example.com:1234");
     }

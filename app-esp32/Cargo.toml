@@ -31,3 +31,6 @@ remote_component = { name = "espressif/mdns", version = "1.4" }
 # LittleFS for data partition (ezBEQ catalogue, UI assets, config)
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "joltwallet/littlefs", version = "1.20" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["../../../code/esp-uac2-host/components/uac2_host"]

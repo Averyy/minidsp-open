@@ -101,157 +101,287 @@ pub fn product_name(hw_id: u8, dsp_version: u8) -> &'static str {
 
 fn profile_2x4hd() -> DeviceProfile {
     DeviceProfile {
-        name: "2x4HD", hw_id: 10, dsp_version: 100,
-        dialect: Dialect::NEW, sources: &SOURCES_2X4HD,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "2x4HD",
+        hw_id: 10,
+        dsp_version: 100,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_2X4HD,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: Some(&DSP_100),
         tier: CapabilityTier::Full,
-        sample_rate: 96_000, has_dirac: false, has_fir: true,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 96_000,
+        has_dirac: false,
+        has_fir: true,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: true,
     }
 }
 
 fn profile_ddrc24() -> DeviceProfile {
     DeviceProfile {
-        name: "DDRC-24", hw_id: 10, dsp_version: 101,
-        dialect: Dialect::NEW, sources: &SOURCES_2X4HD,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "DDRC-24",
+        hw_id: 10,
+        dsp_version: 101,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_2X4HD,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: Some(&DSP_101),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: true, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: true,
     }
 }
 
 fn profile_flex() -> DeviceProfile {
     DeviceProfile {
-        name: "Flex", hw_id: 27, dsp_version: 100,
-        dialect: Dialect::NEW, sources: &SOURCES_FLEX,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "Flex",
+        hw_id: 27,
+        dsp_version: 100,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_FLEX,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: Some(&DSP_100),
         tier: CapabilityTier::Full,
-        sample_rate: 96_000, has_dirac: false, has_fir: true,
-        has_display: true, has_dre: false, has_volume_offsets: true,
+        sample_rate: 96_000,
+        has_dirac: false,
+        has_fir: true,
+        has_display: true,
+        has_dre: false,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_flex_dl() -> DeviceProfile {
     DeviceProfile {
-        name: "Flex (DL)", hw_id: 27, dsp_version: 101,
-        dialect: Dialect::NEW, sources: &SOURCES_FLEX,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "Flex (DL)",
+        hw_id: 27,
+        dsp_version: 101,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_FLEX,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: Some(&DSP_101),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: true, has_fir: false,
-        has_display: true, has_dre: false, has_volume_offsets: true,
+        sample_rate: 48_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: true,
+        has_dre: false,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_shd() -> DeviceProfile {
     DeviceProfile {
-        name: "SHD", hw_id: 14, dsp_version: 105,
-        dialect: Dialect::NEW, sources: &SOURCES_SHD,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "SHD",
+        hw_id: 14,
+        dsp_version: 105,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_SHD,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: Some(&DSP_105),
         tier: CapabilityTier::Full,
-        sample_rate: 96_000, has_dirac: true, has_fir: false,
-        has_display: true, has_dre: false, has_volume_offsets: true,
+        sample_rate: 96_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: true,
+        has_dre: false,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_shd_studio(hw_id: u8) -> DeviceProfile {
     DeviceProfile {
-        name: "SHD Studio", hw_id, dsp_version: 105,
-        dialect: Dialect::NEW, sources: &SOURCES_SHD_STUDIO,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "SHD Studio",
+        hw_id,
+        dsp_version: 105,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_SHD_STUDIO,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: Some(&DSP_105),
         tier: CapabilityTier::Full,
-        sample_rate: 96_000, has_dirac: true, has_fir: false,
-        has_display: true, has_dre: false, has_volume_offsets: true,
+        sample_rate: 96_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: true,
+        has_dre: false,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_shd_power() -> DeviceProfile {
     DeviceProfile {
-        name: "SHD Power", hw_id: 21, dsp_version: 105,
-        dialect: Dialect::NEW, sources: &SOURCES_SHD_POWER,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "SHD Power",
+        hw_id: 21,
+        dsp_version: 105,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_SHD_POWER,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: Some(&DSP_105),
         tier: CapabilityTier::Full,
-        sample_rate: 96_000, has_dirac: true, has_fir: false,
-        has_display: true, has_dre: false, has_volume_offsets: true,
+        sample_rate: 96_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: true,
+        has_dre: false,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_flex_eight() -> DeviceProfile {
     DeviceProfile {
-        name: "Flex Eight", hw_id: 30, dsp_version: 110,
-        dialect: Dialect::NEW, sources: &SOURCES_FLEX_EIGHT,
-        inputs: 2, outputs: 8, presets: 4,
+        name: "Flex Eight",
+        hw_id: 30,
+        dsp_version: 110,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_FLEX_EIGHT,
+        inputs: 2,
+        outputs: 8,
+        presets: 4,
         dsp_table: Some(&DSP_110),
         tier: CapabilityTier::Full,
-        sample_rate: 96_000, has_dirac: false, has_fir: true,
-        has_display: true, has_dre: true, has_volume_offsets: true,
+        sample_rate: 96_000,
+        has_dirac: false,
+        has_fir: true,
+        has_display: true,
+        has_dre: true,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_flex_eight_dl() -> DeviceProfile {
     DeviceProfile {
-        name: "Flex Eight (DL)", hw_id: 30, dsp_version: 111,
-        dialect: Dialect::NEW, sources: &SOURCES_FLEX_EIGHT,
-        inputs: 2, outputs: 8, presets: 4,
+        name: "Flex Eight (DL)",
+        hw_id: 30,
+        dsp_version: 111,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_FLEX_EIGHT,
+        inputs: 2,
+        outputs: 8,
+        presets: 4,
         dsp_table: Some(&DSP_111),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: true, has_fir: false,
-        has_display: true, has_dre: true, has_volume_offsets: true,
+        sample_rate: 48_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: true,
+        has_dre: true,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_flex_ht_113() -> DeviceProfile {
     DeviceProfile {
-        name: "Flex HT", hw_id: 31, dsp_version: 113,
-        dialect: Dialect::NEW, sources: &SOURCES_FLEX_HT,
-        inputs: 8, outputs: 8, presets: 4,
+        name: "Flex HT",
+        hw_id: 31,
+        dsp_version: 113,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_FLEX_HT,
+        inputs: 8,
+        outputs: 8,
+        presets: 4,
         dsp_table: Some(&DSP_113),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: true, has_fir: false,
-        has_display: true, has_dre: true, has_volume_offsets: true,
+        sample_rate: 48_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: true,
+        has_dre: true,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_flex_ht_115() -> DeviceProfile {
     DeviceProfile {
-        name: "Flex HT", hw_id: 31, dsp_version: 115,
-        dialect: Dialect::NEW, sources: &SOURCES_FLEX_HT,
-        inputs: 8, outputs: 8, presets: 4,
+        name: "Flex HT",
+        hw_id: 31,
+        dsp_version: 115,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_FLEX_HT,
+        inputs: 8,
+        outputs: 8,
+        presets: 4,
         dsp_table: Some(&DSP_115),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: true, has_dre: true, has_volume_offsets: true,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: true,
+        has_dre: true,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_flex_htx_113() -> DeviceProfile {
     DeviceProfile {
-        name: "Flex HTx", hw_id: 32, dsp_version: 113,
-        dialect: Dialect::NEW, sources: &SOURCES_FLEX_HTX,
-        inputs: 8, outputs: 8, presets: 4,
+        name: "Flex HTx",
+        hw_id: 32,
+        dsp_version: 113,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_FLEX_HTX,
+        inputs: 8,
+        outputs: 8,
+        presets: 4,
         dsp_table: Some(&DSP_113),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: true, has_fir: false,
-        has_display: true, has_dre: false, has_volume_offsets: true,
+        sample_rate: 48_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: true,
+        has_dre: false,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
 fn profile_flex_htx_115() -> DeviceProfile {
     DeviceProfile {
-        name: "Flex HTx", hw_id: 32, dsp_version: 115,
-        dialect: Dialect::NEW, sources: &SOURCES_FLEX_HTX,
-        inputs: 8, outputs: 8, presets: 4,
+        name: "Flex HTx",
+        hw_id: 32,
+        dsp_version: 115,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_FLEX_HTX,
+        inputs: 8,
+        outputs: 8,
+        presets: 4,
         dsp_table: Some(&DSP_115),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: true, has_dre: false, has_volume_offsets: true,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: true,
+        has_dre: false,
+        has_volume_offsets: true,
+        has_usb_audio: true,
     }
 }
 
@@ -259,121 +389,221 @@ fn profile_flex_htx_115() -> DeviceProfile {
 
 fn profile_4x10hd() -> DeviceProfile {
     DeviceProfile {
-        name: "4x10 HD", hw_id: 1, dsp_version: 0,
-        dialect: Dialect::OLD, sources: &SOURCES_4X10HD,
-        inputs: 4, outputs: 10, presets: 4,
+        name: "4x10 HD",
+        hw_id: 1,
+        dsp_version: 0,
+        dialect: Dialect::OLD,
+        sources: &SOURCES_4X10HD,
+        inputs: 4,
+        outputs: 10,
+        presets: 4,
         dsp_table: Some(&LEGACY_4X10HD),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_10x10hd() -> DeviceProfile {
     DeviceProfile {
-        name: "10x10 HD", hw_id: 1, dsp_version: 51,
-        dialect: Dialect::OLD, sources: &SOURCES_4X10HD,
-        inputs: 10, outputs: 10, presets: 4,
+        name: "10x10 HD",
+        hw_id: 1,
+        dsp_version: 51,
+        dialect: Dialect::OLD,
+        sources: &SOURCES_4X10HD,
+        inputs: 10,
+        outputs: 10,
+        presets: 4,
         dsp_table: Some(&LEGACY_10X10HD),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_nanodigi_2x8() -> DeviceProfile {
     DeviceProfile {
-        name: "NanoDigi 2x8", hw_id: 2, dsp_version: 54,
-        dialect: Dialect::OLD, sources: &SOURCES_LEGACY_2,
-        inputs: 4, outputs: 10, presets: 4,
+        name: "NanoDigi 2x8",
+        hw_id: 2,
+        dsp_version: 54,
+        dialect: Dialect::OLD,
+        sources: &SOURCES_LEGACY_2,
+        inputs: 4,
+        outputs: 10,
+        presets: 4,
         dsp_table: Some(&LEGACY_NANODIGI_2X8),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_2x4_nonhd() -> DeviceProfile {
     DeviceProfile {
-        name: "miniDSP 2x4", hw_id: 2, dsp_version: 22,
-        dialect: Dialect::OLD, sources: &SOURCES_LEGACY_2,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "miniDSP 2x4",
+        hw_id: 2,
+        dsp_version: 22,
+        dialect: Dialect::OLD,
+        sources: &SOURCES_LEGACY_2,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: Some(&LEGACY_M2X4),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_msharc_4x8() -> DeviceProfile {
     DeviceProfile {
-        name: "miniSHARC 4x8", hw_id: 4, dsp_version: 0,
-        dialect: Dialect::NEW, sources: &SOURCES_4X10HD,
-        inputs: 4, outputs: 8, presets: 4,
+        name: "miniSHARC 4x8",
+        hw_id: 4,
+        dsp_version: 0,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_4X10HD,
+        inputs: 4,
+        outputs: 8,
+        presets: 4,
         dsp_table: Some(&LEGACY_MSHARC_4X8),
         tier: CapabilityTier::Full,
-        sample_rate: 96_000, has_dirac: false, has_fir: true,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 96_000,
+        has_dirac: false,
+        has_fir: true,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_ddrc_88bm() -> DeviceProfile {
     DeviceProfile {
-        name: "DDRC-88BM", hw_id: 6, dsp_version: 95,
-        dialect: Dialect::NEW, sources: &SOURCES_LEGACY_2,
-        inputs: 8, outputs: 8, presets: 4,
+        name: "DDRC-88BM",
+        hw_id: 6,
+        dsp_version: 95,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_LEGACY_2,
+        inputs: 8,
+        outputs: 8,
+        presets: 4,
         dsp_table: Some(&LEGACY_DDRC_88BM),
         tier: CapabilityTier::Full,
-        sample_rate: 48_000, has_dirac: true, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: true,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_cdsp_8x12v2() -> DeviceProfile {
     DeviceProfile {
-        name: "C-DSP 8x12 v2", hw_id: 11, dsp_version: 97,
-        dialect: Dialect::NEW, sources: &SOURCES_LEGACY_2,
-        inputs: 8, outputs: 12, presets: 4,
+        name: "C-DSP 8x12 v2",
+        hw_id: 11,
+        dsp_version: 97,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_LEGACY_2,
+        inputs: 8,
+        outputs: 12,
+        presets: 4,
         dsp_table: Some(&LEGACY_CDSP_8X12_V2),
         tier: CapabilityTier::Full,
-        sample_rate: 96_000, has_dirac: false, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 96_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_nanoavr() -> DeviceProfile {
     DeviceProfile {
-        name: "nanoAVR", hw_id: 7, dsp_version: 0,
-        dialect: Dialect::OLD, sources: &SOURCES_LEGACY_2,
-        inputs: 0, outputs: 0, presets: 4,
+        name: "nanoAVR",
+        hw_id: 7,
+        dsp_version: 0,
+        dialect: Dialect::OLD,
+        sources: &SOURCES_LEGACY_2,
+        inputs: 0,
+        outputs: 0,
+        presets: 4,
         dsp_table: None,
         tier: CapabilityTier::Universal,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_nanoavr_hda() -> DeviceProfile {
     DeviceProfile {
-        name: "nanoAVR HDA", hw_id: 8, dsp_version: 0,
-        dialect: Dialect::OLD, sources: &SOURCES_LEGACY_2,
-        inputs: 0, outputs: 0, presets: 4,
+        name: "nanoAVR HDA",
+        hw_id: 8,
+        dsp_version: 0,
+        dialect: Dialect::OLD,
+        sources: &SOURCES_LEGACY_2,
+        inputs: 0,
+        outputs: 0,
+        presets: 4,
         dsp_table: None,
         tier: CapabilityTier::Universal,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
 fn profile_generic(hw_id: u8, dsp_version: u8) -> DeviceProfile {
     DeviceProfile {
-        name: "Unknown MiniDSP", hw_id, dsp_version,
-        dialect: Dialect::NEW, sources: &SOURCES_2X4HD,
-        inputs: 2, outputs: 4, presets: 4,
+        name: "Unknown MiniDSP",
+        hw_id,
+        dsp_version,
+        dialect: Dialect::NEW,
+        sources: &SOURCES_2X4HD,
+        inputs: 2,
+        outputs: 4,
+        presets: 4,
         dsp_table: None,
         tier: CapabilityTier::Universal,
-        sample_rate: 48_000, has_dirac: false, has_fir: false,
-        has_display: false, has_dre: false, has_volume_offsets: false,
+        sample_rate: 48_000,
+        has_dirac: false,
+        has_fir: false,
+        has_display: false,
+        has_dre: false,
+        has_volume_offsets: false,
+        has_usb_audio: false,
     }
 }
 
@@ -441,15 +671,29 @@ mod tests {
     #[test]
     fn all_sharc_devices_have_full_tier() {
         let sharc_devices = [
-            (10, 100), (10, 101), (27, 100), (27, 101),
-            (14, 105), (17, 105), (18, 105), (21, 105),
-            (30, 110), (30, 111),
-            (31, 113), (31, 115), (32, 113), (32, 115),
+            (10, 100),
+            (10, 101),
+            (27, 100),
+            (27, 101),
+            (14, 105),
+            (17, 105),
+            (18, 105),
+            (21, 105),
+            (30, 110),
+            (30, 111),
+            (31, 113),
+            (31, 115),
+            (32, 113),
+            (32, 115),
         ];
         for (hw, dsp) in sharc_devices {
             let p = identify(hw, dsp);
-            assert_eq!(p.tier, CapabilityTier::Full,
-                "device hw_id={hw} dsp={dsp} ({}) should be Full tier", p.name);
+            assert_eq!(
+                p.tier,
+                CapabilityTier::Full,
+                "device hw_id={hw} dsp={dsp} ({}) should be Full tier",
+                p.name
+            );
         }
     }
 }

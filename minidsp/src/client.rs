@@ -1,16 +1,15 @@
 //! High-level MiniDSP client — wraps transport + command queue + device profile.
 
-use crate::transport::{Transport, TransportError};
 use crate::queue::{CommandQueue, Priority};
+use crate::transport::{Transport, TransportError};
 use minidsp_protocol::commands::{self, HardwareId, Response};
 use minidsp_protocol::device::DeviceProfile;
 use minidsp_protocol::device::probe;
-use minidsp_protocol::eeprom;
 use minidsp_protocol::dialect::ValueFormat;
+use minidsp_protocol::eeprom;
 use minidsp_protocol::status::{
-    MasterStatusView, StatusSummary, DeviceInfo, DeviceVersion,
-    BiquadCoeffs, PeqBandConfig, InputChannelConfig, OutputChannelConfig,
-    CompressorConfig, DeviceConfig,
+    BiquadCoeffs, CompressorConfig, DeviceConfig, DeviceInfo, DeviceVersion, InputChannelConfig,
+    MasterStatusView, OutputChannelConfig, PeqBandConfig, StatusSummary,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,18 +69,24 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
     if let Some(table) = profile.dsp_table {
         for input in table.inputs {
             for band in input.peq {
-                shadow.insert(band.addr, PeqShadow {
-                    coeffs: minidsp_protocol::biquad::BYPASS,
-                    bypass: false,
-                });
+                shadow.insert(
+                    band.addr,
+                    PeqShadow {
+                        coeffs: minidsp_protocol::biquad::BYPASS,
+                        bypass: false,
+                    },
+                );
             }
         }
         for output in table.outputs {
             for band in output.peq {
-                shadow.insert(band.addr, PeqShadow {
-                    coeffs: minidsp_protocol::biquad::BYPASS,
-                    bypass: false,
-                });
+                shadow.insert(
+                    band.addr,
+                    PeqShadow {
+                        coeffs: minidsp_protocol::biquad::BYPASS,
+                        bypass: false,
+                    },
+                );
             }
         }
     }
@@ -132,7 +137,11 @@ impl MiniDspClient {
             .await?;
         let hw_id = match hw_resp {
             Response::HardwareId(id) => id,
-            _ => return Err(ClientError::Protocol("unexpected response to ReadHardwareId".into())),
+            _ => {
+                return Err(ClientError::Protocol(
+                    "unexpected response to ReadHardwareId".into(),
+                ));
+            }
         };
 
         // Step 2: Read DSP version from EEPROM
@@ -221,15 +230,17 @@ impl MiniDspClient {
         let resp = self
             .queue
             .execute(
-                commands::read_flash(eeprom::MASTER_STATUS_ADDR.0, eeprom::MASTER_STATUS_ADDR.1, 4),
+                commands::read_flash(
+                    eeprom::MASTER_STATUS_ADDR.0,
+                    eeprom::MASTER_STATUS_ADDR.1,
+                    4,
+                ),
                 Priority::Normal,
             )
             .await?;
         match resp {
-            Response::FlashData(data) => {
-                eeprom::MasterStatusRaw::from_bytes(&data)
-                    .ok_or_else(|| ClientError::Protocol("failed to parse master status".into()))
-            }
+            Response::FlashData(data) => eeprom::MasterStatusRaw::from_bytes(&data)
+                .ok_or_else(|| ClientError::Protocol("failed to parse master status".into())),
             _ => Err(ClientError::Protocol("unexpected response".into())),
         }
     }
@@ -255,7 +266,8 @@ impl MiniDspClient {
 
         let dirac = if self.profile.has_dirac {
             // Read Dirac bypass state from EEPROM 0xFFE0
-            let dirac_resp = self.queue
+            let dirac_resp = self
+                .queue
                 .execute(commands::read_flash(0xFF, 0xE0, 1), Priority::Normal)
                 .await;
             match dirac_resp {
@@ -307,7 +319,9 @@ impl MiniDspClient {
     pub async fn set_config(&self, preset: u8) -> Result<(), ClientError> {
         if preset >= self.profile.presets {
             return Err(ClientError::Protocol(format!(
-                "preset {} out of range (max {})", preset, self.profile.presets - 1
+                "preset {} out of range (max {})",
+                preset,
+                self.profile.presets - 1
             )));
         }
         self.queue
@@ -347,7 +361,12 @@ impl MiniDspClient {
             }
             ValueFormat::FixedPoint => {
                 // Old dialect: mute is raw 4-byte fixed-point via WriteDSP
-                let raw = u32::from_be_bytes([mute_bytes[0], mute_bytes[1], mute_bytes[2], mute_bytes[3]]);
+                let raw = u32::from_be_bytes([
+                    mute_bytes[0],
+                    mute_bytes[1],
+                    mute_bytes[2],
+                    mute_bytes[3],
+                ]);
                 let val = minidsp_protocol::dialect::fixed_point_to_float(raw);
                 self.write_dsp(addr, val, true).await?;
             }
@@ -368,15 +387,12 @@ impl MiniDspClient {
 
     /// Write biquad coefficients to a PEQ band.
     /// Warns (but does not reject) unstable filters for minidsp-rs compatibility.
-    pub async fn write_biquad(
-        &self,
-        addr: u16,
-        coeffs: &[f32; 5],
-    ) -> Result<(), ClientError> {
+    pub async fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), ClientError> {
         if !minidsp_protocol::biquad::is_stable(coeffs) {
             tracing::warn!(
                 "writing potentially unstable biquad at addr {addr}: a1={}, a2={}",
-                coeffs[3], coeffs[4]
+                coeffs[3],
+                coeffs[4]
             );
         }
         self.queue
@@ -414,9 +430,13 @@ impl MiniDspClient {
     /// Set channel polarity inversion using dialect-aware encoding.
     pub async fn set_invert(&self, addr: u16, inverted: bool) -> Result<(), ClientError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => self.write_dsp_u32(addr, if inverted { 1 } else { 0 }, false).await,
+            ValueFormat::Float32 => {
+                self.write_dsp_u32(addr, if inverted { 1 } else { 0 }, false)
+                    .await
+            }
             ValueFormat::FixedPoint => {
-                let val = minidsp_protocol::dialect::polarity_value(inverted, &self.profile.dialect);
+                let val =
+                    minidsp_protocol::dialect::polarity_value(inverted, &self.profile.dialect);
                 self.write_dsp(addr, val, true).await
             }
         }
@@ -434,7 +454,12 @@ impl MiniDspClient {
     }
 
     /// Write a raw 32-bit DSP/config parameter word.
-    pub async fn write_dsp_u32(&self, addr: u16, value: u32, save: bool) -> Result<(), ClientError> {
+    pub async fn write_dsp_u32(
+        &self,
+        addr: u16,
+        value: u32,
+        save: bool,
+    ) -> Result<(), ClientError> {
         self.queue
             .execute(commands::write_dsp_u32(addr, value, save), Priority::High)
             .await?;
@@ -452,19 +477,29 @@ impl MiniDspClient {
             .await?;
         match resp {
             Response::Floats(values) => Ok(values),
-            _ => Err(ClientError::Protocol("unexpected response to ReadFloats".into())),
+            _ => Err(ClientError::Protocol(
+                "unexpected response to ReadFloats".into(),
+            )),
         }
     }
 
     /// Read typed 32-bit DSP/config parameter words.
     pub async fn read_param_words(&self, addr: u16, count: u8) -> Result<Vec<u32>, ClientError> {
         let req = commands::read_floats(addr, count, &self.profile.dialect);
-        let raw = self.queue.execute_raw(req.clone(), Priority::Normal).await?;
-        commands::parse_param_words_response_for_request(&req, &raw)
-            .ok_or_else(|| ClientError::Protocol("unexpected raw response to typed ReadFloats".into()))
+        let raw = self
+            .queue
+            .execute_raw(req.clone(), Priority::Normal)
+            .await?;
+        commands::parse_param_words_response_for_request(&req, &raw).ok_or_else(|| {
+            ClientError::Protocol("unexpected raw response to typed ReadFloats".into())
+        })
     }
 
-    pub async fn set_channel_delay_samples(&self, addr: u16, samples: u32) -> Result<(), ClientError> {
+    pub async fn set_channel_delay_samples(
+        &self,
+        addr: u16,
+        samples: u32,
+    ) -> Result<(), ClientError> {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => self.write_dsp_u32(addr, samples, false).await,
             ValueFormat::FixedPoint => self.write_dsp(addr, samples as f32, true).await,
@@ -472,7 +507,8 @@ impl MiniDspClient {
     }
 
     async fn read_param_word(&self, addr: u16) -> Result<u32, ClientError> {
-        self.read_param_words(addr, 1).await?
+        self.read_param_words(addr, 1)
+            .await?
             .into_iter()
             .next()
             .ok_or_else(|| ClientError::Protocol("empty typed param response".into()))
@@ -482,7 +518,9 @@ impl MiniDspClient {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => Ok(f32::from_bits(self.read_param_word(addr).await?)),
             ValueFormat::FixedPoint => {
-                let linear = self.read_floats(addr, 1).await?
+                let linear = self
+                    .read_floats(addr, 1)
+                    .await?
                     .into_iter()
                     .next()
                     .ok_or_else(|| ClientError::Protocol("empty gain response".into()))?;
@@ -495,7 +533,9 @@ impl MiniDspClient {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => Ok(self.read_param_word(addr).await? >= 2),
             ValueFormat::FixedPoint => {
-                let value = self.read_floats(addr, 1).await?
+                let value = self
+                    .read_floats(addr, 1)
+                    .await?
                     .into_iter()
                     .next()
                     .ok_or_else(|| ClientError::Protocol("empty mute response".into()))?;
@@ -511,7 +551,9 @@ impl MiniDspClient {
                 Ok(samples * 1000.0 / self.profile.sample_rate as f32)
             }
             ValueFormat::FixedPoint => {
-                let samples = self.read_floats(addr, 1).await?
+                let samples = self
+                    .read_floats(addr, 1)
+                    .await?
                     .into_iter()
                     .next()
                     .ok_or_else(|| ClientError::Protocol("empty delay response".into()))?;
@@ -524,7 +566,9 @@ impl MiniDspClient {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => Ok(self.read_param_word(addr).await? != 0),
             ValueFormat::FixedPoint => {
-                let value = self.read_floats(addr, 1).await?
+                let value = self
+                    .read_floats(addr, 1)
+                    .await?
                     .into_iter()
                     .next()
                     .ok_or_else(|| ClientError::Protocol("empty invert response".into()))?;
@@ -534,7 +578,11 @@ impl MiniDspClient {
     }
 
     /// Send raw command payload. For advanced/raw access.
-    pub async fn raw_command(&self, payload: Vec<u8>, priority: Priority) -> Result<Response, ClientError> {
+    pub async fn raw_command(
+        &self,
+        payload: Vec<u8>,
+        priority: Priority,
+    ) -> Result<Response, ClientError> {
         Ok(self.queue.execute(payload, priority).await?)
     }
 
@@ -584,16 +632,23 @@ impl MiniDspClient {
         }
 
         // Save the state
-        *self.saved_peq.lock().await = Some(SavedPeqState { bands: bands.clone() });
+        *self.saved_peq.lock().await = Some(SavedPeqState {
+            bands: bands.clone(),
+        });
 
         // Now bypass all bands
         let mut bypass_cmds = Vec::new();
         for &(addr, _, _) in &bands {
             bypass_cmds.push(commands::bypass_filter(addr, true, &self.profile.dialect));
         }
-        self.queue.execute_batch(bypass_cmds, Priority::Critical).await?;
+        self.queue
+            .execute_batch(bypass_cmds, Priority::Critical)
+            .await?;
 
-        tracing::info!("measurement mode: saved and bypassed {} PEQ bands", bands.len());
+        tracing::info!(
+            "measurement mode: saved and bypassed {} PEQ bands",
+            bands.len()
+        );
         Ok(())
     }
 
@@ -601,7 +656,11 @@ impl MiniDspClient {
     ///
     /// Writes back all saved coefficients and bypass states using safe batch ordering.
     pub async fn restore_measurement_mode(&self) -> Result<(), ClientError> {
-        let saved = self.saved_peq.lock().await.take()
+        let saved = self
+            .saved_peq
+            .lock()
+            .await
+            .take()
             .ok_or_else(|| ClientError::Protocol("no saved measurement mode state".into()))?;
 
         self.restore_measurement_mode_with(&saved).await?;
@@ -651,7 +710,8 @@ impl MiniDspClient {
                 let pending = self.pending_write.lock().await;
                 pending.as_ref().map(|pending| pending.bands.clone())
             };
-            let replay = replay.ok_or_else(|| ClientError::Protocol("missing pending PEQ write".into()))?;
+            let replay =
+                replay.ok_or_else(|| ClientError::Protocol("missing pending PEQ write".into()))?;
 
             execute_peq_batch(
                 &self.queue,
@@ -688,7 +748,10 @@ impl MiniDspClient {
             }
         }
         let shadow = self.peq_shadow.lock().await;
-        Ok(shadow.get(&addr).map(|s| s.coeffs).unwrap_or(minidsp_protocol::biquad::BYPASS))
+        Ok(shadow
+            .get(&addr)
+            .map(|s| s.coeffs)
+            .unwrap_or(minidsp_protocol::biquad::BYPASS))
     }
 
     /// Read PEQ bypass state. Bypass is stored at addr+5 on SHARC devices.
@@ -700,13 +763,16 @@ impl MiniDspClient {
     /// Read the full device config including all PEQ coefficients.
     pub async fn read_device_config(&self) -> Result<DeviceConfig, ClientError> {
         let master_raw = self.get_master_status().await?;
-        let source_name = self.profile.sources
+        let source_name = self
+            .profile
+            .sources
             .source_for_index(master_raw.source)
             .map(|s| s.pascal_case().to_string())
             .unwrap_or_else(|| format!("Unknown({})", master_raw.source));
 
         let dirac = if self.profile.has_dirac {
-            let resp = self.queue
+            let resp = self
+                .queue
                 .execute(commands::read_flash(0xFF, 0xE0, 1), Priority::Normal)
                 .await;
             match resp {
@@ -782,7 +848,10 @@ impl MiniDspClient {
 
                 let compressor = if let Some(comp) = &output.compressor {
                     let bypass = self.read_config_mute(comp.bypass).await.unwrap_or(false);
-                    let threshold = self.read_config_gain_db(comp.threshold).await.unwrap_or(0.0);
+                    let threshold = self
+                        .read_config_gain_db(comp.threshold)
+                        .await
+                        .unwrap_or(0.0);
                     let comp_gain = self.read_config_gain_db(comp.gain).await.unwrap_or(0.0);
                     let ratio = self.read_config_gain_db(comp.ratio).await.unwrap_or(0.0);
                     let knee = self.read_config_gain_db(comp.knee).await.unwrap_or(0.0);
@@ -827,8 +896,7 @@ impl MiniDspClient {
         let mut all_values = Vec::with_capacity(addrs.len());
 
         // Check if addresses are contiguous for bulk read
-        let is_contiguous = addrs.len() <= 14
-            && addrs.windows(2).all(|w| w[1] == w[0] + 1);
+        let is_contiguous = addrs.len() <= 14 && addrs.windows(2).all(|w| w[1] == w[0] + 1);
 
         if is_contiguous {
             let values = self.read_floats(addrs[0], addrs.len() as u8).await?;

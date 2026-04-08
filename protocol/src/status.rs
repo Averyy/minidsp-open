@@ -16,7 +16,13 @@ pub struct BiquadCoeffs {
 
 impl BiquadCoeffs {
     pub fn from_array(c: &[f32; 5]) -> Self {
-        Self { b0: c[0], b1: c[1], b2: c[2], a1: c[3], a2: c[4] }
+        Self {
+            b0: c[0],
+            b1: c[1],
+            b2: c[2],
+            a1: c[3],
+            a2: c[4],
+        }
     }
 
     pub fn to_array(&self) -> [f32; 5] {

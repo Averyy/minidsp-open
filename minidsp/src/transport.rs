@@ -28,12 +28,18 @@ pub enum TransportError {
 pub trait Transport: Send + Sync + 'static {
     /// Send a command payload to the device. The transport handles wire encoding
     /// (HID wrapping for USB, frame encoding for TCP).
-    fn send_frame(&self, payload: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
+    fn send_frame(
+        &self,
+        payload: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 
     /// Receive a response payload from the device. The transport handles wire
     /// decoding (HID unwrapping for USB, frame decoding for TCP).
     /// Returns the decoded payload bytes.
-    fn recv_frame(&self, timeout_ms: u64) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
+    fn recv_frame(
+        &self,
+        timeout_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
 
     /// Check if the transport is still connected.
     fn is_connected(&self) -> bool;

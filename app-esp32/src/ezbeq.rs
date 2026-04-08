@@ -63,28 +63,26 @@ pub type SharedEzBeqState = Arc<Mutex<EzBeqState>>;
 
 impl EzBeqState {
     pub fn new(inputs: u8, outputs: u8) -> Self {
-        let slots = core::array::from_fn::<SlotState, NUM_SLOTS, _>(|i| {
-            SlotState {
-                id: (i + 1).to_string(),
-                last: "Empty".into(),
-                active: i == 0,
-                author: None,
-                gains: (0..inputs)
-                    .map(|ch| ChannelValue {
-                        id: (ch + 1).to_string(),
-                        value: 0.0,
-                    })
-                    .collect(),
-                mutes: (0..inputs)
-                    .map(|ch| ChannelValue {
-                        id: (ch + 1).to_string(),
-                        value: false,
-                    })
-                    .collect(),
-                can_activate: true,
-                inputs,
-                outputs,
-            }
+        let slots = core::array::from_fn::<SlotState, NUM_SLOTS, _>(|i| SlotState {
+            id: (i + 1).to_string(),
+            last: "Empty".into(),
+            active: i == 0,
+            author: None,
+            gains: (0..inputs)
+                .map(|ch| ChannelValue {
+                    id: (ch + 1).to_string(),
+                    value: 0.0,
+                })
+                .collect(),
+            mutes: (0..inputs)
+                .map(|ch| ChannelValue {
+                    id: (ch + 1).to_string(),
+                    value: false,
+                })
+                .collect(),
+            can_activate: true,
+            inputs,
+            outputs,
         });
         Self {
             slots,
@@ -95,9 +93,16 @@ impl EzBeqState {
 }
 
 /// Parse the first 8 bytes of a hex digest string into a byte array for binary search.
-fn parse_digest_prefix(digest_hex: &str) -> Result<[u8; DIGEST_PREFIX_SIZE], Box<dyn std::error::Error>> {
+fn parse_digest_prefix(
+    digest_hex: &str,
+) -> Result<[u8; DIGEST_PREFIX_SIZE], Box<dyn std::error::Error>> {
     if digest_hex.len() < DIGEST_PREFIX_SIZE * 2 {
-        return Err(format!("digest too short: '{}' (need {} hex chars)", digest_hex, DIGEST_PREFIX_SIZE * 2).into());
+        return Err(format!(
+            "digest too short: '{}' (need {} hex chars)",
+            digest_hex,
+            DIGEST_PREFIX_SIZE * 2
+        )
+        .into());
     }
     let mut prefix = [0u8; DIGEST_PREFIX_SIZE];
     for i in 0..DIGEST_PREFIX_SIZE {
@@ -163,14 +168,22 @@ pub fn read_entry_biquads_by_digest(
 }
 
 /// Parse the biquad portion of a record (after digest prefix).
-fn parse_biquad_record(record: &[u8]) -> Result<(u8, f32, Vec<[f32; 5]>), Box<dyn std::error::Error>> {
+fn parse_biquad_record(
+    record: &[u8],
+) -> Result<(u8, f32, Vec<[f32; 5]>), Box<dyn std::error::Error>> {
     let filter_count = record[0];
     if filter_count as usize > MAX_FILTERS {
-        return Err(format!("filter_count {} exceeds MAX_FILTERS {}", filter_count, MAX_FILTERS).into());
+        return Err(format!(
+            "filter_count {} exceeds MAX_FILTERS {}",
+            filter_count, MAX_FILTERS
+        )
+        .into());
     }
     let mv_adjust = f32::from_le_bytes(record[1..5].try_into().unwrap());
     if !mv_adjust.is_finite() || mv_adjust.abs() > 40.0 {
-        return Err(format!("mv_adjust {mv_adjust} out of range (must be finite, |mv| <= 40)").into());
+        return Err(
+            format!("mv_adjust {mv_adjust} out of range (must be finite, |mv| <= 40)").into(),
+        );
     }
 
     let mut coeffs = Vec::with_capacity(filter_count as usize);
@@ -204,26 +217,34 @@ pub fn load_filter(
         .dsp_table
         .ok_or("device has no DSP table")?;
 
-    info!(
-        "loading BEQ: {title} ({filter_count} filters, mv={mv_adjust:+.1}dB)"
-    );
+    info!("loading BEQ: {title} ({filter_count} filters, mv={mv_adjust:+.1}dB)");
 
     // Write filters to input PEQ bands on ALL input channels
     for (ch_idx, input) in table.inputs.iter().enumerate() {
         for (band_idx, band) in input.peq.iter().enumerate() {
             if band_idx < filter_count as usize {
-                device.write_biquad(band.addr, &coeffs[band_idx]).map_err(|e| e.to_string())?;
-                device.bypass_filter(band.addr, false).map_err(|e| e.to_string())?;
+                device
+                    .write_biquad(band.addr, &coeffs[band_idx])
+                    .map_err(|e| e.to_string())?;
+                device
+                    .bypass_filter(band.addr, false)
+                    .map_err(|e| e.to_string())?;
             } else {
-                device.write_biquad(band.addr, &BYPASS_COEFFS).map_err(|e| e.to_string())?;
-                device.bypass_filter(band.addr, true).map_err(|e| e.to_string())?;
+                device
+                    .write_biquad(band.addr, &BYPASS_COEFFS)
+                    .map_err(|e| e.to_string())?;
+                device
+                    .bypass_filter(band.addr, true)
+                    .map_err(|e| e.to_string())?;
             }
         }
 
         // Apply MV adjust to input channel gain (dB → linear)
         if let Some(gain_addr) = input.gain {
             let gain_linear = 10.0f32.powf(mv_adjust / 20.0);
-            device.write_dsp(gain_addr, gain_linear, true).map_err(|e| e.to_string())?;
+            device
+                .write_dsp(gain_addr, gain_linear, true)
+                .map_err(|e| e.to_string())?;
         }
 
         log::debug!(
@@ -244,12 +265,18 @@ pub fn clear_filter(device: &DeviceState) -> Result<(), String> {
 
     for input in table.inputs {
         for band in input.peq {
-            device.write_biquad(band.addr, &BYPASS_COEFFS).map_err(|e| e.to_string())?;
-            device.bypass_filter(band.addr, true).map_err(|e| e.to_string())?;
+            device
+                .write_biquad(band.addr, &BYPASS_COEFFS)
+                .map_err(|e| e.to_string())?;
+            device
+                .bypass_filter(band.addr, true)
+                .map_err(|e| e.to_string())?;
         }
         // Reset input gain to 0dB (linear 1.0)
         if let Some(gain_addr) = input.gain {
-            device.write_dsp(gain_addr, 1.0, true).map_err(|e| e.to_string())?;
+            device
+                .write_dsp(gain_addr, 1.0, true)
+                .map_err(|e| e.to_string())?;
         }
     }
 
@@ -274,10 +301,7 @@ pub fn broadcast_state(device: &DeviceState, beq_state: &mut EzBeqState) {
 }
 
 /// Build the DeviceState JSON for the ezBEQ WebSocket protocol.
-pub fn device_state_json(
-    device: &DeviceState,
-    beq_state: &EzBeqState,
-) -> String {
+pub fn device_state_json(device: &DeviceState, beq_state: &EzBeqState) -> String {
     let slots_json: Vec<serde_json::Value> = beq_state
         .slots
         .iter()
@@ -375,10 +399,24 @@ pub fn register_routes(
             };
 
             // Title and author are enriched by the JS shim (truncate to prevent heap bloat)
-            let raw_title = json.get("title").and_then(|v| v.as_str()).unwrap_or("Unknown");
-            let raw_author = json.get("author").and_then(|v| v.as_str()).unwrap_or("Unknown");
-            let title = if raw_title.len() > 256 { &raw_title[..256] } else { raw_title };
-            let author = if raw_author.len() > 256 { &raw_author[..256] } else { raw_author };
+            let raw_title = json
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown");
+            let raw_author = json
+                .get("author")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown");
+            let title = if raw_title.len() > 256 {
+                &raw_title[..256]
+            } else {
+                raw_title
+            };
+            let author = if raw_author.len() > 256 {
+                &raw_author[..256]
+            } else {
+                raw_author
+            };
 
             match load_filter(&dev, digest, title, author) {
                 Ok(mv_adjust) => {
@@ -484,27 +522,35 @@ pub fn register_routes(
     // PUT /api/1/devices/master/commands — preset save/overwrite (used by React UI)
     {
         let st = device_state.clone();
-        server.fn_handler("/api/1/devices/master/commands", Method::Put, move |mut req| {
-            let dev = match get_device(&st) {
-                Some(d) => d,
-                None => return send_json(req, 503, r#"{"error":"no device"}"#),
-            };
-            let mut buf = [0u8; 512];
-            let len = req.read(&mut buf).unwrap_or(0);
-            let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
-                Ok(v) => v,
-                Err(_) => return send_error(req, 400, "invalid JSON"),
-            };
+        server.fn_handler(
+            "/api/1/devices/master/commands",
+            Method::Put,
+            move |mut req| {
+                let dev = match get_device(&st) {
+                    Some(d) => d,
+                    None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                };
+                let mut buf = [0u8; 512];
+                let len = req.read(&mut buf).unwrap_or(0);
+                let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => return send_error(req, 400, "invalid JSON"),
+                };
 
-            // Handle "overwrite" command (copy current preset to flash)
-            if json.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false) {
-                if let Err(e) = dev.copy_preset() {
-                    return send_error(req, 500, &format!("copy_preset: {e}"));
+                // Handle "overwrite" command (copy current preset to flash)
+                if json
+                    .get("overwrite")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    if let Err(e) = dev.copy_preset() {
+                        return send_error(req, 500, &format!("copy_preset: {e}"));
+                    }
                 }
-            }
 
-            send_json(req, 200, r#"{"status":"ok"}"#)
-        })?;
+                send_json(req, 200, r#"{"status":"ok"}"#)
+            },
+        )?;
     }
 
     // PUT /api/1/devices/master/config/{slot}/active — activate a slot

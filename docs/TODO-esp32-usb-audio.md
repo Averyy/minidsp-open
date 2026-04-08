@@ -1,48 +1,339 @@
-# ESP32 USB Audio Output to miniDSP
+# USB Audio: Measurement Sweep Playback
 
 ## Goal
 
-Add a `POST /devices/{id}/play` HTTP endpoint to minidsp-open that generates a measurement sweep and plays it through the miniDSP's USB audio input. This enables cable-free sub measurement: the caller sends a command over the network, the ESP32 generates the sweep mathematically, outputs audio to the miniDSP, and returns the exact playback start timestamp so the caller can align their recording.
+Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a measurement sweep mathematically, plays it through the miniDSP's USB audio input via the UAC2 driver, and returns the exact playback start timestamp so the caller can align their recording.
 
-This endpoint is useful for:
-- **open-sub-optimizer** — automated measurement (calls play, captures via UMIK, deconvolves, optimizes)
-- **REW users** — anyone with minidsp-open can trigger a sweep wirelessly while REW captures. No need for open-sub-optimizer at all.
-- **Any HTTP client** — `curl -X POST .../play` works. The endpoint is a general-purpose "play a sweep through the miniDSP" feature.
+**Scope:** Both ESP32 and desktop expose these endpoints. The primary value is ESP32 (cable-free measurement over WiFi), but desktop support is useful for Raspberry Pi setups and client parity. The sweep generator is shared (pure math, no platform deps). The UAC2 transport is ESP32-specific; desktop uses a platform audio backend (tracked separately). These are **additive endpoints** — they extend the existing API without breaking any existing routes (per `docs/ref-compatibility.md` additive rules).
 
-## The Sweep Signal
+**Use case:** Cable-free subwoofer measurement. A caller (open-sub-optimizer, REW, or plain `curl`) triggers a sweep over WiFi. The ESP32 outputs audio to the miniDSP. The caller captures via USB mic and deconvolves.
 
-### Mathematical Generation (No File Transfer)
+## Validation Snapshot
 
-The sweep is a Farina exponential sine sweep — a mathematical function. **Generate it sample-by-sample on the ESP32 in real-time.** No file transfer, no storage, no compression. Perfect quality.
+- Real hardware validated on ESP32-S3 + miniDSP 2x4 HD using a **release** firmware build (`cargo build --release`)
+- Default `POST /devices/0/play` response arrives in about `0.35s` when already on `Usb`, and about `0.4-0.5s` when `/play` first switches from `Toslink` to `Usb`
+- Near-full-ring chunking was the first confirmed root cause: `~8190` byte writes into an `8192` byte TX ring stretched completion to about `13.6s`
+- Half-ring chunking (`4092` byte writes) fixed the main pacing bug:
+  - `TX_DONE` low-water callbacks dropped from hundreds per run to `0`
+  - `last_write_after_start` fell from about `13.56s` to about `12.52s`
+- Generator hot-path optimization reduced generation time from about `729ms` to about `483ms` on the default plan
+- A second generator refactor that emits contiguous regions directly (instead of branching per-sample across the whole signal) reduced default-plan generation time again, from about `483ms` to about `333ms`
+- Source auto-switch is verified live: `Toslink -> Usb -> Toslink`
+- Transient bad master-status reads immediately after source changes are handled with short retries
+- First overlap attempt (generator thread + blocking writer thread) improved the design direction but failed on real hardware because per-chunk heap allocation was not stable enough (`memory allocation of 8192 bytes failed`)
+- Second overlap attempt (fixed two-slot ping-pong to avoid per-chunk allocation) also failed to produce a shippable single-play path; it did not crash, but it stopped making forward progress reliably enough to treat as a regression
+- A `20ms` time-based chunk target was also worse than the half-ring baseline:
+  - `writes=612`
+  - `TX_DONE=611`
+  - `last_write_after_start ~= 12.53s`
+  - conclusion: larger steady-state chunks reintroduced refill pressure without improving end-to-end timing
+- Current best known single-play implementation is still:
+  - half-ring chunking
+  - optimized generator hot path
+  - single playback thread with no extra producer thread
+- A startup-path experiment that moved the priming write into the HTTP handler was rejected even though it improved the internal "response ready" point to about `208ms`: on real hardware it immediately reintroduced refill pressure (`TX_DONE=835`) and is therefore not safe
+- Current timing characterization on real hardware:
+  - `48kHz / 24-bit / stereo`: `tx_need_data=0`, `gen≈333ms`, `write≈12.21s`, `last_write_after_start≈12.56s`
+  - `48kHz / 16-bit / stereo`: `tx_need_data=0`, `last_write_after_start≈12.39s`
+  - `44.1kHz / 24-bit / stereo`: `tx_need_data=0`, `last_write_after_start≈12.29s`
+  - conclusion: once underruns are eliminated, the remaining delta scales with byte rate and enqueue timing; it is not evidence of a UAC2 driver clock/stretch bug
+
+**Performance note:** Use a **release** firmware build for any timing or glitch validation. Debug (`cargo build`) builds are dramatically slower in the sweep-generation hot path and are not representative for `/play`.
+
+## Timing Investigation Checklist
+
+Goal: explain and, if possible, eliminate the remaining gap between nominal signal duration (`12.237s`) and observed playback-thread completion time (`~13.6s`) on real hardware.
+
+- [x] Add precise playback timestamps in the ESP32 `/play` path:
+  - stream start call
+  - first nonzero `startedAtUs`
+  - first HTTP response sent
+  - last successful write return
+  - stop call / stop return
+  - source-restore start / finish
+- [x] Add expected-vs-actual byte accounting:
+  - expected total bytes
+  - actual bytes queued
+  - write count
+  - first / last write sizes
+- [x] Add write-latency distribution stats:
+  - min / max / avg / p50 / p95 / p99
+- [x] Count `UAC2_HOST_DEVICE_EVENT_TX_DONE` notifications to detect underrun / refill pressure
+- [x] Measure whether the extra time is:
+  - before first queued sample
+  - during steady-state writes
+  - after the last write while stopping / draining
+- [x] Run release-build hardware measurements with current chunk sizing
+- [x] Run release-build hardware measurements with smaller chunk sizes to see whether near-full-ring writes are causing avoidable backpressure
+- [x] Compare 24-bit vs 16-bit and 48kHz vs 44.1kHz timing
+- [x] Measure source-switch overhead separately from playback time
+- [ ] Capture or otherwise verify the physical output duration once software timestamps are clear
+- [x] Decide whether the remaining gap is:
+  - real playback stretch
+  - enqueue pacing only
+  - stop/drain overhead
+  - acceptable transport latency vs bug
+- [ ] Capture or otherwise verify the physical output duration once software timestamps are clear
+- [ ] Update this doc and `PROGRESS.md` with the final root cause and validated fix
+
+**Current conclusion:** the original `~13.6s` issue was a real app-side pacing bug caused by near-full-ring writes. That is fixed. The remaining `~12.29-12.56s` enqueue-finish metric depends on byte volume (`48/24` > `48/16` > `44.1/24`), stays at `TX_DONE=0`, and has negligible stop time, which is consistent with app-side enqueue timing against the driver ring buffer and `startedAtUs` semantics, not with a driver-side sample-clock defect.
+
+## Definition of Done
+
+The feature is complete when:
+- [ ] `curl -X POST http://<esp32>:5380/devices/0/play` plays a ~12-second measurement sweep through the miniDSP's analog outputs
+- [ ] The response arrives within ~200ms (before playback finishes) and contains a real `startedAtUs` hardware timestamp plus correct sample offsets
+- [ ] `curl -X POST http://<esp32>:5380/sync -d '{"clientTimeUs":0}'` returns an ESP32 timestamp (works with or without a miniDSP connected)
+- [ ] HID control (volume, mute, config, etc.) continues working normally during and after audio playback
+- [ ] Audio playback at 48kHz/24-bit/stereo has no audible glitches over the full sweep duration
+- [ ] USB disconnect mid-playback doesn't crash — cleans up gracefully
+- [ ] The sweep generator has desktop unit tests (`cargo test` in the workspace, no ESP32 needed)
+- [ ] The firmware builds and boots cleanly with zero new warnings
+- [ ] Back-to-back plays work: sweep finishes, immediately `POST /play` again — full stop→cleanup→re-init cycle succeeds
+- [ ] Play then HID: after a sweep completes, `GET /devices/0/config` and other HID commands still work correctly
+- [ ] Heap survives playback: free heap doesn't drop dangerously low with WiFi + HTTP + HID + UAC2 all active (log free heap before/during/after)
+- [ ] HID-only device: `POST /play` on a device without USB audio (e.g., 2x4 non-HD) returns a clear error, not a crash or hang
+- [ ] Malformed requests: empty body uses defaults, garbage JSON returns 400, missing Content-Type is handled gracefully
+- [ ] Sample rate switch between plays: play at 48kHz, then play at 44.1kHz — clock reconfiguration works
+
+## Task Ordering
 
 ```
-x(t) = sin(2π × f1 × T / ln(f2/f1) × (exp(t × ln(f2/f1) / T) - 1))
+Tasks 4 (sweep_gen) and 6 (/sync) have NO dependencies — start here.
+Tasks 1 → 2 → 3 are sequential (build → FFI → boot integration).
+Task 5 (/play endpoint) depends on all others.
 ```
 
-Parameters (open-sub-optimizer defaults from `src/sweep-gen.ts`):
+## What Already Exists
+
+| What | Where | Status |
+|------|-------|--------|
+| UAC2 host driver (C, ESP-IDF component) | `~/code/esp-uac2-host/components/uac2_host/` | **Complete v0.1.0** — 12 tests pass on real miniDSP 2x4 HD, zero errors, 766s stability run |
+| UAC2 public API | `~/code/esp-uac2-host/components/uac2_host/include/usb/uac2_host.h` | Full API with install/uninstall, open/close, start/stop/write, clock, volume |
+| UAC2 descriptor structs | `~/code/esp-uac2-host/components/uac2_host/include/usb/uac2_desc.h` | Clock source/selector, terminals, feature unit, AS, format type |
+| ESP32 firmware (Rust on ESP-IDF) | `app-esp32/` | Boots, WiFi, USB HID, HTTP API, mDNS, TCP bridge, UDP discovery — all working |
+| USB HID transport | `app-esp32/src/usb_hid.rs` | Raw `esp_idf_sys` FFI, calls `usb_host_install()`, claims HID interface |
+| HTTP server | `app-esp32/src/http_server.rs` | `EspHttpServer` with all device routes, debug endpoints, ezBEQ |
+| Device state | `app-esp32/src/device.rs` | `DeviceState` wrapping `Arc<UsbHidBus>` + protocol layer |
+| miniDSP 2x4 HD simulator | `~/code/esp-uac2-host/simulators/minidsp-2x4hd/` | Full composite: UAC2 audio + HID, fault injection, 373-byte descriptor match |
+| UAC2 driver reference doc | `~/code/esp-uac2-host/llms.txt` | Complete API reference, internal design, hardware constraints |
+
+## Architecture Overview
+
+The miniDSP is a **composite USB device** with HID (control) and Audio (playback) interfaces on the same USB connection. The ESP32-S3 USB Host Library supports multiple clients — the existing HID client and the new UAC2 driver client coexist.
+
+```
+                     ┌──────────────────────────────────┐
+                     │          miniDSP 2x4 HD          │
+                     │  (composite USB device)          │
+                     │  ┌─────────┐  ┌──────────────┐  │
+                     │  │  HID    │  │  UAC2 Audio   │  │
+                     │  │ (IF 4)  │  │  (IF 1, alt1) │  │
+                     │  └────▲────┘  └──────▲───────┘  │
+                     └───────┼──────────────┼──────────┘
+                             │              │
+                     ┌───────┼──────────────┼──────────┐
+                     │   ESP-IDF USB Host Library       │
+                     │       │              │           │
+                     │  ┌────┴────┐  ┌──────┴───────┐  │
+                     │  │HID clnt │  │ UAC2 driver  │  │
+                     │  │(Rust    │  │ (C component │  │
+                     │  │ FFI)    │  │  via FFI)    │  │
+                     │  └────▲────┘  └──────▲───────┘  │
+                     └───────┼──────────────┼──────────┘
+                             │              │
+                 ┌───────────┴──┐   ┌───────┴──────────┐
+                 │ usb_hid.rs   │   │ usb_audio.rs     │
+                 │ (existing)   │   │ (NEW)            │
+                 └───────▲──────┘   └───────▲──────────┘
+                         │                  │
+                 ┌───────┴──────────────────┴──────────┐
+                 │          main.rs boot sequence       │
+                 │  1. usb_host_install()               │
+                 │  2. UsbHidBus::init() (HID client)   │
+                 │  3. uac2_host_install() (audio clnt) │
+                 └───────────────────▲─────────────────┘
+                                     │
+                 ┌───────────────────┴─────────────────┐
+                 │        HTTP server handlers          │
+                 │  POST /devices/{id}/play             │
+                 │  POST /sync                          │
+                 └─────────────────────────────────────┘
+```
+
+## Implementation Tasks
+
+### Task 1: Add esp-uac2-host as a C component to the build
+
+The UAC2 driver is a C ESP-IDF component. The Rust ESP32 project needs to compile and link it.
+
+**What to do:**
+- Add the component path so ESP-IDF discovers it during build
+- Add required sdkconfig options for isochronous audio
+- Ensure `esp-idf-sys` bindgen picks up the UAC2 headers
+
+**Build integration options** (pick the simplest that works):
+- `extra_components` in `Cargo.toml` `[package.metadata.esp-idf-sys]` section
+- Or symlink/copy the component into `app-esp32/components/uac2_host/`
+- Or set `EXTRA_COMPONENT_DIRS` in the build
+
+**Required sdkconfig additions** (`app-esp32/sdkconfig.defaults`):
+```
+CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y  # Bias DWC_OTG FIFO for isochronous OUT (required for audio playback)
+```
+Note: `CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512` is already set.
+
+**Acceptance criteria:**
+- [ ] `cargo build` (for ESP32 target) compiles with the UAC2 component included and zero new warnings
+- [ ] The UAC2 header types (`uac2_host_driver_config_t`, `uac2_host_device_handle_t`, etc.) are accessible from Rust via `esp_idf_sys` bindings or a local `bindings.rs`
+
+### Task 2: Rust FFI bindings for the UAC2 driver
+
+Create a safe Rust wrapper around the C UAC2 driver API. The driver is event-driven (callbacks) but the ESP32 firmware is blocking/synchronous.
+
+**Key C functions to wrap** (from `uac2_host.h`):
+```c
+esp_err_t uac2_host_install(const uac2_host_driver_config_t *config);
+esp_err_t uac2_host_uninstall(void);
+esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config, uac2_host_device_handle_t *handle);
+esp_err_t uac2_host_device_close(uac2_host_device_handle_t dev);
+esp_err_t uac2_host_device_start(uac2_host_device_handle_t dev, const uac2_host_stream_config_t *config);
+esp_err_t uac2_host_device_stop(uac2_host_device_handle_t dev);
+esp_err_t uac2_host_device_write(uac2_host_device_handle_t dev, const uint8_t *data, uint32_t size, uint32_t timeout_ms);
+int64_t   uac2_host_device_get_start_time(uac2_host_device_handle_t dev);
+```
+
+**Design notes:**
+- The driver's event callbacks fire from the USB Host client task — they must not block
+- The driver callback reports `UAC2_HOST_DRIVER_EVENT_TX_CONNECTED` with `addr` + `iface_num` — stash these so a later `open` call can use them
+- Use `Condvar` or `AtomicBool` to signal from C callback to Rust (same pattern as `usb_hid.rs` `XferSync`)
+- The driver handle is an opaque pointer — wrap in a struct that implements `Send` (transfers only happen from one thread at a time)
+
+**Acceptance criteria:**
+- [ ] A Rust module (`app-esp32/src/usb_audio.rs`) that wraps the UAC2 C API
+- [ ] `install()` / `uninstall()` manage the driver lifecycle
+- [ ] Can detect when a UAC2 playback interface connects (callback → stored state)
+- [ ] Can open, start streaming, write PCM data, get start timestamp, stop, and close
+- [ ] Error handling converts `esp_err_t` to Rust `Result`
+
+### Task 3: Integrate UAC2 driver into boot sequence
+
+The UAC2 driver needs to be installed after `usb_host_install()` (which happens inside `UsbHidBus::init()` in `usb_hid.rs`).
+
+**Current boot sequence** (`app-esp32/src/main.rs`):
+1. Logger → NVS → Storage → WiFi
+2. `UsbHidBus::init()` — calls `usb_host_install()`, registers HID client, starts event threads
+3. `bus.wait_for_device()` — waits for MiniDSP
+4. `DeviceState::probe()` — reads HID identity
+5. HTTP server starts
+
+**Modified sequence — add after step 2:**
+- Create `SharedAudioState` (see below) and pass it to the UAC2 install callback
+- Call `uac2_host_install()` (via the Rust wrapper) — registers a second USB Host client
+- The UAC2 driver will automatically discover the audio interface when the miniDSP connects
+- Pass `SharedAudioState` to `http_server::start()` alongside the existing `SharedDeviceState`
+
+**Shared audio/playback state design:**
+
+The audio state is **independent** of the HID `SharedDeviceState`. They have separate lifecycles:
+
+```rust
+/// Audio subsystem state — created at boot, lives for the process lifetime.
+/// UAC2 callbacks update `device`; HTTP handlers check `device` and `playing`.
+pub struct AudioState {
+    /// UAC2 device handle — set by connect callback, cleared by disconnect callback.
+    /// None means no audio-capable device is currently connected.
+    device: Mutex<Option<Uac2Device>>,
+    /// Playback lock — true while a /play request is actively streaming.
+    /// Checked atomically by /play to reject concurrent requests (409).
+    playing: AtomicBool,
+    /// Signals UAC2 device arrival (for callers that want to wait).
+    connected: Condvar,
+}
+pub type SharedAudioState = Arc<AudioState>;
+```
+
+**Lifecycle rules:**
+- `AudioState` is created once at boot, before `uac2_host_install()`
+- The UAC2 **connect callback** sets `device` to `Some(handle)` and notifies `connected`
+- The UAC2 **disconnect callback** sets `device` to `None`. If `playing` is true, the in-flight playback thread will see write failures and clean up on its own (it clears `playing` and drops its handle clone).
+- The **main loop does NOT manage audio state** — it only manages HID `SharedDeviceState` as today. Audio lifecycle is entirely callback-driven.
+- On reconnect: connect callback replaces the handle. Next `/play` just works.
+- HID disconnect does not invalidate audio state, and vice versa. They are independent clients on the same composite device.
+
+**Important:** `usb_host_install()` must only be called once. It's currently called inside `UsbHidBus::init()`. Do NOT call it again. `uac2_host_install()` is a separate function that registers a new client on the already-installed USB Host Library. **Do NOT modify `usb_hid.rs`** — it already provides the shared infrastructure (global `usb_host_install()` + `usb_host_lib_handle_events()` pump) that the UAC2 driver needs. The UAC2 driver registers its own client alongside HID. Add the UAC2 integration in a new `usb_audio.rs`, not inside `usb_hid.rs`.
+
+**Acceptance criteria:**
+- [ ] UAC2 driver installs successfully during boot (visible in serial log)
+- [ ] When a miniDSP connects, both HID and UAC2 interfaces are discovered (HID by existing code, audio by UAC2 driver callback)
+- [ ] `SharedAudioState` is created at boot and passed to both the UAC2 callback and the HTTP server
+- [ ] UAC2 connect/disconnect callbacks correctly update `AudioState.device` without touching HID state
+- [ ] If no miniDSP is connected, boot continues normally (audio just stays unavailable)
+- [ ] USB reconnect: if the miniDSP disconnects and reconnects, the UAC2 driver rediscovers the audio interface and updates `AudioState`
+- [ ] During playback, a USB disconnect causes the playback thread to clean up (clear `playing`, drop handle) without crashing
+
+### Task 4: Sweep generator
+
+Implement mathematical real-time audio generation. **No file transfer, no WAV files, no storage. Generate sample-by-sample.**
+
+**Signal structure:**
+```
+[preamble: 2s low-level dither] [tone burst: 3 cycles @ 80Hz] [gap: 200ms silence] [sweep: 8s Farina ESS] [decay: 2s silence]
+Total: ~12.24 seconds at 48kHz = ~588,288 samples
+```
+
+**Farina exponential sine sweep formula:**
+```
+x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
+```
+
+**Default parameters** (overridable via API):
 - `f1 = 5 Hz` (display start; actual sweep starts at f1/2 = 2.5 Hz for guard band)
-- `f2 = 500 Hz` (display stop; actual sweep goes to min(2×f2, fs/2) = 1000 Hz)
+- `f2 = 500 Hz` (display stop; actual sweep goes to min(2*f2, fs/2) = 1000 Hz)
 - `duration = 8 seconds`
-- `fs = 48000 Hz` (sample rate)
+- `fs = 48000 Hz`
 - Tukey fade-in: 0.02s
 
-At 240 MHz with hardware FPU, `sin(exp(x))` takes ~50-100 cycles per sample. At 48 kHz stereo = 96K samples/sec × 100 cycles = ~10M cycles/sec = **4% CPU**. Trivially feasible.
+**Implementation approach:**
+- Implement as a state machine / iterator that produces samples on demand
+- Each call returns a chunk of PCM samples (e.g., 288 bytes = one USB frame at 48kHz/24-bit/stereo)
+- Stereo: both channels identical
+- Use `f32` std math (`sin`, `exp`, `ln`) — ESP32-S3 has hardware FPU. No `libm` crate needed.
+- At 240 MHz with hardware FPU, `sin(exp(x))` is ~50-100 cycles per sample = ~4% CPU at 48kHz stereo. Trivially feasible.
+- **This module must have zero ESP-IDF dependencies** (`no use esp_idf_*`) — it's pure math + PCM encoding. This is what makes it desktop-testable via `cargo test`.
 
-### Signal Structure
+**Zero-crossing truncation** (must match `open-sub-optimizer/src/sweep-gen.ts`):
+- Generate the raw sweep for `round(duration * fs)` samples
+- Walk backward from the end to find the last sign change (where `raw[n] * raw[n+1] <= 0`)
+- Truncate the sweep at that zero crossing (`nSamples = lastZero + 1`)
+- Apply the Tukey fade-in to the truncated sweep (same order as the TypeScript reference)
+- `totalSamples` in the `/play` response reflects the truncated sweep length (plus preamble/tone burst/gap/decay)
+- This ensures deconvolution window alignment matches the existing `open-sub-optimizer` client
 
-```
-[2s preamble/dither] [40ms tone burst @ 80Hz] [200ms gap] [8s sweep @ 5-500Hz] [2s decay]
-Total: ~12.24 seconds
-```
+**Note on decay duration:** The default `decaySec` is 2.0 seconds (vs. `open-sub-optimizer`'s 1.5s default for trailing silence). 2s is more conservative for room decay capture. The difference is intentional but the parameter is overridable via the API, so clients can request 1.5s if they prefer parity.
 
-- **Preamble**: Low-level dither for DAC stabilization and miniDSP ASRC lock
-- **Tone burst**: 3 cycles at 80 Hz (timing marker — see Timing section)
-- **Gap**: Short silence between burst and sweep
-- **Sweep**: The actual measurement signal (Farina ESS)
-- **Decay**: Captures room reverb tail
+**Preamble**: Low-level white noise or dither (-60 dBFS). Purpose: stabilize miniDSP ASRC lock (~2 seconds).
 
-### API
+**Tone burst**: `sin(2pi * 80 * t)` for 3 cycles (37.5ms). Purpose: timing marker for cross-correlation alignment.
 
+**PCM encoding:**
+- 24-bit: pack each `f32` sample as 3 bytes little-endian (multiply by 2^23 - 1, clamp, take lower 3 bytes)
+- 16-bit: pack as 2 bytes little-endian (multiply by 2^15 - 1)
+- Stereo interleaved: L, R, L, R, ...
+
+**Acceptance criteria:**
+- [ ] A module (`app-esp32/src/sweep_gen.rs`) that generates the complete signal
+- [ ] Configurable parameters: f1, f2, duration, fade, tone burst frequency/cycles, preamble/gap/decay durations, sample rate, bit depth
+- [ ] Produces PCM bytes on demand (iterator/callback pattern, not allocating the entire signal)
+- [ ] 24-bit stereo PCM at 48kHz by default
+- [ ] Total sample count is deterministic and known before generation starts
+- [ ] Unit-testable: can run on desktop (`cargo test`) by testing the math/PCM encoding without USB
+
+### Task 5: POST /devices/{id}/play endpoint
+
+The HTTP handler that ties everything together.
+
+**Request:**
 ```
 POST /devices/{deviceIndex}/play
 Content-Type: application/json
@@ -66,419 +357,187 @@ Content-Type: application/json
 }
 ```
 
-**Response** (returned when playback actually begins):
+All fields are optional — use defaults above when omitted.
+
+**Response** (returned after playback starts, not after it finishes):
 ```json
 {
   "startedAtUs": 1719482837291456,
   "toneBurstOffsetSamples": 96000,
   "sweepOffsetSamples": 105600,
   "totalSamples": 588288,
-  "sampleRate": 48000
+  "sampleRate": 48000,
+  "sourceChanged": true,
+  "previousSource": "toslink"
 }
 ```
 
-The response includes:
-- `startedAtUs` — ESP32 hardware timer value (microsecond precision) when the first audio sample was output. Callers use this + clock sync to know when playback started in their own timeframe.
-- `toneBurstOffsetSamples` — sample index where the tone burst begins in the generated signal. Callers use this for timing alignment (see Timing section).
-- `sweepOffsetSamples` — sample index where the sweep begins. Callers deconvolve starting here.
-- `totalSamples` — total signal length.
+- `startedAtUs` — from `uac2_host_device_get_start_time()`, the ESP32 `esp_timer_get_time()` value when the first isochronous URB was submitted. Microsecond precision.
+- `toneBurstOffsetSamples` — sample index where tone burst begins (= preamble_samples)
+- `sweepOffsetSamples` — sample index where sweep begins (= preamble + tone_burst + gap samples)
+- `totalSamples` — total signal length in samples (reflects zero-crossing-truncated sweep length)
+- `sourceChanged` — `true` if `/play` switched the device source to USB, `false` if it was already on USB
+- `previousSource` — the source that was active before `/play` switched (only present when `sourceChanged` is `true`). Source will be restored after playback completes.
 
-Signal goes to both stereo channels identically. The miniDSP's input routing matrix routes input 1 to all outputs. Individual output muting (via the existing HID mute commands) isolates each sub.
+**Playback flow:**
+1. Parse request parameters (or use defaults)
+2. Check that UAC2 audio interface is connected (`AudioState.device.is_some()`) → 503 if not
+3. Check that no other playback is in progress (`AudioState.playing`) → 409 if busy
+4. Set `AudioState.playing = true`
+5. **Source auto-switch:** Read current source via HID status → save as `prev_source`. If current source is not `Usb`, send `set_source(usb_index)` via HID. If source is already `Usb`, skip.
+6. Start the UAC2 stream (`device_start` with requested sample rate / bit depth)
+7. Get `startedAtUs` from `device_get_start_time()`
+8. Compute sample offsets
+9. **Return the HTTP response immediately** (caller now knows when playback started)
+10. Continue generating + writing samples in a background thread until complete
+11. Stop the stream after the last sample
+12. **Source restore:** Send `set_source(prev_source)` to restore the original source. Best-effort — if the device disconnected mid-play, skip restore (device is already gone).
+13. Clear `AudioState.playing = false`
 
-### Clock Sync Endpoint
+**Source switching semantics:**
+- `/play` always auto-switches to `Usb` source before playback and restores the previous source after completion
+- If source switch fails (HID error), fail the `/play` request before starting audio — return 500
+- If device disconnects mid-play: playback thread sees write failures, cleans up, does NOT attempt source restore (device is gone)
+- The response includes `sourceChanged` and `previousSource` so the caller knows what happened
 
-For callers that need timing alignment (see Timing section), minidsp-open exposes a clock sync endpoint:
+**Sample rate note:** The `/play` `sampleRate` parameter defaults to **48000 Hz** regardless of `DeviceProfile.sample_rate`. `DeviceProfile.sample_rate` describes the DSP's internal processing rate (e.g., 96kHz for SHD family). USB playback rate is negotiated separately with the UAC2 device. The implementation must NOT use `profile.sample_rate` as the playback default.
 
+**Important design decisions:**
+- The HTTP response returns as soon as streaming starts (after `device_start` + first write), NOT after all 12 seconds of audio finish. The caller needs the timing info early to align their capture.
+- Use `AudioState.playing` (AtomicBool) to prevent concurrent playback requests.
+- Playback runs in a dedicated thread. The HTTP handler spawns it, gets the start timestamp back via a channel or shared state, then responds.
+- If the USB device disconnects mid-playback, the write calls will fail — clean up gracefully (clear `playing`, skip source restore).
+
+**Acceptance criteria:**
+- [ ] `POST /devices/{id}/play` with default parameters plays a ~12s sweep through the miniDSP's audio interface
+- [ ] Response is returned within ~200ms of the request (not 12 seconds later)
+- [ ] `startedAtUs` value is a real ESP32 hardware timer reading, not a fake timestamp
+- [ ] `toneBurstOffsetSamples` and `sweepOffsetSamples` are correct (match the actual signal structure)
+- [ ] Concurrent requests return 409 Conflict
+- [ ] Request on a device where `has_usb_audio` is `false` returns 400 ("device does not support USB audio playback")
+- [ ] Request with `has_usb_audio: true` but no UAC2 connection returns 503 Service Unavailable
+- [ ] Source auto-switch: if device is not on USB source, `/play` switches to USB before playback and restores the previous source after completion
+- [ ] Source auto-switch: `sourceChanged` and `previousSource` are correct in the response
+- [ ] Source auto-switch: if device is already on USB, no switch occurs and `sourceChanged` is `false`
+- [ ] Audio plays at 48kHz (default), not at `DeviceProfile.sample_rate`
+- [ ] Playback completes and cleans up (stops stream, restores source, clears `playing` flag)
+- [ ] Custom parameters (e.g., different f1/f2, different duration) are honored
+
+### Task 6: POST /sync endpoint
+
+Simple clock sync for callers that need timing alignment.
+
+**Request:**
 ```
 POST /sync
 Content-Type: application/json
 
 { "clientTimeUs": 1719482837000000 }
-
-Response:
-{ "clientTimeUs": 1719482837000000, "serverTimeUs": 1719482837291456 }
 ```
 
-The caller sends multiple sync requests (e.g., 50-100), measures round-trip times, takes the minimum RTT, estimates one-way latency as min_RTT/2, and builds a clock offset model. Research shows ~200μs median accuracy over WiFi with this approach (Lectrobox ESP32 NTP study).
-
-## Timing Synchronization
-
-### The Problem
-
-When the ESP32 plays audio through the miniDSP and a laptop captures via USB mic, the clocks are different. The caller needs to know when the sweep started relative to their recording, or inter-sub phase alignment will be wrong.
-
-### The Solution: Three-Layer Alignment (No Extra Hardware)
-
-No timing speaker. No chirp. No extra hardware. The sub itself provides the timing reference.
-
-**Layer 1: Coarse clock sync (~200μs)**
-
-Before measurement, the caller hits `POST /sync` 50-100 times and builds a clock offset model. This gets the two clocks within ~200μs of each other. The caller now knows roughly when to expect audio in their recording.
-
-**Layer 2: ESP32 start confirmation (eliminates network command jitter)**
-
-The `POST /play` response includes `startedAtUs` — the exact ESP32 hardware timer value when audio output began. The caller converts this to their own clock using the sync model. This tells them the sweep's position in the recording within ~200μs (the clock sync accuracy).
-
-**Layer 3: Tone burst + deconvolution (sub-sample precision)**
-
-The generated signal includes a **tone burst** (3 cycles at 80 Hz, ~40ms) before the sweep. This burst goes through the same sub being measured. The caller:
-
-1. Knows roughly where the burst should appear (from layers 1+2, ±200μs = ±10 samples at 48kHz)
-2. Cross-correlates the recording against the known burst template in that narrow window
-3. Finds the exact sample where the burst arrives — direct sound is always the first arrival
-4. The sweep starts at a known sample offset after the burst (same stream, sample-locked)
-5. Deconvolves the sweep portion → transfer function H(f) with correct phase
-
-**Why the tone burst works through the sub:**
-- 80 Hz is well within the sub's passband
-- 3 cycles = 37.5ms, giving a focused cross-correlation peak
-- Room reflections arrive AFTER the direct sound — and we know where to look (±200μs window from clock sync), so we pick the first peak
-- The burst and sweep travel the same acoustic path (same sub) — playback delay cancels completely
-
-**Why inter-sub phase is correct:**
-- Sub 1: align to sub 1's tone burst arrival → deconvolve → H₁(f) referenced to sub 1's acoustic arrival
-- Sub 2: align to sub 2's tone burst arrival → deconvolve → H₂(f) referenced to sub 2's acoustic arrival
-- Each measurement is self-referenced — no common timing speaker needed
-- The optimizer computes relative delays between subs, which are correct because each H(f) is anchored to its own sub's direct sound
-
-**Additional validation:** The sweep itself has a known, exact frequency-time relationship: `f(t) = f1 × exp(t × ln(f2/f1) / T)`. The deconvolution is a matched filter that exploits this structure. Room modes affect amplitude but not the frequency trajectory. The deconvolution peak provides sub-sample alignment as a final confirmation that the tone burst timing was correct.
-
-**Accuracy summary:**
-
-| Layer | What it does | Accuracy |
-|-------|-------------|----------|
-| Clock sync (`POST /sync`) | Tells caller roughly when to expect audio | ~200μs |
-| Start confirmation (`startedAtUs`) | Eliminates network command jitter | ~200μs (clock-sync limited) |
-| Tone burst cross-correlation | Finds exact onset from the sub | ~20-40μs (1-2 samples) |
-| Deconvolution (matched filter) | Full sweep alignment + validation | Sub-sample (~2μs) |
-
-At 200 Hz: 200μs = 14° phase error (from clock sync alone). With tone burst refinement: <1° phase error. With deconvolution: negligible.
-
-### For REW Users
-
-REW users calling this endpoint don't need to implement the clock sync or tone burst detection. REW has its own "acoustic timing reference" feature. They can either:
-- Use REW's built-in timing detection on the tone burst (REW recognizes timing markers)
-- Or just use REW's standard measurement mode — REW handles timing internally when it controls the capture
-
-The endpoint plays the sweep, REW captures, REW aligns. The `startedAtUs` and sample offsets in the response are available for callers that want them, but not required.
-
-## USB Audio Implementation
-
-### Status: READY
-
-**The UAC2 driver is built and working.** `~/code/esp-uac2-host` provides a complete USB Audio Class 2.0 host driver for ESP32-S3, tested end-to-end with a miniDSP 2x4 HD simulator. The driver handles:
-- UAC2 descriptor parsing (clock source/selector, terminals, feature units)
-- Control requests (SET_CUR, GET_CUR, GET_RANGE) for sample rate, volume, mute
-- SET_INTERFACE for isochronous endpoint activation/deactivation
-- Isochronous OUT streaming with feedback-based adaptive packet sizing
-- Ring buffer for PCM data flow
-- All verified with 487,000+ audio frames delivered, zero errors
-
-**UAC1 vs UAC2 answer:** The miniDSP presents UAC2 descriptors (`bInterfaceProtocol = 0x20`) at Full Speed. Espressif's UAC1 driver cannot be used. The custom UAC2 driver is required and is complete.
-
-### What We're Working With
-
-The miniDSP accepts audio via USB — that's a core product feature. The ESP32-S3 is already connected via USB for HID control. The miniDSP is a composite USB device with both HID and Audio interfaces on the same connection.
-
-**Bandwidth:** 48 kHz × 2ch × 24-bit = 288 KB/s = 2.3 Mbps. USB Full Speed supports 12 Mbps. Each 1ms isochronous frame needs 288 bytes vs the 1023-byte maximum. Plenty of room.
-
-### Implementation Plan
-
-**Step 1: Audio streaming via `esp-uac2-host`**
-
-Open the miniDSP's audio interface alongside the existing HID interface. The UAC2 driver uses an install/uninstall lifecycle — it owns the USB Host client internally and discovers devices automatically:
-```c
-#include "usb/uac2_host.h"
-
-// Install the UAC2 driver (once, at startup, after usb_host_install)
-uac2_host_driver_config_t drv_cfg = {
-    .create_background_task = true,
-    .task_priority = 3,
-    .stack_size = 6144,
-    .core_id = 0,
-    .callback = driver_event_cb,   // fires UAC2_HOST_DRIVER_EVENT_TX_CONNECTED
-    .callback_arg = &app_state,
-};
-uac2_host_install(&drv_cfg);
-
-// In driver_event_cb: open the playback interface when discovered
-// (addr and iface_num come from the callback)
-uac2_host_device_handle_t audio_dev;
-uac2_host_device_config_t dev_cfg = {
-    .addr = addr,
-    .iface_num = iface_num,
-    .callback = device_event_cb,   // fires TX_DONE, DISCONNECTED, etc.
-    .callback_arg = &app_state,
-};
-uac2_host_device_open(&dev_cfg, &audio_dev);
-
-// Start streaming: 48kHz, 24-bit, stereo (direction implicit from interface)
-uac2_host_stream_config_t cfg = {
-    .sample_freq = 48000,
-    .bit_resolution = 24,
-    .channels = 2,
-};
-uac2_host_device_start(audio_dev, &cfg);
-
-// Write PCM data (blocks until ringbuf has space, or returns ESP_ERR_TIMEOUT)
-uac2_host_device_write(audio_dev, pcm_data, num_bytes, timeout_ms);
-
-// Get hardware timestamp of first audio frame output (microseconds)
-int64_t start_us = uac2_host_device_get_start_time(audio_dev);
-
-// Stop and clean up
-uac2_host_device_stop(audio_dev);
-uac2_host_device_close(audio_dev);
-
-// At shutdown
-uac2_host_uninstall();
+**Response:**
+```json
+{
+  "clientTimeUs": 1719482837000000,
+  "serverTimeUs": 1719482837291456
+}
 ```
 
-**Step 2: Sweep generation**
+`serverTimeUs` is `esp_timer_get_time()` — same clock as `startedAtUs` from the play endpoint.
 
-Mathematical real-time generation (see The Sweep Signal section above). No file transfer.
+**Acceptance criteria:**
+- [ ] `POST /sync` returns within <5ms (it's just a clock read)
+- [ ] `serverTimeUs` is a real `esp_timer_get_time()` value
+- [ ] `clientTimeUs` is echoed back unchanged
+- [ ] Works without any USB device connected (it's just a clock endpoint)
 
-**Step 3: HTTP endpoint**
+## USB Audio + HID Coexistence
 
-Wire `POST /play` handler → sweep generator → USB audio output:
-```
-POST /play request
-  → parse parameters
-  → open USB audio interface (alongside existing HID)
-  → set sample rate, bit depth, channel count
-  → note hardware timer value → startedAtUs
-  → generate samples in real-time:
-      preamble → dither
-      tone burst → 3 cycles of sin(2π × 80 × t)
-      gap → silence
-      sweep → Farina ESS
-      decay → silence
-  → pack into PCM frames, submit isochronous OUT transfers
-  → respond with startedAtUs + sample offsets
-```
+Both drivers share the ESP-IDF USB Host Library but operate independently:
 
-### Supported Devices
+- `usb_host_install()` — called once (currently in `UsbHidBus::init()`)
+- HID client — registered by `UsbHidBus::init()`, claims HID interface
+- UAC2 client — registered by `uac2_host_install()`, claims audio interface
+- Both clients receive `NEW_DEV` events and filter for their own interfaces
+- Both can be active simultaneously on the same composite device (confirmed working on real miniDSP 2x4 HD with the UAC2 driver test suite)
 
-Only XMOS-based (modern) miniDSP devices have USB audio.
+**The UAC2 driver manages its own USB Host client internally.** You do NOT need to manually register a client or handle USB events for audio — just call `uac2_host_install()` and it handles discovery, enumeration, and streaming.
 
-| Device | USB Audio | Supported |
-|--------|-----------|-----------|
-| 2x4 HD, DDRC-24 | Yes (XMOS XU216, UAC2) | Yes |
-| Flex, Flex DL | Yes (XMOS, UAC2) | Yes |
-| Flex Eight, Flex HT/HTx | Yes (XMOS, UAC2) | Yes |
-| SHD, SHD Studio | Yes (XMOS, UAC2) | Yes |
-| 2x4 (non-HD), 4x10 HD, 10x10 HD | No (HID only) | No |
-| OpenDRC series, miniSHARC | No (HID only) | No |
+## Supported Devices
 
-## What the Caller Needs to Do
+USB audio capability is tracked in the shared device model via `DeviceProfile.has_usb_audio: bool` (`protocol/src/device/mod.rs`). This flag is `true` for all XMOS-based (modern) devices that have a UAC2 audio interface: 2x4 HD, DDRC-24, Flex, Flex DL, Flex Eight, Flex Eight DL, Flex HT, Flex HTx, SHD, SHD Studio, SHD Power. It is `false` for HID-only devices (2x4, 4x10 HD, 10x10 HD, OpenDRC series, miniSHARC).
 
-### open-sub-optimizer (automated measurement)
+**Capability gating — two layers:**
+1. **Profile flag** (`has_usb_audio`): gates whether `/play` is even attempted. If `false`, return 400 with a clear error ("device does not support USB audio playback"). This check uses the already-probed `DeviceProfile` and doesn't require a UAC2 connection.
+2. **Runtime handle** (`AudioState.device`): gates whether audio is currently available. A device may have `has_usb_audio = true` but the UAC2 interface might not have connected yet (or disconnected). If `device` is `None`, return 503.
 
-The measurement flow in open-sub-optimizer for the minidsp-open network path:
+The `POST /play` endpoint should check both: profile capability first, then runtime availability.
 
-1. **Sync clocks**: `POST /sync` × 50-100 times → build clock offset model
-2. **For each sub at each position**:
-   a. Mute all except target sub: `POST /devices/0/config/output/{ch}/mute`
-   b. Start mic capture (laptop UMIK, ~0.5s before expected playback)
-   c. Play sweep: `POST /devices/0/play` → get `startedAtUs`, offsets
-   d. Wait for capture to complete
-   e. Find tone burst in recording (cross-correlate in ±200μs window)
-   f. Deconvolve sweep portion → H(f)
-3. **Unmute all**: restore muting state
+## Hardware Constraints
 
-open-sub-optimizer needs:
-- A `MinidspOpenClient` class that wraps the clock sync + play + mute APIs
-- Tone burst cross-correlation (similar to existing `findChirpArrival()` but with a tone burst template)
-- Modified orchestrator flow for the network measurement path
+- **ESP32-S3 is Full Speed USB (12 Mbps)**. 48kHz/24-bit/stereo = 288 bytes per 1ms frame = 2.3 Mbps = 25% bus utilization. Fine.
+- **DWC_OTG FIFO is 1024 bytes total.** With `PERIODIC_OUT` bias: PTX=600 (iso OUT), RX=128 (iso IN feedback), NPTX=64. Audio OUT + feedback IN fits. **Cannot do simultaneous TX+RX** (capture packets are ~294 bytes, exceed 128-byte RX FIFO). Playback-only is fine.
+- **ASRC lock:** The miniDSP's ASRC needs ~2 seconds to lock on a new USB audio source. The 2-second preamble covers this.
+- **Memory:** UAC2 driver uses ~40-50 KB internal SRAM (ring buffers + URBs). ESP32-S3 has ~200-280 KB free after WiFi. Fits.
+- **Feedback:** The miniDSP sends 4-byte 16.16 feedback at 48kHz = 0x00300000 (48.0000 samples/frame). The UAC2 driver handles feedback-based adaptive packet sizing internally.
 
-### REW users (manual measurement)
+## Signal Design Rationale
 
-1. Set up REW for measurement capture (UMIK input, acoustic timing reference enabled)
-2. Trigger sweep: `curl -X POST http://minidsp.local:5380/devices/0/play -H 'Content-Type: application/json' -d '{"sweep":{"f1":5,"f2":500,"duration":8}}'`
-3. REW captures and processes using its own timing alignment
-4. Export measurements, import into MSO or open-sub-optimizer
+**Why a tone burst before the sweep:**
+- Enables sub-sample timing alignment via cross-correlation
+- 80 Hz is within the sub's passband
+- 3 cycles (37.5ms) gives a focused correlation peak
+- Room reflections arrive after direct sound — caller picks the first peak
 
-No special software needed beyond minidsp-open and REW.
+**Why NOT a chirp/click timing marker:**
+- Subs roll off above ~200 Hz — a broadband marker gets filtered
+- 80 Hz tone burst passes through cleanly
 
-## Files to Create/Modify
+**Why 2-second preamble:**
+- miniDSP ASRC lock time (~2s for USB audio source)
+- Without this, the first seconds of audio are garbled
 
-| File | Purpose |
-|------|---------|
-| `src/usb_audio.rs` (or `.c`) | USB audio host — enumerate audio interface, isochronous OUT |
-| `src/sweep_gen.rs` | Mathematical sweep + tone burst generation |
-| `src/http/play.rs` | `POST /devices/{id}/play` handler |
-| `src/http/sync.rs` | `POST /sync` clock sync handler |
-| `src/http/mod.rs` | Register new routes |
+## Testing
 
-### Dependencies
+### With the simulator (no real hardware needed)
+Two ESP32-S3 boards connected via USB OTG. Board 1 runs the minidsp-2x4hd simulator (`~/code/esp-uac2-host/simulators/minidsp-2x4hd/`). Board 2 runs the minidsp-open firmware.
 
-- ESP-IDF USB Host stack (already used for HID)
-- **`esp-uac2-host`** (`~/code/esp-uac2-host`) — custom UAC2 host driver (ESP-IDF component, C). Add as a local component or git submodule. MIT licensed.
-- No additional crates for sweep generation (`libm::sinf`, `libm::expf`)
+The simulator accepts UAC2 audio and counts frames — it confirms the host is sending valid audio at the correct rate. It also provides HID for device identity. This is the primary development environment.
 
-## UAC2 Driver: `esp-uac2-host`
+### With real miniDSP 2x4 HD
+Connect the ESP32 directly to the miniDSP via USB OTG. The miniDSP outputs audio on its analog outputs — audible verification.
 
-**Status: COMPLETE (v0.1.0).** The driver is at `~/code/esp-uac2-host` and provides:
-- Espressif-pattern install/uninstall lifecycle (`uac2_host_install`/`uac2_host_uninstall`)
-- Internal device discovery — driver owns the USB Host client, fires callbacks on connect
-- Two-level struct split: physical device (shared, refcounted) + logical interface (per-handle)
-- UAC2 descriptor parsing (clock source/selector/multiplier, terminals, feature units)
-- UAC2 control requests (CUR/RANGE for sample rate, clock validity, volume, mute)
-- SET_INTERFACE for proper endpoint activation/deactivation
-- Isochronous OUT with feedback-based adaptive packet sizing (4-byte 16.16 format confirmed on real miniDSP)
-- Ring buffer with configurable pre-fill and threshold-based events
-- Hardware timer start timestamp (`uac2_host_device_get_start_time`)
-- Device handle validation on all public API functions
-- Disconnect/reconnect support (idle disconnect verified, 3+ cycles)
-- All 12 tests pass on real miniDSP 2x4 HD + simulator, zero errors
-- Multiple code reviews with all findings fixed
-- Clean build with `-Werror -Wextra`, v0.1.0 (headers at `include/usb/uac2_host.h`, `include/usb/uac2_desc.h`)
+### Desktop unit tests
+The sweep generator (`sweep_gen.rs`) should be testable via `cargo test` (no ESP32 needed) — pure math.
 
-### Using as ESP-IDF Component
+## Existing Code Patterns to Follow
 
-Add to your project's `CMakeLists.txt`:
-```cmake
-set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../esp-uac2-host/components/uac2_host")
-```
+- **USB FFI pattern**: `app-esp32/src/usb_hid.rs` — raw `esp_idf_sys` FFI with C callbacks, `Condvar`-based sync, `AtomicBool` for connection state. Follow this style for the UAC2 FFI.
+- **HTTP handler pattern**: `app-esp32/src/http_server.rs` — `EspHttpServer::fn_handler()` closures, `SharedDeviceState` for shared state, `get_device()` helper. Register new routes in the `start()` function.
+- **Error responses**: existing handlers use `req.into_response(status, ...)` with JSON error bodies.
+- **Thread spawning**: `std::thread::Builder::new().name(...).stack_size(...).spawn(...)` — see TCP bridge and UDP discovery in `main.rs`.
+- **Module structure**: each module in `app-esp32/src/` is declared in `main.rs` with `mod module_name;`.
 
-Or add as a git submodule:
-```bash
-git submodule add ../esp-uac2-host components/uac2_host
-```
+## File Summary
 
-### Kconfig Required
+| File | Action | Purpose |
+|------|--------|---------|
+| `app-esp32/src/usb_audio.rs` | **Create** | UAC2 driver FFI wrapper, `AudioState`/`SharedAudioState` types, lifecycle management |
+| `app-esp32/src/sweep_gen.rs` | **Create** | Sweep/tone burst/preamble generator (pure math, iterator-based, zero-crossing truncation) |
+| `app-esp32/src/main.rs` | **Modify** | Add `mod usb_audio; mod sweep_gen;`, create `SharedAudioState`, install UAC2 driver after HID init, pass audio state to HTTP server |
+| `app-esp32/src/http_server.rs` | **Modify** | Accept `SharedAudioState` param, add `POST /devices/{id}/play` and `POST /sync` routes, source auto-switch logic |
+| `app-esp32/Cargo.toml` | **Modify** | Add esp-uac2-host component reference (if needed for build integration) |
+| `app-esp32/build.rs` | **Modify** | Add component path or bindgen config for UAC2 headers (if needed) |
+| `app-esp32/sdkconfig.defaults` | **Modify** | Add `CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODICOUT=y` |
+| `protocol/src/device/mod.rs` | **Modify** | Add `has_usb_audio: bool` to `DeviceProfile` |
+| `protocol/src/device/probe.rs` | **Modify** | Set `has_usb_audio: true` for XMOS devices (2x4 HD, DDRC-24, Flex/DL, Flex Eight/DL, Flex HT/HTx, SHD/Studio/Power), `false` for all others |
+| `docs/ref-compatibility.md` | **Modify** | Document `POST /devices/{id}/play` and `POST /sync` as additive endpoints |
 
-In `sdkconfig.defaults`:
-```
-CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512  # miniDSP config descriptor is 373 bytes
-CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODICOUT=y   # Bias DWC_OTG FIFO for isochronous OUT
-```
+## Key References
 
-## miniDSP 2x4 HD Simulator
-
-A full TinyUSB-based simulator is available at `~/code/esp-uac2-host/simulators/minidsp-2x4hd/` for development and testing without real hardware. It runs on a second ESP32-S3 dev board.
-
-### What It Simulates
-
-- **UAC2 audio**: Playback IF1 (alt 1 = 24-bit, alt 2 = 16-bit), feedback endpoint (10.14 format)
-- **HID control**: All 20 commands (ReadHardwareId, ReadFlash, ReadFloats, WriteDSP, WriteBiquad, SetVolume, SetMute, SetConfig, SetSource, BypassFilter, DiracBypass, etc.)
-- **EEPROM state**: Preset, source, volume, mute, serial, mod tokens, DSP ID
-- **DSP parameter state**: WriteDSP/WriteBiquad store values, ReadFloats reads them back
-- **Fault injection**: Config switch delay, empty HID response, HID NAK, command timeout
-- **Exact USB identity**: VID=0x2752, PID=0x0011, bcdDevice=0x06F2 (matches real miniDSP)
-
-### What It Does NOT Simulate
-
-- ASRC lock behavior (the 2-second preamble requirement — real miniDSP needs this)
-- Capture direction (ESP32-S3 FIFO limitation, not needed for sweeps)
-- DFU interface
-- Real analog/TOSLINK input switching
-- Actual audio processing (samples are received and counted, not processed)
-
-### Hardware Setup
-
-Two ESP32-S3-DevKitC-1 boards connected via their USB OTG ports (left-side USB-C):
-- **Board 1 (simulator)**: Runs `simulators/minidsp-2x4hd/` firmware. UART serial on right-side USB-C.
-- **Board 2 (host)**: Runs your application (or the test firmware). UART serial on right-side USB-C.
-- **VBUS**: Simulator board is self-powered, but VBUS must be present on the OTG cable for enumeration. Use a powered USB hub or provide 5V externally.
-
-### Building and Flashing
-
-```bash
-# Activate ESP-IDF
-export PATH="/opt/homebrew/bin:$PATH" && . ~/esp/esp-idf/export.sh
-
-# Build and flash the simulator
-cd ~/code/esp-uac2-host/simulators/minidsp-2x4hd
-idf.py build
-idf.py -p /dev/cu.usbmodem<SIMULATOR_SERIAL> flash
-
-# Build and flash the host
-cd ~/code/esp-uac2-host  # or your project
-idf.py build
-idf.py -p /dev/cu.usbmodem<HOST_SERIAL> flash
-```
-
-### Serial Monitoring via serial-mcp
-
-Claude Code has direct serial access to both boards via `serial-mcp` tools. Use these instead of copy-pasting terminal output:
-
-```
-# List ports — look for VID 0x1A86 (CH340 UART bridges)
-list_serial_ports
-
-# Open both boards
-serial_open port=/dev/cu.usbmodem<SIM_SERIAL> baud_rate=115200
-serial_open port=/dev/cu.usbmodem<HOST_SERIAL> baud_rate=115200
-
-# Read simulator output
-serial_read session_id=/dev/cu.usbmodem<SIM_SERIAL>
-
-# Wait for specific output
-serial_wait_for pattern="TEST.*PASS|abort" session_id=/dev/cu.usbmodem<HOST_SERIAL> timeout=30
-
-# Simulator fault injection (send keypress)
-serial_command data="1" session_id=/dev/cu.usbmodem<SIM_SERIAL>  # toggle config switch delay
-serial_command data="s" session_id=/dev/cu.usbmodem<SIM_SERIAL>  # show simulator state
-serial_command data="h" session_id=/dev/cu.usbmodem<SIM_SERIAL>  # fault injection help
-```
-
-### Simulator Fault Injection Keys
-
-| Key | Effect |
-|-----|--------|
-| `1` | Toggle config switch delay (4.5s audio NAK after SetConfig) |
-| `2` | Toggle empty HID response |
-| `3` | NAK next 3 HID writes |
-| `4` | Toggle command timeout (withhold HID response) |
-| `s` | Show simulator state (preset, volume, frame count, faults) |
-| `h` | Show help |
-
-## Clock Sync: Implementation Notes
-
-Use the **Snapcast protocol pattern**: custom NTP-like ping-pong over UDP, median filtering over 50+ samples. Snapcast ESP32 clients (multiple implementations exist, proven in production multi-room audio) achieve ~200μs accuracy on commodity WiFi hardware.
-
-**Lectrobox NTP implementation** (`github.com/jelson/rulos`, path `src/lib/chip/esp32/periph/ntp`) achieved 216μs median with:
-- WiFi promiscuous mode for low-jitter receive timestamps
-- Least-squares linear regression over observations
-- 200μs asymmetry correction constant (send path is slower than receive on ESP32)
-- Top-quartile RTT outlier rejection
-
-For our use case, a simpler version suffices: 50-100 UDP round-trips before measurement, min-RTT filtering, simple offset calculation. We only need accurate sync for the next ~15 seconds, not continuous long-term tracking.
-
-**Clock drift is negligible for our sweep duration.** Gamper (Microsoft Research, 2017) proved drift is ~0.02 samples/second between two devices. For a 15s sweep: 0.3 samples total. Irrelevant.
-
-## Resolved Questions
-
-- **Does the miniDSP fall back to UAC1 at Full Speed?** NO. It presents UAC2 descriptors (`bInterfaceProtocol = 0x20`) at Full Speed. The custom UAC2 driver (`esp-uac2-host`) is required and is complete.
-- **Can we open HID and Audio interfaces simultaneously?** YES, confirmed with the simulator. ESP-IDF supports claiming multiple interfaces on a composite device. The host driver opens the audio interface while HID is on a separate interface.
-- **ASRC lock time:** miniDSP ASRC needs ~2 seconds to lock. The 2-second preamble in the sweep signal covers this. The simulator does not replicate ASRC behavior — verify with real hardware.
-
-## Resolved Questions (Real Hardware Verified April 2026)
-
-- **Feedback format:** **4 bytes / 16.16 format** (not 3-byte 10.14 as originally expected). Value at 48kHz: 0x00300000 (48.0000 samples/frame). Locks immediately, drift <0.002%.
-- **Full config descriptor:** Complete 373-byte descriptor captured from real miniDSP 2x4 HD. Stored at `~/code/esp-uac2-host/ref/minidsp_2x4hd_descriptors.h`.
-- **Volume range:** -127 to 0 dB, 1 dB resolution (master + per-channel).
-- **VBUS requirement:** miniDSP is self-powered but needs VBUS present. Bridge `USB-OTG` solder pads on DevKitC-1.
-- **Hot-unplug during streaming:** Causes ESP32 reset (ESP-IDF v5.4 HAL `abort()` in DWC_OTG ISR for isochronous channels). Not fixable in driver code. Board auto-recovers. Idle disconnect/reconnect works cleanly.
-
-## References
-
-### Code (for implementation)
-- **USE THIS** — UAC2 host driver (complete): `~/code/esp-uac2-host` (MIT, ESP-IDF component)
-- **Simulator** — miniDSP 2x4 HD simulator: `~/code/esp-uac2-host/simulators/minidsp-2x4hd/`
-- **Reference** — Espressif UAC1 host driver (architecture reference): `github.com/espressif/esp-usb` (`host/class/uac/usb_host_uac`)
-- **UAC2 protocol reference** — USBX (MIT): `github.com/eclipse-threadx/usbx` (`ux_class_audio20.h`)
-- **Clock sync reference** — Lectrobox ESP32 NTP: `github.com/jelson/rulos` (`src/lib/chip/esp32/periph/ntp`)
-- **Proves ~200μs WiFi sync works** — ESP32 Snapcast client: `github.com/carlosderseher/snapclient`
-
-### Documentation
-- XMOS USB Audio Design Guide: `xmos.com/file/sw_usb_audio-design-guide`
-- Espressif UAC2 request: `github.com/espressif/esp-usb/issues/173`
-- Gamper (2017): clock drift negligible for sweeps <30s
-- miniDSP device registry: `~/code/minidsp-open/docs/ref-devices.md`
-
-### open-sub-optimizer (caller side)
-- Sweep generation: `~/code/open-sub-optimizer/src/sweep-gen.ts`
-- Cross-correlation: `~/code/open-sub-optimizer/src/cross-correlate.ts`
-- Measurement paths: `~/code/open-sub-optimizer/docs/TODO-measurement-paths.md`
+- **UAC2 driver API**: `~/code/esp-uac2-host/components/uac2_host/include/usb/uac2_host.h` (the header you'll be calling)
+- **UAC2 driver LLM reference**: `~/code/esp-uac2-host/llms.txt` (complete API docs, design notes, hardware constraints)
+- **UAC2 driver implementation**: `~/code/esp-uac2-host/components/uac2_host/uac2_host.c` (~2400 lines)
+- **UAC2 test app** (C usage example): `~/code/esp-uac2-host/main/main.c` — shows install, callback, open, start, write, stop
+- **Existing HID FFI** (Rust pattern to follow): `app-esp32/src/usb_hid.rs`
+- **Open-sub-optimizer sweep reference**: `~/code/open-sub-optimizer/src/sweep-gen.ts` (TypeScript implementation of the same Farina ESS)

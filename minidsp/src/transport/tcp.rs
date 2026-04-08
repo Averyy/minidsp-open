@@ -45,28 +45,29 @@ fn map_io_error(err: std::io::Error) -> TransportError {
 }
 
 impl Transport for TcpTransport {
-    fn send_frame(&self, payload: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+    fn send_frame(
+        &self,
+        payload: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
         let stream = self.stream.clone();
         let frame = packet::encode_frame(payload);
         Box::pin(async move {
             let mut stream = stream.lock().await;
-            stream
-                .write_all(&frame)
-                .await
-                .map_err(map_io_error)?;
-            stream
-                .flush()
-                .await
-                .map_err(map_io_error)?;
+            stream.write_all(&frame).await.map_err(map_io_error)?;
+            stream.flush().await.map_err(map_io_error)?;
             Ok(())
         })
     }
 
-    fn recv_frame(&self, timeout_ms: u64) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+    fn recv_frame(
+        &self,
+        timeout_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
         let stream = self.stream.clone();
         let read_buf = self.read_buf.clone();
         Box::pin(async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
             loop {
                 // Try to decode a server response frame (no checksum)
@@ -81,11 +82,7 @@ impl Transport for TcpTransport {
                 // Need more data — read with timeout
                 let mut tmp = [0u8; 256];
                 let mut stream = stream.lock().await;
-                let result = tokio::time::timeout_at(
-                    deadline,
-                    stream.read(&mut tmp),
-                )
-                .await;
+                let result = tokio::time::timeout_at(deadline, stream.read(&mut tmp)).await;
 
                 match result {
                     Ok(Ok(0)) => return Err(TransportError::Disconnected),
@@ -109,10 +106,7 @@ impl Transport for TcpTransport {
         let stream = self.stream.clone();
         Box::pin(async move {
             let mut stream = stream.lock().await;
-            stream
-                .shutdown()
-                .await
-                .map_err(map_io_error)
+            stream.shutdown().await.map_err(map_io_error)
         })
     }
 

@@ -6,12 +6,13 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-pub mod packet;
+pub mod biquad;
 pub mod commands;
 pub mod device;
 pub mod dialect;
-pub mod biquad;
+pub mod discovery;
 pub mod eeprom;
+pub mod packet;
+pub mod playback;
 pub mod source;
 pub mod status;
-pub mod discovery;

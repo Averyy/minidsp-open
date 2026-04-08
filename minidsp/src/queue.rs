@@ -71,7 +71,10 @@ impl CommandQueue {
         Self::with_reconnect(transport, ReconnectConfig::default())
     }
 
-    pub fn with_reconnect(transport: Box<dyn Transport>, reconnect_config: ReconnectConfig) -> Self {
+    pub fn with_reconnect(
+        transport: Box<dyn Transport>,
+        reconnect_config: ReconnectConfig,
+    ) -> Self {
         let transport_url = transport.url();
         Self {
             transport: Mutex::new(transport),
@@ -151,7 +154,8 @@ impl CommandQueue {
         }
         self.notify.notify_one();
         self.process_next().await;
-        rx.await.map_err(|_| TransportError::Io("response channel closed".into()))?
+        rx.await
+            .map_err(|_| TransportError::Io("response channel closed".into()))?
     }
 
     /// Submit a batch of commands that execute contiguously.
@@ -160,7 +164,9 @@ impl CommandQueue {
         commands: Vec<Vec<u8>>,
         priority: Priority,
     ) -> Result<Vec<Response>, TransportError> {
-        let batch_id = self.next_batch_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let batch_id = self
+            .next_batch_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut receivers = Vec::with_capacity(commands.len());
 
         {
@@ -179,7 +185,8 @@ impl CommandQueue {
         }
 
         // Pause level polling during batch
-        self.levels_paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.levels_paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.notify.notify_one();
 
         // Process all queued commands
@@ -187,11 +194,13 @@ impl CommandQueue {
             self.process_next().await;
         }
 
-        self.levels_paused.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.levels_paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let mut responses = Vec::with_capacity(receivers.len());
         for rx in receivers {
-            let qr = rx.await
+            let qr = rx
+                .await
                 .map_err(|_| TransportError::Io("response channel closed".into()))??;
             responses.push(qr.parsed);
         }
@@ -200,11 +209,13 @@ impl CommandQueue {
 
     /// Check if level polling is paused.
     pub fn is_levels_paused(&self) -> bool {
-        self.levels_paused.load(std::sync::atomic::Ordering::Relaxed)
+        self.levels_paused
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn reconnect_epoch(&self) -> u64 {
-        self.reconnect_epoch.load(std::sync::atomic::Ordering::Relaxed)
+        self.reconnect_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Process the next command in the queue.
@@ -213,9 +224,7 @@ impl CommandQueue {
         let cmd = {
             let mut queues = self.queues.lock().await;
             // Pick highest-priority non-empty queue
-            let cmd = (0..4)
-                .rev()
-                .find_map(|p| queues[p].pop_front());
+            let cmd = (0..4).rev().find_map(|p| queues[p].pop_front());
             cmd
         };
 
@@ -260,27 +269,40 @@ impl CommandQueue {
         let response = commands::parse_response_for_request(&cmd.payload, &raw, &dialect);
 
         // Handle preset change: wait for PresetComplete
-        if cmd.payload.first() == Some(&commands::CMD_SET_CONFIG) && matches!(response, Response::Ack) {
+        if cmd.payload.first() == Some(&commands::CMD_SET_CONFIG)
+            && matches!(response, Response::Ack)
+        {
             match transport.recv_frame(5000).await {
                 Ok(raw2) => {
                     let resp2 = commands::parse_response_for_request(&cmd.payload, &raw2, &dialect);
-                    return Ok(QueueResponse { parsed: resp2, raw: raw2 });
+                    return Ok(QueueResponse {
+                        parsed: resp2,
+                        raw: raw2,
+                    });
                 }
                 Err(TransportError::Disconnected) => return Err(TransportError::Disconnected),
                 Err(_) => {
-                    return Ok(QueueResponse { parsed: response, raw });
+                    return Ok(QueueResponse {
+                        parsed: response,
+                        raw,
+                    });
                 }
             }
         }
 
-        Ok(QueueResponse { parsed: response, raw })
+        Ok(QueueResponse {
+            parsed: response,
+            raw,
+        })
     }
 
     async fn reconnect_transport(&self) -> Result<(), TransportError> {
         let mut attempt = 0u32;
 
         loop {
-            if self.reconnect_config.max_retries != 0 && attempt >= self.reconnect_config.max_retries {
+            if self.reconnect_config.max_retries != 0
+                && attempt >= self.reconnect_config.max_retries
+            {
                 return Err(TransportError::Disconnected);
             }
 
@@ -297,7 +319,8 @@ impl CommandQueue {
                 Ok(new_transport) => {
                     let mut transport = self.transport.lock().await;
                     *transport = new_transport;
-                    self.reconnect_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.reconnect_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::info!("transport reconnected via {}", self.transport_url);
                     return Ok(());
                 }
@@ -328,7 +351,9 @@ async fn open_transport(url: &str) -> Result<Box<dyn Transport>, TransportError>
         #[cfg(not(unix))]
         {
             let _ = (path, device_id);
-            return Err(TransportError::Io("ws+unix reconnect is only supported on unix".into()));
+            return Err(TransportError::Io(
+                "ws+unix reconnect is only supported on unix".into(),
+            ));
         }
     }
 
@@ -345,9 +370,10 @@ async fn open_transport(url: &str) -> Result<Box<dyn Transport>, TransportError>
                     path_err
                 );
                 let devices = crate::transport::hid::enumerate()?;
-                if let Some(device) = devices.into_iter().find(|device| {
-                    device.vendor_id == usb.vid && device.product_id == usb.pid
-                }) {
+                if let Some(device) = devices
+                    .into_iter()
+                    .find(|device| device.vendor_id == usb.vid && device.product_id == usb.pid)
+                {
                     return Ok(Box::new(HidTransport::open(&device.path)?));
                 }
                 return Err(path_err);
@@ -355,11 +381,14 @@ async fn open_transport(url: &str) -> Result<Box<dyn Transport>, TransportError>
         }
     }
 
-    Err(TransportError::Io(format!("unsupported transport url for reconnect: {url}")))
+    Err(TransportError::Io(format!(
+        "unsupported transport url for reconnect: {url}"
+    )))
 }
 
 fn parse_ws_unix_url(rest: &str) -> Result<(String, usize), TransportError> {
-    let (path, suffix) = rest.rsplit_once("/devices/")
+    let (path, suffix) = rest
+        .rsplit_once("/devices/")
         .ok_or_else(|| TransportError::Io(format!("invalid ws+unix transport url: {rest}")))?;
     let device_id = suffix
         .strip_suffix("/ws")
@@ -383,15 +412,21 @@ fn parse_usb_url(rest: &str) -> Result<ParsedUsbUrl, TransportError> {
     let mut vid = None;
     let mut pid = None;
     for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else { continue };
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
         match key {
             "vid" => {
-                vid = Some(u16::from_str_radix(value, 16)
-                    .map_err(|e| TransportError::Io(format!("invalid usb vid: {e}")))?);
+                vid = Some(
+                    u16::from_str_radix(value, 16)
+                        .map_err(|e| TransportError::Io(format!("invalid usb vid: {e}")))?,
+                );
             }
             "pid" => {
-                pid = Some(u16::from_str_radix(value, 16)
-                    .map_err(|e| TransportError::Io(format!("invalid usb pid: {e}")))?);
+                pid = Some(
+                    u16::from_str_radix(value, 16)
+                        .map_err(|e| TransportError::Io(format!("invalid usb pid: {e}")))?,
+                );
             }
             _ => {}
         }

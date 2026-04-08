@@ -250,8 +250,12 @@ pub static OFFICIAL_USB_PRODUCT_HINTS: &[OfficialUsbProductHint] = &[
         label: "HA-DSP",
         public_product_family: "HA-DSP headphone processor family",
         public_software_family: Some("HA-DSP-CF plugin family"),
-        public_product_url: Some("https://www.minidsp.com/images/documents/Product%20Brief%20-%20HA-DSP.pdf"),
-        public_manual_url: Some("https://www.minidsp.com/images/documents/HA-DSP%20User%20Manual.pdf"),
+        public_product_url: Some(
+            "https://www.minidsp.com/images/documents/Product%20Brief%20-%20HA-DSP.pdf",
+        ),
+        public_manual_url: Some(
+            "https://www.minidsp.com/images/documents/HA-DSP%20User%20Manual.pdf",
+        ),
         status: "alias_only",
         exact_runtime_known: false,
         runtime_family_bucket: None,
@@ -264,7 +268,9 @@ pub static OFFICIAL_USB_PRODUCT_HINTS: &[OfficialUsbProductHint] = &[
         public_product_family: "DDRC-22 family",
         public_software_family: Some("DDRC-22 Utility family"),
         public_product_url: Some("https://www.minidsp.com/products/dirac-series"),
-        public_manual_url: Some("https://www.minidsp.com/images/documents/Dirac%20Series%20-%20DDRC-22%20User%20Manual.pdf"),
+        public_manual_url: Some(
+            "https://www.minidsp.com/images/documents/Dirac%20Series%20-%20DDRC-22%20User%20Manual.pdf",
+        ),
         status: "family_candidate",
         exact_runtime_known: false,
         runtime_family_bucket: Some("small Dirac family (2 channels, 1 zone)"),
@@ -277,7 +283,9 @@ pub static OFFICIAL_USB_PRODUCT_HINTS: &[OfficialUsbProductHint] = &[
         public_product_family: "DDRC-88A / DDRC-88D family",
         public_software_family: Some("DDRC-88BM plugin family"),
         public_product_url: Some("https://www.minidsp.com/products/accessories/ddrc-88bm"),
-        public_manual_url: Some("https://www.minidsp.com/images/documents/DDRC-88A%20User%20Manual.pdf"),
+        public_manual_url: Some(
+            "https://www.minidsp.com/images/documents/DDRC-88A%20User%20Manual.pdf",
+        ),
         status: "family_candidate",
         exact_runtime_known: false,
         runtime_family_bucket: Some("legacy Dirac family (8 channels, 1 zone)"),
@@ -316,7 +324,9 @@ pub static OFFICIAL_USB_PRODUCT_HINTS: &[OfficialUsbProductHint] = &[
         public_product_family: "C-DSP 8x12 DL",
         public_software_family: Some("C-DSP 8x12 DL plugin family"),
         public_product_url: Some("https://www.minidsp.com/products/car-audio-dsp/cdsp-8x12-dl"),
-        public_manual_url: Some("https://www.minidsp.com/images/documents/C-DSP%208x12%20DL%20User%20Manual.pdf"),
+        public_manual_url: Some(
+            "https://www.minidsp.com/images/documents/C-DSP%208x12%20DL%20User%20Manual.pdf",
+        ),
         status: "family_candidate",
         exact_runtime_known: false,
         runtime_family_bucket: Some("custom-install 8x12 Dirac family"),
@@ -329,7 +339,9 @@ pub static OFFICIAL_USB_PRODUCT_HINTS: &[OfficialUsbProductHint] = &[
         public_product_family: "Harmony DSP 8x12",
         public_software_family: Some("C-DSP 8x12 DL plugin family"),
         public_product_url: Some("https://www.minidsp.com/products/car-audio-dsp/harmony-8x12"),
-        public_manual_url: Some("https://www.minidsp.com/images/documents/Harmony%20DSP%208x12%20User%20Manual.pdf"),
+        public_manual_url: Some(
+            "https://www.minidsp.com/images/documents/Harmony%20DSP%208x12%20User%20Manual.pdf",
+        ),
         status: "family_candidate",
         exact_runtime_known: false,
         runtime_family_bucket: Some("HT-family 8x12 Dirac family"),
@@ -377,30 +389,12 @@ pub static OFFICIAL_USB_PRODUCT_HINTS: &[OfficialUsbProductHint] = &[
 ];
 
 pub static OFFICIAL_FIRMWARE_UPGRADE_USB_PIDS: &[OfficialFirmwareUpgradeUsbPid] = &[
-    OfficialFirmwareUpgradeUsbPid {
-        vid: 0,
-        pid: 0,
-    },
-    OfficialFirmwareUpgradeUsbPid {
-        vid: 0,
-        pid: 1,
-    },
-    OfficialFirmwareUpgradeUsbPid {
-        vid: 0,
-        pid: 16,
-    },
-    OfficialFirmwareUpgradeUsbPid {
-        vid: 0,
-        pid: 268,
-    },
-    OfficialFirmwareUpgradeUsbPid {
-        vid: 2,
-        pid: 30,
-    },
-    OfficialFirmwareUpgradeUsbPid {
-        vid: 10066,
-        pid: 8,
-    },
+    OfficialFirmwareUpgradeUsbPid { vid: 0, pid: 0 },
+    OfficialFirmwareUpgradeUsbPid { vid: 0, pid: 1 },
+    OfficialFirmwareUpgradeUsbPid { vid: 0, pid: 16 },
+    OfficialFirmwareUpgradeUsbPid { vid: 0, pid: 268 },
+    OfficialFirmwareUpgradeUsbPid { vid: 2, pid: 30 },
+    OfficialFirmwareUpgradeUsbPid { vid: 10066, pid: 8 },
     OfficialFirmwareUpgradeUsbPid {
         vid: 10066,
         pid: 16,
@@ -483,13 +477,7 @@ pub static OFFICIAL_FIRMWARE_UPGRADE_USB_PIDS: &[OfficialFirmwareUpgradeUsbPid] 
     },
 ];
 
-pub static OFFICIAL_MIGRATION_HARDWARE_IDS: &[u8] = &[
-    10,
-    14,
-    17,
-    21,
-    27,
-];
+pub static OFFICIAL_MIGRATION_HARDWARE_IDS: &[u8] = &[10, 14, 17, 21, 27];
 
 pub static OFFICIAL_DESKTOP_FALLBACK_MODELS: &[OfficialDesktopFallbackModel] = &[
     OfficialDesktopFallbackModel {
@@ -658,15 +646,7 @@ pub static OFFICIAL_LEGACY_DEVICES: &[OfficialLegacyDevice] = &[
     },
 ];
 
-pub static OFFICIAL_DIRAC_DSP_VERSIONS: &[u8] = &[
-    61,
-    94,
-    95,
-    101,
-    105,
-    111,
-    113,
-];
+pub static OFFICIAL_DIRAC_DSP_VERSIONS: &[u8] = &[61, 94, 95, 101, 105, 111, 113];
 
 pub static MINIDSP_RS_REFERENCE_PROFILES: &[MinidspRsReferenceProfile] = &[
     MinidspRsReferenceProfile {

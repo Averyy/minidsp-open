@@ -95,9 +95,7 @@ pub fn encode_value(value: f32, dialect: &Dialect) -> [u8; 4] {
 pub fn decode_value(data: &[u8; 4], dialect: &Dialect) -> f32 {
     match dialect.value_format {
         ValueFormat::Float32 => f32::from_le_bytes(*data),
-        ValueFormat::FixedPoint => {
-            fixed_point_to_float(u32::from_be_bytes(*data))
-        }
+        ValueFormat::FixedPoint => fixed_point_to_float(u32::from_be_bytes(*data)),
     }
 }
 
@@ -160,8 +158,20 @@ pub fn decode_mute(data: &[u8], dialect: &Dialect) -> Option<bool> {
 /// Old (ADAU1445): -1.0 = inverted, 1.0 = normal (gain multiplier).
 pub fn polarity_value(inverted: bool, dialect: &Dialect) -> f32 {
     match dialect.value_format {
-        ValueFormat::Float32 => if inverted { 1.0 } else { 0.0 },
-        ValueFormat::FixedPoint => if inverted { -1.0 } else { 1.0 },
+        ValueFormat::Float32 => {
+            if inverted {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        ValueFormat::FixedPoint => {
+            if inverted {
+                -1.0
+            } else {
+                1.0
+            }
+        }
     }
 }
 
@@ -177,7 +187,10 @@ mod tests {
         for &v in &values {
             let fp = float_to_fixed_point(v);
             let back = fixed_point_to_float(fp);
-            assert!((v - back).abs() < 0.0001, "roundtrip failed for {v}: got {back}");
+            assert!(
+                (v - back).abs() < 0.0001,
+                "roundtrip failed for {v}: got {back}"
+            );
         }
     }
 

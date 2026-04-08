@@ -75,7 +75,11 @@ pub async fn serve(addr: &str, state: Arc<DaemonState>) -> std::io::Result<()> {
                                 read_buf.drain(..consumed);
 
                                 if let Some(client) = state.get_device(0).await {
-                                    match client.queue().execute_raw(payload, Priority::Normal).await {
+                                    match client
+                                        .queue()
+                                        .execute_raw(payload, Priority::Normal)
+                                        .await
+                                    {
                                         Ok(raw_resp) => {
                                             let frame = packet::encode_tcp_response(&raw_resp);
                                             if let Err(e) = stream.write_all(&frame).await {

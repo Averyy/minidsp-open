@@ -44,7 +44,9 @@ mod tests {
     #[test]
     fn bypass_detected() {
         assert!(is_bypass(&BYPASS));
-        assert!(!is_bypass(&[1.0003468, -1.9990215, 0.9986773, -1.9990215, 0.9990241]));
+        assert!(!is_bypass(&[
+            1.0003468, -1.9990215, 0.9986773, -1.9990215, 0.9990241
+        ]));
     }
 
     #[test]

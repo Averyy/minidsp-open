@@ -5,15 +5,15 @@
 //! and sends/receives binary MiniDSP protocol frames.
 
 use super::{Transport, TransportError};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 use minidsp_protocol::packet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
-use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio::sync::Mutex;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 /// WebSocket transport that connects to the daemon's raw frame bridge.
 /// Uses type-erased async IO so it works over both TCP and Unix sockets.
@@ -52,7 +52,7 @@ impl WsTransport {
         // Reject TLS schemes — we don't support wss:// yet
         if base_url.starts_with("https://") || base_url.starts_with("wss://") {
             return Err(TransportError::Io(
-                "TLS (wss://, https://) not supported — use ws:// or http://".into()
+                "TLS (wss://, https://) not supported — use ws:// or http://".into(),
             ));
         }
 
@@ -64,7 +64,9 @@ impl WsTransport {
             .await
             .map_err(|e| TransportError::Io(format!("TCP connect to {host_port}: {e}")))?;
 
-        let request = ws_url.as_str().into_client_request()
+        let request = ws_url
+            .as_str()
+            .into_client_request()
             .map_err(|e| TransportError::Io(format!("WS request: {e}")))?;
 
         let boxed: Box<dyn AsyncRw> = Box::new(tcp_stream);
@@ -90,7 +92,9 @@ impl WsTransport {
             .map_err(|e| TransportError::Io(format!("unix socket {path}: {e}")))?;
 
         let ws_url = format!("ws://localhost/devices/{device_id}/ws");
-        let request = ws_url.as_str().into_client_request()
+        let request = ws_url
+            .as_str()
+            .into_client_request()
             .map_err(|e| TransportError::Io(format!("WS request: {e}")))?;
 
         let boxed: Box<dyn AsyncRw> = Box::new(unix_stream);
@@ -129,7 +133,10 @@ fn format_ws_url(base: &str, device_id: usize) -> String {
 }
 
 impl Transport for WsTransport {
-    fn send_frame(&self, payload: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+    fn send_frame(
+        &self,
+        payload: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
         let sink = self.sink.clone();
         let frame = packet::encode_frame(payload);
         Box::pin(async move {
@@ -141,10 +148,14 @@ impl Transport for WsTransport {
         })
     }
 
-    fn recv_frame(&self, timeout_ms: u64) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+    fn recv_frame(
+        &self,
+        timeout_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
         let stream = self.stream.clone();
         Box::pin(async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             // Hold lock for the entire receive operation (no concurrent recv callers)
             let mut stream = stream.lock().await;
 
@@ -158,7 +169,10 @@ impl Transport for WsTransport {
                             return Ok(payload);
                         }
                         // Decode failure — corrupted frame, skip and try next
-                        tracing::warn!("WS: undecodable binary frame ({} bytes), skipping", data.len());
+                        tracing::warn!(
+                            "WS: undecodable binary frame ({} bytes), skipping",
+                            data.len()
+                        );
                         continue;
                     }
                     Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {

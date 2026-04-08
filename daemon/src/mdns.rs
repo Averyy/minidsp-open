@@ -34,7 +34,7 @@ pub fn advertise(
         SERVICE_TYPE,
         &instance_name,
         &format!("{hostname}.local."),
-        "",  // Let mdns-sd determine IP
+        "", // Let mdns-sd determine IP
         port,
         properties,
     )?;

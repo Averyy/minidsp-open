@@ -4,13 +4,13 @@
 //! wire bytes and parses the exact same responses as minidsp-rs would.
 //! See docs/ref-compatibility.md for the canonical contract.
 
-use minidsp_protocol::commands::*;
-use minidsp_protocol::dialect::Dialect;
-use minidsp_protocol::packet;
-use minidsp_protocol::device::probe;
-use minidsp_protocol::eeprom;
-use minidsp_protocol::source::Source;
 use minidsp_protocol::biquad;
+use minidsp_protocol::commands::*;
+use minidsp_protocol::device::probe;
+use minidsp_protocol::dialect::Dialect;
+use minidsp_protocol::eeprom;
+use minidsp_protocol::packet;
+use minidsp_protocol::source::Source;
 
 // ============================================================
 // CLI output format compatibility
@@ -47,10 +47,19 @@ fn source_lowercase_parsing() {
     assert_eq!(Source::from_str_lowercase("aesebu"), Some(Source::AesEbu));
     assert_eq!(Source::from_str_lowercase("hdmi"), Some(Source::Hdmi));
     assert_eq!(Source::from_str_lowercase("analog"), Some(Source::Analog));
-    assert_eq!(Source::from_str_lowercase("bluetooth"), Some(Source::Bluetooth));
+    assert_eq!(
+        Source::from_str_lowercase("bluetooth"),
+        Some(Source::Bluetooth)
+    );
     // RCA/XLR aliases (SHD)
-    assert_eq!(Source::from_str_lowercase("rca"), Some(Source::AnalogSingleEnd));
-    assert_eq!(Source::from_str_lowercase("xlr"), Some(Source::AnalogBalanced));
+    assert_eq!(
+        Source::from_str_lowercase("rca"),
+        Some(Source::AnalogSingleEnd)
+    );
+    assert_eq!(
+        Source::from_str_lowercase("xlr"),
+        Some(Source::AnalogBalanced)
+    );
 }
 
 #[test]
@@ -120,11 +129,16 @@ fn hid_report_format() {
 #[test]
 fn hid_response_uses_length_only_without_checksum() {
     let data = [
-        0x0c, 0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x21, 0xf6, 0x08, 0x5b,
+        0x0c, 0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0xf6, 0x08,
+        0x5b,
     ];
     let payload = packet::decode_hid_response(&data).unwrap();
-    assert_eq!(payload, vec![0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    assert_eq!(
+        payload,
+        vec![
+            0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ]
+    );
 }
 
 #[test]
@@ -143,7 +157,10 @@ fn set_volume_wire_format() {
 
     // Verify dB conversion
     let raw = eeprom::MasterStatusRaw {
-        preset: 0, source: 0, volume: 20, mute: 0,
+        preset: 0,
+        source: 0,
+        volume: 20,
+        mute: 0,
     };
     assert!((raw.volume_db() - (-10.0)).abs() < 0.01);
 }
@@ -190,7 +207,7 @@ fn read_floats_wire_format() {
     assert_eq!(cmd[0], 0x14);
     assert_eq!(cmd[1], 0x0F); // addr_hi (no write bit for reads)
     assert_eq!(cmd[2], 0xC0); // addr_lo
-    assert_eq!(cmd[3], 4);    // count
+    assert_eq!(cmd[3], 4); // count
 }
 
 #[test]
@@ -337,12 +354,21 @@ fn source_maps_match_docs() {
 
     // hw_id 30 (Flex Eight): NO analog, starts at 1
     assert_eq!(SOURCES_FLEX_EIGHT.source_for_index(0), None);
-    assert_eq!(SOURCES_FLEX_EIGHT.source_for_index(1), Some(Source::Toslink));
+    assert_eq!(
+        SOURCES_FLEX_EIGHT.source_for_index(1),
+        Some(Source::Toslink)
+    );
     assert_eq!(SOURCES_FLEX_EIGHT.count(), 4);
 
     // hw_id 14 (SHD): 7 sources including analog balanced
-    assert_eq!(SOURCES_SHD.source_for_index(3), Some(Source::AnalogSingleEnd));
-    assert_eq!(SOURCES_SHD.source_for_index(4), Some(Source::AnalogBalanced));
+    assert_eq!(
+        SOURCES_SHD.source_for_index(3),
+        Some(Source::AnalogSingleEnd)
+    );
+    assert_eq!(
+        SOURCES_SHD.source_for_index(4),
+        Some(Source::AnalogBalanced)
+    );
     assert_eq!(SOURCES_SHD.source_for_index(6), Some(Source::Lan));
     assert_eq!(SOURCES_SHD.count(), 7);
 
@@ -393,8 +419,14 @@ fn mute_encoding_compatibility() {
     assert_eq!(encode_mute(false, &Dialect::NEW), vec![0x01, 0x00]);
 
     // Old dialect: muted=0x00000000, unmuted=0x00800000 (u32 BE)
-    assert_eq!(encode_mute(true, &Dialect::OLD), vec![0x00, 0x00, 0x00, 0x00]);
-    assert_eq!(encode_mute(false, &Dialect::OLD), vec![0x00, 0x80, 0x00, 0x00]);
+    assert_eq!(
+        encode_mute(true, &Dialect::OLD),
+        vec![0x00, 0x00, 0x00, 0x00]
+    );
+    assert_eq!(
+        encode_mute(false, &Dialect::OLD),
+        vec![0x00, 0x80, 0x00, 0x00]
+    );
 
     // Decode roundtrip
     assert!(decode_mute(&encode_mute(true, &Dialect::NEW), &Dialect::NEW).unwrap());

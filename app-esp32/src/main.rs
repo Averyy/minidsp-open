@@ -24,6 +24,7 @@ mod ezbeq;
 mod http_server;
 mod storage;
 mod updater;
+mod usb_audio;
 mod usb_hid;
 mod wifi;
 
@@ -36,8 +37,7 @@ fn main() {
     info!("minidsp-open v{} starting", env!("CARGO_PKG_VERSION"));
 
     // Initialize NVS (required for WiFi credentials)
-    let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take()
-        .expect("failed to initialize NVS");
+    let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take().expect("failed to initialize NVS");
 
     // Mount LittleFS data partition (ezBEQ catalogue, UI, config)
     match storage::mount() {
@@ -70,6 +70,7 @@ fn main() {
 
     // Shared device state (None until USB device is probed)
     let device_state: http_server::SharedDeviceState = Arc::new(Mutex::new(None));
+    let audio_state = usb_audio::AudioState::new();
 
     // Shared ezBEQ slot state (initialized when device is probed, used in STA mode only)
     let beq_state: ezbeq::SharedEzBeqState = Arc::new(Mutex::new(
@@ -83,7 +84,14 @@ fn main() {
         info!("step 2: starting captive portal at {ap_ip}");
         wifi::configure_dhcp_for_captive_portal(ap_ip);
         wifi::start_captive_dns(ap_ip);
-        match http_server::start(device_state.clone(), 80, nvs.clone(), Some(ap_ip), None) {
+        match http_server::start(
+            device_state.clone(),
+            audio_state.clone(),
+            80,
+            nvs.clone(),
+            Some(ap_ip),
+            None,
+        ) {
             Ok(server) => {
                 info!("captive portal running on port 80");
                 Box::leak(Box::new(server));
@@ -101,6 +109,12 @@ fn main() {
             None
         }
     };
+
+    if bus.is_some() {
+        if let Err(e) = usb_audio::install(audio_state.clone()) {
+            error!("UAC2 audio init failed: {e} — audio playback unavailable");
+        }
+    }
 
     // Step 4: Wait for MiniDSP device (up to 30s)
     if let Some(ref bus) = bus {
@@ -144,7 +158,14 @@ fn main() {
     // Step 6: Start HTTP server (STA mode — SoftAP portal already started above)
     if wifi_is_sta && wifi_handle.is_some() {
         info!("step 6: starting HTTP server on port 5380");
-        match http_server::start(device_state.clone(), 5380, nvs.clone(), None, Some(beq_state.clone())) {
+        match http_server::start(
+            device_state.clone(),
+            audio_state.clone(),
+            5380,
+            nvs.clone(),
+            None,
+            Some(beq_state.clone()),
+        ) {
             Ok(server) => {
                 info!("HTTP server running on port 5380");
                 Box::leak(Box::new(server));
@@ -254,9 +275,7 @@ fn main() {
 
 /// Start mDNS advertisement for the MiniDSP service.
 #[cfg(any(esp_idf_comp_mdns_enabled, esp_idf_comp_espressif__mdns_enabled))]
-fn start_mdns(
-    device_state: &http_server::SharedDeviceState,
-) -> Option<esp_idf_svc::mdns::EspMdns> {
+fn start_mdns(device_state: &http_server::SharedDeviceState) -> Option<esp_idf_svc::mdns::EspMdns> {
     use esp_idf_svc::mdns::EspMdns;
 
     let mut mdns = match EspMdns::take() {
@@ -347,7 +366,8 @@ fn tcp_bridge(state: http_server::SharedDeviceState) {
 
         loop {
             // Try to decode a frame from buffered data first
-            if let Some((payload, consumed)) = minidsp_protocol::packet::decode_tcp_frame(&read_buf) {
+            if let Some((payload, consumed)) = minidsp_protocol::packet::decode_tcp_frame(&read_buf)
+            {
                 read_buf.drain(..consumed);
 
                 // Forward to device
@@ -467,7 +487,7 @@ fn fallback_discovery_serial() -> u32 {
 fn get_sta_ip() -> Option<[u8; 4]> {
     unsafe {
         let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(
-            b"WIFI_STA_DEF\0".as_ptr() as *const _,
+            b"WIFI_STA_DEF\0".as_ptr() as *const _
         );
         if netif.is_null() {
             return None;

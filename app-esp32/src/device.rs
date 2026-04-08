@@ -10,11 +10,13 @@ use minidsp_protocol::device::probe;
 use minidsp_protocol::device::DeviceProfile;
 use minidsp_protocol::dialect::{Dialect, ValueFormat};
 use minidsp_protocol::eeprom;
+use minidsp_protocol::source::Source;
 use minidsp_protocol::status::*;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 struct PeqShadow {
@@ -68,18 +70,24 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
     if let Some(table) = profile.dsp_table {
         for input in table.inputs {
             for band in input.peq {
-                shadow.insert(band.addr, PeqShadow {
-                    coeffs: minidsp_protocol::biquad::BYPASS,
-                    bypass: false,
-                });
+                shadow.insert(
+                    band.addr,
+                    PeqShadow {
+                        coeffs: minidsp_protocol::biquad::BYPASS,
+                        bypass: false,
+                    },
+                );
             }
         }
         for output in table.outputs {
             for band in output.peq {
-                shadow.insert(band.addr, PeqShadow {
-                    coeffs: minidsp_protocol::biquad::BYPASS,
-                    bypass: false,
-                });
+                shadow.insert(
+                    band.addr,
+                    PeqShadow {
+                        coeffs: minidsp_protocol::biquad::BYPASS,
+                        bypass: false,
+                    },
+                );
             }
         }
     }
@@ -113,14 +121,25 @@ impl DeviceState {
         let (addr_hi, addr_lo) = eeprom::DSP_VERSION_ADDR;
         let req = commands::read_flash(addr_hi, addr_lo, 1);
         let resp = bus.command(&req)?;
-        debug!("dsp_version raw resp ({} bytes): {:02x?}", resp.len(), &resp[..resp.len().min(10)]);
+        debug!(
+            "dsp_version raw resp ({} bytes): {:02x?}",
+            resp.len(),
+            &resp[..resp.len().min(10)]
+        );
         let parsed = commands::parse_response_for_request(&req, &resp, &Dialect::NEW);
         let dsp_version = match parsed {
             Response::FlashData(ref data) => {
-                debug!("dsp_version FlashData ({} bytes): {:02x?}", data.len(), data);
+                debug!(
+                    "dsp_version FlashData ({} bytes): {:02x?}",
+                    data.len(),
+                    data
+                );
                 eeprom::parse_dsp_version(data).unwrap_or(0)
             }
-            ref other => { debug!("dsp_version response: {other:?}"); 0 }
+            ref other => {
+                debug!("dsp_version response: {other:?}");
+                0
+            }
         };
         debug!("dsp_version: {dsp_version}");
 
@@ -166,6 +185,11 @@ impl DeviceState {
     pub fn product_name(&self) -> &str {
         probe::product_name(self.hw_id.hw_id, self.dsp_version)
     }
+
+    pub fn current_source(&self) -> Result<Option<Source>, UsbHidError> {
+        let status = self.get_master_status()?;
+        Ok(self.profile.sources.source_for_index(status.source))
+    }
     fn dialect(&self) -> &Dialect {
         &self.profile.dialect
     }
@@ -173,6 +197,29 @@ impl DeviceState {
     // -- Master status --
 
     pub fn get_master_status(&self) -> Result<eeprom::MasterStatusRaw, UsbHidError> {
+        const MASTER_STATUS_RETRIES: usize = 6;
+        const MASTER_STATUS_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+        let mut last_err = None;
+        for attempt in 0..MASTER_STATUS_RETRIES {
+            match self.read_master_status_once() {
+                Ok(status) => return Ok(status),
+                Err(UsbHidError::Protocol(err)) => {
+                    last_err = Some(err);
+                    if attempt + 1 < MASTER_STATUS_RETRIES {
+                        std::thread::sleep(MASTER_STATUS_RETRY_DELAY);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(UsbHidError::Protocol(
+            last_err.unwrap_or_else(|| "master status retry exhausted".into()),
+        ))
+    }
+
+    fn read_master_status_once(&self) -> Result<eeprom::MasterStatusRaw, UsbHidError> {
         let (hi, lo) = eeprom::MASTER_STATUS_ADDR;
         let req = commands::read_flash(hi, lo, 4);
         let resp = self.bus.command(&req)?;
@@ -181,9 +228,7 @@ impl DeviceState {
                 eeprom::MasterStatusRaw::from_bytes(&data)
                     .ok_or_else(|| UsbHidError::Protocol("bad master status".into()))
             }
-            other => Err(UsbHidError::Protocol(format!(
-                "master status: {other:?}"
-            ))),
+            other => Err(UsbHidError::Protocol(format!("master status: {other:?}"))),
         }
     }
 
@@ -260,7 +305,9 @@ impl DeviceState {
                 }
             }
 
-            let gain = input.gain.and_then(|addr| self.read_config_gain_db(addr).ok());
+            let gain = input
+                .gain
+                .and_then(|addr| self.read_config_gain_db(addr).ok());
             let mute = input.mute.and_then(|addr| self.read_config_mute(addr).ok());
 
             inputs.push(InputConfigRead {
@@ -291,7 +338,9 @@ impl DeviceState {
 
             let gain = self.read_config_gain_db(output.gain).ok();
             let mute = self.read_config_mute(output.mute).ok();
-            let delay = output.delay.and_then(|addr| self.read_config_delay(addr).ok());
+            let delay = output
+                .delay
+                .and_then(|addr| self.read_config_delay(addr).ok());
             let invert = output
                 .polarity
                 .and_then(|addr| self.read_config_invert(addr).ok());
@@ -315,9 +364,7 @@ impl DeviceState {
         let resp = self.bus.command(&req)?;
         match commands::parse_response_for_request(&req, &resp, self.dialect()) {
             Response::Floats(values) => Ok(values),
-            other => Err(UsbHidError::Protocol(format!(
-                "read_floats: {other:?}"
-            ))),
+            other => Err(UsbHidError::Protocol(format!("read_floats: {other:?}"))),
         }
     }
 
@@ -343,7 +390,9 @@ impl DeviceState {
                 return Ok(coeffs);
             }
         }
-        Ok(self.peq_shadow.lock()
+        Ok(self
+            .peq_shadow
+            .lock()
             .map_err(|_| UsbHidError::Protocol("peq shadow poisoned".into()))?
             .get(&addr)
             .map(|s| s.coeffs)
@@ -358,7 +407,8 @@ impl DeviceState {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => Ok(f32::from_bits(self.read_param_word(addr)?)),
             ValueFormat::FixedPoint => {
-                let linear = self.read_floats(addr, 1)?
+                let linear = self
+                    .read_floats(addr, 1)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| UsbHidError::Protocol("empty gain response".into()))?;
@@ -371,7 +421,8 @@ impl DeviceState {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => Ok(self.read_param_word(addr)? >= 2),
             ValueFormat::FixedPoint => {
-                let value = self.read_floats(addr, 1)?
+                let value = self
+                    .read_floats(addr, 1)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| UsbHidError::Protocol("empty mute response".into()))?;
@@ -383,19 +434,23 @@ impl DeviceState {
     fn read_config_delay(&self, addr: u16) -> Result<std::time::Duration, UsbHidError> {
         let samples = match self.profile.dialect.value_format {
             ValueFormat::Float32 => self.read_param_word(addr)? as f32,
-            ValueFormat::FixedPoint => self.read_floats(addr, 1)?
+            ValueFormat::FixedPoint => self
+                .read_floats(addr, 1)?
                 .into_iter()
                 .next()
                 .ok_or_else(|| UsbHidError::Protocol("empty delay response".into()))?,
         };
-        Ok(std::time::Duration::from_secs_f32(samples / self.profile.sample_rate as f32))
+        Ok(std::time::Duration::from_secs_f32(
+            samples / self.profile.sample_rate as f32,
+        ))
     }
 
     fn read_config_invert(&self, addr: u16) -> Result<bool, UsbHidError> {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => Ok(self.read_param_word(addr)? != 0),
             ValueFormat::FixedPoint => {
-                let value = self.read_floats(addr, 1)?
+                let value = self
+                    .read_floats(addr, 1)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| UsbHidError::Protocol("empty invert response".into()))?;
@@ -414,8 +469,7 @@ impl DeviceState {
         let mut all_values = Vec::with_capacity(addrs.len());
 
         // Check if addresses are contiguous for a single bulk read
-        let is_contiguous =
-            addrs.len() <= 14 && addrs.windows(2).all(|w| w[1] == w[0] + 1);
+        let is_contiguous = addrs.len() <= 14 && addrs.windows(2).all(|w| w[1] == w[0] + 1);
 
         if is_contiguous {
             let values = self.read_floats(addrs[0], addrs.len() as u8)?;
@@ -425,10 +479,7 @@ impl DeviceState {
             let mut i = 0;
             while i < addrs.len() {
                 let start = i;
-                while i + 1 < addrs.len()
-                    && addrs[i + 1] == addrs[i] + 1
-                    && (i - start + 1) < 14
-                {
+                while i + 1 < addrs.len() && addrs[i + 1] == addrs[i] + 1 && (i - start + 1) < 14 {
                     i += 1;
                 }
                 let count = (i - start + 1).min(14);
@@ -485,14 +536,12 @@ impl DeviceState {
     }
 
     pub fn set_display_brightness(&self, level: u8) -> Result<(), UsbHidError> {
-        self.bus
-            .command(&commands::set_display_brightness(level))?;
+        self.bus.command(&commands::set_display_brightness(level))?;
         Ok(())
     }
 
     pub fn set_display_idle_time(&self, secs: u8) -> Result<(), UsbHidError> {
-        self.bus
-            .command(&commands::set_display_idle_time(secs))?;
+        self.bus.command(&commands::set_display_idle_time(secs))?;
         Ok(())
     }
 

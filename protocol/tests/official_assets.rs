@@ -15,26 +15,33 @@ fn modern_probe_coverage_matches_official_assets() {
             device.hw_id, device.dsp_version
         );
         assert_eq!(
-            profile.tier, CapabilityTier::Full,
+            profile.tier,
+            CapabilityTier::Full,
             "official modern device {} / dsp {} regressed below Full tier",
-            device.hw_id, device.dsp_version
+            device.hw_id,
+            device.dsp_version
         );
         assert!(
             profile.dsp_table.is_some(),
             "official modern device {} / dsp {} is missing a dsp table",
-            device.hw_id, device.dsp_version
+            device.hw_id,
+            device.dsp_version
         );
         assert_eq!(
             profile.sources.count(),
             device.source_count,
             "source-count mismatch for official device {} / dsp {} ({})",
-            device.hw_id, device.dsp_version, device.product_name
+            device.hw_id,
+            device.dsp_version,
+            device.product_name
         );
         assert_eq!(
             profile.has_dirac,
             generated_official::OFFICIAL_DIRAC_DSP_VERSIONS.contains(&device.dsp_version),
             "dirac flag mismatch for official device {} / dsp {} ({})",
-            device.hw_id, device.dsp_version, device.product_name
+            device.hw_id,
+            device.dsp_version,
+            device.product_name
         );
         assert_eq!(
             profile.has_display, device.has_display,
@@ -114,7 +121,10 @@ fn unresolved_usb_aliases_keep_current_family_classification() {
     };
 
     let ha = find("HA-DSP");
-    assert_eq!(ha.public_product_family, "HA-DSP headphone processor family");
+    assert_eq!(
+        ha.public_product_family,
+        "HA-DSP headphone processor family"
+    );
     assert_eq!(
         ha.public_product_url,
         Some("https://www.minidsp.com/images/documents/Product%20Brief%20-%20HA-DSP.pdf")
@@ -135,9 +145,14 @@ fn unresolved_usb_aliases_keep_current_family_classification() {
     );
     assert_eq!(
         ddrc22.public_manual_url,
-        Some("https://www.minidsp.com/images/documents/Dirac%20Series%20-%20DDRC-22%20User%20Manual.pdf")
+        Some(
+            "https://www.minidsp.com/images/documents/Dirac%20Series%20-%20DDRC-22%20User%20Manual.pdf"
+        )
     );
-    assert_eq!(ddrc22.public_software_family, Some("DDRC-22 Utility family"));
+    assert_eq!(
+        ddrc22.public_software_family,
+        Some("DDRC-22 Utility family")
+    );
     assert_eq!(
         ddrc22.runtime_family_bucket,
         Some("small Dirac family (2 channels, 1 zone)")
@@ -154,7 +169,10 @@ fn unresolved_usb_aliases_keep_current_family_classification() {
         ddrc88.public_manual_url,
         Some("https://www.minidsp.com/images/documents/DDRC-88A%20User%20Manual.pdf")
     );
-    assert_eq!(ddrc88.public_software_family, Some("DDRC-88BM plugin family"));
+    assert_eq!(
+        ddrc88.public_software_family,
+        Some("DDRC-88BM plugin family")
+    );
     assert_eq!(
         ddrc88.runtime_family_bucket,
         Some("legacy Dirac family (8 channels, 1 zone)")
@@ -171,7 +189,10 @@ fn unresolved_usb_aliases_keep_current_family_classification() {
         cdsp.public_manual_url,
         Some("https://www.minidsp.com/images/documents/C-DSP%208x12%20DL%20User%20Manual.pdf")
     );
-    assert_eq!(cdsp.public_software_family, Some("C-DSP 8x12 DL plugin family"));
+    assert_eq!(
+        cdsp.public_software_family,
+        Some("C-DSP 8x12 DL plugin family")
+    );
     assert_eq!(
         cdsp.runtime_family_bucket,
         Some("custom-install 8x12 Dirac family")
@@ -188,7 +209,10 @@ fn unresolved_usb_aliases_keep_current_family_classification() {
         harmony.public_manual_url,
         Some("https://www.minidsp.com/images/documents/Harmony%20DSP%208x12%20User%20Manual.pdf")
     );
-    assert_eq!(harmony.public_software_family, Some("C-DSP 8x12 DL plugin family"));
+    assert_eq!(
+        harmony.public_software_family,
+        Some("C-DSP 8x12 DL plugin family")
+    );
     assert_eq!(
         harmony.runtime_family_bucket,
         Some("HT-family 8x12 Dirac family")
@@ -227,14 +251,15 @@ fn desktop_fallback_models_match_official_modern_devices_grouped_by_dsp() {
         models.sort_unstable();
     }
 
-    let mut actual: Vec<(u8, Vec<&'static str>)> = generated_official::OFFICIAL_DESKTOP_FALLBACK_MODELS
-        .iter()
-        .map(|entry| {
-            let mut models = entry.models.to_vec();
-            models.sort_unstable();
-            (entry.dsp_id, models)
-        })
-        .collect();
+    let mut actual: Vec<(u8, Vec<&'static str>)> =
+        generated_official::OFFICIAL_DESKTOP_FALLBACK_MODELS
+            .iter()
+            .map(|entry| {
+                let mut models = entry.models.to_vec();
+                models.sort_unstable();
+                (entry.dsp_id, models)
+            })
+            .collect();
     actual.sort_by_key(|(dsp, _)| *dsp);
 
     assert_eq!(
@@ -265,7 +290,9 @@ fn minidsp_rs_reference_profiles_are_covered_by_probe_table() {
         assert!(
             reference.rust_profile.is_some(),
             "generated reference unexpectedly lacks a rust profile for minidsp-rs row {} / dsp {} ({})",
-            reference.hw_id, reference.dsp_version, reference.name
+            reference.hw_id,
+            reference.dsp_version,
+            reference.name
         );
         let expected_name_match = profile.name == reference.name;
         assert_eq!(

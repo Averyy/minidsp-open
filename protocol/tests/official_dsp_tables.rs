@@ -36,7 +36,8 @@ struct DspFilter {
 
 #[test]
 fn modern_dsp_tables_reference_official_slot_indexes() {
-    let matrix: DeviceMatrix = serde_json::from_str(DEVICE_MATRIX_JSON).expect("parse device matrix json");
+    let matrix: DeviceMatrix =
+        serde_json::from_str(DEVICE_MATRIX_JSON).expect("parse device matrix json");
     let mut seen_dsp_versions = HashSet::new();
 
     for row in matrix.modern_devices {
@@ -52,7 +53,12 @@ fn modern_dsp_tables_reference_official_slot_indexes() {
             .items
             .into_iter()
             .map(|item| item.idx)
-            .chain(row.dsp_defaults.filters.into_iter().map(|filter| filter.idx))
+            .chain(
+                row.dsp_defaults
+                    .filters
+                    .into_iter()
+                    .map(|filter| filter.idx),
+            )
             .collect();
         assert_channel_control_indexes_known(profile.name, row.dsp_version, table, &known_indexes);
     }
@@ -66,13 +72,34 @@ fn assert_channel_control_indexes_known(
 ) {
     for (channel, input) in table.inputs.iter().enumerate() {
         if let Some(addr) = input.mute {
-            assert_known_index(profile_name, dsp_version, "input.mute", channel, addr, known_indexes);
+            assert_known_index(
+                profile_name,
+                dsp_version,
+                "input.mute",
+                channel,
+                addr,
+                known_indexes,
+            );
         }
         if let Some(addr) = input.gain {
-            assert_known_index(profile_name, dsp_version, "input.gain", channel, addr, known_indexes);
+            assert_known_index(
+                profile_name,
+                dsp_version,
+                "input.gain",
+                channel,
+                addr,
+                known_indexes,
+            );
         }
         if let Some(addr) = input.polarity {
-            assert_known_index(profile_name, dsp_version, "input.polarity", channel, addr, known_indexes);
+            assert_known_index(
+                profile_name,
+                dsp_version,
+                "input.polarity",
+                channel,
+                addr,
+                known_indexes,
+            );
         }
         for (band, peq) in input.peq.iter().enumerate() {
             assert_known_index(
@@ -105,10 +132,31 @@ fn assert_channel_control_indexes_known(
     }
 
     for (channel, output) in table.outputs.iter().enumerate() {
-        assert_known_index(profile_name, dsp_version, "output.mute", channel, output.mute, known_indexes);
-        assert_known_index(profile_name, dsp_version, "output.gain", channel, output.gain, known_indexes);
+        assert_known_index(
+            profile_name,
+            dsp_version,
+            "output.mute",
+            channel,
+            output.mute,
+            known_indexes,
+        );
+        assert_known_index(
+            profile_name,
+            dsp_version,
+            "output.gain",
+            channel,
+            output.gain,
+            known_indexes,
+        );
         if let Some(addr) = output.delay {
-            assert_known_index(profile_name, dsp_version, "output.delay", channel, addr, known_indexes);
+            assert_known_index(
+                profile_name,
+                dsp_version,
+                "output.delay",
+                channel,
+                addr,
+                known_indexes,
+            );
         }
         if let Some(addr) = output.polarity {
             assert_known_index(

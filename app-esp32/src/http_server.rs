@@ -10,12 +10,19 @@
 
 use crate::device::DeviceState;
 use crate::diagnostics;
+use crate::usb_audio;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::io::Write;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use log::{debug, info};
+use log::{debug, info, warn};
+use minidsp_protocol::playback::{
+    PlayRequest, PlayResponse, PlaybackPlan, SyncRequest, SyncResponse,
+};
+use minidsp_protocol::source::Source;
 use minidsp_protocol::status::StatusSummary;
+use serde_json::json;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 /// Shared device state — None when USB disconnected, Some when connected.
@@ -27,6 +34,7 @@ pub type SharedDeviceState = Arc<Mutex<Option<Arc<DeviceState>>>>;
 /// `beq_state` is the shared ezBEQ slot state (None in SoftAP mode).
 pub fn start(
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
     port: u16,
     nvs: EspDefaultNvsPartition,
     ap_ip: Option<std::net::Ipv4Addr>,
@@ -39,7 +47,10 @@ pub fn start(
         // routes, and CORS/catch-all handlers. Keep some headroom so the HTTP
         // server doesn't fail with ESP_ERR_HTTPD_HANDLERS_FULL as routes evolve.
         max_uri_handlers: 64,
-        stack_size: 16384,
+        // `/devices/0/play` does request parsing, source switching, and
+        // playback-thread orchestration before handing back the response.
+        // The default 16 KiB httpd task stack is not enough on real hardware.
+        stack_size: 24 * 1024,
         max_open_sockets: 13,
         uri_match_wildcard: true,
         ..Default::default()
@@ -66,7 +77,8 @@ pub fn start(
                             "dsp_version": info.version.dsp_version,
                             "serial": info.version.serial,
                         }
-                    }])).unwrap_or_else(|_| "[]".into())
+                    }]))
+                    .unwrap_or_else(|_| "[]".into())
                 }
                 None => "[]".into(),
             };
@@ -159,6 +171,154 @@ pub fn start(
     // Source and preset routes
     register_source_routes(&mut server, state.clone())?;
     register_preset_routes(&mut server, state.clone())?;
+
+    {
+        server.fn_handler("/sync", Method::Post, move |mut req| {
+            let body = match read_request_body(&mut req, 512) {
+                Ok(body) => body,
+                Err(message) => return send_error(req, 413, message),
+            };
+            let sync_req: SyncRequest = match serde_json::from_slice(&body) {
+                Ok(value) => value,
+                Err(_) => return send_error(req, 400, "invalid JSON"),
+            };
+            let response = SyncResponse {
+                client_time_us: sync_req.client_time_us,
+                server_time_us: usb_audio::server_time_us(),
+            };
+            match serde_json::to_string(&response) {
+                Ok(json) => send_json(req, 200, &json),
+                Err(_) => send_error(req, 500, "failed to serialize response"),
+            }
+        })?;
+    }
+
+    {
+        let st = state.clone();
+        let audio = audio_state.clone();
+        server.fn_handler("/devices/0/play", Method::Post, move |mut req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            if !dev.profile().has_usb_audio {
+                return send_error(req, 400, "device does not support USB audio playback");
+            }
+            let audio_device = match audio.current_device() {
+                Some(device) => device,
+                None => return send_error(req, 503, "USB audio interface not connected"),
+            };
+            if !audio.try_begin_playback() {
+                return send_error(req, 409, "playback already in progress");
+            }
+
+            let body = match read_request_body(&mut req, 4096) {
+                Ok(body) => body,
+                Err(message) => {
+                    audio.finish_playback();
+                    return send_error(req, 413, message);
+                }
+            };
+            let play_request = if body.is_empty() {
+                PlayRequest::default()
+            } else {
+                match serde_json::from_slice::<PlayRequest>(&body) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        audio.finish_playback();
+                        return send_error(req, 400, "invalid JSON");
+                    }
+                }
+            };
+
+            let plan = match PlaybackPlan::build(play_request) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    audio.finish_playback();
+                    return send_error(req, 400, &err.to_string());
+                }
+            };
+
+            let current_source = match dev.current_source() {
+                Ok(Some(source)) => source,
+                Ok(None) => {
+                    audio.finish_playback();
+                    return send_error(req, 500, "current source unavailable");
+                }
+                Err(err) => {
+                    audio.finish_playback();
+                    return send_error(req, 500, &format!("read source: {err}"));
+                }
+            };
+            let usb_index = match dev.profile().sources.index_for_source(Source::Usb) {
+                Some(index) => index,
+                None => {
+                    audio.finish_playback();
+                    return send_error(req, 500, "USB source missing from device profile");
+                }
+            };
+
+            let mut source_changed = false;
+            let mut previous_source = None;
+            let mut restore_source = None;
+            if current_source != Source::Usb {
+                if let Err(err) = dev.set_source(usb_index) {
+                    audio.finish_playback();
+                    return send_error(req, 500, &format!("set_source: {err}"));
+                }
+                source_changed = true;
+                previous_source = Some(current_source.to_string());
+                restore_source = Some(current_source);
+            }
+
+            let (tx, rx) = mpsc::sync_channel(1);
+            let dev_for_thread = dev.clone();
+            let audio_for_thread = audio.clone();
+            if let Err(err) = std::thread::Builder::new()
+                .name("playback".into())
+                .stack_size(24 * 1024)
+                .spawn(move || {
+                    run_playback_thread(
+                        dev_for_thread,
+                        audio_for_thread,
+                        audio_device,
+                        plan,
+                        source_changed,
+                        previous_source,
+                        restore_source,
+                        tx,
+                    );
+                })
+            {
+                if let Some(source) = restore_source {
+                    if let Some(index) = dev.profile().sources.index_for_source(source) {
+                        if let Err(restore_err) = dev.set_source(index) {
+                            warn!(
+                                "failed to restore source after playback spawn failure: {restore_err}"
+                            );
+                        }
+                    }
+                }
+                audio.finish_playback();
+                return send_error(req, 500, &format!("spawn playback thread: {err}"));
+            }
+
+            match rx.recv() {
+                Ok(Ok(response)) => match serde_json::to_string(&response) {
+                    Ok(json) => send_json(req, 200, &json),
+                    Err(_) => send_error(req, 500, "failed to serialize response"),
+                },
+                Ok(Err(message)) => {
+                    audio.finish_playback();
+                    send_error(req, 500, &message)
+                }
+                Err(_) => {
+                    audio.finish_playback();
+                    send_error(req, 500, "playback thread ended unexpectedly")
+                }
+            }
+        })?;
+    }
 
     // GET /devices/0/config — full config read-back
     {
@@ -268,27 +428,48 @@ pub fn start(
                             for peq in peqs {
                                 let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
                                     Some(i) => i as usize,
-                                    None => return send_error(req, 400, "peq missing 'index' field"),
+                                    None => {
+                                        return send_error(req, 400, "peq missing 'index' field")
+                                    }
                                 };
                                 if let Some(band) = input_ch.peq.get(band_idx) {
                                     if let Some(coeff) = peq.get("coeff") {
                                         let c = [
-                                            coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                                            coeff.get("b1").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                                            coeff.get("b2").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                                            coeff.get("a1").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                                            coeff.get("a2").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
+                                            coeff.get("b1").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
+                                            coeff.get("b2").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
+                                            coeff.get("a1").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
+                                            coeff.get("a2").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
                                         ];
                                         if c.iter().any(|v| !v.is_finite()) {
-                                            return send_error(req, 400, "biquad coefficients must be finite");
+                                            return send_error(
+                                                req,
+                                                400,
+                                                "biquad coefficients must be finite",
+                                            );
                                         }
                                         if let Err(e) = dev.write_biquad(band.addr, &c) {
-                                            return send_error(req, 500, &format!("write_biquad: {e}"));
+                                            return send_error(
+                                                req,
+                                                500,
+                                                &format!("write_biquad: {e}"),
+                                            );
                                         }
                                     }
-                                    if let Some(bypass) = peq.get("bypass").and_then(|v| v.as_bool()) {
+                                    if let Some(bypass) =
+                                        peq.get("bypass").and_then(|v| v.as_bool())
+                                    {
                                         if let Err(e) = dev.bypass_filter(band.addr, bypass) {
-                                            return send_error(req, 500, &format!("bypass_filter: {e}"));
+                                            return send_error(
+                                                req,
+                                                500,
+                                                &format!("bypass_filter: {e}"),
+                                            );
                                         }
                                     }
                                 }
@@ -297,7 +478,11 @@ pub fn start(
                         // Per-channel gain
                         if let Some(gain) = input.get("gain").and_then(|v| v.as_f64()) {
                             if !gain.is_finite() || gain.abs() > 120.0 {
-                                return send_error(req, 400, "gain out of range (must be finite, |gain| <= 120 dB)");
+                                return send_error(
+                                    req,
+                                    400,
+                                    "gain out of range (must be finite, |gain| <= 120 dB)",
+                                );
                             }
                             if let Some(gain_addr) = input_ch.gain {
                                 if let Err(e) = dev.set_channel_gain(gain_addr, gain as f32) {
@@ -330,28 +515,52 @@ pub fn start(
                             for peq in peqs {
                                 let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
                                     Some(i) => i as usize,
-                                    None => return send_error(req, 400, "peq missing 'index' field"),
+                                    None => {
+                                        return send_error(req, 400, "peq missing 'index' field")
+                                    }
                                 };
                                 if let Some(band) = output_ch.peq.get(band_idx) {
-                                    info!("config write output[{idx}] peq[{band_idx}] addr=0x{:04x}", band.addr);
+                                    info!(
+                                        "config write output[{idx}] peq[{band_idx}] addr=0x{:04x}",
+                                        band.addr
+                                    );
                                     if let Some(coeff) = peq.get("coeff") {
                                         let c = [
-                                            coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                                            coeff.get("b1").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                                            coeff.get("b2").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                                            coeff.get("a1").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                                            coeff.get("a2").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                            coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
+                                            coeff.get("b1").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
+                                            coeff.get("b2").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
+                                            coeff.get("a1").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
+                                            coeff.get("a2").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                                as f32,
                                         ];
                                         if c.iter().any(|v| !v.is_finite()) {
-                                            return send_error(req, 400, "biquad coefficients must be finite");
+                                            return send_error(
+                                                req,
+                                                400,
+                                                "biquad coefficients must be finite",
+                                            );
                                         }
                                         if let Err(e) = dev.write_biquad(band.addr, &c) {
-                                            return send_error(req, 500, &format!("write_biquad: {e}"));
+                                            return send_error(
+                                                req,
+                                                500,
+                                                &format!("write_biquad: {e}"),
+                                            );
                                         }
                                     }
-                                    if let Some(bypass) = peq.get("bypass").and_then(|v| v.as_bool()) {
+                                    if let Some(bypass) =
+                                        peq.get("bypass").and_then(|v| v.as_bool())
+                                    {
                                         if let Err(e) = dev.bypass_filter(band.addr, bypass) {
-                                            return send_error(req, 500, &format!("bypass_filter: {e}"));
+                                            return send_error(
+                                                req,
+                                                500,
+                                                &format!("bypass_filter: {e}"),
+                                            );
                                         }
                                     }
                                 }
@@ -361,7 +570,11 @@ pub fn start(
                         if let Some(gain) = output.get("gain").and_then(|v| v.as_f64()) {
                             debug!("config write output[{idx}] gain -> {gain}");
                             if !gain.is_finite() || gain.abs() > 120.0 {
-                                return send_error(req, 400, "gain out of range (must be finite, |gain| <= 120 dB)");
+                                return send_error(
+                                    req,
+                                    400,
+                                    "gain out of range (must be finite, |gain| <= 120 dB)",
+                                );
                             }
                             if let Err(e) = dev.set_channel_gain(output_ch.gain, gain as f32) {
                                 return send_error(req, 500, &format!("set_gain: {e}"));
@@ -377,7 +590,8 @@ pub fn start(
                         // Delay (Duration format: {secs, nanos} or float seconds)
                         if let Some(delay) = output.get("delay") {
                             let secs = if let Some(s) = delay.get("secs").and_then(|v| v.as_f64()) {
-                                let nanos = delay.get("nanos").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let nanos =
+                                    delay.get("nanos").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 s + nanos / 1_000_000_000.0
                             } else {
                                 delay.as_f64().unwrap_or(0.0)
@@ -385,8 +599,11 @@ pub fn start(
                             debug!("config write output[{idx}] delay_secs -> {secs}");
                             if let Some(delay_addr) = output_ch.delay {
                                 let sample_rate = dev.profile().sample_rate as f32;
-                                let samples = (secs as f32 * sample_rate).round().clamp(0.0, 48000.0);
-                                if let Err(e) = dev.set_channel_delay_samples(delay_addr, samples as u32) {
+                                let samples =
+                                    (secs as f32 * sample_rate).round().clamp(0.0, 48000.0);
+                                if let Err(e) =
+                                    dev.set_channel_delay_samples(delay_addr, samples as u32)
+                                {
                                     return send_error(req, 500, &format!("set_delay: {e}"));
                                 }
                             }
@@ -428,13 +645,14 @@ pub fn start(
 
     // GET /llms.txt
     server.fn_handler("/llms.txt", Method::Get, |req| {
-        send_text(req, "# minidsp-open\nMiniDSP audio processor controller.\nHTTP API on port 5380.\n")
+        send_text(
+            req,
+            "# minidsp-open\nMiniDSP audio processor controller.\nHTTP API on port 5380.\n",
+        )
     })?;
 
     // CORS preflight handler — responds to OPTIONS on any path
-    server.fn_handler("/*", Method::Options, |req| {
-        send_cors_preflight(req)
-    })?;
+    server.fn_handler("/*", Method::Options, |req| send_cors_preflight(req))?;
 
     // Root page — provisioning in SoftAP mode, serve UI or redirect in STA mode
     if ap_ip.is_some() {
@@ -534,13 +752,19 @@ pub fn start(
             let path = uri.split('?').next().unwrap_or(uri);
 
             // Never serve HTML for API paths — return 404 JSON instead
-            if path.starts_with("/api/") || path.starts_with("/devices") || path.starts_with("/debug") {
+            if path.starts_with("/api/")
+                || path.starts_with("/devices")
+                || path.starts_with("/debug")
+            {
                 return send_json(req, 404, r#"{"error":"not found"}"#);
             }
 
             // Path traversal protection: reject ".." in any encoding
-            if path.contains("..") || path.contains("%2e") || path.contains("%2E")
-                || path.contains('\0') || path.contains("%00")
+            if path.contains("..")
+                || path.contains("%2e")
+                || path.contains("%2E")
+                || path.contains('\0')
+                || path.contains("%00")
             {
                 return send_json(req, 400, r#"{"error":"bad path"}"#);
             }
@@ -586,7 +810,9 @@ fn esp32_device_ws_url(port: u16, ap_ip: Option<std::net::Ipv4Addr>) -> String {
 }
 
 fn get_sta_ip_string() -> Option<String> {
-    use esp_idf_svc::sys::{esp_netif_get_handle_from_ifkey, esp_netif_get_ip_info, esp_netif_ip_info_t};
+    use esp_idf_svc::sys::{
+        esp_netif_get_handle_from_ifkey, esp_netif_get_ip_info, esp_netif_ip_info_t,
+    };
 
     unsafe {
         let netif = esp_netif_get_handle_from_ifkey(b"WIFI_STA_DEF\0".as_ptr() as _);
@@ -598,7 +824,10 @@ fn get_sta_ip_string() -> Option<String> {
             return None;
         }
         let octets = info.ip.addr.to_le_bytes();
-        Some(format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]))
+        Some(format!(
+            "{}.{}.{}.{}",
+            octets[0], octets[1], octets[2], octets[3]
+        ))
     }
 }
 
@@ -633,15 +862,17 @@ fn register_debug_routes(
         let mut buf = [0u8; 128];
         let len = req.read(&mut buf).unwrap_or(0);
 
-        let level_str = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..len])
-        {
+        let level_str = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
             json.get("level")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string()
         } else {
             // Try plain text body
-            std::str::from_utf8(&buf[..len]).unwrap_or("").trim().to_string()
+            std::str::from_utf8(&buf[..len])
+                .unwrap_or("")
+                .trim()
+                .to_string()
         };
 
         match diagnostics::set_log_level(&level_str) {
@@ -649,7 +880,11 @@ fn register_debug_routes(
                 let body = format!(r#"{{"level":"{name}"}}"#);
                 send_json(req, 200, &body)
             }
-            None => send_error(req, 400, "invalid level (use: error, warn, info, debug, trace)"),
+            None => send_error(
+                req,
+                400,
+                "invalid level (use: error, warn, info, debug, trace)",
+            ),
         }
     })?;
 
@@ -717,12 +952,14 @@ fn register_debug_routes(
                             "status": "current",
                             "baseUrl": crate::updater::base_url(&nvs),
                         }),
-                        crate::updater::UpdateResult::Updated { version, files } => serde_json::json!({
-                            "status": "updated",
-                            "baseUrl": crate::updater::base_url(&nvs),
-                            "version": version,
-                            "files": files,
-                        }),
+                        crate::updater::UpdateResult::Updated { version, files } => {
+                            serde_json::json!({
+                                "status": "updated",
+                                "baseUrl": crate::updater::base_url(&nvs),
+                                "version": version,
+                                "files": files,
+                            })
+                        }
                         crate::updater::UpdateResult::NoStorage => serde_json::json!({
                             "status": "no_storage",
                             "baseUrl": crate::updater::base_url(&nvs),
@@ -977,10 +1214,7 @@ fn register_device_feature_routes(
 
 /// Extract the current device from shared state.
 pub fn get_device(state: &SharedDeviceState) -> Option<Arc<DeviceState>> {
-    state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    state.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 pub fn send_json<C: esp_idf_svc::http::server::Connection>(
@@ -1048,7 +1282,10 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
 ) -> Result<(), C::Error> {
     let headers = [
         ("Access-Control-Allow-Origin", "*"),
-        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS"),
+        (
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+        ),
         ("Access-Control-Allow-Headers", "Content-Type"),
         ("Access-Control-Max-Age", "86400"),
     ];
@@ -1060,12 +1297,52 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
 fn send_empty_200<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
 ) -> Result<(), C::Error> {
-    let headers = [
-        ("Access-Control-Allow-Origin", "*"),
-    ];
+    let headers = [("Access-Control-Allow-Origin", "*")];
     let mut resp = req.into_response(200, None, &headers)?;
     resp.write_all(b"")?;
     Ok(())
+}
+
+fn read_request_body<C: esp_idf_svc::http::server::Connection>(
+    req: &mut esp_idf_svc::http::server::Request<C>,
+    max_len: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let declared_len = req
+        .header("Content-Length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    if declared_len > max_len {
+        return Err("request body too large");
+    }
+
+    let mut body = Vec::with_capacity(declared_len.min(max_len));
+    let mut buf = [0u8; 512];
+
+    loop {
+        let remaining = if declared_len == 0 {
+            max_len.saturating_sub(body.len())
+        } else {
+            declared_len.saturating_sub(body.len())
+        };
+        if remaining == 0 {
+            break;
+        }
+
+        let read_len = remaining.min(buf.len());
+        let read = req
+            .read(&mut buf[..read_len])
+            .map_err(|_| "failed to read request body")?;
+        if read == 0 {
+            break;
+        }
+
+        body.extend_from_slice(&buf[..read]);
+        if body.len() > max_len {
+            return Err("request body too large");
+        }
+    }
+
+    Ok(body)
 }
 
 pub fn send_error<C: esp_idf_svc::http::server::Connection>(
@@ -1073,8 +1350,8 @@ pub fn send_error<C: esp_idf_svc::http::server::Connection>(
     status: u16,
     message: &str,
 ) -> Result<(), C::Error> {
-    // Escape message for JSON
-    let body = format!(r#"{{"error":"{}"}}"#, message.replace('"', "\\\""));
+    let body = serde_json::to_string(&json!({ "error": message }))
+        .unwrap_or_else(|_| r#"{"error":"internal error"}"#.to_string());
     send_json(req, status, &body)
 }
 
@@ -1117,14 +1394,231 @@ fn master_status_json(status: &StatusSummary) -> String {
     // and include dirac as null when absent
     let mut map = serde_json::Map::new();
     map.insert("preset".into(), serde_json::json!(status.master.preset));
-    map.insert("source".into(), serde_json::Value::String(status.master.source.clone()));
-    map.insert("volume".into(), serde_json::to_value(status.master.volume).unwrap_or_default());
+    map.insert(
+        "source".into(),
+        serde_json::Value::String(status.master.source.clone()),
+    );
+    map.insert(
+        "volume".into(),
+        serde_json::to_value(status.master.volume).unwrap_or_default(),
+    );
     map.insert("mute".into(), serde_json::json!(status.master.mute));
-    map.insert("dirac".into(), match status.master.dirac {
-        Some(d) => serde_json::json!(d),
-        None => serde_json::Value::Null,
-    });
+    map.insert(
+        "dirac".into(),
+        match status.master.dirac {
+            Some(d) => serde_json::json!(d),
+            None => serde_json::Value::Null,
+        },
+    );
     serde_json::to_string(&map).unwrap_or_default()
+}
+
+fn run_playback_thread(
+    dev: Arc<DeviceState>,
+    audio_state: usb_audio::SharedAudioState,
+    audio_device: Arc<usb_audio::Uac2Device>,
+    plan: PlaybackPlan,
+    source_changed: bool,
+    previous_source: Option<String>,
+    restore_source: Option<Source>,
+    started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
+) {
+    let start_result = start_playback(&audio_device, &plan).map(|mut start| {
+        start.response.source_changed = source_changed;
+        start.response.previous_source = previous_source.clone();
+        start
+    });
+
+    match start_result {
+        Ok(start) => {
+            let playback_started_us = usb_audio::server_time_us();
+            let expected_total_bytes = plan.offsets().total_samples * plan.layout().frame_bytes();
+            info!(
+                "playback thread started: {} samples at {} Hz {}-bit",
+                plan.offsets().total_samples,
+                plan.request.sample_rate,
+                plan.request.bit_depth.bits()
+            );
+            let _ = started_tx.send(Ok(start.response.clone()));
+            let mut generate_time_us = 0i64;
+            let mut write_time_us = start.first_write_time_us;
+            let mut total_bytes_written = start.first_write_bytes;
+            let mut first_write_bytes = Some(start.first_write_bytes);
+            let mut last_write_bytes = start.first_write_bytes;
+            let mut last_write_return_us = start.first_write_return_us;
+            let mut write_latencies_us = vec![start.first_write_time_us];
+
+            let mut generator = start.generator;
+            let mut buffer = vec![0u8; start.chunk_bytes];
+            while !generator.is_finished() {
+                let generate_started_us = usb_audio::server_time_us();
+                let written = generator.fill_pcm_bytes(&mut buffer);
+                generate_time_us += usb_audio::server_time_us() - generate_started_us;
+                if written == 0 {
+                    break;
+                }
+                let write_started_us = usb_audio::server_time_us();
+                if let Err(err) = audio_device.write(&buffer[..written], 250) {
+                    warn!("playback stream failed after start: {err}");
+                    break;
+                }
+                let write_elapsed_us = usb_audio::server_time_us() - write_started_us;
+                write_time_us += write_elapsed_us;
+                write_latencies_us.push(write_elapsed_us);
+                total_bytes_written += written;
+                first_write_bytes.get_or_insert(written);
+                last_write_bytes = written;
+                last_write_return_us = usb_audio::server_time_us();
+                if write_latencies_us.len() % 100 == 0 {
+                    info!(
+                        "playback progress: {} / {} samples, gen={} ms write={} ms",
+                        generator.cursor(),
+                        plan.offsets().total_samples,
+                        generate_time_us / 1000,
+                        write_time_us / 1000
+                    );
+                }
+            }
+
+            let stop_started_us = usb_audio::server_time_us();
+            if let Err(err) = audio_device.stop_stream() {
+                warn!("UAC2 stop failed after playback: {err}");
+            }
+            let stop_finished_us = usb_audio::server_time_us();
+            let (
+                write_min_us,
+                write_max_us,
+                write_avg_us,
+                write_p50_us,
+                write_p95_us,
+                write_p99_us,
+            ) = summarize_write_latencies(&write_latencies_us);
+            info!(
+                "playback thread completed in {} ms (gen={} ms, write={} ms, expected_bytes={}, actual_bytes={}, writes={}, first_write_bytes={}, last_write_bytes={}, tx_need_data={}, last_write_after_start={} ms, stop_time={} ms, write_min={} us, write_max={} us, write_avg={} us, write_p50={} us, write_p95={} us, write_p99={} us)",
+                (usb_audio::server_time_us() - playback_started_us) / 1000,
+                generate_time_us / 1000,
+                write_time_us / 1000,
+                expected_total_bytes,
+                total_bytes_written,
+                write_latencies_us.len(),
+                first_write_bytes.unwrap_or(0),
+                last_write_bytes,
+                usb_audio::tx_need_data_count(),
+                (last_write_return_us - playback_started_us) / 1000,
+                (stop_finished_us - stop_started_us) / 1000,
+                write_min_us,
+                write_max_us,
+                write_avg_us,
+                write_p50_us,
+                write_p95_us,
+                write_p99_us,
+            );
+        }
+        Err(err) => {
+            let _ = started_tx.send(Err(err));
+        }
+    }
+
+    if let Some(source) = restore_source {
+        if let Some(index) = dev.profile().sources.index_for_source(source) {
+            if let Err(err) = dev.set_source(index) {
+                warn!("failed to restore source after playback: {err}");
+            } else {
+                info!("restored source after playback to {}", source);
+            }
+        }
+    }
+
+    audio_state.finish_playback();
+}
+
+struct PlaybackStart {
+    response: PlayResponse,
+    generator: minidsp_protocol::playback::PlaybackGenerator,
+    chunk_bytes: usize,
+    first_write_bytes: usize,
+    first_write_time_us: i64,
+    first_write_return_us: i64,
+}
+
+fn start_playback(
+    audio_device: &usb_audio::Uac2Device,
+    plan: &PlaybackPlan,
+) -> Result<PlaybackStart, String> {
+    usb_audio::reset_tx_need_data_count();
+    audio_device
+        .start_stream(plan.request.sample_rate, plan.request.bit_depth)
+        .map_err(|e| e.to_string())?;
+
+    // Keep chunks below the low-water threshold so the producer can stay ahead
+    // of playback instead of blocking until almost a full-ring drain each time.
+    let chunk_frames = ((usb_audio::TX_RING_BUFFER_BYTES / 2) / plan.layout().frame_bytes()).max(1);
+    let mut generator = plan.generator();
+    let mut buffer = vec![0u8; chunk_frames * plan.layout().frame_bytes()];
+
+    let first_written = generator.fill_pcm_bytes(&mut buffer);
+    if first_written == 0 {
+        let _ = audio_device.stop_stream();
+        return Err("playback generator produced no data".into());
+    }
+    let first_write_started_us = usb_audio::server_time_us();
+    if let Err(err) = audio_device.write(&buffer[..first_written], 250) {
+        let _ = audio_device.stop_stream();
+        return Err(err.to_string());
+    }
+    let first_write_return_us = usb_audio::server_time_us();
+
+    let mut started_at_us = audio_device.start_time_us();
+    for _ in 0..20 {
+        if started_at_us != 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        started_at_us = audio_device.start_time_us();
+    }
+    if started_at_us == 0 {
+        started_at_us = usb_audio::server_time_us();
+    }
+
+    Ok(PlaybackStart {
+        response: PlayResponse {
+            started_at_us,
+            tone_burst_offset_samples: plan.offsets().tone_burst_offset_samples,
+            sweep_offset_samples: plan.offsets().sweep_offset_samples,
+            total_samples: plan.offsets().total_samples,
+            sample_rate: plan.request.sample_rate,
+            source_changed: false,
+            previous_source: None,
+        },
+        generator,
+        chunk_bytes: buffer.len(),
+        first_write_bytes: first_written,
+        first_write_time_us: first_write_return_us - first_write_started_us,
+        first_write_return_us,
+    })
+}
+
+fn summarize_write_latencies(samples: &[i64]) -> (i64, i64, i64, i64, i64, i64) {
+    if samples.is_empty() {
+        return (0, 0, 0, 0, 0, 0);
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let sum: i64 = sorted.iter().sum();
+    let percentile = |n: usize| -> i64 {
+        let idx = ((sorted.len() - 1) * n) / 100;
+        sorted[idx]
+    };
+
+    (
+        sorted[0],
+        *sorted.last().unwrap_or(&0),
+        sum / sorted.len() as i64,
+        percentile(50),
+        percentile(95),
+        percentile(99),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,7 +1662,10 @@ fn register_ws_routes(
                     let (status, json) = match get_device(&st) {
                         Some(dev) => match dev.get_status_summary() {
                             Ok(s) => (200, status_json(&s)),
-                            Err(e) => (500, format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "\\\""))),
+                            Err(e) => (
+                                500,
+                                format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "\\\"")),
+                            ),
                         },
                         None => (503, r#"{"error":"no device"}"#.to_string()),
                     };
@@ -1193,7 +1690,10 @@ fn register_ws_routes(
                         let stop = Arc::new(AtomicBool::new(false));
                         let fd = ws.session();
                         if let Ok(mut guard) = ws_ref.lock() {
-                            *guard = Some(ActiveWs { stop: stop.clone(), fd });
+                            *guard = Some(ActiveWs {
+                                stop: stop.clone(),
+                                fd,
+                            });
                         }
 
                         let dev_state = st.clone();
@@ -1274,17 +1774,15 @@ fn register_ws_routes(
                     // Raw frame bridge: decode framed packet, forward payload to device
                     if let Some(payload) = minidsp_protocol::packet::decode_frame(&buf[..len]) {
                         match get_device(&st) {
-                            Some(dev) => {
-                                match dev.raw_command(&payload) {
-                                    Ok(resp) => {
-                                        let frame = minidsp_protocol::packet::encode_frame(&resp);
-                                        let _ = ws.send(FrameType::Binary(false), &frame);
-                                    }
-                                    Err(e) => {
-                                        log::warn!("WS raw bridge: device error: {e}");
-                                    }
+                            Some(dev) => match dev.raw_command(&payload) {
+                                Ok(resp) => {
+                                    let frame = minidsp_protocol::packet::encode_frame(&resp);
+                                    let _ = ws.send(FrameType::Binary(false), &frame);
                                 }
-                            }
+                                Err(e) => {
+                                    log::warn!("WS raw bridge: device error: {e}");
+                                }
+                            },
                             None => {
                                 log::warn!("WS raw bridge: no device connected");
                             }
@@ -1330,10 +1828,7 @@ fn register_ws_routes(
 /// is NOT performed and this returns false.
 #[cfg(esp_idf_httpd_ws_support)]
 unsafe fn ws_is_upgrade(raw_req: *mut esp_idf_svc::sys::httpd_req_t) -> bool {
-    esp_idf_svc::sys::httpd_req_get_hdr_value_len(
-        raw_req,
-        b"Sec-WebSocket-Key\0".as_ptr(),
-    ) > 0
+    esp_idf_svc::sys::httpd_req_get_hdr_value_len(raw_req, b"Sec-WebSocket-Key\0".as_ptr()) > 0
 }
 
 /// Parse query parameters from the request URI for WebSocket poll configuration.
@@ -1348,11 +1843,7 @@ unsafe fn ws_parse_query(raw_req: *mut esp_idf_svc::sys::httpd_req_t) -> (bool, 
 /// Send a regular HTTP JSON response from within a ws_handler callback.
 /// Used when the handler detects a non-WebSocket GET request.
 #[cfg(esp_idf_httpd_ws_support)]
-unsafe fn ws_send_http_json(
-    raw_req: *mut esp_idf_svc::sys::httpd_req_t,
-    status: u16,
-    json: &str,
-) {
+unsafe fn ws_send_http_json(raw_req: *mut esp_idf_svc::sys::httpd_req_t, status: u16, json: &str) {
     use esp_idf_svc::sys::*;
 
     httpd_resp_set_type(raw_req, b"application/json\0".as_ptr());
@@ -1391,7 +1882,10 @@ fn ws_poll_loop(
     if let Some(dev) = get_device(&state) {
         if let Ok(status) = dev.get_status_summary() {
             let json = status_json(&status);
-            if sender.send(FrameType::Text(false), json.as_bytes()).is_err() {
+            if sender
+                .send(FrameType::Text(false), json.as_bytes())
+                .is_err()
+            {
                 return;
             }
         }
@@ -1412,7 +1906,10 @@ fn ws_poll_loop(
             None => r#"{"error":"no device"}"#.to_string(),
         };
 
-        if sender.send(FrameType::Text(false), json.as_bytes()).is_err() {
+        if sender
+            .send(FrameType::Text(false), json.as_bytes())
+            .is_err()
+        {
             break; // Connection lost
         }
     }
@@ -1526,7 +2023,10 @@ fn register_ezbeq_ws(
                             let stop = Arc::new(AtomicBool::new(false));
                             let fd = ws.session();
                             if let Ok(mut guard) = ws_ref.lock() {
-                                *guard = Some(ActiveWsBeq { stop: stop.clone(), fd });
+                                *guard = Some(ActiveWsBeq {
+                                    stop: stop.clone(),
+                                    fd,
+                                });
                             }
 
                             let dev_state = st.clone();
@@ -1536,7 +2036,14 @@ fn register_ezbeq_ws(
                                 .name("beq_lvl".into())
                                 .stack_size(8192)
                                 .spawn(move || {
-                                    push_levels(sender, dev_state, stop, beq_clone, fd, ws_ref_clone);
+                                    push_levels(
+                                        sender,
+                                        dev_state,
+                                        stop,
+                                        beq_clone,
+                                        fd,
+                                        ws_ref_clone,
+                                    );
                                 })
                             {
                                 log::warn!("failed to spawn levels thread: {e}");
@@ -1575,8 +2082,7 @@ fn build_catalogue_meta() -> String {
     let count = match std::fs::File::open(crate::storage::full_path("catalogue.bin")) {
         Ok(mut f) => {
             let mut header = [0u8; 12];
-            if std::io::Read::read_exact(&mut f, &mut header).is_ok()
-                && &header[0..4] == b"BEQ\x02"
+            if std::io::Read::read_exact(&mut f, &mut header).is_ok() && &header[0..4] == b"BEQ\x02"
             {
                 u32::from_le_bytes(header[4..8].try_into().unwrap())
             } else {
@@ -1633,16 +2139,10 @@ fn push_levels(
                 Ok(status) => {
                     let mut levels = serde_json::Map::new();
                     for (i, &v) in status.input_levels.iter().enumerate() {
-                        levels.insert(
-                            format!("I{i}"),
-                            serde_json::Value::from(v),
-                        );
+                        levels.insert(format!("I{i}"), serde_json::Value::from(v));
                     }
                     for (i, &v) in status.output_levels.iter().enumerate() {
-                        levels.insert(
-                            format!("O{i}"),
-                            serde_json::Value::from(v),
-                        );
+                        levels.insert(format!("O{i}"), serde_json::Value::from(v));
                     }
                     serde_json::to_string(&serde_json::json!({
                         "message": "Levels",
@@ -1659,7 +2159,10 @@ fn push_levels(
             None => continue,
         };
 
-        if sender.send(FrameType::Text(false), json.as_bytes()).is_err() {
+        if sender
+            .send(FrameType::Text(false), json.as_bytes())
+            .is_err()
+        {
             break;
         }
     }
@@ -1667,7 +2170,9 @@ fn push_levels(
     log::info!("levels push thread stopped");
 
     // Only return sender if the session is still the same (no new client replaced us)
-    let still_active = active_ws.lock().ok()
+    let still_active = active_ws
+        .lock()
+        .ok()
         .and_then(|g| g.as_ref().map(|a| a.fd == session_fd))
         .unwrap_or(false);
     if still_active {

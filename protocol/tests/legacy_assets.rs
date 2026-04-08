@@ -2,8 +2,10 @@ use minidsp_protocol::device::probe;
 use serde_json::Value;
 
 fn legacy_matrix() -> Value {
-    serde_json::from_str(include_str!("../../docs/generated/device-support-matrix.json"))
-        .expect("generated legacy matrix JSON should parse")
+    serde_json::from_str(include_str!(
+        "../../docs/generated/device-support-matrix.json"
+    ))
+    .expect("generated legacy matrix JSON should parse")
 }
 
 #[test]

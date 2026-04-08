@@ -17,12 +17,9 @@ Status tracking:
 # Desktop
 cargo build && cargo test
 
-# ESP32 — activate environment first (see /esp-idf skill for details)
+# ESP32 — `esp` wrapper handles all environment setup
 cd app-esp32
-export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.rustup/toolchains/esp/bin:$PATH"
-. ~/esp/esp-idf/export.sh 2>/dev/null
-source ~/export-esp.sh
-cargo build
+esp cargo build
 ```
 
 **Use `/esp-idf` for general ESP-IDF knowledge** — environment setup, flashing, serial monitoring, common gotchas, DTR/RTS, Python issues.
@@ -34,8 +31,8 @@ Flash with `esptool.py` (not espflash — it panics on our CH340 boards). The bu
 ```bash
 # 1. Close serial-mcp session
 # 2. Convert ELF → bin, then flash all three parts
-esptool.py --chip esp32s3 elf2image target/xtensa-esp32s3-espidf/debug/minidsp-esp32 -o /tmp/app.bin
-esptool.py --chip esp32s3 -p /dev/ttyUSB1 -b 460800 write_flash \
+esp esptool.py --chip esp32s3 elf2image target/xtensa-esp32s3-espidf/debug/minidsp-esp32 -o /tmp/app.bin
+esp esptool.py --chip esp32s3 -p /dev/ttyUSB1 -b 460800 write_flash \
   --flash_size 16MB 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 /tmp/app.bin
 # 3. Reopen serial-mcp
 ```

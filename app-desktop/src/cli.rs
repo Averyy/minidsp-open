@@ -1,21 +1,20 @@
 //! CLI command implementations.
 
-use crate::{
-    Cli, ChannelCommand, PeqCommand, CrossoverCommand, CompressorCommand, FirCommand,
-    apply_force_kind, connect, connect_all_local, discover_daemon_tcp,
-    discover_network_devices,
-};
 #[cfg(unix)]
 use crate::discover_daemon_unix;
+use crate::output;
+use crate::{
+    ChannelCommand, Cli, CompressorCommand, CrossoverCommand, FirCommand, PeqCommand,
+    apply_force_kind, connect, connect_all_local, discover_daemon_tcp, discover_network_devices,
+};
 use minidsp::client::MiniDspClient;
 use minidsp::transport::hid;
 use minidsp::transport::tcp::TcpTransport;
 use minidsp::transport::ws::WsTransport;
 use minidsp_daemon::http::json::DeviceJson;
 use minidsp_protocol::device::probe;
-use minidsp_protocol::status::DeviceInfo;
 use minidsp_protocol::source::Source;
-use crate::output;
+use minidsp_protocol::status::DeviceInfo;
 
 /// TOML config file structure (minidsp-rs compatible).
 #[derive(Debug, serde::Deserialize, Default)]
@@ -125,7 +124,10 @@ fn print_discovered_devices<T: ProbeDeviceView>(devices: &[T]) -> bool {
 }
 
 /// Print device status.
-pub async fn status(client: &MiniDspClient, format: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn status(
+    client: &MiniDspClient,
+    format: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let summary = client.get_status_summary().await?;
 
     match format {
@@ -154,22 +156,46 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(addr) = cli.tcp.as_deref().or(env_tcp.as_deref()) {
         let client = MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
         let info = client.device_info();
-        print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+        print_probe_device(
+            0,
+            &info.product_name,
+            info.version.serial,
+            &info.url,
+            info.version.hw_id,
+            info.version.dsp_version,
+        );
         printed = true;
     } else if let Some(url) = cli.url.as_deref().or(env_url.as_deref()) {
         if url.starts_with("tcp://") {
             let addr = &url["tcp://".len()..];
-            let client = MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
+            let client =
+                MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
             let info = client.device_info();
-            print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+            print_probe_device(
+                0,
+                &info.product_name,
+                info.version.serial,
+                &info.url,
+                info.version.hw_id,
+                info.version.dsp_version,
+            );
             printed = true;
-        } else if (url.starts_with("http://") || url.starts_with("ws://")) && !url.ends_with("/ws") {
+        } else if (url.starts_with("http://") || url.starts_with("ws://")) && !url.ends_with("/ws")
+        {
             let devices = discover_daemon_tcp(url).await?;
             printed = print_discovered_devices(&devices);
         } else if url.starts_with("http://") || url.starts_with("ws://") {
-            let client = MiniDspClient::connect(Box::new(WsTransport::connect(url, 0).await?)).await?;
+            let client =
+                MiniDspClient::connect(Box::new(WsTransport::connect(url, 0).await?)).await?;
             let info = client.device_info();
-            print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+            print_probe_device(
+                0,
+                &info.product_name,
+                info.version.serial,
+                &info.url,
+                info.version.hw_id,
+                info.version.dsp_version,
+            );
             printed = true;
         } else if url.starts_with("usb://") || url.starts_with("usb:") {
             let path = if let Some(rest) = url.strip_prefix("usb://") {
@@ -181,7 +207,14 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let transport = hid::HidTransport::open(&path)?;
             let client = MiniDspClient::connect(Box::new(transport)).await?;
             let info = client.device_info();
-            print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+            print_probe_device(
+                0,
+                &info.product_name,
+                info.version.serial,
+                &info.url,
+                info.version.hw_id,
+                info.version.dsp_version,
+            );
             printed = true;
         }
     } else if let Some(url) = cli.daemon_url.as_deref().or(env_daemon_url.as_deref()) {
@@ -191,36 +224,41 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let transport = hid::HidTransport::open(path)?;
         let client = MiniDspClient::connect(Box::new(transport)).await?;
         let info = client.device_info();
-        print_probe_device(0, &info.product_name, info.version.serial, &info.url, info.version.hw_id, info.version.dsp_version);
+        print_probe_device(
+            0,
+            &info.product_name,
+            info.version.serial,
+            &info.url,
+            info.version.hw_id,
+            info.version.dsp_version,
+        );
         printed = true;
     } else {
         let devices = hid::enumerate()?;
         for (i, dev) in devices.iter().enumerate() {
             match hid::HidTransport::open(&dev.path) {
-                Ok(transport) => {
-                    match MiniDspClient::connect(Box::new(transport)).await {
-                        Ok(client) => {
-                            let name = probe::product_name(client.hw_id().hw_id, client.dsp_version());
-                            let url = format!(
-                                "usb:{}?vid={:04x}&pid={:04x}",
-                                urlencoding::encode(&dev.path),
-                                dev.vendor_id,
-                                dev.product_id,
-                            );
-                            print_probe_device(
-                                i,
-                                &name,
-                                client.serial(),
-                                &url,
-                                client.hw_id().hw_id,
-                                client.dsp_version(),
-                            );
-                        }
-                        Err(e) => {
-                            println!("{i}: Device at {} (open failed: {e})", dev.path);
-                        }
+                Ok(transport) => match MiniDspClient::connect(Box::new(transport)).await {
+                    Ok(client) => {
+                        let name = probe::product_name(client.hw_id().hw_id, client.dsp_version());
+                        let url = format!(
+                            "usb:{}?vid={:04x}&pid={:04x}",
+                            urlencoding::encode(&dev.path),
+                            dev.vendor_id,
+                            dev.product_id,
+                        );
+                        print_probe_device(
+                            i,
+                            &name,
+                            client.serial(),
+                            &url,
+                            client.hw_id().hw_id,
+                            client.dsp_version(),
+                        );
                     }
-                }
+                    Err(e) => {
+                        println!("{i}: Device at {} (open failed: {e})", dev.path);
+                    }
+                },
                 Err(e) => {
                     println!("{i}: Device at {} (open failed: {e})", dev.path);
                 }
@@ -252,9 +290,14 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Start the daemon server.
-pub async fn server(bind: &str, config_path: Option<&str>, cli_advertise: Option<&str>, cli_ip: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    use minidsp_daemon::state::DaemonState;
+pub async fn server(
+    bind: &str,
+    config_path: Option<&str>,
+    cli_advertise: Option<&str>,
+    cli_ip: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use minidsp_daemon::http::routes;
+    use minidsp_daemon::state::DaemonState;
     use std::sync::Arc;
 
     // Load optional TOML config
@@ -266,15 +309,24 @@ pub async fn server(bind: &str, config_path: Option<&str>, cli_advertise: Option
     };
 
     // Override bind address from config if not provided on CLI
-    let http_bind = config.http_server.as_ref()
+    let http_bind = config
+        .http_server
+        .as_ref()
         .and_then(|h| h.bind_address.as_deref())
         .unwrap_or(bind);
-    let tcp_bind = config.tcp_server.as_ref()
+    let tcp_bind = config
+        .tcp_server
+        .as_ref()
         .and_then(|t| t.bind_address.as_deref())
         .unwrap_or("0.0.0.0:5333");
     // CLI --advertise overrides config file hostname
     let hostname = cli_advertise
-        .or_else(|| config.advertise.as_ref().and_then(|a| a.hostname.as_deref()))
+        .or_else(|| {
+            config
+                .advertise
+                .as_ref()
+                .and_then(|a| a.hostname.as_deref())
+        })
         .unwrap_or("minidsp-open");
 
     let state = Arc::new(DaemonState::new());
@@ -283,16 +335,14 @@ pub async fn server(bind: &str, config_path: Option<&str>, cli_advertise: Option
     let devices = hid::enumerate().unwrap_or_default();
     for (i, dev) in devices.iter().enumerate() {
         match hid::HidTransport::open(&dev.path) {
-            Ok(transport) => {
-                match MiniDspClient::connect(Box::new(transport)).await {
-                    Ok(client) => {
-                        let name = probe::product_name(client.hw_id().hw_id, client.dsp_version());
-                        tracing::info!("Device {i}: {name} (serial {})", client.serial());
-                        state.add_device(i, Arc::new(client)).await;
-                    }
-                    Err(e) => tracing::warn!("Device {i}: connect failed: {e}"),
+            Ok(transport) => match MiniDspClient::connect(Box::new(transport)).await {
+                Ok(client) => {
+                    let name = probe::product_name(client.hw_id().hw_id, client.dsp_version());
+                    tracing::info!("Device {i}: {name} (serial {})", client.serial());
+                    state.add_device(i, Arc::new(client)).await;
                 }
-            }
+                Err(e) => tracing::warn!("Device {i}: connect failed: {e}"),
+            },
             Err(e) => tracing::warn!("Device {i}: open failed: {e}"),
         }
     }
@@ -323,13 +373,20 @@ pub async fn server(bind: &str, config_path: Option<&str>, cli_advertise: Option
         // CLI --ip overrides config file ip
         let disc_ip = cli_ip
             .and_then(|s| s.parse().ok())
-            .or_else(|| config.advertise.as_ref()
-                .and_then(|a| a.ip.as_deref())
-                .and_then(|s| s.parse().ok()))
+            .or_else(|| {
+                config
+                    .advertise
+                    .as_ref()
+                    .and_then(|a| a.ip.as_deref())
+                    .and_then(|s| s.parse().ok())
+            })
             .unwrap_or_else(|| {
                 // Auto-detect local IP by connecting to a remote address
                 std::net::UdpSocket::bind("0.0.0.0:0")
-                    .and_then(|s| { s.connect("8.8.8.8:53")?; s.local_addr() })
+                    .and_then(|s| {
+                        s.connect("8.8.8.8:53")?;
+                        s.local_addr()
+                    })
                     .map(|a| match a.ip() {
                         std::net::IpAddr::V4(v4) => v4,
                         _ => std::net::Ipv4Addr::UNSPECIFIED,
@@ -339,9 +396,15 @@ pub async fn server(bind: &str, config_path: Option<&str>, cli_advertise: Option
         tokio::spawn(async move {
             if let Err(e) = minidsp_daemon::discovery::broadcast_loop(
                 disc_ip,
-                hw_id, fw_major, fw_minor, dsp, serial,
+                hw_id,
+                fw_major,
+                fw_minor,
+                dsp,
+                serial,
                 disc_hostname,
-            ).await {
+            )
+            .await
+            {
                 tracing::error!("UDP discovery error: {e}");
             }
         });
@@ -359,15 +422,10 @@ pub async fn server(bind: &str, config_path: Option<&str>, cli_advertise: Option
                 Ok(unix_listener) => {
                     // Set socket permissions to 0o766
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        sock_path,
-                        std::fs::Permissions::from_mode(0o766),
-                    );
+                    let _ =
+                        std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o766));
                     tracing::info!("Unix socket listening on {sock_path}");
-                    if let Err(e) = axum::serve(
-                        unix_listener,
-                        unix_app.into_make_service(),
-                    ).await {
+                    if let Err(e) = axum::serve(unix_listener, unix_app.into_make_service()).await {
                         tracing::error!("Unix socket server error: {e}");
                     }
                 }
@@ -380,13 +438,18 @@ pub async fn server(bind: &str, config_path: Option<&str>, cli_advertise: Option
 
     // Start mDNS advertisement
     let _mdns_handle = if let Some(client) = state.get_device(0).await {
-        let port: u16 = http_bind.rsplit(':').next()
+        let port: u16 = http_bind
+            .rsplit(':')
+            .next()
             .and_then(|p| p.parse().ok())
             .unwrap_or(5380);
         let product = probe::product_name(client.hw_id().hw_id, client.dsp_version());
         match minidsp_daemon::mdns::advertise(
-            port, client.serial(), product,
-            client.hw_id().hw_id, client.dsp_version(),
+            port,
+            client.serial(),
+            product,
+            client.hw_id().hw_id,
+            client.dsp_version(),
         ) {
             Ok(mdns) => {
                 tracing::info!("mDNS: advertising as minidsp-{}.local", client.serial());
@@ -452,7 +515,10 @@ pub async fn execute_file(path: &str, cli: &Cli) -> Result<(), Box<dyn std::erro
 }
 
 /// Execute a single command line (from -f file or interactive).
-async fn execute_line(client: &MiniDspClient, line: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn execute_line(
+    client: &MiniDspClient,
+    line: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return Ok(());
@@ -472,7 +538,10 @@ async fn execute_line(client: &MiniDspClient, line: &str) -> Result<(), Box<dyn 
             let name = parts.get(1).ok_or("missing source name")?;
             let src = Source::from_str_lowercase(name)
                 .ok_or_else(|| format!("unknown source '{name}'"))?;
-            let idx = client.profile().sources.index_for_source(src)
+            let idx = client
+                .profile()
+                .sources
+                .index_for_source(src)
                 .ok_or_else(|| format!("source '{name}' not available"))?;
             client.set_source(idx).await?;
         }
@@ -491,14 +560,22 @@ async fn execute_line(client: &MiniDspClient, line: &str) -> Result<(), Box<dyn 
 
                     // Get list of bands: "all" → all bands, numeric → single band
                     let bands: Vec<u16> = if *band_str == "all" {
-                        let table = client.profile().dsp_table
+                        let table = client
+                            .profile()
+                            .dsp_table
                             .ok_or("device does not support PEQ")?;
                         let peq_slice = if is_input {
-                            table.inputs.get(ch as usize)
-                                .map(|c| c.peq).ok_or_else(|| format!("channel {ch} out of range"))?
+                            table
+                                .inputs
+                                .get(ch as usize)
+                                .map(|c| c.peq)
+                                .ok_or_else(|| format!("channel {ch} out of range"))?
                         } else {
-                            table.outputs.get(ch as usize)
-                                .map(|c| c.peq).ok_or_else(|| format!("channel {ch} out of range"))?
+                            table
+                                .outputs
+                                .get(ch as usize)
+                                .map(|c| c.peq)
+                                .ok_or_else(|| format!("channel {ch} out of range"))?
                         };
                         peq_slice.iter().map(|b| b.addr).collect()
                     } else {
@@ -526,7 +603,9 @@ async fn execute_line(client: &MiniDspClient, line: &str) -> Result<(), Box<dyn 
                                 client.bypass_filter(addr, state).await?;
                             }
                             "clear" => {
-                                client.write_biquad(addr, &[1.0, 0.0, 0.0, 0.0, 0.0]).await?;
+                                client
+                                    .write_biquad(addr, &[1.0, 0.0, 0.0, 0.0, 0.0])
+                                    .await?;
                                 client.bypass_filter(addr, true).await?;
                             }
                             _ => return Err(format!("unknown PEQ action '{action}'").into()),
@@ -548,25 +627,39 @@ async fn execute_line(client: &MiniDspClient, line: &str) -> Result<(), Box<dyn 
                         return Err("input delay not supported via this command".into());
                     }
                     let ms: f32 = parts.get(3).ok_or("missing delay value")?.parse()?;
-                    let samples = (ms * client.profile().sample_rate as f32 / 1000.0).round().clamp(0.0, 48000.0);
-                    let table = client.profile().dsp_table
+                    let samples = (ms * client.profile().sample_rate as f32 / 1000.0)
+                        .round()
+                        .clamp(0.0, 48000.0);
+                    let table = client
+                        .profile()
+                        .dsp_table
                         .ok_or("device does not support channel delay")?;
-                    let ch_def = table.outputs.get(ch as usize)
+                    let ch_def = table
+                        .outputs
+                        .get(ch as usize)
                         .ok_or_else(|| format!("output channel {ch} out of range"))?;
-                    let delay_addr = ch_def.delay
+                    let delay_addr = ch_def
+                        .delay
                         .ok_or("output channel does not have delay control")?;
-                    client.set_channel_delay_samples(delay_addr, samples as u32).await?;
+                    client
+                        .set_channel_delay_samples(delay_addr, samples as u32)
+                        .await?;
                 }
                 "invert" => {
                     if is_input {
                         return Err("input polarity inversion not supported".into());
                     }
                     let state = parse_on_off_str(parts.get(3).unwrap_or(&"on"))?;
-                    let table = client.profile().dsp_table
+                    let table = client
+                        .profile()
+                        .dsp_table
                         .ok_or("device does not support polarity inversion")?;
-                    let ch_def = table.outputs.get(ch as usize)
+                    let ch_def = table
+                        .outputs
+                        .get(ch as usize)
                         .ok_or_else(|| format!("output channel {ch} out of range"))?;
-                    let polarity = ch_def.polarity
+                    let polarity = ch_def
+                        .polarity
                         .ok_or("output channel does not have polarity inversion")?;
                     client.set_invert(polarity, state).await?;
                 }
@@ -601,46 +694,82 @@ fn parse_on_off_str(s: &str) -> Result<bool, Box<dyn std::error::Error>> {
     }
 }
 
-fn get_peq_addr(client: &MiniDspClient, is_input: bool, ch: u8, band: u8) -> Result<u16, Box<dyn std::error::Error>> {
-    let table = client.profile().dsp_table
+fn get_peq_addr(
+    client: &MiniDspClient,
+    is_input: bool,
+    ch: u8,
+    band: u8,
+) -> Result<u16, Box<dyn std::error::Error>> {
+    let table = client
+        .profile()
+        .dsp_table
         .ok_or("device does not support PEQ")?;
     let peq_slice = if is_input {
-        let ch_def = table.inputs.get(ch as usize)
+        let ch_def = table
+            .inputs
+            .get(ch as usize)
             .ok_or_else(|| format!("input channel {ch} out of range"))?;
         ch_def.peq
     } else {
-        let ch_def = table.outputs.get(ch as usize)
+        let ch_def = table
+            .outputs
+            .get(ch as usize)
             .ok_or_else(|| format!("output channel {ch} out of range"))?;
         ch_def.peq
     };
-    let peq = peq_slice.get(band as usize)
+    let peq = peq_slice
+        .get(band as usize)
         .ok_or_else(|| format!("PEQ band {band} out of range"))?;
     Ok(peq.addr)
 }
 
-fn get_channel_gain_addr(client: &MiniDspClient, is_input: bool, ch: u8) -> Result<u16, Box<dyn std::error::Error>> {
-    let table = client.profile().dsp_table
+fn get_channel_gain_addr(
+    client: &MiniDspClient,
+    is_input: bool,
+    ch: u8,
+) -> Result<u16, Box<dyn std::error::Error>> {
+    let table = client
+        .profile()
+        .dsp_table
         .ok_or("device does not support channel gain")?;
     if is_input {
-        let ch_def = table.inputs.get(ch as usize)
+        let ch_def = table
+            .inputs
+            .get(ch as usize)
             .ok_or_else(|| format!("input channel {ch} out of range"))?;
-        ch_def.gain.ok_or_else(|| format!("input channel {ch} does not have gain control").into())
+        ch_def
+            .gain
+            .ok_or_else(|| format!("input channel {ch} does not have gain control").into())
     } else {
-        let ch_def = table.outputs.get(ch as usize)
+        let ch_def = table
+            .outputs
+            .get(ch as usize)
             .ok_or_else(|| format!("output channel {ch} out of range"))?;
         Ok(ch_def.gain)
     }
 }
 
-fn get_channel_mute_addr(client: &MiniDspClient, is_input: bool, ch: u8) -> Result<u16, Box<dyn std::error::Error>> {
-    let table = client.profile().dsp_table
+fn get_channel_mute_addr(
+    client: &MiniDspClient,
+    is_input: bool,
+    ch: u8,
+) -> Result<u16, Box<dyn std::error::Error>> {
+    let table = client
+        .profile()
+        .dsp_table
         .ok_or("device does not support channel mute")?;
     if is_input {
-        let ch_def = table.inputs.get(ch as usize)
+        let ch_def = table
+            .inputs
+            .get(ch as usize)
             .ok_or_else(|| format!("input channel {ch} out of range"))?;
-        ch_def.mute.ok_or_else(|| format!("input channel {ch} does not have mute control").into())
+        ch_def
+            .mute
+            .ok_or_else(|| format!("input channel {ch} does not have mute control").into())
     } else {
-        let ch_def = table.outputs.get(ch as usize)
+        let ch_def = table
+            .outputs
+            .get(ch as usize)
             .ok_or_else(|| format!("output channel {ch} out of range"))?;
         Ok(ch_def.mute)
     }
@@ -663,74 +792,101 @@ pub async fn channel_command(
             client.set_channel_mute(addr, state).await?;
         }
         ChannelCommand::Delay { ms } => {
-            let table = client.profile().dsp_table
+            let table = client
+                .profile()
+                .dsp_table
                 .ok_or("device does not support channel delay")?;
             let ch_def = if is_input {
                 return Err("input delay not supported".into());
             } else {
-                table.outputs.get(channel as usize)
+                table
+                    .outputs
+                    .get(channel as usize)
                     .ok_or_else(|| format!("output channel {channel} out of range"))?
             };
-            let delay_addr = ch_def.delay
+            let delay_addr = ch_def
+                .delay
                 .ok_or("output channel does not have delay control")?;
             let sample_rate = client.profile().sample_rate as f32;
             let samples = (ms * sample_rate / 1000.0).round().clamp(0.0, 48000.0);
-            client.set_channel_delay_samples(delay_addr, samples as u32).await?;
+            client
+                .set_channel_delay_samples(delay_addr, samples as u32)
+                .await?;
         }
         ChannelCommand::Invert { state } => {
-            let table = client.profile().dsp_table
+            let table = client
+                .profile()
+                .dsp_table
                 .ok_or("device does not support polarity inversion")?;
             let ch_def = if is_input {
                 return Err("input polarity inversion not supported".into());
             } else {
-                table.outputs.get(channel as usize)
+                table
+                    .outputs
+                    .get(channel as usize)
                     .ok_or_else(|| format!("output channel {channel} out of range"))?
             };
-            let polarity = ch_def.polarity
+            let polarity = ch_def
+                .polarity
                 .ok_or("output channel does not have polarity inversion")?;
             client.set_invert(polarity, state).await?;
         }
         ChannelCommand::Peq { ref index, ref cmd } => {
             if index == "all" {
                 // Apply to all PEQ bands on this channel
-                let table = client.profile().dsp_table
+                let table = client
+                    .profile()
+                    .dsp_table
                     .ok_or("device does not support PEQ")?;
                 let bands = if is_input {
-                    table.inputs.get(channel as usize)
+                    table
+                        .inputs
+                        .get(channel as usize)
                         .map(|ch| ch.peq)
                         .ok_or_else(|| format!("input channel {channel} out of range"))?
                 } else {
-                    table.outputs.get(channel as usize)
+                    table
+                        .outputs
+                        .get(channel as usize)
                         .map(|ch| ch.peq)
                         .ok_or_else(|| format!("output channel {channel} out of range"))?
                 };
                 for band in bands {
                     match cmd {
                         PeqCommand::Set { b0, b1, b2, a1, a2 } => {
-                            client.write_biquad(band.addr, &[*b0, *b1, *b2, *a1, *a2]).await?;
+                            client
+                                .write_biquad(band.addr, &[*b0, *b1, *b2, *a1, *a2])
+                                .await?;
                         }
                         PeqCommand::Bypass { state } => {
                             client.bypass_filter(band.addr, *state).await?;
                         }
                         PeqCommand::Clear => {
-                            client.write_biquad(band.addr, &[1.0, 0.0, 0.0, 0.0, 0.0]).await?;
+                            client
+                                .write_biquad(band.addr, &[1.0, 0.0, 0.0, 0.0, 0.0])
+                                .await?;
                             client.bypass_filter(band.addr, true).await?;
                         }
                     }
                 }
             } else {
-                let band_idx: u8 = index.parse()
-                    .map_err(|_| format!("invalid PEQ index '{index}' (expected number or 'all')"))?;
+                let band_idx: u8 = index.parse().map_err(|_| {
+                    format!("invalid PEQ index '{index}' (expected number or 'all')")
+                })?;
                 let addr = get_peq_addr(client, is_input, channel, band_idx)?;
                 match cmd {
                     PeqCommand::Set { b0, b1, b2, a1, a2 } => {
-                        client.write_biquad(addr, &[*b0, *b1, *b2, *a1, *a2]).await?;
+                        client
+                            .write_biquad(addr, &[*b0, *b1, *b2, *a1, *a2])
+                            .await?;
                     }
                     PeqCommand::Bypass { state } => {
                         client.bypass_filter(addr, *state).await?;
                     }
                     PeqCommand::Clear => {
-                        client.write_biquad(addr, &[1.0, 0.0, 0.0, 0.0, 0.0]).await?;
+                        client
+                            .write_biquad(addr, &[1.0, 0.0, 0.0, 0.0, 0.0])
+                            .await?;
                         client.bypass_filter(addr, true).await?;
                     }
                 }
@@ -740,26 +896,45 @@ pub async fn channel_command(
             if is_input {
                 return Err("crossover not available on input channels".into());
             }
-            let table = client.profile().dsp_table
+            let table = client
+                .profile()
+                .dsp_table
                 .ok_or("device does not support crossover")?;
-            let ch_def = table.outputs.get(channel as usize)
+            let ch_def = table
+                .outputs
+                .get(channel as usize)
                 .ok_or_else(|| format!("output channel {channel} out of range"))?;
-            let xover = ch_def.crossover
+            let xover = ch_def
+                .crossover
                 .ok_or("output channel does not have crossover")?;
             match cmd {
-                CrossoverCommand::Set { group, coefficients } => {
+                CrossoverCommand::Set {
+                    group,
+                    coefficients,
+                } => {
                     // Group 0 = LPF, Group 1 = HPF. Each group has 4 biquads (20 coefficients).
                     let base_addr = match *group {
                         0 => xover.lpf_addr,
                         1 => xover.hpf_addr,
-                        n => return Err(format!("crossover group must be 0 (LPF) or 1 (HPF), got {n}").into()),
+                        n => {
+                            return Err(format!(
+                                "crossover group must be 0 (LPF) or 1 (HPF), got {n}"
+                            )
+                            .into());
+                        }
                     };
                     if coefficients.len() != 20 {
-                        return Err(format!("crossover needs exactly 20 coefficients (4 biquads x 5), got {}", coefficients.len()).into());
+                        return Err(format!(
+                            "crossover needs exactly 20 coefficients (4 biquads x 5), got {}",
+                            coefficients.len()
+                        )
+                        .into());
                     }
                     for (i, chunk) in coefficients.chunks(5).enumerate() {
                         let addr = base_addr + (i * 5) as u16;
-                        client.write_biquad(addr, &[chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]]).await?;
+                        client
+                            .write_biquad(addr, &[chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]])
+                            .await?;
                     }
                 }
                 CrossoverCommand::Bypass { state } => {
@@ -777,18 +952,28 @@ pub async fn channel_command(
             if is_input {
                 return Err("compressor not available on input channels".into());
             }
-            let table = client.profile().dsp_table
+            let table = client
+                .profile()
+                .dsp_table
                 .ok_or("device does not support compressor")?;
-            let ch_def = table.outputs.get(channel as usize)
+            let ch_def = table
+                .outputs
+                .get(channel as usize)
                 .ok_or_else(|| format!("output channel {channel} out of range"))?;
-            let comp = ch_def.compressor
+            let comp = ch_def
+                .compressor
                 .ok_or("output channel does not have compressor")?;
             match cmd {
                 CompressorCommand::Bypass { state } => {
                     let val = if *state { 1.0 } else { 0.0 };
                     client.write_dsp(comp.bypass, val, true).await?;
                 }
-                CompressorCommand::Set { threshold, ratio, attack, release } => {
+                CompressorCommand::Set {
+                    threshold,
+                    ratio,
+                    attack,
+                    release,
+                } => {
                     if *attack <= 0.0 || *release <= 0.0 {
                         return Err("attack and release must be > 0 ms".into());
                     }
@@ -804,15 +989,21 @@ pub async fn channel_command(
             }
         }
         ChannelCommand::Fir { ref cmd } => {
-            let table = client.profile().dsp_table
+            let table = client
+                .profile()
+                .dsp_table
                 .ok_or("device does not support FIR")?;
             let fir = if is_input {
-                table.inputs.get(channel as usize)
+                table
+                    .inputs
+                    .get(channel as usize)
                     .ok_or_else(|| format!("input channel {channel} out of range"))?
                     .fir
                     .ok_or("input channel does not have FIR filter")?
             } else {
-                table.outputs.get(channel as usize)
+                table
+                    .outputs
+                    .get(channel as usize)
                     .ok_or_else(|| format!("output channel {channel} out of range"))?
                     .fir
                     .ok_or("output channel does not have FIR filter")?
@@ -824,21 +1015,39 @@ pub async fn channel_command(
                 }
                 FirCommand::Load { file } => {
                     let contents = std::fs::read_to_string(file)?;
-                    let coeffs: Vec<f32> = contents.lines()
+                    let coeffs: Vec<f32> = contents
+                        .lines()
                         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
                         .map(|l| l.trim().parse::<f32>())
                         .collect::<Result<Vec<_>, _>>()?;
                     if coeffs.len() > fir.max_taps as usize {
-                        return Err(format!("FIR has {} taps but device maximum is {}", coeffs.len(), fir.max_taps).into());
+                        return Err(format!(
+                            "FIR has {} taps but device maximum is {}",
+                            coeffs.len(),
+                            fir.max_taps
+                        )
+                        .into());
                     }
                     // Use FIR load protocol: start, then send chunks
                     use minidsp_protocol::commands;
-                    client.raw_command(commands::fir_load_start(channel), minidsp::queue::Priority::High).await?;
+                    client
+                        .raw_command(
+                            commands::fir_load_start(channel),
+                            minidsp::queue::Priority::High,
+                        )
+                        .await?;
                     for chunk in coeffs.chunks(14) {
-                        client.raw_command(commands::fir_load_data(channel, chunk), minidsp::queue::Priority::High).await?;
+                        client
+                            .raw_command(
+                                commands::fir_load_data(channel, chunk),
+                                minidsp::queue::Priority::High,
+                            )
+                            .await?;
                     }
                     // Write tap count
-                    client.write_dsp(fir.taps_count, coeffs.len() as f32, true).await?;
+                    client
+                        .write_dsp(fir.taps_count, coeffs.len() as f32, true)
+                        .await?;
                 }
             }
         }
@@ -846,14 +1055,21 @@ pub async fn channel_command(
             if !is_input {
                 return Err("routing only available on input channels".into());
             }
-            let table = client.profile().dsp_table
+            let table = client
+                .profile()
+                .dsp_table
                 .ok_or("device does not support routing")?;
             let routing = table.routing;
             if channel >= routing.rows || output >= routing.cols {
-                return Err(format!("routing index ({channel}, {output}) out of range (max {}x{})", routing.rows, routing.cols).into());
+                return Err(format!(
+                    "routing index ({channel}, {output}) out of range (max {}x{})",
+                    routing.rows, routing.cols
+                )
+                .into());
             }
             // Gain address = gain_base + (input * cols + output)
-            let gain_addr = routing.gain_base + (channel as u16 * routing.cols as u16 + output as u16);
+            let gain_addr =
+                routing.gain_base + (channel as u16 * routing.cols as u16 + output as u16);
             let gain_linear = 10.0f32.powf(gain_db / 20.0);
             client.write_dsp(gain_addr, gain_linear, true).await?;
         }

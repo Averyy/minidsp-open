@@ -24,7 +24,7 @@ use esp_idf_sys::*;
 use log::{debug, error, info, warn};
 use minidsp_protocol::device::probe::is_official_usb_device;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 /// USB HID class code.
@@ -93,15 +93,10 @@ impl XferSync {
     }
 
     fn wait(&self, timeout: Duration) -> Result<i32, UsbHidError> {
-        let guard = self
-            .mutex
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
         let result = self
             .condvar
-            .wait_timeout_while(guard, timeout, |_| {
-                !self.done.load(Ordering::SeqCst)
-            })
+            .wait_timeout_while(guard, timeout, |_| !self.done.load(Ordering::SeqCst))
             .map_err(|_| UsbHidError::Transfer("condvar poisoned".into()))?;
 
         if result.1.timed_out() {
@@ -162,14 +157,9 @@ impl UsbHidBus {
     ) -> Result<(), UsbHidError> {
         self.out_sync.reset();
         unsafe {
-            ptr::copy_nonoverlapping(
-                out_buf.as_ptr(),
-                (*out_xfer).data_buffer,
-                USB_REPORT_SIZE,
-            );
+            ptr::copy_nonoverlapping(out_buf.as_ptr(), (*out_xfer).data_buffer, USB_REPORT_SIZE);
             (*out_xfer).num_bytes = USB_REPORT_SIZE as i32;
-            (*out_xfer).context =
-                &self.out_sync as *const XferSync as *mut core::ffi::c_void;
+            (*out_xfer).context = &self.out_sync as *const XferSync as *mut core::ffi::c_void;
             esp_ok(usb_host_transfer_submit(out_xfer))
                 .map_err(|e| UsbHidError::Transfer(format!("submit OUT: {e}")))?;
         }
@@ -259,7 +249,6 @@ impl UsbHidBus {
                 for i in 0..num_devs as usize {
                     let addr = dev_addrs[i];
                     if addr > 0 {
-                        // Inject the address as if NEW_DEV just fired
                         let (lock, cvar) = &cb.dev_event;
                         let mut guard = lock.lock().unwrap();
                         *cb.new_dev_addr.lock().unwrap() = Some(addr);
@@ -267,7 +256,7 @@ impl UsbHidBus {
                         *guard = true;
                         cvar.notify_all();
                         info!("USB: pre-connected device at addr={addr}");
-                        break; // Only handle one device
+                        break;
                     }
                 }
             }
@@ -378,8 +367,7 @@ impl UsbHidBus {
         self.in_sync.reset();
         unsafe {
             (*in_xfer).num_bytes = USB_REPORT_SIZE as i32;
-            (*in_xfer).context =
-                &self.in_sync as *const XferSync as *mut core::ffi::c_void;
+            (*in_xfer).context = &self.in_sync as *const XferSync as *mut core::ffi::c_void;
             esp_ok(usb_host_transfer_submit(in_xfer))
                 .map_err(|e| UsbHidError::Transfer(format!("submit IN: {e}")))?;
         }
@@ -422,8 +410,16 @@ impl UsbHidBus {
             return Ok(payload);
         }
 
-        let hex: String = data.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-        Err(UsbHidError::Protocol(format!("invalid response frame ({} bytes): {hex}", data.len())))
+        let hex: String = data
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Err(UsbHidError::Protocol(format!(
+            "invalid response frame ({} bytes): {hex}",
+            data.len()
+        )))
     }
 
     /// Send a command payload without waiting for a reply packet.
@@ -432,7 +428,10 @@ impl UsbHidBus {
         debug!("USB send-only command start: {:02x?}", payload);
 
         if !self.is_connected() {
-            warn!("USB send-only rejected while disconnected: {:02x?}", payload);
+            warn!(
+                "USB send-only rejected while disconnected: {:02x?}",
+                payload
+            );
             return Err(UsbHidError::Disconnected);
         }
 
@@ -472,7 +471,6 @@ impl UsbHidBus {
         }
         *self.dev_hdl.lock().unwrap() = ptr::null_mut();
     }
-
 }
 
 impl Drop for UsbHidBus {
@@ -532,55 +530,58 @@ fn wait_and_open_device(
         };
         info!("USB device connected at address {dev_addr}");
 
-    // Open device (may fail if device disappeared during enumeration)
-    let dev_hdl = unsafe {
-        let mut hdl: usb_device_handle_t = ptr::null_mut();
-        match esp_ok(usb_host_device_open(client_hdl, dev_addr, &mut hdl)) {
-            Ok(()) => hdl,
-            Err(e) => {
-                warn!("device_open({dev_addr}) failed: {e} — retrying");
-                continue;
+        // Open device (may fail if device disappeared during enumeration)
+        let dev_hdl = unsafe {
+            let mut hdl: usb_device_handle_t = ptr::null_mut();
+            match esp_ok(usb_host_device_open(client_hdl, dev_addr, &mut hdl)) {
+                Ok(()) => hdl,
+                Err(e) => {
+                    warn!("device_open({dev_addr}) failed: {e} — retrying");
+                    continue;
+                }
             }
+        };
+
+        // Check VID
+        let (vid, pid) = unsafe {
+            let mut desc_ptr: *const usb_device_desc_t = ptr::null();
+            esp_ok(usb_host_get_device_descriptor(dev_hdl, &mut desc_ptr))
+                .map_err(|e| UsbHidError::Init(format!("get_descriptor: {e}")))?;
+            let desc = &(*desc_ptr).__bindgen_anon_1;
+            (desc.idVendor, desc.idProduct)
+        };
+
+        if !is_official_usb_device(vid, pid) {
+            // Not an officially-supported MiniDSP HID candidate — close and try the next device
+            unsafe { usb_host_device_close(client_hdl, dev_hdl) };
+            warn!("skipping non-MiniDSP device VID=0x{vid:04X} PID=0x{pid:04X}");
+            continue;
         }
-    };
+        info!("MiniDSP device: VID=0x{vid:04X} PID=0x{pid:04X}");
 
-    // Check VID
-    let (vid, pid) = unsafe {
-        let mut desc_ptr: *const usb_device_desc_t = ptr::null();
-        esp_ok(usb_host_get_device_descriptor(dev_hdl, &mut desc_ptr))
-            .map_err(|e| UsbHidError::Init(format!("get_descriptor: {e}")))?;
-        let desc = &(*desc_ptr).__bindgen_anon_1;
-        (desc.idVendor, desc.idProduct)
-    };
-
-    if !is_official_usb_device(vid, pid) {
-        // Not an officially-supported MiniDSP HID candidate — close and try the next device
-        unsafe { usb_host_device_close(client_hdl, dev_hdl) };
-        warn!("skipping non-MiniDSP device VID=0x{vid:04X} PID=0x{pid:04X}");
-        continue;
-    }
-    info!("MiniDSP device: VID=0x{vid:04X} PID=0x{pid:04X}");
-
-    // Get config descriptor and find HID interface + endpoints
-    let (hid_intf, ep_in, ep_out) = unsafe {
-        let mut config_ptr: *const usb_config_desc_t = ptr::null();
-        esp_ok(usb_host_get_active_config_descriptor(dev_hdl, &mut config_ptr))
+        // Get config descriptor and find HID interface + endpoints
+        let (hid_intf, ep_in, ep_out) = unsafe {
+            let mut config_ptr: *const usb_config_desc_t = ptr::null();
+            esp_ok(usb_host_get_active_config_descriptor(
+                dev_hdl,
+                &mut config_ptr,
+            ))
             .map_err(|e| UsbHidError::Init(format!("get_config_desc: {e}")))?;
 
-        find_hid_endpoints(config_ptr)?
-    };
-    info!("HID interface {hid_intf}: EP IN=0x{ep_in:02X}, EP OUT=0x{ep_out:02X}");
+            find_hid_endpoints(config_ptr)?
+        };
+        info!("HID interface {hid_intf}: EP IN=0x{ep_in:02X}, EP OUT=0x{ep_out:02X}");
 
-    // Claim HID interface
-    unsafe {
-        esp_ok(usb_host_interface_claim(client_hdl, dev_hdl, hid_intf, 0))
-            .map_err(|e| UsbHidError::Init(format!("interface_claim({hid_intf}): {e}")))?;
-    }
-    info!("HID interface {hid_intf} claimed");
+        // Claim HID interface
+        unsafe {
+            esp_ok(usb_host_interface_claim(client_hdl, dev_hdl, hid_intf, 0))
+                .map_err(|e| UsbHidError::Init(format!("interface_claim({hid_intf}): {e}")))?;
+        }
+        info!("HID interface {hid_intf} claimed");
 
-    cb.device_present.store(true, Ordering::SeqCst);
+        cb.device_present.store(true, Ordering::SeqCst);
 
-    return Ok((dev_hdl, vid, pid, hid_intf, ep_in, ep_out));
+        return Ok((dev_hdl, vid, pid, hid_intf, ep_in, ep_out));
     } // end loop
 }
 
