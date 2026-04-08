@@ -95,7 +95,7 @@ pub fn decode_response_frame(data: &[u8]) -> Option<(Vec<u8>, usize)> {
         return None;
     }
     let len = data[0] as usize; // self-inclusive
-    if len == 0 || data.len() < len {
+    if len <= 1 || data.len() < len {
         return None;
     }
     Some((data[1..len].to_vec(), len))
@@ -107,16 +107,33 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
         return Some(payload);
     }
 
-    // Some real devices prepend a report ID 0x00 on IN packets even though
-    // the logical MiniDSP response still begins at the next byte.
-    if data.first() == Some(&0x00) {
-        // Real hardware may return an unframed payload with a leading report ID
-        // byte for command-specific responses like ReadFloats / DSP Read:
-        // `[0x00, 0x14, ...]` or `[0x00, 0x02, ...]`. Handle these before
-        // trying to interpret the command byte as a length byte.
+    // Some real devices prepend a report ID on IN packets even though the
+    // logical MiniDSP response still begins at the next byte.
+    if matches!(data.first().copied(), Some(0x00) | Some(0x01)) {
+        // Real hardware can also return an unframed payload echo with a
+        // leading report ID, notably `0x01` for direct-USB write ACKs.
         if matches!(
-            data.get(1),
-            Some(&crate::commands::CMD_READ_FLOATS) | Some(&crate::commands::RESP_EVENT)
+            data.get(1).copied(),
+            Some(crate::commands::CMD_READ_HARDWARE_ID)
+                | Some(crate::commands::CMD_READ_FLOATS)
+                | Some(crate::commands::CMD_READ_FLASH)
+                | Some(crate::commands::CMD_WRITE_DSP)
+                | Some(crate::commands::CMD_WRITE_BIQUAD)
+                | Some(crate::commands::CMD_SET_VOLUME)
+                | Some(crate::commands::CMD_SET_MUTE)
+                | Some(crate::commands::CMD_SET_SOURCE)
+                | Some(crate::commands::CMD_SET_CONFIG)
+                | Some(crate::commands::CMD_BYPASS_FILTER)
+                | Some(crate::commands::CMD_DIRAC_BYPASS)
+                | Some(crate::commands::CMD_SET_DISPLAY_BRIGHTNESS)
+                | Some(crate::commands::CMD_SET_DISPLAY_IDLE_TIME)
+                | Some(crate::commands::CMD_SET_DRE)
+                | Some(crate::commands::CMD_COPY_PRESET)
+                | Some(crate::commands::CMD_FIR_LOAD_DATA)
+                | Some(crate::commands::CMD_RELOAD_DSP_PARAM)
+                | Some(crate::commands::CMD_LOG_CONTROL)
+                | Some(crate::commands::CMD_SET_HDMI_SOURCE)
+                | Some(crate::commands::RESP_EVENT)
         ) {
             return Some(data[1..].to_vec());
         }
@@ -228,7 +245,7 @@ mod tests {
     fn hid_ack_response_without_checksum() {
         let report = [0x01, 0x42, 0x14, 0xfe, 0x30, 0x39, 0x00, 0x00];
         let decoded = decode_hid_response(&report).unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(&decoded[..5], &[0x42, 0x14, 0xfe, 0x30, 0x39]);
     }
 
     #[test]
@@ -255,6 +272,15 @@ mod tests {
         let decoded = decode_hid_response(&report).unwrap();
         assert_eq!(&decoded[..7], &[0x02, 0xa0, 0x58, 0x05, 0x71, 0x00, 0x00]);
         assert_eq!(decoded.len(), HID_DATA_SIZE - 1);
+    }
+
+    #[test]
+    fn hid_unframed_write_echo_with_leading_one_report_id() {
+        let mut report = [0u8; HID_DATA_SIZE];
+        report[..9].copy_from_slice(&[0x01, 0x13, 0xA0, 0x00, 0x1D, 0x00, 0x00, 0x80, 0xC0]);
+
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(&decoded[..8], &[0x13, 0xA0, 0x00, 0x1D, 0x00, 0x00, 0x80, 0xC0]);
     }
 
     #[test]

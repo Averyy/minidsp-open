@@ -185,6 +185,14 @@ enum DebugCommand {
         #[arg(default_value = "1")]
         count: u8,
     },
+    /// Dump typed 32-bit words from a DSP/config address
+    DumpWord {
+        /// DSP address (decimal)
+        addr: u16,
+        /// Number of words to read (max 14)
+        #[arg(default_value = "1")]
+        count: u8,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -196,14 +204,14 @@ enum ChannelCommand {
     },
     /// Set channel mute
     Mute {
-        #[arg(value_parser = parse_on_off)]
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_on_off)]
         state: bool,
     },
     /// Set channel delay in milliseconds
     Delay { ms: f32 },
     /// Invert channel polarity
     Invert {
-        #[arg(value_parser = parse_on_off)]
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_on_off)]
         state: bool,
     },
     /// PEQ filter commands
@@ -235,6 +243,9 @@ enum ChannelCommand {
         /// Gain in dB for this routing path
         #[arg(allow_hyphen_values = true)]
         gain_db: f32,
+        /// Disable this route instead of enabling it
+        #[arg(long)]
+        off: bool,
     },
 }
 
@@ -250,7 +261,7 @@ enum CrossoverCommand {
     },
     /// Bypass crossover
     Bypass {
-        #[arg(value_parser = parse_on_off)]
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_on_off)]
         state: bool,
     },
 }
@@ -259,7 +270,7 @@ enum CrossoverCommand {
 enum CompressorCommand {
     /// Set compressor bypass
     Bypass {
-        #[arg(value_parser = parse_on_off)]
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_on_off)]
         state: bool,
     },
     /// Set compressor parameters (threshold, ratio, attack, release)
@@ -280,7 +291,7 @@ enum CompressorCommand {
 enum FirCommand {
     /// Set FIR bypass
     Bypass {
-        #[arg(value_parser = parse_on_off)]
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_on_off)]
         state: bool,
     },
     /// Load FIR coefficients from file (one coefficient per line)
@@ -312,7 +323,7 @@ enum PeqCommand {
     },
     /// Set PEQ bypass
     Bypass {
-        #[arg(value_parser = parse_on_off)]
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_on_off)]
         state: bool,
     },
     /// Clear PEQ band (set to identity biquad + bypass on)
@@ -509,6 +520,13 @@ async fn execute_command(
                 let values = client.read_floats(addr, count).await?;
                 for (i, v) in values.iter().enumerate() {
                     println!("  [{:04X}+{}] = {v}", addr, i);
+                }
+            }
+            DebugCommand::DumpWord { addr, count } => {
+                let count = count.min(14);
+                let values = client.read_param_words(addr, count).await?;
+                for (i, v) in values.iter().enumerate() {
+                    println!("  [{:04X}+{}] = {} (0x{:08X})", addr, i, v, v);
                 }
             }
         },

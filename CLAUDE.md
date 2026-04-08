@@ -4,7 +4,7 @@ Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macO
 
 ## Project State
 
-Desktop Phase 1 is feature-complete. ESP32 firmware (IDF v5.4) boots, WiFi STA connects, serves the compatibility HTTP API + WebSocket + TCP bridge + UDP discovery, and both the no-MiniDSP appliance path and the basic real-MiniDSP control path are verified on hardware. The shared HID response framing bug is fixed in code; the remaining live compatibility bug is ESP32 config-register read-back (`GET /devices/0/config`) on physical hardware. Desktop CLI has the full intended minidsp-rs compatibility surface: WsTransport, crossover/compressor/FIR/routing, debug subcommand, env vars, and `-v`/`--log`.
+Desktop Phase 1 is feature-complete. ESP32 firmware (IDF v5.4) boots, WiFi STA connects, serves the compatibility HTTP API + WebSocket + TCP bridge + UDP discovery, and both the no-MiniDSP appliance path and the basic real-MiniDSP control path are verified on hardware. The shared HID response framing bug is fixed in code, including real direct-USB write ACKs on the physical 2x4 HD. The remaining live compatibility investigation is DSP100 / 2x4 HD config-state semantics: the official app can restore a known-good audible USB-routing preset, route-gain cells are writable live, but selector words `6..13` do not yet behave like authoritative runtime routing read-back in our tooling. Desktop CLI has the full intended minidsp-rs compatibility surface: WsTransport, crossover/compressor/FIR/routing, debug subcommand, env vars, and `-v`/`--log`.
 
 Status tracking:
 - `PROGRESS.md` = source of truth for project status and open work

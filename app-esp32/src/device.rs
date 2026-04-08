@@ -46,6 +46,8 @@ pub struct InputConfigRead {
     pub peq: Option<Vec<PeqConfigRead>>,
     pub gain: Option<f32>,
     pub mute: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub routing: Vec<RoutingConfigRead>,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +65,13 @@ pub struct PeqConfigRead {
     pub index: u8,
     pub coeff: Option<BiquadCoeffs>,
     pub bypass: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoutingConfigRead {
+    pub output: u8,
+    pub enabled: bool,
+    pub gain_db: f32,
 }
 
 fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
@@ -95,10 +104,22 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
 }
 
 impl DeviceState {
-    /// Probe a device via USB HID: ReadHardwareId, read dsp_version, read serial.
-    pub fn probe(bus: Arc<UsbHidBus>) -> Result<Self, UsbHidError> {
+    fn expect_write_ok(&self, payload: &[u8], context: &str) -> Result<(), UsbHidError> {
+        let resp = self.bus.command(payload)?;
+        match commands::parse_response_for_request(payload, &resp, self.dialect()) {
+            Response::Ack | Response::PresetComplete | Response::ResetComplete => Ok(()),
+            Response::Error(data) => Err(UsbHidError::Protocol(format!(
+                "{context}: device error {data:02x?}"
+            ))),
+            other => Err(UsbHidError::Protocol(format!(
+                "{context}: unexpected response {other:?}"
+            ))),
+        }
+    }
+
+    pub fn probe_with_timeout(bus: Arc<UsbHidBus>, timeout: Duration) -> Result<Self, UsbHidError> {
         // ReadHardwareId
-        let resp = bus.command(&commands::read_hardware_id())?;
+        let resp = bus.command_with_timeout(&commands::read_hardware_id(), timeout)?;
         let parsed = commands::parse_response_for_request(
             &commands::read_hardware_id(),
             &resp,
@@ -120,7 +141,7 @@ impl DeviceState {
         // Read DSP version from EEPROM 0xFFA1
         let (addr_hi, addr_lo) = eeprom::DSP_VERSION_ADDR;
         let req = commands::read_flash(addr_hi, addr_lo, 1);
-        let resp = bus.command(&req)?;
+        let resp = bus.command_with_timeout(&req, timeout)?;
         debug!(
             "dsp_version raw resp ({} bytes): {:02x?}",
             resp.len(),
@@ -146,7 +167,7 @@ impl DeviceState {
         // Read serial from EEPROM 0xFFFE
         let (addr_hi, addr_lo) = eeprom::SERIAL_ADDR;
         let req = commands::read_flash(addr_hi, addr_lo, 2);
-        let resp = bus.command(&req)?;
+        let resp = bus.command_with_timeout(&req, timeout)?;
         let parsed = commands::parse_response_for_request(&req, &resp, &Dialect::NEW);
         let serial = match parsed {
             Response::FlashData(data) => eeprom::parse_serial(&data).unwrap_or(0),
@@ -309,12 +330,36 @@ impl DeviceState {
                 .gain
                 .and_then(|addr| self.read_config_gain_db(addr).ok());
             let mute = input.mute.and_then(|addr| self.read_config_mute(addr).ok());
+            let mut routing = Vec::new();
+            let matrix = table.routing;
+            if ch_idx < matrix.rows as usize {
+                for output in 0..matrix.cols {
+                    let flat_idx = ch_idx as u16 * matrix.cols as u16 + output as u16;
+                    let status_addr = matrix.status_base + flat_idx;
+                    let gain_addr = matrix.gain_base + flat_idx;
+                    let status = self.read_param_word(status_addr).unwrap_or(0);
+                    let enabled = match self.profile.dialect.value_format {
+                        // DSP100 mixer status readback via 0x14 is boolean-
+                        // collapsed: write values 2 (enabled) and 1 (disabled)
+                        // both read back as 1. Treat non-zero as enabled.
+                        ValueFormat::Float32 => status != 0,
+                        ValueFormat::FixedPoint => status != 0,
+                    };
+                    let gain_db = self.read_config_gain_db(gain_addr).unwrap_or(0.0);
+                    routing.push(RoutingConfigRead {
+                        output,
+                        enabled,
+                        gain_db,
+                    });
+                }
+            }
 
             inputs.push(InputConfigRead {
                 index: ch_idx as u8,
                 peq: Some(peqs),
                 gain,
                 mute,
+                routing,
             });
         }
 
@@ -368,11 +413,19 @@ impl DeviceState {
         }
     }
 
+    pub fn read_dsp_floats(&self, addr: u16, count: u8) -> Result<Vec<f32>, UsbHidError> {
+        self.read_floats(addr, count)
+    }
+
     fn read_param_words(&self, addr: u16, count: u8) -> Result<Vec<u32>, UsbHidError> {
         let req = commands::read_floats(addr, count, self.dialect());
         let resp = self.bus.command(&req)?;
         commands::parse_param_words_response_for_request(&req, &resp)
             .ok_or_else(|| UsbHidError::Protocol("typed read_floats parse failed".into()))
+    }
+
+    pub fn read_dsp_words(&self, addr: u16, count: u8) -> Result<Vec<u32>, UsbHidError> {
+        self.read_param_words(addr, count)
     }
 
     fn read_param_word(&self, addr: u16) -> Result<u32, UsbHidError> {
@@ -419,7 +472,7 @@ impl DeviceState {
 
     fn read_config_mute(&self, addr: u16) -> Result<bool, UsbHidError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => Ok(self.read_param_word(addr)? >= 2),
+            ValueFormat::Float32 => Ok(self.read_param_word(addr)? == 1),
             ValueFormat::FixedPoint => {
                 let value = self
                     .read_floats(addr, 1)?
@@ -489,14 +542,19 @@ impl DeviceState {
             }
         }
 
-        // Convert raw float to dB: 20 * log10(abs(value)), clamped to -140 dB
+        // SHARC-family meter registers already report dB-like float values.
+        // Re-applying log10() here turns valid negative readings like -120 dB
+        // into misleading positive numbers (~41.58). Return the raw meter
+        // values and only clamp pathological silence / NaN cases.
         let db_values: Vec<f32> = all_values
             .iter()
             .map(|&v| {
-                if v.abs() < 1e-10 {
+                if !v.is_finite() {
+                    -140.0
+                } else if v <= -140.0 || v.abs() < 1e-10 {
                     -140.0
                 } else {
-                    20.0 * v.abs().log10()
+                    v
                 }
             })
             .collect();
@@ -506,8 +564,7 @@ impl DeviceState {
     // -- Control commands --
 
     pub fn set_volume(&self, value: u8) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::set_volume(value))?;
-        Ok(())
+        self.expect_write_ok(&commands::set_volume(value), "set volume")
     }
 
     pub fn set_volume_db(&self, db: f32) -> Result<(), UsbHidError> {
@@ -516,43 +573,41 @@ impl DeviceState {
     }
 
     pub fn set_mute(&self, muted: bool) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::set_mute(muted))?;
-        Ok(())
+        self.expect_write_ok(&commands::set_mute(muted), "set mute")
     }
 
     pub fn set_source(&self, source: u8) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::set_source(source))?;
-        Ok(())
+        self.expect_write_ok(&commands::set_source(source), "set source")
     }
 
     pub fn set_preset(&self, preset: u8) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::set_config(preset, 0))?;
-        Ok(())
+        self.expect_write_ok(&commands::set_config(preset, 0), "set preset")
     }
 
     pub fn set_dirac_bypass(&self, bypass: bool) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::dirac_bypass(bypass))?;
-        Ok(())
+        self.expect_write_ok(&commands::dirac_bypass(bypass), "set dirac bypass")
     }
 
     pub fn set_display_brightness(&self, level: u8) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::set_display_brightness(level))?;
-        Ok(())
+        self.expect_write_ok(
+            &commands::set_display_brightness(level),
+            "set display brightness",
+        )
     }
 
     pub fn set_display_idle_time(&self, secs: u8) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::set_display_idle_time(secs))?;
-        Ok(())
+        self.expect_write_ok(
+            &commands::set_display_idle_time(secs),
+            "set display idle time",
+        )
     }
 
     pub fn set_dre(&self, enabled: bool) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::set_dre(enabled))?;
-        Ok(())
+        self.expect_write_ok(&commands::set_dre(enabled), "set dre")
     }
 
     pub fn copy_preset(&self) -> Result<(), UsbHidError> {
-        self.bus.command(&commands::copy_preset(true))?;
-        Ok(())
+        self.expect_write_ok(&commands::copy_preset(true), "copy preset")
     }
 
     // -- DSP writes --
@@ -593,16 +648,23 @@ impl DeviceState {
 
     #[allow(dead_code)]
     pub fn write_dsp(&self, addr: u16, value: f32, save: bool) -> Result<(), UsbHidError> {
-        self.bus
-            .command(&commands::write_dsp(addr, value, save, self.dialect()))?;
-        Ok(())
+        self.expect_write_ok(
+            &commands::write_dsp(addr, value, save, self.dialect()),
+            "write dsp",
+        )
     }
 
     #[allow(dead_code)]
     pub fn write_dsp_u32(&self, addr: u16, value: u32, save: bool) -> Result<(), UsbHidError> {
-        self.bus
-            .command(&commands::write_dsp_u32(addr, value, save))?;
-        Ok(())
+        self.expect_write_ok(&commands::write_dsp_u32(addr, value, save), "write dsp u32")
+    }
+
+    #[allow(dead_code)]
+    pub fn write_dsp_selector_u32(&self, addr: u16, value: u32) -> Result<(), UsbHidError> {
+        self.expect_write_ok(
+            &commands::write_dsp_u32_le_with_ctrl(addr, value, 0x80),
+            "write dsp selector",
+        )
     }
 
     /// Set channel polarity inversion using dialect-aware encoding.
@@ -626,14 +688,67 @@ impl DeviceState {
     }
 
     #[allow(dead_code)]
+    pub fn set_routing(
+        &self,
+        input: u8,
+        output: u8,
+        enabled: bool,
+        gain_db: f32,
+    ) -> Result<(), UsbHidError> {
+        let table = self
+            .profile
+            .dsp_table
+            .ok_or_else(|| UsbHidError::Protocol("routing unsupported".into()))?;
+        let routing = table.routing;
+        if input >= routing.rows || output >= routing.cols {
+            return Err(UsbHidError::Protocol(format!(
+                "routing index ({input}, {output}) out of range (max {}x{})",
+                routing.rows, routing.cols
+            )));
+        }
+
+        let flat_idx = input as u16 * routing.cols as u16 + output as u16;
+        let status_addr = routing.status_base + flat_idx;
+        let gain_addr = routing.gain_base + flat_idx;
+
+        self.set_channel_gain(gain_addr, gain_db)?;
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
+                // Mixer status: 2=enabled, 1=disabled (matches minidsp-rs WriteInt).
+                // Uses 0x13 with LE u32 value — audio-verified on 2x4 HD.
+                let val = if enabled { 2u32 } else { 1u32 };
+                self.write_dsp_selector_u32(status_addr, val)
+            }
+            ValueFormat::FixedPoint => self.write_dsp(status_addr, if enabled { 1.0 } else { 0.0 }, true),
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn set_channel_mute(&self, addr: u16, muted: bool) -> Result<(), UsbHidError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => self.write_dsp_u32(addr, if muted { 2 } else { 1 }, false),
+            ValueFormat::Float32 => {
+                // Mute status: 1=muted, 2=unmuted (matches minidsp-rs WriteInt).
+                let val = if muted { 1u32 } else { 2u32 };
+                self.write_dsp_selector_u32(addr, val)
+            }
             ValueFormat::FixedPoint => {
                 let val = if muted { 0.0 } else { 1.0 };
                 self.write_dsp(addr, val, true)
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn write_dsp_linked_u32(
+        &self,
+        addr: u16,
+        value: u32,
+        linked_addrs: &[u16],
+    ) -> Result<(), UsbHidError> {
+        self.expect_write_ok(
+            &commands::write_dsp_linked_u32(addr, value, linked_addrs),
+            "write dsp linked u32",
+        )
     }
 
     #[allow(dead_code)]

@@ -349,17 +349,11 @@ pub fn start(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let declared_len = req
-                .header("Content-Length")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-            if declared_len > 8192 {
-                return send_error(req, 413, "request body too large");
-            }
-
-            let mut body = vec![0u8; declared_len.max(1)];
-            let read = req.read(&mut body[..declared_len.max(1)]).unwrap_or(0);
-            body.truncate(read);
+            let body = match read_request_body(&mut req, 8192) {
+                Ok(body) => body,
+                Err("request body too large") => return send_error(req, 413, "request body too large"),
+                Err(_) => return send_error(req, 400, "failed to read request body"),
+            };
 
             info!("POST /devices/0/config start: {} bytes", body.len());
             let json: serde_json::Value = match serde_json::from_slice(&body) {
@@ -495,6 +489,53 @@ pub fn start(
                             if let Some(mute_addr) = input_ch.mute {
                                 if let Err(e) = dev.set_channel_mute(mute_addr, mute) {
                                     return send_error(req, 500, &format!("set_mute: {e}"));
+                                }
+                            }
+                        }
+                        if let Some(routes) = input.get("routing").and_then(|v| v.as_array()) {
+                            for route in routes {
+                                let output = match route.get("output").and_then(|v| v.as_u64()) {
+                                    Some(v) => v as u8,
+                                    None => {
+                                        return send_error(
+                                            req,
+                                            400,
+                                            "routing missing 'output' field",
+                                        )
+                                    }
+                                };
+                                let enabled =
+                                    match route.get("enabled").and_then(|v| v.as_bool()) {
+                                        Some(v) => v,
+                                        None => {
+                                            return send_error(
+                                                req,
+                                                400,
+                                                "routing missing 'enabled' field",
+                                            )
+                                        }
+                                    };
+                                let gain_db =
+                                    match route.get("gain_db").and_then(|v| v.as_f64()) {
+                                        Some(v) if v.is_finite() => v as f32,
+                                        Some(_) => {
+                                            return send_error(
+                                                req,
+                                                400,
+                                                "routing gain must be finite",
+                                            )
+                                        }
+                                        None => {
+                                            return send_error(
+                                                req,
+                                                400,
+                                                "routing missing 'gain_db' field",
+                                            )
+                                        }
+                                    };
+                                if let Err(e) = dev.set_routing(idx as u8, output, enabled, gain_db)
+                                {
+                                    return send_error(req, 500, &format!("set_routing: {e}"));
                                 }
                             }
                         }
@@ -856,6 +897,79 @@ fn register_debug_routes(
         let snapshot = diagnostics::log_snapshot();
         send_text(req, &snapshot)
     })?;
+
+    // GET /debug/dsp?addr=0x20&count=4&format=floats|words
+    {
+        let st = state.clone();
+        server.fn_handler("/debug/dsp", Method::Get, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+
+            let uri = req.uri().to_string();
+            let query = uri.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let mut addr: Option<u16> = None;
+            let mut count: u8 = 1;
+            let mut format = "floats";
+
+            for part in query.split('&') {
+                let Some((key, value)) = part.split_once('=') else {
+                    continue;
+                };
+                match key {
+                    "addr" => {
+                        addr = if let Some(hex) = value
+                            .strip_prefix("0x")
+                            .or_else(|| value.strip_prefix("0X"))
+                        {
+                            u16::from_str_radix(hex, 16).ok()
+                        } else {
+                            value.parse::<u16>().ok()
+                        };
+                    }
+                    "count" => {
+                        if let Ok(parsed) = value.parse::<u8>() {
+                            count = parsed.clamp(1, 14);
+                        }
+                    }
+                    "format" if value == "words" || value == "floats" => {
+                        format = value;
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(addr) = addr else {
+                return send_error(req, 400, "missing addr query parameter");
+            };
+
+            let body = match format {
+                "words" => match dev.read_dsp_words(addr, count) {
+                    Ok(values) => serde_json::to_string(&json!({
+                        "addr": addr,
+                        "count": count,
+                        "format": "words",
+                        "values": values,
+                    }))
+                    .unwrap_or_default(),
+                    Err(e) => return send_error(req, 500, &e.to_string()),
+                },
+                _ => match dev.read_dsp_floats(addr, count) {
+                    Ok(values) => serde_json::to_string(&json!({
+                        "addr": addr,
+                        "count": count,
+                        "format": "floats",
+                        "values": values,
+                    }))
+                    .unwrap_or_default(),
+                    Err(e) => return send_error(req, 500, &e.to_string()),
+                },
+            };
+
+            send_json(req, 200, &body)
+        })?;
+    }
 
     // POST /debug/level — change runtime log level
     server.fn_handler("/debug/level", Method::Post, |mut req| {

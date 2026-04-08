@@ -577,6 +577,14 @@ async fn write_config(
                             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                     }
                 }
+                if let Some(routes) = input.routing {
+                    for route in routes {
+                        client
+                            .set_routing(input.index, route.output, route.enabled, route.gain_db)
+                            .await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    }
+                }
             }
         }
     }
@@ -688,6 +696,17 @@ async fn read_config(
             ),
             gain: input.gain,
             mute: input.mute,
+            routing: Some(
+                input
+                    .routing
+                    .into_iter()
+                    .map(|route| RoutingConfigJson {
+                        output: route.output,
+                        enabled: route.enabled,
+                        gain_db: route.gain_db,
+                    })
+                    .collect(),
+            ),
         })
         .collect::<Vec<_>>();
 

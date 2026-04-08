@@ -11,6 +11,22 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a
 ## Validation Snapshot
 
 - Real hardware validated on ESP32-S3 + miniDSP 2x4 HD using a **release** firmware build (`cargo build --release`)
+- The original “silent `/play`” investigation exposed shared compatibility bugs, not only ESP32-specific ones:
+  - direct Mac USB playback to the same 2x4 HD was also silent until the official MiniDSP app reset the device settings
+  - after that reset, practical hardware testing showed the narrower USB-only rule: an output only plays USB audio when at least one input route is explicitly enabled for that output in the app UI
+  - output 3/4 stayed silent for USB playback until their routes were enabled, which ruled out the earlier mistaken “all inputs go to all outputs” assumption
+- Shared protocol fixes that came out of the `/play` investigation:
+  - direct-USB HID write ACKs on the 2x4 HD can arrive as report-ID-prefixed unframed echoes (`0x01 ...`); the old decoder misclassified successful writes as failures
+  - typed `ReadFloats` parsing for modern 5-byte headers was reading from the wrong offset
+- Current DSP100 / 2x4 HD routing conclusion from the same investigation:
+  - route-gain cells (`32..39`) are live and writable
+  - the official app's saved default preset XML is stereo one-hot at selector addresses `6..13`: input 1 only to output 1, input 2 only to output 2, outputs 3/4 disabled
+  - live hardware still reads selector addresses `6..13` back as all `1`, even after the preset reset
+  - the old shared routing write path was only half-working on the real 2x4 HD: the gain write landed, but the follow-up selector/status write timed out
+  - extracted official-app code now proves the live per-route mixer toggle path is `setMultipleMixerBypass()` -> `GetSetLinkedIntValCmd` (`0x30` linked-int), not the generic `LoadDspParam` (`0x13`) path
+  - desktop and ESP32 shared routing writes now use that same linked-int `0x30` status-write shape for modern route-enable writes
+  - therefore silent `/play` troubleshooting must not assume selector read-back is authoritative for modern routing enable state
+  - the remaining `/play` audibility risk is now specifically the USB route-enable path, not general sweep generation or USB transport
 - Default `POST /devices/0/play` response arrives in about `0.35s` when already on `Usb`, and about `0.4-0.5s` when `/play` first switches from `Toslink` to `Usb`
 - Near-full-ring chunking was the first confirmed root cause: `~8190` byte writes into an `8192` byte TX ring stretched completion to about `13.6s`
 - Half-ring chunking (`4092` byte writes) fixed the main pacing bug:
@@ -19,6 +35,18 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a
 - Generator hot-path optimization reduced generation time from about `729ms` to about `483ms` on the default plan
 - A second generator refactor that emits contiguous regions directly (instead of branching per-sample across the whole signal) reduced default-plan generation time again, from about `483ms` to about `333ms`
 - Source auto-switch is verified live: `Toslink -> Usb -> Toslink`
+- HID + UAC2 reconnect/late-appearance is now verified on the real 2x4 HD:
+  - unplug/replug while the ESP32 stays up recovers `/devices`, `/sync`, and `/play`
+  - MiniDSP appearing later while the ESP32 is already running recovers `/devices`, `/sync`, and `/play`
+  - ESP32 rebooting with the MiniDSP off, then the MiniDSP appearing later, recovers `/devices`, `/sync`, and `/play`
+- Repeated-play stress is now verified on the real 2x4 HD:
+  - 8 consecutive default `POST /devices/0/play` runs completed without crash, reconnect loss, or HID regression
+  - concurrent `/play` while one sweep is active returns HTTP `409`
+  - every post-play `GET /devices/0/config` returned HTTP `200`
+  - `heap_min` stayed flat at `15444` bytes across the run and free heap recovered to about `83-85 KiB` between plays
+- The reconnect fix required two app-side changes in `app-esp32`:
+  - recover HID endpoint state after a timed-out transfer instead of leaving the session poisoned
+  - keep `uac2_host_install()` at USB-host startup so the audio client sees already-attached devices and reconnects
 - Transient bad master-status reads immediately after source changes are handled with short retries
 - First overlap attempt (generator thread + blocking writer thread) improved the design direction but failed on real hardware because per-chunk heap allocation was not stable enough (`memory allocation of 8192 bytes failed`)
 - Second overlap attempt (fixed two-slot ping-pong to avoid per-chunk allocation) also failed to produce a shippable single-play path; it did not crash, but it stopped making forward progress reliably enough to treat as a regression
@@ -37,6 +65,33 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a
   - `48kHz / 16-bit / stereo`: `tx_need_data=0`, `last_write_after_start≈12.39s`
   - `44.1kHz / 24-bit / stereo`: `tx_need_data=0`, `last_write_after_start≈12.29s`
   - conclusion: once underruns are eliminated, the remaining delta scales with byte rate and enqueue timing; it is not evidence of a UAC2 driver clock/stretch bug
+- Official-app comparison on the physical 2x4 HD established a known-good audible USB-audio baseline:
+  - MiniDSP app UI preset `2` corresponds to our zero-based `preset: 1`
+  - source `USB`, master volume `0 dB`, master mute off
+  - visible matrix routing is stereo pass-through: `Input 1 -> Output 1`, `Input 2 -> Output 2`
+  - for audible subwoofer tests in that state, the sub should be connected to physical output `2`
+- Opening the official app changed the device from a previously silent test state into a working-audio baseline.
+  - Direct Mac USB playback was also silent before that reset, which rules out an ESP32-only explanation.
+  - Live user testing then confirmed the important routing behavior the official app exposed: each output only becomes audible when an input route is enabled for that output.
+  - That means the remaining `/play` audibility risk is much more likely to be device-state compatibility than UAC2 transport.
+  - Still unresolved: whether that transition was only preset/routing restoration or whether the app also silently reinitialized USB-audio playback inside the MiniDSP.
+- The follow-up compatibility investigation found two more concrete app-side bugs:
+  - routing writes were missing from `POST /devices/{id}/config` on both desktop and ESP32
+  - the desktop CLI `input <n> routing <out> <gain_db>` path was using the wrong gain encoding for float32 devices
+- The same investigation also found a broader shared-protocol bug:
+  - typed `ReadFloats` replies on modern devices can include a 5-byte typed header (`0x14, addr_hi, addr_lo, 0x00, count, ...`)
+  - our raw-word parser was previously decoding those replies from the wrong byte offset
+  - that means some SHARC/XMOS config/status reads were being interpreted from misaligned bytes until the shared parser fix
+- Continuing reverse-engineering against the official app and the live 2x4 HD found the next modern-device compatibility issue:
+  - the official app uses `GetSetLinkedIntValCmd` for modern mute and mixer-status writes
+  - that command writes the final scalar field as little-endian 32-bit (`writeUInt32LE`), not the generic big-endian raw-word form we had inferred earlier
+  - extracted `streamDevice.js` now proves that both `setMultipleChnMute()` and `setMultipleMixerBypass()` instantiate `GetSetLinkedIntValCmd` directly
+  - shared desktop + ESP32 code now matches that builder for modern route-enable writes; the unresolved part is hardware outcome, not builder selection
+  - live mute writes also confirm DSP100 mute polarity is `1 = muted`, `2 = unmuted`
+- One modern-device config-read issue remains open:
+  - DSP100 `DGain_*_status` and `MixerNxMSmoothed1_*_status` semantics on the physical 2x4 HD are not fully decoded yet
+  - our current readback still does not match the official app UI for all mute/routing states
+  - continue treating modern mute/routing readback as a compatibility investigation item, not a solved surface
 
 **Performance note:** Use a **release** firmware build for any timing or glitch validation. Debug (`cargo build`) builds are dramatically slower in the sweep-generation hot path and are not representative for `/play`.
 
@@ -73,8 +128,8 @@ Goal: explain and, if possible, eliminate the remaining gap between nominal sign
   - enqueue pacing only
   - stop/drain overhead
   - acceptable transport latency vs bug
-- [ ] Capture or otherwise verify the physical output duration once software timestamps are clear
-- [ ] Update this doc and `PROGRESS.md` with the final root cause and validated fix
+- [x] Update this doc and `PROGRESS.md` with the validated HID/UAC2 reconnect fix
+- [x] Finish repeated-play stress testing and document the results
 
 **Current conclusion:** the original `~13.6s` issue was a real app-side pacing bug caused by near-full-ring writes. That is fixed. The remaining `~12.29-12.56s` enqueue-finish metric depends on byte volume (`48/24` > `48/16` > `44.1/24`), stays at `TX_DONE=0`, and has negligible stop time, which is consistent with app-side enqueue timing against the driver ring buffer and `startedAtUs` semantics, not with a driver-side sample-clock defect.
 
@@ -82,6 +137,7 @@ Goal: explain and, if possible, eliminate the remaining gap between nominal sign
 
 The feature is complete when:
 - [ ] `curl -X POST http://<esp32>:5380/devices/0/play` plays a ~12-second measurement sweep through the miniDSP's analog outputs
+- [ ] A single route-enable written by our code on DSP100 / 2x4 HD is enough to make USB playback audible on the targeted output, without requiring the official app as a follow-up step
 - [ ] The response arrives within ~200ms (before playback finishes) and contains a real `startedAtUs` hardware timestamp plus correct sample offsets
 - [ ] `curl -X POST http://<esp32>:5380/sync -d '{"clientTimeUs":0}'` returns an ESP32 timestamp (works with or without a miniDSP connected)
 - [ ] HID control (volume, mute, config, etc.) continues working normally during and after audio playback
@@ -89,12 +145,16 @@ The feature is complete when:
 - [ ] USB disconnect mid-playback doesn't crash — cleans up gracefully
 - [ ] The sweep generator has desktop unit tests (`cargo test` in the workspace, no ESP32 needed)
 - [ ] The firmware builds and boots cleanly with zero new warnings
-- [ ] Back-to-back plays work: sweep finishes, immediately `POST /play` again — full stop→cleanup→re-init cycle succeeds
-- [ ] Play then HID: after a sweep completes, `GET /devices/0/config` and other HID commands still work correctly
-- [ ] Heap survives playback: free heap doesn't drop dangerously low with WiFi + HTTP + HID + UAC2 all active (log free heap before/during/after)
+- [x] Back-to-back plays work: sweep finishes, immediately `POST /play` again — full stop→cleanup→re-init cycle succeeds
+- [x] Play then HID: after a sweep completes, `GET /devices/0/config` and other HID commands still work correctly
+- [x] Heap survives playback: free heap doesn't drop dangerously low with WiFi + HTTP + HID + UAC2 all active (log free heap before/during/after)
 - [ ] HID-only device: `POST /play` on a device without USB audio (e.g., 2x4 non-HD) returns a clear error, not a crash or hang
 - [ ] Malformed requests: empty body uses defaults, garbage JSON returns 400, missing Content-Type is handled gracefully
 - [ ] Sample rate switch between plays: play at 48kHz, then play at 44.1kHz — clock reconfiguration works
+- [x] ESP32 already running with no device, then MiniDSP appears later: `/devices`, `/sync`, and `/play` all recover
+- [x] ESP32 reboot with MiniDSP off, then MiniDSP appears later: `/devices`, `/sync`, and `/play` all recover
+- [x] Unplug/replug while ESP32 stays up: `/devices`, `/sync`, and `/play` all recover
+- [ ] Shared modern-device routing/mute read-back matches the official 2x4 HD app after the official-app reset baseline
 
 ## Task Ordering
 

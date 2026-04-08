@@ -60,6 +60,8 @@ pub struct InputChannelConfig {
     pub gain: Option<f32>,
     pub mute: Option<bool>,
     pub peq: Vec<PeqBandConfig>,
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Vec::is_empty", default))]
+    pub routing: Vec<RoutingConfig>,
 }
 
 /// Output channel config.
@@ -73,6 +75,15 @@ pub struct OutputChannelConfig {
     pub peq: Vec<PeqBandConfig>,
     #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
     pub compressor: Option<CompressorConfig>,
+}
+
+/// Routing matrix entry for one input -> output path.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct RoutingConfig {
+    pub output: u8,
+    pub enabled: bool,
+    pub gain_db: f32,
 }
 
 /// Full device config — JSON-serializable representation of all device state.

@@ -141,12 +141,12 @@ pub fn write_dsp(addr: u16, value: f32, save: bool, dialect: &Dialect) -> Vec<u8
     cmd
 }
 
-/// Build a WriteDSP command with a raw little-endian 32-bit payload.
+/// Build a WriteDSP command with a raw 32-bit scalar payload.
 ///
-/// This is used for config slots modeled by the official app as typed 32-bit
-/// values (`integer`, `samplecnt`, etc.) rather than DSP coefficient floats.
+/// This is the plain scalar `WriteDSP` shape used for modern slots that do
+/// not need the official app's linked-int wrapper.
 pub fn write_dsp_u32(addr: u16, value: u32, save: bool) -> Vec<u8> {
-    let bytes = value.to_le_bytes();
+    let bytes = value.to_be_bytes();
     vec![
         CMD_WRITE_DSP,
         if save { 0x80 } else { 0xA0 },
@@ -157,6 +157,62 @@ pub fn write_dsp_u32(addr: u16, value: u32, save: bool) -> Vec<u8> {
         bytes[2],
         bytes[3],
     ]
+}
+
+/// Build a WriteDSP command with a raw 32-bit scalar payload encoded
+/// little-endian and an explicit control byte.
+///
+/// DSP100 mixer selector/status slots match the official app's `LoadDspParam`
+/// shape: opcode `0x13`, control `0x80`, address big-endian, value
+/// little-endian.
+pub fn write_dsp_u32_le_with_ctrl(addr: u16, value: u32, ctrl: u8) -> Vec<u8> {
+    let bytes = value.to_le_bytes();
+    vec![
+        CMD_WRITE_DSP,
+        ctrl,
+        (addr >> 8) as u8,
+        addr as u8,
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+    ]
+}
+
+/// Build the official app's linked-int `0x30` payload shape.
+///
+/// Modern mute and mixer-status slots on SHARC/XMOS devices use the official
+/// app's `GetSetLinkedIntValCmd`, which multiplexes opcode `0x30` with a
+/// non-biquad payload:
+///
+/// - control byte = `0x80 + linked_addr_count`
+/// - target address = big-endian u16
+/// - linked addresses = big-endian u16 list, or a single zero placeholder
+/// - scalar value = little-endian u32
+pub fn write_dsp_linked_u32(addr: u16, value: u32, linked_addrs: &[u16]) -> Vec<u8> {
+    let linked_count = linked_addrs.len().min(0x7f);
+    let mut cmd = Vec::with_capacity(
+        1 + 1
+            + 2
+            + if linked_count == 0 {
+                2
+            } else {
+                linked_count * 2
+            }
+            + 4,
+    );
+    cmd.push(CMD_WRITE_BIQUAD);
+    cmd.push(0x80 + linked_count as u8);
+    cmd.extend_from_slice(&addr.to_be_bytes());
+    if linked_count == 0 {
+        cmd.extend_from_slice(&0u16.to_be_bytes());
+    } else {
+        for &linked in linked_addrs.iter().take(linked_count) {
+            cmd.extend_from_slice(&linked.to_be_bytes());
+        }
+    }
+    cmd.extend_from_slice(&value.to_le_bytes());
+    cmd
 }
 
 /// Build a ReadFloats command. Reads `count` float values starting at `addr`.
@@ -449,6 +505,18 @@ pub fn parse_param_words_response_for_request(request: &[u8], data: &[u8]) -> Op
 
     let needed = count * 4;
 
+    if data.len() >= 5
+        && data.first().copied() == Some(CMD_READ_FLOATS)
+        && request.len() >= 4
+        && data.get(1) == request.get(1)
+        && data.get(2) == request.get(2)
+        && data.get(3).copied() == Some(0x00)
+        && data.get(4) == request.get(3)
+        && data.len() >= 5 + needed
+    {
+        return Some(decode_word_chunks(&data[5..5 + needed], count));
+    }
+
     if data.len() >= 3
         && data.first().copied() == Some(CMD_READ_FLOATS)
         && request.len() >= 3
@@ -623,7 +691,56 @@ mod tests {
         let cmd = write_dsp_u32(0x0042, 2, true);
         assert_eq!(
             cmd,
+            vec![CMD_WRITE_DSP, 0x80, 0x00, 0x42, 0x00, 0x00, 0x00, 0x02]
+        );
+    }
+
+    #[test]
+    fn write_dsp_linked_u32_without_links() {
+        let cmd = write_dsp_linked_u32(0x0042, 2, &[]);
+        assert_eq!(
+            cmd,
+            vec![
+                CMD_WRITE_BIQUAD,
+                0x80,
+                0x00,
+                0x42,
+                0x00,
+                0x00,
+                0x02,
+                0x00,
+                0x00,
+                0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn write_dsp_u32_le_with_ctrl_new_dialect() {
+        let cmd = write_dsp_u32_le_with_ctrl(0x0042, 2, 0x80);
+        assert_eq!(
+            cmd,
             vec![CMD_WRITE_DSP, 0x80, 0x00, 0x42, 0x02, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn write_dsp_linked_u32_with_one_link() {
+        let cmd = write_dsp_linked_u32(0x0042, 2, &[0x1234]);
+        assert_eq!(
+            cmd,
+            vec![
+                CMD_WRITE_BIQUAD,
+                0x81,
+                0x00,
+                0x42,
+                0x12,
+                0x34,
+                0x02,
+                0x00,
+                0x00,
+                0x00,
+            ]
         );
     }
 
@@ -852,6 +969,15 @@ mod tests {
     fn parse_param_words_response_for_integer_slot() {
         let req = read_floats(0x0002, 1, &Dialect::NEW);
         let data = [0x14, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00];
+
+        let words = parse_param_words_response_for_request(&req, &data).unwrap();
+        assert_eq!(words, vec![2]);
+    }
+
+    #[test]
+    fn parse_param_words_response_for_typed_header_integer_slot() {
+        let req = read_floats(0x0002, 1, &Dialect::NEW);
+        let data = [0x14, 0x00, 0x02, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00];
 
         let words = parse_param_words_response_for_request(&req, &data).unwrap();
         assert_eq!(words, vec![2]);

@@ -145,7 +145,7 @@ fn hid_response_uses_length_only_without_checksum() {
 fn hid_ack_response_can_be_single_length_byte() {
     let data = [0x01, 0x42, 0x14, 0xfe, 0x30, 0x39, 0x00, 0x00];
     let payload = packet::decode_hid_response(&data).unwrap();
-    assert!(payload.is_empty());
+    assert_eq!(&payload[..5], &[0x42, 0x14, 0xfe, 0x30, 0x39]);
 }
 
 #[test]

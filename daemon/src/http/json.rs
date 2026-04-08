@@ -53,6 +53,8 @@ pub struct InputConfigJson {
     pub peq: Option<Vec<PeqConfigJson>>,
     pub gain: Option<f32>,
     pub mute: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<Vec<RoutingConfigJson>>,
 }
 
 /// Output config for POST /devices/{id}/config — includes delay and polarity.
@@ -82,4 +84,11 @@ pub struct BiquadCoeffJson {
     pub b2: f32,
     pub a1: f32,
     pub a2: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RoutingConfigJson {
+    pub output: u8,
+    pub enabled: bool,
+    pub gain_db: f32,
 }

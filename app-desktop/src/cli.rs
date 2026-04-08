@@ -1051,27 +1051,11 @@ pub async fn channel_command(
                 }
             }
         }
-        ChannelCommand::Routing { output, gain_db } => {
+        ChannelCommand::Routing { output, gain_db, off } => {
             if !is_input {
                 return Err("routing only available on input channels".into());
             }
-            let table = client
-                .profile()
-                .dsp_table
-                .ok_or("device does not support routing")?;
-            let routing = table.routing;
-            if channel >= routing.rows || output >= routing.cols {
-                return Err(format!(
-                    "routing index ({channel}, {output}) out of range (max {}x{})",
-                    routing.rows, routing.cols
-                )
-                .into());
-            }
-            // Gain address = gain_base + (input * cols + output)
-            let gain_addr =
-                routing.gain_base + (channel as u16 * routing.cols as u16 + output as u16);
-            let gain_linear = 10.0f32.powf(gain_db / 20.0);
-            client.write_dsp(gain_addr, gain_linear, true).await?;
+            client.set_routing(channel, output, !off, gain_db).await?;
         }
     }
     Ok(())

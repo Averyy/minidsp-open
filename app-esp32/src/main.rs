@@ -16,7 +16,7 @@
 use esp_idf_svc::sys;
 use log::{error, info, warn};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod device;
 mod diagnostics;
@@ -27,6 +27,12 @@ mod updater;
 mod usb_audio;
 mod usb_hid;
 mod wifi;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsbState {
+    Absent,
+    ProtocolReady,
+}
 
 fn main() {
     sys::link_patches();
@@ -117,29 +123,17 @@ fn main() {
     }
 
     // Step 4: Wait for MiniDSP device (up to 30s)
+    let mut usb_state = UsbState::Absent;
     if let Some(ref bus) = bus {
-        match bus.wait_for_device(Duration::from_secs(30)) {
-            Ok((_vid, _pid)) => {
-                match device::DeviceState::probe(bus.clone()) {
-                    Ok(state) => {
-                        info!(
-                            "device: {} (hw_id={}, dsp={})",
-                            state.product_name(),
-                            state.hw_id().hw_id,
-                            state.dsp_version()
-                        );
-                        // Update ezBEQ state with actual device channel counts
-                        if let Some(table) = state.profile().dsp_table {
-                            let inputs = table.inputs.len() as u8;
-                            let outputs = table.outputs.len() as u8;
-                            *beq_state.lock().unwrap() = ezbeq::EzBeqState::new(inputs, outputs);
-                        }
-                        *device_state.lock().unwrap() = Some(Arc::new(state));
-                    }
-                    Err(e) => error!("device probe failed: {e}"),
-                }
+        match discover_and_activate_device(bus, Duration::from_secs(30)) {
+            Ok(state) => {
+                usb_state = UsbState::ProtocolReady;
+                on_device_activated(state, &device_state, &beq_state);
             }
-            Err(e) => warn!("No MiniDSP device found: {e} — will retry in background"),
+            Err(e) => {
+                usb_state = UsbState::Absent;
+                warn!("No MiniDSP device found: {e} — will retry in background");
+            }
         }
     }
 
@@ -239,27 +233,19 @@ fn main() {
                 // Device was connected but is now gone
                 warn!("USB device lost — clearing device state");
                 *device_state.lock().unwrap() = None;
+                usb_state = UsbState::Absent;
             }
 
             // Scan if we don't have a working device (regardless of is_connected,
             // since non-MiniDSP devices can set the flag)
             if device_state.lock().unwrap().is_none() {
+                log_usb_state_transition(&mut usb_state, UsbState::Absent, "device missing");
                 info!("USB: scanning for device (timeout: {usb_backoff:?})");
-                match bus.wait_for_device(usb_backoff) {
-                    Ok((_vid, _pid)) => {
-                        match device::DeviceState::probe(bus.clone()) {
-                            Ok(state) => {
-                                info!(
-                                    "USB device found: {} (hw_id={}, dsp={})",
-                                    state.product_name(),
-                                    state.hw_id().hw_id,
-                                    state.dsp_version()
-                                );
-                                *device_state.lock().unwrap() = Some(Arc::new(state));
-                                usb_backoff = Duration::from_secs(5);
-                            }
-                            Err(e) => error!("USB device probe failed: {e}"),
-                        }
+                match discover_and_activate_device(bus, usb_backoff) {
+                    Ok(state) => {
+                        usb_backoff = Duration::from_secs(5);
+                        usb_state = UsbState::ProtocolReady;
+                        on_device_activated(state, &device_state, &beq_state);
                     }
                     Err(_) => {
                         // No device found within timeout — back off
@@ -270,6 +256,121 @@ fn main() {
         }
 
         std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn discover_and_activate_device(
+    bus: &Arc<usb_hid::UsbHidBus>,
+    timeout: Duration,
+) -> Result<device::DeviceState, usb_hid::UsbHidError> {
+    const ATTACH_SETTLE: Duration = Duration::from_secs(10);
+
+    info!("USB state: waiting for HID attach");
+    bus.wait_for_device(timeout)?;
+    info!("USB state: HID session ready");
+    if let Some(age) = bus.last_attach_age() {
+        if age < ATTACH_SETTLE {
+            let wait = ATTACH_SETTLE - age;
+            info!("USB state: waiting {wait:?} for device firmware warmup after attach");
+            std::thread::sleep(wait);
+        }
+    }
+    probe_device_with_retries(bus.clone(), Duration::from_secs(20))
+}
+
+fn probe_device_with_retries(
+    bus: Arc<usb_hid::UsbHidBus>,
+    warmup_window: Duration,
+) -> Result<device::DeviceState, usb_hid::UsbHidError> {
+    const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+    let deadline = Instant::now() + warmup_window;
+    let mut attempt = 0usize;
+
+    let final_err = loop {
+        attempt += 1;
+        info!("USB state: probing protocol (attempt {attempt})");
+        let err = match device::DeviceState::probe_with_timeout(bus.clone(), PROBE_COMMAND_TIMEOUT) {
+            Ok(state) => {
+                info!("USB state: protocol ready after {attempt} attempt(s)");
+                return Ok(state);
+            }
+            Err(usb_hid::UsbHidError::Protocol(msg)) => {
+                warn!("USB state: protocol not ready on attempt {attempt}: {msg}");
+                usb_hid::UsbHidError::Protocol(msg)
+            }
+            Err(usb_hid::UsbHidError::Timeout) => {
+                warn!("USB state: timeout during probe attempt {attempt}");
+                usb_hid::UsbHidError::Timeout
+            }
+            Err(usb_hid::UsbHidError::Transfer(msg)) => {
+                warn!("USB state: transport failure during probe attempt {attempt}: {msg}");
+                if bus.is_connected() || bus.has_present_device().unwrap_or(false) {
+                    match bus.reopen_present_device() {
+                        Ok(Some((_vid, _pid))) => info!("USB state: reopened HID session"),
+                        Ok(None) => warn!("USB state: no present device found while reopening HID"),
+                        Err(err) => warn!("USB state: HID reopen failed: {err}"),
+                    }
+                } else {
+                    return Err(usb_hid::UsbHidError::Disconnected);
+                }
+                usb_hid::UsbHidError::Transfer(msg)
+            }
+            Err(usb_hid::UsbHidError::Disconnected) => {
+                if bus.is_connected() || bus.has_present_device().unwrap_or(false) {
+                    warn!("USB state: HID session dropped during probe, retrying attach");
+                    match bus.reopen_present_device() {
+                        Ok(Some((_vid, _pid))) => info!("USB state: reopened HID session after disconnect"),
+                        Ok(None) => warn!("USB state: no present device found while reopening after disconnect"),
+                        Err(err) => warn!("USB state: HID reopen after disconnect failed: {err}"),
+                    }
+                    usb_hid::UsbHidError::Disconnected
+                } else {
+                    warn!("USB state: device disconnected during probe");
+                    return Err(usb_hid::UsbHidError::Disconnected);
+                }
+            }
+            Err(err) => return Err(err),
+        };
+
+        if Instant::now() >= deadline {
+            break err;
+        }
+        if !(bus.is_connected() || bus.has_present_device().unwrap_or(false)) {
+            return Err(usb_hid::UsbHidError::Disconnected);
+        }
+        std::thread::sleep(RETRY_DELAY);
+    };
+
+    Err(final_err)
+}
+
+fn on_device_activated(
+    state: device::DeviceState,
+    device_state: &http_server::SharedDeviceState,
+    beq_state: &ezbeq::SharedEzBeqState,
+) {
+    info!(
+        "device: {} (hw_id={}, dsp={})",
+        state.product_name(),
+        state.hw_id().hw_id,
+        state.dsp_version()
+    );
+
+    if let Some(table) = state.profile().dsp_table {
+        let inputs = table.inputs.len() as u8;
+        let outputs = table.outputs.len() as u8;
+        *beq_state.lock().unwrap() = ezbeq::EzBeqState::new(inputs, outputs);
+    }
+
+    *device_state.lock().unwrap() = Some(Arc::new(state));
+}
+
+fn log_usb_state_transition(current: &mut UsbState, next: UsbState, reason: &str) {
+    if *current != next {
+        info!("USB state: {current:?} -> {next:?} ({reason})");
+        *current = next;
     }
 }
 

@@ -9,7 +9,7 @@ use minidsp_protocol::dialect::ValueFormat;
 use minidsp_protocol::eeprom;
 use minidsp_protocol::status::{
     BiquadCoeffs, CompressorConfig, DeviceConfig, DeviceInfo, DeviceVersion, InputChannelConfig,
-    MasterStatusView, OutputChannelConfig, PeqBandConfig, StatusSummary,
+    MasterStatusView, OutputChannelConfig, PeqBandConfig, RoutingConfig, StatusSummary,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -126,6 +126,28 @@ async fn execute_peq_batch(
 }
 
 impl MiniDspClient {
+    fn ensure_write_response(resp: Response, context: &str) -> Result<(), ClientError> {
+        match resp {
+            Response::Ack | Response::PresetComplete | Response::ResetComplete => Ok(()),
+            Response::Error(data) => Err(ClientError::Protocol(format!(
+                "{context}: device error {data:02x?}"
+            ))),
+            other => Err(ClientError::Protocol(format!(
+                "{context}: unexpected response {other:?}"
+            ))),
+        }
+    }
+
+    async fn execute_write(
+        &self,
+        payload: Vec<u8>,
+        priority: Priority,
+        context: &str,
+    ) -> Result<(), ClientError> {
+        let resp = self.queue.execute(payload, priority).await?;
+        Self::ensure_write_response(resp, context)
+    }
+
     /// Connect to a device via transport, probe its identity, and return a client.
     pub async fn connect(transport: Box<dyn Transport>) -> Result<Self, ClientError> {
         let transport_url = transport.url();
@@ -295,10 +317,8 @@ impl MiniDspClient {
 
     /// Set volume (raw byte value, gain = -0.5 * value).
     pub async fn set_volume(&self, value: u8) -> Result<(), ClientError> {
-        self.queue
-            .execute(commands::set_volume(value), Priority::High)
-            .await?;
-        Ok(())
+        self.execute_write(commands::set_volume(value), Priority::High, "set volume")
+            .await
     }
 
     /// Set volume in dB.
@@ -309,10 +329,8 @@ impl MiniDspClient {
 
     /// Set mute state.
     pub async fn set_mute(&self, muted: bool) -> Result<(), ClientError> {
-        self.queue
-            .execute(commands::set_mute(muted), Priority::High)
-            .await?;
-        Ok(())
+        self.execute_write(commands::set_mute(muted), Priority::High, "set mute")
+            .await
     }
 
     /// Switch preset (0-3).
@@ -324,18 +342,18 @@ impl MiniDspClient {
                 self.profile.presets - 1
             )));
         }
-        self.queue
-            .execute(commands::set_config(preset, 0), Priority::Critical)
-            .await?;
-        Ok(())
+        self.execute_write(
+            commands::set_config(preset, 0),
+            Priority::Critical,
+            "set config",
+        )
+        .await
     }
 
     /// Set source by index.
     pub async fn set_source(&self, source: u8) -> Result<(), ClientError> {
-        self.queue
-            .execute(commands::set_source(source), Priority::High)
-            .await?;
-        Ok(())
+        self.execute_write(commands::set_source(source), Priority::High, "set source")
+            .await
     }
 
     /// Set Dirac bypass state.
@@ -343,24 +361,31 @@ impl MiniDspClient {
         if !self.profile.has_dirac {
             return Err(ClientError::Unsupported);
         }
-        self.queue
-            .execute(commands::dirac_bypass(bypass), Priority::High)
-            .await?;
-        Ok(())
+        self.execute_write(
+            commands::dirac_bypass(bypass),
+            Priority::High,
+            "set dirac bypass",
+        )
+        .await
     }
 
     /// Set channel mute using dialect-aware encoding.
     pub async fn set_channel_mute(&self, addr: u16, muted: bool) -> Result<(), ClientError> {
-        use minidsp_protocol::dialect::encode_mute;
-        let mute_bytes = encode_mute(muted, &self.profile.dialect);
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => {
-                // Official app models modern-device mute slots as integer words.
-                let val = if muted { 2 } else { 1 };
-                self.write_dsp_u32(addr, val, false).await?;
+                // Mute status: 1=muted, 2=unmuted (matches minidsp-rs WriteInt).
+                // Uses 0x13 with LE u32 value — same path as routing.
+                let val = if muted { 1u32 } else { 2u32 };
+                self.execute_write(
+                    commands::write_dsp_u32_le_with_ctrl(addr, val, 0x80),
+                    Priority::High,
+                    "set channel mute",
+                )
+                .await?;
             }
             ValueFormat::FixedPoint => {
-                // Old dialect: mute is raw 4-byte fixed-point via WriteDSP
+                use minidsp_protocol::dialect::encode_mute;
+                let mute_bytes = encode_mute(muted, &self.profile.dialect);
                 let raw = u32::from_be_bytes([
                     mute_bytes[0],
                     mute_bytes[1],
@@ -383,6 +408,48 @@ impl MiniDspClient {
                 self.write_dsp(addr, gain_linear, true).await
             }
         }
+    }
+
+    /// Set one input->output routing entry.
+    pub async fn set_routing(
+        &self,
+        input: u8,
+        output: u8,
+        enabled: bool,
+        gain_db: f32,
+    ) -> Result<(), ClientError> {
+        let table = self.profile.dsp_table.ok_or(ClientError::Unsupported)?;
+        let routing = table.routing;
+        if input >= routing.rows || output >= routing.cols {
+            return Err(ClientError::Protocol(format!(
+                "routing index ({input}, {output}) out of range (max {}x{})",
+                routing.rows, routing.cols
+            )));
+        }
+
+        let flat_idx = input as u16 * routing.cols as u16 + output as u16;
+        let status_addr = routing.status_base + flat_idx;
+        let gain_addr = routing.gain_base + flat_idx;
+
+        self.set_channel_gain(gain_addr, gain_db).await?;
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
+                // Mixer status: 2=enabled, 1=disabled (matches minidsp-rs WriteInt).
+                // Uses 0x13 (LoadDspParam) with u32 LE value — audio-verified on 2x4 HD.
+                let val = if enabled { 2u32 } else { 1u32 };
+                self.execute_write(
+                    commands::write_dsp_u32_le_with_ctrl(status_addr, val, 0x80),
+                    Priority::High,
+                    "set routing status",
+                )
+                .await?;
+            }
+            ValueFormat::FixedPoint => {
+                self.write_dsp(status_addr, if enabled { 1.0 } else { 0.0 }, true)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Write biquad coefficients to a PEQ band.
@@ -444,13 +511,12 @@ impl MiniDspClient {
 
     /// Write DSP parameter.
     pub async fn write_dsp(&self, addr: u16, value: f32, save: bool) -> Result<(), ClientError> {
-        self.queue
-            .execute(
-                commands::write_dsp(addr, value, save, &self.profile.dialect),
-                Priority::High,
-            )
-            .await?;
-        Ok(())
+        self.execute_write(
+            commands::write_dsp(addr, value, save, &self.profile.dialect),
+            Priority::High,
+            "write dsp",
+        )
+        .await
     }
 
     /// Write a raw 32-bit DSP/config parameter word.
@@ -460,10 +526,38 @@ impl MiniDspClient {
         value: u32,
         save: bool,
     ) -> Result<(), ClientError> {
-        self.queue
-            .execute(commands::write_dsp_u32(addr, value, save), Priority::High)
-            .await?;
-        Ok(())
+        self.execute_write(
+            commands::write_dsp_u32(addr, value, save),
+            Priority::High,
+            "write dsp u32",
+        )
+        .await
+    }
+
+    /// Write a DSP selector/status word using the official app's raw scalar
+    /// `LoadDspParam` shape for modern devices.
+    pub async fn write_dsp_selector_u32(&self, addr: u16, value: u32) -> Result<(), ClientError> {
+        self.execute_write(
+            commands::write_dsp_u32_le_with_ctrl(addr, value, 0x80),
+            Priority::High,
+            "write dsp selector",
+        )
+        .await
+    }
+
+    /// Write a linked-int 32-bit DSP/config parameter word.
+    pub async fn write_dsp_linked_u32(
+        &self,
+        addr: u16,
+        value: u32,
+        linked_addrs: &[u16],
+    ) -> Result<(), ClientError> {
+        self.execute_write(
+            commands::write_dsp_linked_u32(addr, value, linked_addrs),
+            Priority::High,
+            "write dsp linked u32",
+        )
+        .await
     }
 
     /// Read float values from DSP memory.
@@ -531,7 +625,7 @@ impl MiniDspClient {
 
     async fn read_config_mute(&self, addr: u16) -> Result<bool, ClientError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => Ok(self.read_param_word(addr).await? >= 2),
+            ValueFormat::Float32 => Ok(self.read_param_word(addr).await? == 1),
             ValueFormat::FixedPoint => {
                 let value = self
                     .read_floats(addr, 1)
@@ -817,11 +911,39 @@ impl MiniDspClient {
                         });
                     }
                 }
+                let mut routing_entries = Vec::new();
+                let routing = table.routing;
+                if ch_idx < routing.rows as usize {
+                    for output in 0..routing.cols {
+                        let flat_idx = ch_idx as u16 * routing.cols as u16 + output as u16;
+                        let status_addr = routing.status_base + flat_idx;
+                        let gain_addr = routing.gain_base + flat_idx;
+                        let status = self.read_param_word(status_addr).await.unwrap_or(0);
+                        let enabled = match self.profile.dialect.value_format {
+                            // DSP100 mixer status readback via 0x14 is boolean-
+                            // collapsed: write values 2 (enabled) and 1 (disabled)
+                            // both read back as 1. Only 0 reads back as 0. So we
+                            // cannot distinguish enabled from disabled via readback
+                            // alone. Treat non-zero as enabled — callers that need
+                            // authoritative state should use the saved preset or
+                            // the audio test instead.
+                            ValueFormat::Float32 => status != 0,
+                            ValueFormat::FixedPoint => status != 0,
+                        };
+                        let gain_db = self.read_config_gain_db(gain_addr).await.unwrap_or(0.0);
+                        routing_entries.push(RoutingConfig {
+                            output,
+                            enabled,
+                            gain_db,
+                        });
+                    }
+                }
                 inputs.push(InputChannelConfig {
                     index: ch_idx as u8,
                     gain,
                     mute,
                     peq,
+                    routing: routing_entries,
                 });
             }
 
@@ -916,14 +1038,19 @@ impl MiniDspClient {
             }
         }
 
-        // Convert raw float to dB (20 * log10(abs(value)), clamped)
+        // SHARC-family meter registers already report dB-like float values.
+        // Re-applying log10() here turns valid negative readings like -120 dB
+        // into misleading positive numbers (~41.58). Return the raw meter
+        // values and only clamp pathological silence / NaN cases.
         let db_values: Vec<f32> = all_values
             .iter()
             .map(|&v| {
-                if v.abs() < 1e-10 {
+                if !v.is_finite() {
+                    -140.0
+                } else if v <= -140.0 || v.abs() < 1e-10 {
                     -140.0
                 } else {
-                    20.0 * v.abs().log10()
+                    v
                 }
             })
             .collect();
