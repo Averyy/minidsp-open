@@ -251,6 +251,10 @@ impl Uac2Device {
         unsafe { uac2_host_device_get_start_time(self.handle_ptr()) }
     }
 
+    pub fn feedback_raw(&self) -> u32 {
+        unsafe { uac2_host_device_get_feedback(self.handle_ptr()) }
+    }
+
     pub fn stop_stream(&self) -> Result<(), UsbAudioError> {
         unsafe {
             esp_ok(uac2_host_device_stop(self.handle_ptr()))
@@ -525,6 +529,7 @@ unsafe extern "C" {
         timeout_ms: u32,
     ) -> esp_err_t;
     fn uac2_host_device_get_start_time(dev: uac2_host_device_handle_t) -> i64;
+    fn uac2_host_device_get_feedback(dev: uac2_host_device_handle_t) -> u32;
 }
 const UAC2_TASK_CORE: BaseType_t = 0;
-pub const TX_RING_BUFFER_BYTES: usize = 8 * 1024;
+pub const TX_RING_BUFFER_BYTES: usize = 48 * 1024;

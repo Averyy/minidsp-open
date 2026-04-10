@@ -459,64 +459,73 @@ impl UsbHidBus {
 
         self.submit_out_transfer(out_xfer, &out_buf, payload, timeout)?;
 
-        // Submit IN transfer with dedicated sync
-        self.in_sync.reset();
-        unsafe {
-            (*in_xfer).num_bytes = USB_REPORT_SIZE as i32;
-            (*in_xfer).context = &self.in_sync as *const XferSync as *mut core::ffi::c_void;
-            esp_ok(usb_host_transfer_submit(in_xfer))
-                .map_err(|e| UsbHidError::Transfer(format!("submit IN: {e}")))?;
-        }
-        debug!("USB IN submitted for payload: {:02x?}", payload);
-        let status = self.in_sync.wait(timeout).map_err(|e| {
-            warn!("USB IN wait failed for {:02x?}: {}", payload, e);
-            self.recover_endpoints_after_timeout();
-            e
-        })?;
-        if status != 0 {
-            warn!("USB IN completion status {} for {:02x?}", status, payload);
-            return Err(UsbHidError::Transfer(format!("IN status: {status}")));
-        }
-        debug!("USB IN completed for payload: {:02x?}", payload);
+        // Receive loop: retry IN transfers on undecodable packets (stale data,
+        // garbled frames) within the original timeout window, matching the
+        // desktop HID transport behavior.
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(UsbHidError::Timeout);
+            }
 
-        // Read response from IN transfer buffer
-        let actual_len = unsafe { (*in_xfer).actual_num_bytes as usize };
-        let mut resp_buf = vec![0u8; actual_len.min(USB_REPORT_SIZE)];
-        unsafe {
-            ptr::copy_nonoverlapping(
-                (*in_xfer).data_buffer,
-                resp_buf.as_mut_ptr(),
-                resp_buf.len(),
+            // Submit IN transfer
+            self.in_sync.reset();
+            unsafe {
+                (*in_xfer).num_bytes = USB_REPORT_SIZE as i32;
+                (*in_xfer).context = &self.in_sync as *const XferSync as *mut core::ffi::c_void;
+                esp_ok(usb_host_transfer_submit(in_xfer))
+                    .map_err(|e| UsbHidError::Transfer(format!("submit IN: {e}")))?;
+            }
+            debug!("USB IN submitted for payload: {:02x?}", payload);
+            let status = self.in_sync.wait(remaining).map_err(|e| {
+                warn!("USB IN wait failed for {:02x?}: {}", payload, e);
+                self.recover_endpoints_after_timeout();
+                e
+            })?;
+            if status != 0 {
+                warn!("USB IN completion status {} for {:02x?}", status, payload);
+                return Err(UsbHidError::Transfer(format!("IN status: {status}")));
+            }
+            debug!("USB IN completed for payload: {:02x?}", payload);
+
+            // Read response from IN transfer buffer
+            let actual_len = unsafe { (*in_xfer).actual_num_bytes as usize };
+            let mut resp_buf = vec![0u8; actual_len.min(USB_REPORT_SIZE)];
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    (*in_xfer).data_buffer,
+                    resp_buf.as_mut_ptr(),
+                    resp_buf.len(),
+                );
+            }
+
+            if resp_buf.len() >= 4 {
+                debug!(
+                    "USB IN: {} bytes, full packet: {:02x?}",
+                    resp_buf.len(),
+                    &resp_buf[..resp_buf.len().min(USB_REPORT_SIZE)]
+                );
+            }
+
+            // Try to decode the HID response frame
+            if let Some(payload) = minidsp_protocol::packet::decode_hid_response(&resp_buf) {
+                debug!("USB command decoded response: {:02x?}", payload);
+                return Ok(payload);
+            }
+
+            // Undecodable packet — log and retry within the timeout window
+            let hex: String = resp_buf
+                .iter()
+                .take(16)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            warn!(
+                "USB HID: undecodable response ({} bytes: {hex}), retrying",
+                resp_buf.len()
             );
         }
-
-        // Log raw response for debugging
-        if resp_buf.len() >= 4 {
-            debug!(
-                "USB IN: {} bytes, full packet: {:02x?}",
-                resp_buf.len(),
-                &resp_buf[..resp_buf.len().min(USB_REPORT_SIZE)]
-            );
-        }
-
-        // HID responses are `[len][payload]` with no checksum; bytes after the
-        // frame boundary in the 64-byte interrupt packet may be arbitrary.
-        let data = &resp_buf;
-        if let Some(payload) = minidsp_protocol::packet::decode_hid_response(data) {
-            debug!("USB command decoded response: {:02x?}", payload);
-            return Ok(payload);
-        }
-
-        let hex: String = data
-            .iter()
-            .take(16)
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        Err(UsbHidError::Protocol(format!(
-            "invalid response frame ({} bytes): {hex}",
-            data.len()
-        )))
     }
 
     /// Send a command payload and receive the response with the default timeout.

@@ -104,9 +104,25 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
     shadow
 }
 
+/// Timeout for slow commands that write to flash (preset copy, set_config).
+const SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
+
 impl DeviceState {
     fn expect_write_ok(&self, payload: &[u8], context: &str) -> Result<(), UsbHidError> {
         let resp = self.bus.command(payload)?;
+        match commands::parse_response_for_request(payload, &resp, self.dialect()) {
+            Response::Ack | Response::PresetComplete | Response::ResetComplete => Ok(()),
+            Response::Error(data) => Err(UsbHidError::Protocol(format!(
+                "{context}: device error {data:02x?}"
+            ))),
+            other => Err(UsbHidError::Protocol(format!(
+                "{context}: unexpected response {other:?}"
+            ))),
+        }
+    }
+
+    fn expect_write_ok_slow(&self, payload: &[u8], context: &str) -> Result<(), UsbHidError> {
+        let resp = self.bus.command_with_timeout(payload, SLOW_COMMAND_TIMEOUT)?;
         match commands::parse_response_for_request(payload, &resp, self.dialect()) {
             Response::Ack | Response::PresetComplete | Response::ResetComplete => Ok(()),
             Response::Error(data) => Err(UsbHidError::Protocol(format!(
@@ -348,13 +364,11 @@ impl DeviceState {
                     let status_addr = matrix.status_base + flat_idx;
                     let gain_addr = matrix.gain_base + flat_idx;
                     let status = self.read_param_word(status_addr).unwrap_or(0);
-                    let enabled = match self.profile.dialect.value_format {
-                        // DSP100 mixer status readback via 0x14 is boolean-
-                        // collapsed: write values 2 (enabled) and 1 (disabled)
-                        // both read back as 1. Treat non-zero as enabled.
-                        ValueFormat::Float32 => status != 0,
-                        ValueFormat::FixedPoint => status != 0,
-                    };
+                    // Mixer status readback via 0x14 is boolean-collapsed on
+                    // devices with unreliable selector readback: write values
+                    // 2 (enabled) and 1 (disabled) both read back as 1.
+                    // Treat non-zero as enabled on all dialects.
+                    let enabled = status != 0;
                     let gain_db = self.read_config_gain_db(gain_addr).unwrap_or(0.0);
                     routing.push(RoutingConfigRead {
                         output,
@@ -454,6 +468,18 @@ impl DeviceState {
     }
 
     fn read_peq_coeffs(&self, addr: u16) -> Result<[f32; 5], UsbHidError> {
+        // On devices with unreliable selector readback (DSP100), always prefer
+        // shadow state — live reads can return collapsed/bogus values.
+        if self.profile.has_unreliable_selector_readback {
+            return Ok(self
+                .peq_shadow
+                .lock()
+                .map_err(|_| UsbHidError::Protocol("peq shadow poisoned".into()))?
+                .get(&addr)
+                .map(|s| s.coeffs)
+                .unwrap_or(minidsp_protocol::biquad::BYPASS));
+        }
+
         let values = self.read_floats(addr, 5).unwrap_or_default();
         if values.len() >= 5 {
             let coeffs = [values[0], values[1], values[2], values[3], values[4]];
@@ -461,6 +487,7 @@ impl DeviceState {
                 return Ok(coeffs);
             }
         }
+        // Fallback to shadow for any device if live read returned all zeros
         Ok(self
             .peq_shadow
             .lock()
@@ -600,7 +627,7 @@ impl DeviceState {
     }
 
     pub fn set_preset(&self, preset: u8) -> Result<(), UsbHidError> {
-        self.expect_write_ok(&commands::set_config(preset, 0), "set preset")
+        self.expect_write_ok_slow(&commands::set_config(preset, 0), "set preset")
     }
 
     pub fn set_dirac_bypass(&self, bypass: bool) -> Result<(), UsbHidError> {
@@ -626,7 +653,7 @@ impl DeviceState {
     }
 
     pub fn copy_preset(&self) -> Result<(), UsbHidError> {
-        self.expect_write_ok(&commands::copy_preset(true), "copy preset")
+        self.expect_write_ok_slow(&commands::copy_preset(true), "copy preset")
     }
 
     // -- DSP writes --
@@ -839,9 +866,55 @@ impl DeviceState {
 
     // -- Raw command --
 
-    #[allow(dead_code)]
+    /// Execute a raw command and mirror successful write side-effects into
+    /// the PEQ shadow so `/config` reflects TCP bridge / WebSocket activity.
     pub fn raw_command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
-        self.bus.command(payload)
+        let resp = self.bus.command(payload)?;
+        let parsed = commands::parse_response_for_request(payload, &resp, self.dialect());
+        if matches!(
+            parsed,
+            Response::Ack | Response::PresetComplete | Response::ResetComplete
+        ) {
+            self.mirror_raw_to_shadow(payload);
+        }
+        Ok(resp)
+    }
+
+    /// Parse a raw write payload and update the PEQ shadow accordingly.
+    fn mirror_raw_to_shadow(&self, payload: &[u8]) {
+        // Biquad write: CMD_WRITE_BIQUAD (0x13), ctrl=0x80, addr[2], pad[2], coeffs[20]
+        if payload.first().copied() == Some(commands::CMD_WRITE_BIQUAD)
+            && payload.len() >= 26
+            && payload[1] == 0x80
+        {
+            let addr = u16::from_be_bytes([payload[2], payload[3]]);
+            let mut coeffs = [0.0f32; 5];
+            let mut offset = 6;
+            for coeff in &mut coeffs {
+                if let Some(bytes) = payload.get(offset..offset + 4) {
+                    let arr: [u8; 4] = bytes.try_into().unwrap();
+                    *coeff = minidsp_protocol::dialect::decode_value(&arr, self.dialect());
+                    offset += 4;
+                }
+            }
+            if let Ok(mut shadow) = self.peq_shadow.lock() {
+                if let Some(entry) = shadow.get_mut(&addr) {
+                    entry.coeffs = coeffs;
+                }
+            }
+            return;
+        }
+
+        // Bypass filter: CMD_BYPASS_FILTER (0x13 with ctrl bit pattern)
+        if payload.first().copied() == Some(commands::CMD_BYPASS_FILTER) && payload.len() >= 6 {
+            let addr = u16::from_be_bytes([payload[2], payload[3]]);
+            let bypass = payload[1] & 0x80 != 0;
+            if let Ok(mut shadow) = self.peq_shadow.lock() {
+                if let Some(entry) = shadow.get_mut(&addr) {
+                    entry.bypass = bypass;
+                }
+            }
+        }
     }
 
     // -- Device info --

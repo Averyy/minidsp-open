@@ -28,12 +28,9 @@ Permanent technical detail belongs in:
 - Desktop queue reconnect now re-acquires transports on disconnect and replays idempotent pending PEQ batch writes after reconnect.
 - Measurement-mode saved PEQ state now persists in daemon state so restore survives client rebuild/reconnect.
 - ESP32 WiFi monitor now records disconnect reason codes, distinguishes credential failures from transient AP loss, and exposes `lastWifiDisconnectReason` in `/debug/info`.
-- ESP32 `/sync` and `/devices/{id}/play` are live on real 2x4 HD hardware in release firmware: `/play` responds before playback completes, streams the full sweep, and restores the previous source after auto-switching to USB.
-- ESP32 `/play` timing is now characterized on real hardware: the original `~13.6s` completion bug was fixed by half-ring chunking, and the remaining `~12.29-12.56s` enqueue-finish metric scales with byte volume at `TX_DONE=0`, which points to app-side enqueue/reporting semantics rather than a UAC2 driver clock defect.
-- Live audible `/play` testing on 2026-04-09 narrowed the remaining defect to our app-side signal/routing behavior, not the UAC2 transport:
-  - clean `/play` runs on physical output `2` complete with exact expected byte counts and `TX_DONE=0`, but the default signal still sounds like repeated `BRAP` bursts instead of a smooth subwoofer sweep
-  - a cleaner custom request (`16-bit`, no preamble/tone burst/gap/decay, `50-80 Hz`) sounds slightly better but is still wrong / too high-pitched
-  - that keeps the current suspicion on our generated signal shape and/or PCM formatting, not on a driver underrun or sample-clock bug
+- ESP32 firmware updated 2026-04-10 to match desktop fixes: HID retry-on-undecodable, `has_unreliable_selector_readback` PEQ readback, TCP bridge shadow mirroring, slow command timeouts (35s for preset copy/switch), PSRAM enabled for large allocations.
+- ESP32 all non-playback features verified on real 2x4 HD hardware: status, volume/mute/source/preset, config read/write (PEQ/gains/routing/delay/polarity/mute), preset copy, TCP bridge, UDP discovery, WebSocket, ezBEQ API, debug endpoints, sync.
+- ESP32 `/play` now pre-generates entire sweep into PSRAM before starting USB audio stream (ESP32 float math too slow for real-time 48 kHz generation). All bytes delivered correctly (`tx_need_data=0` with 48 KB ring buffer), feedback endpoint reads `48.0000 Hz`, but periodic audio dropouts (~3 blips per 3 seconds) persist even with a simple 200 Hz constant tone. The issue is in the USB isochronous transfer path, not in our application code or ring buffer management. Investigation continues.
 - Shared `/play` defaults were then updated again to match REW/MSO-style measurement conventions:
   - default request is now a `5-400 Hz`, `5.46 s`, `16-bit` sweep with `2 s` low-level dither pre-silence, `2 s` post-silence, and `20 ms` raised-cosine fade-in/out
   - when the sweep starts below `10 Hz`, the generator now follows REW's hybrid behavior: linear chirp from `5 Hz` to `10 Hz`, then logarithmic from `10 Hz` to `400 Hz`

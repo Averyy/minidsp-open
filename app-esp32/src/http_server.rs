@@ -1553,63 +1553,93 @@ fn run_playback_thread(
     restore_source: Option<Source>,
     started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
 ) {
-    let start_result = start_playback(&audio_device, &plan).map(|mut start| {
-        start.response.source_changed = source_changed;
-        start.response.previous_source = previous_source.clone();
-        start
-    });
+    // Pre-generate the entire sweep into memory before starting the USB
+    // audio stream. ESP32 float math (sin/cos/ln) is too slow to keep up
+    // with real-time 48 kHz playback, so we generate everything upfront
+    // into PSRAM (~1.8 MB for a 9.5 s sweep) and then just blast bytes
+    // to the ring buffer during playback.
+    let total_bytes = plan.offsets().total_samples * plan.layout().frame_bytes();
+    info!(
+        "pre-generating {} samples ({} bytes) at {} Hz {}-bit",
+        plan.offsets().total_samples,
+        total_bytes,
+        plan.request.sample_rate,
+        plan.request.bit_depth.bits()
+    );
+    let gen_started_us = usb_audio::server_time_us();
+    let mut pcm_data = vec![0u8; total_bytes];
+    let mut generator = plan.generator();
+    let mut offset = 0;
+    while !generator.is_finished() && offset < pcm_data.len() {
+        let written = generator.fill_pcm_bytes(&mut pcm_data[offset..]);
+        if written == 0 {
+            break;
+        }
+        offset += written;
+    }
+    let pcm_data = &pcm_data[..offset];
+    let gen_elapsed_ms = (usb_audio::server_time_us() - gen_started_us) / 1000;
+    info!(
+        "pre-generation complete: {} bytes in {} ms",
+        pcm_data.len(),
+        gen_elapsed_ms
+    );
+
+    // Start the USB audio stream and write the pre-generated data
+    let start_result = start_playback_pregenerated(&audio_device, &plan, pcm_data).map(
+        |mut start| {
+            start.response.source_changed = source_changed;
+            start.response.previous_source = previous_source.clone();
+            start
+        },
+    );
 
     match start_result {
         Ok(start) => {
             let playback_started_us = usb_audio::server_time_us();
-            let expected_total_bytes = plan.offsets().total_samples * plan.layout().frame_bytes();
             info!(
-                "playback thread started: {} samples at {} Hz {}-bit",
-                plan.offsets().total_samples,
-                plan.request.sample_rate,
-                plan.request.bit_depth.bits()
+                "playback streaming started: {} bytes pre-generated",
+                pcm_data.len()
             );
             let _ = started_tx.send(Ok(start.response.clone()));
-            let mut generate_time_us = 0i64;
             let mut write_time_us = start.first_write_time_us;
             let mut total_bytes_written = start.first_write_bytes;
-            let mut first_write_bytes = Some(start.first_write_bytes);
             let mut last_write_bytes = start.first_write_bytes;
             let mut last_write_return_us = start.first_write_return_us;
             let mut write_latencies_us = vec![start.first_write_time_us];
 
-            let mut generator = start.generator;
-            let mut buffer = vec![0u8; start.chunk_bytes];
-            while !generator.is_finished() {
-                let generate_started_us = usb_audio::server_time_us();
-                let written = generator.fill_pcm_bytes(&mut buffer);
-                generate_time_us += usb_audio::server_time_us() - generate_started_us;
-                if written == 0 {
-                    break;
-                }
+            // Stream remaining pre-generated data in chunks
+            let chunk_bytes = start.chunk_bytes;
+            let mut pos = start.first_write_bytes;
+            while pos < pcm_data.len() {
+                let end = (pos + chunk_bytes).min(pcm_data.len());
                 let write_started_us = usb_audio::server_time_us();
-                if let Err(err) = audio_device.write(&buffer[..written], 250) {
-                    warn!("playback stream failed after start: {err}");
+                if let Err(err) = audio_device.write(&pcm_data[pos..end], 250) {
+                    warn!("playback stream failed: {err}");
                     break;
                 }
                 let write_elapsed_us = usb_audio::server_time_us() - write_started_us;
                 write_time_us += write_elapsed_us;
                 write_latencies_us.push(write_elapsed_us);
+                let written = end - pos;
                 total_bytes_written += written;
-                first_write_bytes.get_or_insert(written);
                 last_write_bytes = written;
                 last_write_return_us = usb_audio::server_time_us();
+                pos = end;
                 if write_latencies_us.len() % 100 == 0 {
                     info!(
-                        "playback progress: {} / {} samples, gen={} ms write={} ms",
-                        generator.cursor(),
-                        plan.offsets().total_samples,
-                        generate_time_us / 1000,
+                        "playback progress: {} / {} bytes, write={} ms",
+                        total_bytes_written,
+                        pcm_data.len(),
                         write_time_us / 1000
                     );
                 }
             }
 
+            let fb_raw = audio_device.feedback_raw();
+            let fb_hz = fb_raw >> 16;
+            let fb_frac = ((fb_raw & 0xFFFF) as u64 * 10000) / 65536;
+            info!("USB feedback at end of playback: raw=0x{fb_raw:08x} ({fb_hz}.{fb_frac:04} Hz)");
             let stop_started_us = usb_audio::server_time_us();
             if let Err(err) = audio_device.stop_stream() {
                 warn!("UAC2 stop failed after playback: {err}");
@@ -1624,14 +1654,13 @@ fn run_playback_thread(
                 write_p99_us,
             ) = summarize_write_latencies(&write_latencies_us);
             info!(
-                "playback thread completed in {} ms (gen={} ms, write={} ms, expected_bytes={}, actual_bytes={}, writes={}, first_write_bytes={}, last_write_bytes={}, tx_need_data={}, last_write_after_start={} ms, stop_time={} ms, write_min={} us, write_max={} us, write_avg={} us, write_p50={} us, write_p95={} us, write_p99={} us)",
+                "playback completed in {} ms (gen={} ms, write={} ms, expected_bytes={}, actual_bytes={}, writes={}, last_write_bytes={}, tx_need_data={}, last_write_after_start={} ms, stop_time={} ms, write_min={} us, write_max={} us, write_avg={} us, write_p50={} us, write_p95={} us, write_p99={} us)",
                 (usb_audio::server_time_us() - playback_started_us) / 1000,
-                generate_time_us / 1000,
+                gen_elapsed_ms,
                 write_time_us / 1000,
-                expected_total_bytes,
+                total_bytes,
                 total_bytes_written,
                 write_latencies_us.len(),
-                first_write_bytes.unwrap_or(0),
                 last_write_bytes,
                 usb_audio::tx_need_data_count(),
                 (last_write_return_us - playback_started_us) / 1000,
@@ -1665,39 +1694,47 @@ fn run_playback_thread(
 
 struct PlaybackStart {
     response: PlayResponse,
-    generator: minidsp_protocol::playback::PlaybackGenerator,
     chunk_bytes: usize,
     first_write_bytes: usize,
     first_write_time_us: i64,
     first_write_return_us: i64,
 }
 
-fn start_playback(
+fn start_playback_pregenerated(
     audio_device: &usb_audio::Uac2Device,
     plan: &PlaybackPlan,
+    pcm_data: &[u8],
 ) -> Result<PlaybackStart, String> {
     usb_audio::reset_tx_need_data_count();
     audio_device
         .start_stream(plan.request.sample_rate, plan.request.bit_depth)
         .map_err(|e| e.to_string())?;
 
-    // Keep chunks below the low-water threshold so the producer can stay ahead
-    // of playback instead of blocking until almost a full-ring drain each time.
-    let chunk_frames = ((usb_audio::TX_RING_BUFFER_BYTES / 2) / plan.layout().frame_bytes()).max(1);
-    let mut generator = plan.generator();
-    let mut buffer = vec![0u8; chunk_frames * plan.layout().frame_bytes()];
+    // Write chunks of ~4 KB (1024 stereo frames = ~21 ms of audio).
+    // The ring buffer is much larger, so these fill without blocking.
+    let chunk_bytes = 4096_usize / plan.layout().frame_bytes() * plan.layout().frame_bytes();
+    let chunk_bytes = chunk_bytes.max(plan.layout().frame_bytes());
 
-    let first_written = generator.fill_pcm_bytes(&mut buffer);
-    if first_written == 0 {
-        let _ = audio_device.stop_stream();
-        return Err("playback generator produced no data".into());
-    }
+    // Pre-fill the entire ring buffer before the streaming loop starts.
+    // This builds up ~250 ms of headroom (48 KB / 192 bytes per ms) so
+    // the write thread never starves the USB isochronous driver.
+    let prefill_end = usb_audio::TX_RING_BUFFER_BYTES.min(pcm_data.len());
+    let mut prefill_pos = 0;
     let first_write_started_us = usb_audio::server_time_us();
-    if let Err(err) = audio_device.write(&buffer[..first_written], 250) {
-        let _ = audio_device.stop_stream();
-        return Err(err.to_string());
+    while prefill_pos < prefill_end {
+        let end = (prefill_pos + chunk_bytes).min(prefill_end);
+        if let Err(err) = audio_device.write(&pcm_data[prefill_pos..end], 500) {
+            let _ = audio_device.stop_stream();
+            return Err(err.to_string());
+        }
+        prefill_pos = end;
     }
     let first_write_return_us = usb_audio::server_time_us();
+    info!(
+        "ring buffer pre-filled: {} bytes in {} ms",
+        prefill_pos,
+        (first_write_return_us - first_write_started_us) / 1000
+    );
 
     let mut started_at_us = audio_device.start_time_us();
     for _ in 0..20 {
@@ -1721,9 +1758,8 @@ fn start_playback(
             source_changed: false,
             previous_source: None,
         },
-        generator,
-        chunk_bytes: buffer.len(),
-        first_write_bytes: first_written,
+        chunk_bytes,
+        first_write_bytes: prefill_pos,
         first_write_time_us: first_write_return_us - first_write_started_us,
         first_write_return_us,
     })

@@ -25,6 +25,12 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 # Stack overflow detection (hardware watchpoint at end of stack)
 CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 
+# PSRAM (8 MB octal on N8R8 module) — allows large heap allocations
+# With MALLOC mode, allocations > 16 KB auto-spill to PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
 # Heap — disable memory protection for full PSRAM access
 CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
 
