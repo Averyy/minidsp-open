@@ -531,5 +531,5 @@ unsafe extern "C" {
     fn uac2_host_device_get_start_time(dev: uac2_host_device_handle_t) -> i64;
     fn uac2_host_device_get_feedback(dev: uac2_host_device_handle_t) -> u32;
 }
-const UAC2_TASK_CORE: BaseType_t = 0;
+const UAC2_TASK_CORE: BaseType_t = 1;
 pub const TX_RING_BUFFER_BYTES: usize = 48 * 1024;

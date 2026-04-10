@@ -17,7 +17,7 @@ use esp_idf_svc::io::Write;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{debug, info, warn};
 use minidsp_protocol::playback::{
-    PlayRequest, PlayResponse, PlaybackPlan, SyncRequest, SyncResponse,
+    BitDepth, PlayRequest, PlayResponse, PlaybackPlan, SyncRequest, SyncResponse,
 };
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::StatusSummary;
@@ -212,6 +212,93 @@ pub fn start(
             };
             if !audio.try_begin_playback() {
                 return send_error(req, 409, "playback already in progress");
+            }
+
+            // Check for diagnostic test modes via query parameter
+            let uri = req.uri().to_string();
+            let test_mode = uri
+                .split_once('?')
+                .map(|(_, q)| q)
+                .unwrap_or("")
+                .split('&')
+                .find_map(|p| {
+                    let (k, v) = p.split_once('=').unwrap_or((p, ""));
+                    if k == "test" { Some(v.to_string()) } else { None }
+                });
+
+            if test_mode.as_deref() == Some("sine") {
+                // Inline sine test: bypass PlaybackGenerator and PSRAM entirely.
+                // Generates sin(2πft) into a stack buffer in a tight write loop,
+                // identical to the standalone driver test harness.
+                let usb_index = match dev.profile().sources.index_for_source(Source::Usb) {
+                    Some(index) => index,
+                    None => {
+                        audio.finish_playback();
+                        return send_error(req, 500, "USB source missing from device profile");
+                    }
+                };
+                let (source_changed, previous_source, restore_source) = {
+                    let _op = dev.begin_operation();
+                    let current_source = match dev.current_source() {
+                        Ok(Some(source)) => source,
+                        _ => {
+                            audio.finish_playback();
+                            return send_error(req, 500, "current source unavailable");
+                        }
+                    };
+                    if current_source == Source::Usb {
+                        (false, None, None)
+                    } else {
+                        if let Err(err) = dev.set_source(usb_index) {
+                            audio.finish_playback();
+                            return send_error(req, 500, &format!("set_source: {err}"));
+                        }
+                        (true, Some(current_source.to_string()), Some(current_source))
+                    }
+                };
+
+                let (tx, rx) = mpsc::sync_channel(1);
+                let dev_for_thread = dev.clone();
+                let audio_for_thread = audio.clone();
+                if let Err(err) = std::thread::Builder::new()
+                    .name("sine_test".into())
+                    .stack_size(16 * 1024)
+                    .spawn(move || {
+                        run_inline_sine_test(
+                            dev_for_thread,
+                            audio_for_thread,
+                            audio_device,
+                            source_changed,
+                            previous_source,
+                            restore_source,
+                            tx,
+                        );
+                    })
+                {
+                    if let Some(source) = restore_source {
+                        if let Some(index) = dev.profile().sources.index_for_source(source) {
+                            let _op = dev.begin_operation();
+                            let _ = dev.set_source(index);
+                        }
+                    }
+                    audio.finish_playback();
+                    return send_error(req, 500, &format!("spawn sine test: {err}"));
+                }
+
+                return match rx.recv() {
+                    Ok(Ok(response)) => match serde_json::to_string(&response) {
+                        Ok(json) => send_json(req, 200, &json),
+                        Err(_) => send_error(req, 500, "failed to serialize response"),
+                    },
+                    Ok(Err(message)) => {
+                        audio.finish_playback();
+                        send_error(req, 500, &message)
+                    }
+                    Err(_) => {
+                        audio.finish_playback();
+                        send_error(req, 500, "sine test thread ended unexpectedly")
+                    }
+                };
             }
 
             let body = match read_request_body(&mut req, 4096) {
@@ -1553,6 +1640,12 @@ fn run_playback_thread(
     restore_source: Option<Source>,
     started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
 ) {
+    // Disable WiFi power save during playback — beacon wakeups cause
+    // ~1-2 ms CPU stalls that can disrupt USB isochronous timing.
+    unsafe {
+        esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
+    }
+
     // Pre-generate the entire sweep into memory before starting the USB
     // audio stream. ESP32 float math (sin/cos/ln) is too slow to keep up
     // with real-time 48 kHz playback, so we generate everything upfront
@@ -1570,12 +1663,17 @@ fn run_playback_thread(
     let mut pcm_data = vec![0u8; total_bytes];
     let mut generator = plan.generator();
     let mut offset = 0;
+    let mut yield_counter = 0u32;
     while !generator.is_finished() && offset < pcm_data.len() {
         let written = generator.fill_pcm_bytes(&mut pcm_data[offset..]);
         if written == 0 {
             break;
         }
         offset += written;
+        yield_counter += 1;
+        if yield_counter % 100 == 0 {
+            std::thread::yield_now();
+        }
     }
     let pcm_data = &pcm_data[..offset];
     let gen_elapsed_ms = (usb_audio::server_time_us() - gen_started_us) / 1000;
@@ -1610,11 +1708,18 @@ fn run_playback_thread(
 
             // Stream remaining pre-generated data in chunks
             let chunk_bytes = start.chunk_bytes;
+            // Copy each chunk from PSRAM to a stack buffer (internal SRAM)
+            // before writing to the ring buffer. xRingbufferSend holds a
+            // critical section during memcpy — PSRAM SPI latency inside
+            // that section can block the USB host task.
+            let mut sram_buf = [0u8; 1920];
             let mut pos = start.first_write_bytes;
             while pos < pcm_data.len() {
                 let end = (pos + chunk_bytes).min(pcm_data.len());
+                let len = end - pos;
+                sram_buf[..len].copy_from_slice(&pcm_data[pos..end]);
                 let write_started_us = usb_audio::server_time_us();
-                if let Err(err) = audio_device.write(&pcm_data[pos..end], 250) {
+                if let Err(err) = audio_device.write(&sram_buf[..len], 250) {
                     warn!("playback stream failed: {err}");
                     break;
                 }
@@ -1690,6 +1795,159 @@ fn run_playback_thread(
     }
 
     audio_state.finish_playback();
+
+    // Restore WiFi power save after playback
+    unsafe {
+        esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
+    }
+}
+
+/// Inline sine test: generates sin(2πft) on the stack and writes to USB
+/// in a tight loop, identical to the standalone driver test harness.
+/// No PSRAM, no PlaybackGenerator, no pre-generation — isolates whether
+/// blips come from the data pipeline or the system environment.
+fn run_inline_sine_test(
+    dev: Arc<DeviceState>,
+    audio_state: usb_audio::SharedAudioState,
+    audio_device: Arc<usb_audio::Uac2Device>,
+    source_changed: bool,
+    previous_source: Option<String>,
+    restore_source: Option<Source>,
+    started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
+) {
+    const SAMPLE_RATE: u32 = 48_000;
+    const CHUNK_MS: u32 = 10;
+    const FRAMES_PER_CHUNK: usize = (SAMPLE_RATE / (1000 / CHUNK_MS)) as usize; // 480
+    const FRAME_BYTES: usize = 4; // 2ch × 16-bit
+    const CHUNK_BYTES: usize = FRAMES_PER_CHUNK * FRAME_BYTES; // 1920
+    const FREQUENCY_HZ: f32 = 1000.0;
+    const AMPLITUDE: f32 = 0.5;
+    const DURATION_SEC: u32 = 5;
+    const TOTAL_CHUNKS: u32 = DURATION_SEC * (1000 / CHUNK_MS);
+    const PREFILL_CHUNKS: u32 = 5; // 50ms
+
+    unsafe {
+        esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
+    }
+
+    info!(
+        "inline sine test: {} Hz, {} sec, {} Hz/{}-bit stereo",
+        FREQUENCY_HZ, DURATION_SEC, SAMPLE_RATE, 16
+    );
+
+    usb_audio::reset_tx_need_data_count();
+    if let Err(err) = audio_device.start_stream(SAMPLE_RATE, BitDepth::Pcm16) {
+        let _ = started_tx.send(Err(err.to_string()));
+        audio_state.finish_playback();
+        unsafe {
+            esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
+        }
+        return;
+    }
+
+    let phase_inc = 2.0 * core::f32::consts::PI * FREQUENCY_HZ / SAMPLE_RATE as f32;
+    let mut phase: f32 = 0.0;
+    let mut buf = [0u8; CHUNK_BYTES];
+
+    // Pre-fill 50ms into the ring buffer, matching standalone
+    for _ in 0..PREFILL_CHUNKS {
+        fill_sine_16bit_stereo(&mut buf, &mut phase, phase_inc, AMPLITUDE);
+        if let Err(err) = audio_device.write(&buf, 100) {
+            let _ = audio_device.stop_stream();
+            let _ = started_tx.send(Err(format!("prefill write: {err}")));
+            audio_state.finish_playback();
+            unsafe {
+                esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
+            }
+            return;
+        }
+    }
+
+    // Wait for stream to actually start (first SOF)
+    let mut started_at_us = audio_device.start_time_us();
+    for _ in 0..20 {
+        if started_at_us != 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        started_at_us = audio_device.start_time_us();
+    }
+    if started_at_us == 0 {
+        started_at_us = usb_audio::server_time_us();
+    }
+
+    let _ = started_tx.send(Ok(PlayResponse {
+        started_at_us,
+        tone_burst_offset_samples: 0,
+        sweep_offset_samples: 0,
+        total_samples: FRAMES_PER_CHUNK * (TOTAL_CHUNKS + PREFILL_CHUNKS) as usize,
+        sample_rate: SAMPLE_RATE,
+        source_changed,
+        previous_source: previous_source.clone(),
+    }));
+
+    // Tight write loop — generate inline, write immediately
+    let stream_start_us = usb_audio::server_time_us();
+    let mut writes: u32 = 0;
+    for _ in 0..TOTAL_CHUNKS {
+        fill_sine_16bit_stereo(&mut buf, &mut phase, phase_inc, AMPLITUDE);
+        match audio_device.write(&buf, 100) {
+            Ok(()) => writes += 1,
+            Err(err) => {
+                warn!("inline sine write failed at chunk {writes}: {err}");
+                break;
+            }
+        }
+    }
+    let stream_elapsed_ms = (usb_audio::server_time_us() - stream_start_us) / 1000;
+
+    let fb_raw = audio_device.feedback_raw();
+    let fb_hz = fb_raw >> 16;
+    let fb_frac = ((fb_raw & 0xFFFF) as u64 * 10000) / 65536;
+    info!(
+        "inline sine test complete: {} writes in {} ms, feedback=0x{:08x} ({}.{:04} Hz), tx_need_data={}",
+        writes, stream_elapsed_ms, fb_raw, fb_hz, fb_frac, usb_audio::tx_need_data_count()
+    );
+
+    if let Err(err) = audio_device.stop_stream() {
+        warn!("UAC2 stop failed after sine test: {err}");
+    }
+
+    if let Some(source) = restore_source {
+        if let Some(index) = dev.profile().sources.index_for_source(source) {
+            let _op = dev.begin_operation();
+            if let Err(err) = dev.set_source(index) {
+                warn!("failed to restore source after sine test: {err}");
+            } else {
+                info!("restored source after sine test to {}", source);
+            }
+        }
+    }
+
+    audio_state.finish_playback();
+    unsafe {
+        esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
+    }
+}
+
+/// Fill a buffer with 16-bit stereo sine samples (same algorithm as
+/// the standalone driver test's `tone_gen_fill`).
+fn fill_sine_16bit_stereo(buf: &mut [u8], phase: &mut f32, phase_inc: f32, amplitude: f32) {
+    let frames = buf.len() / 4; // 2ch × 2 bytes
+    for i in 0..frames {
+        let sample = amplitude * phase.sin();
+        *phase += phase_inc;
+        if *phase >= 2.0 * core::f32::consts::PI {
+            *phase -= 2.0 * core::f32::consts::PI;
+        }
+        let val = (sample * 32767.0) as i16;
+        let bytes = val.to_le_bytes();
+        let offset = i * 4;
+        buf[offset] = bytes[0];
+        buf[offset + 1] = bytes[1];
+        buf[offset + 2] = bytes[0];
+        buf[offset + 3] = bytes[1];
+    }
 }
 
 struct PlaybackStart {
@@ -1710,20 +1968,22 @@ fn start_playback_pregenerated(
         .start_stream(plan.request.sample_rate, plan.request.bit_depth)
         .map_err(|e| e.to_string())?;
 
-    // Write chunks of ~4 KB (1024 stereo frames = ~21 ms of audio).
-    // The ring buffer is much larger, so these fill without blocking.
-    let chunk_bytes = 4096_usize / plan.layout().frame_bytes() * plan.layout().frame_bytes();
-    let chunk_bytes = chunk_bytes.max(plan.layout().frame_bytes());
+    // Write 10ms chunks (~1920 bytes at 48kHz/16-bit stereo), matching
+    // the standalone driver test harness's write pattern.
+    let frames_per_10ms = (plan.request.sample_rate as usize) / 100;
+    let chunk_bytes = frames_per_10ms * plan.layout().frame_bytes();
 
-    // Pre-fill the entire ring buffer before the streaming loop starts.
-    // This builds up ~250 ms of headroom (48 KB / 192 bytes per ms) so
-    // the write thread never starves the USB isochronous driver.
-    let prefill_end = usb_audio::TX_RING_BUFFER_BYTES.min(pcm_data.len());
+    // Pre-fill 50ms of audio into the ring buffer before the streaming
+    // loop starts, matching the standalone driver test harness.
+    let prefill_end = (chunk_bytes * 5).min(pcm_data.len());
     let mut prefill_pos = 0;
+    let mut prefill_sram = [0u8; 1920];
     let first_write_started_us = usb_audio::server_time_us();
     while prefill_pos < prefill_end {
         let end = (prefill_pos + chunk_bytes).min(prefill_end);
-        if let Err(err) = audio_device.write(&pcm_data[prefill_pos..end], 500) {
+        let len = end - prefill_pos;
+        prefill_sram[..len].copy_from_slice(&pcm_data[prefill_pos..end]);
+        if let Err(err) = audio_device.write(&prefill_sram[..len], 500) {
             let _ = audio_device.stop_stream();
             return Err(err.to_string());
         }
