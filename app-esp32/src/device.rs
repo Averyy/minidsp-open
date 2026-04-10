@@ -869,7 +869,20 @@ impl DeviceState {
     /// Execute a raw command and mirror successful write side-effects into
     /// the PEQ shadow so `/config` reflects TCP bridge / WebSocket activity.
     pub fn raw_command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
-        let resp = self.bus.command(payload)?;
+        let mut resp = self.bus.command(payload)?;
+        // Trim HID echo garbage: for write commands, real DSP100/2x4 HD hardware
+        // returns an unframed 0x01-prefixed echo of the full 64-byte HID buffer.
+        // decode_hid_response strips the 0x01 prefix but returns all 63 trailing
+        // bytes including garbage. Trim to the original request length so TCP
+        // bridge clients (Device Console, minidsp-rs) only see the echoed command.
+        if let Some(opcode) = payload.first().copied() {
+            if commands::is_write_command(opcode)
+                && resp.first().copied() == payload.first().copied()
+                && resp.len() > payload.len()
+            {
+                resp.truncate(payload.len());
+            }
+        }
         let parsed = commands::parse_response_for_request(payload, &resp, self.dialect());
         if matches!(
             parsed,

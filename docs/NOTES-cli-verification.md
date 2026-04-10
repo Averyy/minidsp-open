@@ -249,10 +249,32 @@ Before doing another broad CLI validation pass:
    - fresh-client routing state and FIR `active_taps` now restore cleanly on the desktop daemon via persisted verified shadow
 3. Keep `/play` debugging separate from config/control debugging.
 
+## 2026-04-10 additions
+
+### TCP bridge write-ack framing fix
+
+- **Bug closed.** The official Device Console crashed with `Error: Unexpected DSP command code 1` on every write command when connecting to the daemon via TCP bridge. Root cause: `protocol/src/packet.rs::decode_hid_response` for the `0x01`-prefix unframed-echo case returned `data[1..].to_vec()` — all 63 trailing HID buffer bytes — instead of trimming to the actual echo length.
+- Fix at `minidsp/src/queue.rs::execute_queued_command`: when the request opcode is a write command and the oversized response first byte matches the request opcode, truncate to `cmd.payload.len()`. Same trim in `app-esp32/src/device.rs::raw_command`.
+- Python TCP client verification on the physical 2x4 HD: `WriteDSP` 64→9 bytes, `SetVolume` 64→3 bytes, `SetMute` 64→3 bytes. Read responses unchanged.
+- Two new unit tests added to `minidsp/src/queue.rs`: `write_dsp_response_trimmed_to_request_length` and `read_floats_response_not_trimmed`.
+
+### DSP100 authoritative-state investigation — CLOSED
+
+- **Item closed.** The 2026-04-10 first-attach experiment with the official Device Console (reference: `app/minidsp-snapshots/20260410-firstattach-experiment/`) definitively answered the open question. When the app has no local cache for a device it offers only "Initialize to default Settings" or "Disconnect". There is no hidden readback opcode path. The official app has the same limitation as this repo: token-matched XML cache, fall back to defaults if no cache.
+- DSP state recovery items from the investigation checklist (routing, FIR tap count) can be treated as solved at the current ceiling: persisted verified shadow keyed by device serial.
+
+### Compressor parameter drift — new data point
+
+- **Item stays open** but the address/polarity question is now settled. Direct capture of the Device Console editing Output 1 compressor on a clean-default preset (2026-04-10 session) confirmed our addresses match exactly: threshold=`0x800028`, ratio=`0x80002a`, attack=`0x80002c`, release=`0x80002d`, status=`0x800016` with `2=enabled`/`3=bypassed`. These match `DSP100_OUTPUTS` in `protocol/src/device/dsp.rs` exactly.
+- The bypass polarity for compressor status (`2=on`, `3=off`) is already correct in `minidsp/src/client.rs:1109-1110` with a matching comment.
+- Likely remaining cause: default threshold `-30 dB` is too quiet to trigger audible compression on the signal used in prior tests. Next step is an audible retest on loud material, not more protocol investigation.
+
 ## Pause State
 
 - `0x06` / `0x07` are now decoded as the official preset-save flash-block pipeline, not a hidden authoritative compressor/routing readback path.
 - `0x40` is the DSP-version query, not an unknown state opcode.
 - Device Console writes compressor edits through the same `0x13` DSP100 slots this repo already uses and still polls only the compressor meter path nearby.
 - Device Console also compares XML/device modification tokens and explicitly writes a fresh active-preset token after preset-content updates; the desktop daemon now mirrors that behavior for `/config` and measurement-mode mutations.
-- Remaining DSP100 gaps are still authoritative runtime readback for routing/FIR/compressor-style state and compressor parameter effect/readback parity beyond threshold/gain.
+- **DSP100 authoritative-state reverse engineering task is closed (2026-04-10).** The official app has the same workaround rule we do; there is no stronger readback path to find.
+- **TCP bridge write-ack framing bug is fixed (2026-04-10).** Official Device Console now connects without crashing.
+- Remaining DSP100 gap: compressor parameter effect/readback parity beyond threshold/gain. Addresses and polarity are now confirmed correct; the remaining issue is most likely test methodology rather than protocol mismatch.

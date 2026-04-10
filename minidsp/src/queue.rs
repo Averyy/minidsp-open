@@ -317,7 +317,7 @@ impl CommandQueue {
         transport.send_frame(&cmd.payload).await?;
 
         loop {
-            let raw = match transport
+            let mut raw = match transport
                 .recv_frame(remaining_timeout_ms(deadline)?.min(500))
                 .await
             {
@@ -325,6 +325,17 @@ impl CommandQueue {
                 Err(TransportError::Timeout) => continue,
                 Err(err) => return Err(err),
             };
+            // Trim HID echo garbage: for write commands, real DSP100/2x4 HD hardware
+            // returns an unframed 0x01-prefixed echo of the full 64-byte HID buffer.
+            // decode_hid_response strips the 0x01 prefix but returns all 63 trailing
+            // bytes including garbage. Trim to the original request length so TCP
+            // bridge clients (Device Console, minidsp-rs) only see the echoed command.
+            if commands::is_write_command(request_opcode)
+                && raw.first().copied() == cmd.payload.first().copied()
+                && raw.len() > cmd.payload.len()
+            {
+                raw.truncate(cmd.payload.len());
+            }
             let response = {
                 let dialect = self.dialect.lock().await;
                 commands::parse_response_for_request(&cmd.payload, &raw, &dialect)
@@ -887,6 +898,69 @@ mod tests {
         assert_eq!(
             default_timeout_for_payload(&commands::set_source(2)),
             DEFAULT_COMMAND_TIMEOUT
+        );
+    }
+
+    /// Regression test: WriteDSP response from real 2x4 HD hardware arrives as
+    /// a 63-byte buffer (0x01-prefix stripped by decode_hid_response, 63-1=62
+    /// bytes of payload). The queue must trim that down to the 8-byte echoed
+    /// command so TCP bridge clients see `0x13 0x80 0x00 0x16 0x02 0x00 0x00 0x00`
+    /// instead of `0x13 0x80 ... <54 bytes of garbage>`.
+    #[tokio::test]
+    async fn write_dsp_response_trimmed_to_request_length() {
+        // Simulate the raw response as returned by decode_hid_response for a
+        // 0x01-prefixed HID echo: first 8 bytes are the echoed command, the
+        // rest are HID buffer garbage from real hardware.
+        let request = vec![0x13u8, 0x80, 0x00, 0x16, 0x02, 0x00, 0x00, 0x00]; // WriteDSP
+        let mut oversized_response = request.clone();
+        // Append 55 bytes of garbage (0x01-prefix stripped, 63-byte buffer → 63 bytes;
+        // but we test the trim logic directly, so just append enough garbage).
+        oversized_response.extend(std::iter::repeat(0xed).take(55));
+        assert_eq!(oversized_response.len(), 63);
+
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(
+            oversized_response,
+        )])));
+
+        let resp = queue
+            .execute_raw(request.clone(), Priority::High)
+            .await
+            .expect("execute_raw should succeed with oversized write echo");
+
+        // The raw returned to the TCP bridge must be exactly the echoed command, not 63 bytes.
+        assert_eq!(
+            resp.len(),
+            request.len(),
+            "raw response should be trimmed to request length ({}), got {} bytes: {:02x?}",
+            request.len(),
+            resp.len(),
+            resp
+        );
+        assert_eq!(&resp[..], &request[..], "trimmed response should equal the echoed command");
+    }
+
+    /// Confirm read commands (0x14 ReadFloats) are NOT trimmed even if the
+    /// response happens to start with the same opcode byte.
+    #[tokio::test]
+    async fn read_floats_response_not_trimmed() {
+        let request = commands::read_floats(0x0016, 2, &minidsp_protocol::dialect::Dialect::NEW);
+        // A real ReadFloats response: opcode + addr (2) + count (1) + values (8) = 12 bytes
+        let response = vec![
+            commands::CMD_READ_FLOATS, 0x00, 0x16, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let expected_len = response.len();
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(response)])));
+
+        let resp = queue
+            .execute_raw(request.clone(), Priority::Normal)
+            .await
+            .expect("execute_raw should succeed for read floats");
+
+        assert_eq!(
+            resp.len(),
+            expected_len,
+            "read floats response must not be trimmed: got {} bytes",
+            resp.len()
         );
     }
 }

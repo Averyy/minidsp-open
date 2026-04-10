@@ -351,6 +351,26 @@ The transport may be internally arbitrated and serialized, but wire-level compat
 
 Upstream also supports multiple plugin-compatible listeners on one host, mapped by `device_index` or `device_serial`. Desktop compatibility should preserve equivalent multi-device deployment capability.
 
+### TCP response framing requirement
+
+Write-ack responses must not include trailing HID buffer bytes.
+
+When real hardware acknowledges a write command, the USB HID report can have the form `[0x01][echoed command bytes][padding/junk to fill the 64-byte HID report]`. The bridge must trim that report to just the echoed command bytes before network framing. Forwarding the full 64-byte buffer as a response payload is a protocol error.
+
+The official MiniDSP Device Console enforces this strictly: it crashes with `Error: Unexpected DSP command code 1` if any trailing garbage byte in the framed response happens to contain `0x01` where it expects a new command code.
+
+Canonical verification (2026-04-10, Python TCP client against the fixed daemon on the physical 2x4 HD):
+
+| Command | Response size before fix | Response size after fix |
+|---------|--------------------------|------------------------|
+| `WriteDSP` | 64 bytes (length byte `0x40`) | 9 bytes (length byte `0x09`) |
+| `SetVolume` | 64 bytes | 3 bytes |
+| `SetMute` | 64 bytes | 3 bytes |
+| `ReadHardwareId` | 12 bytes | 12 bytes (unchanged) |
+| `ReadFloats` | 12 bytes | 12 bytes (unchanged) |
+
+Read responses are not affected — only write-ack responses that arrive as unframed `0x01`-prefix HID echoes need trimming. The trim rule: if the request opcode is a write command and the oversized response first byte matches the request first byte, truncate the response to `cmd.payload.len()`. See `minidsp/src/queue.rs::execute_queued_command` for the implementation.
+
 ### TCP framing example
 
 Representative behavior:
@@ -533,6 +553,7 @@ Additive rule:
 - additive features should prefer new routes over behavior changes on compatibility routes
 
 Current verification note:
+- TCP bridge write-ack framing is live-verified on the physical 2x4 HD (2026-04-10): the official Device Console now connects and issues write commands without crashing; Python TCP client confirms correct response sizes for `WriteDSP` (9 bytes), `SetVolume` (3 bytes), `SetMute` (3 bytes), and that read responses are unchanged at 12 bytes each.
 - Desktop `GET /devices/{id}` is live-verified on the physical 2x4 HD after the 2026-04-10 meter fallback fix: malformed DSP100 meter replies now degrade to `-140 dB` silence instead of stalling compatibility status.
 - Desktop config read-back is implemented, but on DSP100 / 2x4 HD some fields still rely on verified shadow state rather than authoritative live hardware readback. Fresh-daemon `/devices/{id}/config` now clamps bogus low-address DSP100 scalar/tap reads to verified shadow or conservative zero instead of surfacing garbage values.
 - Desktop daemon preset-content writes now also mirror the official app's explicit modification-token save model on the physical 2x4 HD, so `/devices/{id}/config` shadow restore is keyed by a real active-preset freshness marker rather than by raw runtime writes that never touched `0xFFC8`.

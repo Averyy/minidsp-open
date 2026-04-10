@@ -12,6 +12,19 @@ Permanent technical detail belongs in:
 
 ## Current Status
 
+- TCP bridge write-response framing is fixed and verified on the physical 2x4 HD (2026-04-10):
+  - the official MiniDSP Device Console discovered the daemon via UDP broadcast and crashed immediately on every write command with `Error: Unexpected DSP command code 1`
+  - root cause: `protocol/src/packet.rs::decode_hid_response` was returning all 63 trailing bytes of the HID buffer for the `0x01`-prefix unframed-echo case instead of trimming to the actual echo length
+  - fix: `minidsp/src/queue.rs::execute_queued_command` now trims the response to `cmd.payload.len()` when the request opcode is a write command and the oversized response first byte matches the request first byte; same trim applied in `app-esp32/src/device.rs::raw_command`
+  - Python TCP client verification on the physical 2x4 HD: `WriteDSP` response shrank from 64 bytes to 9 bytes, `SetVolume` from 64 to 3 bytes, `SetMute` from 64 to 3 bytes; `ReadHardwareId` and `ReadFloats` responses unchanged at 12 bytes each
+- 2026-04-10 first-attach experiment with the official Device Console against the physical 2x4 HD (see `app/minidsp-snapshots/20260410-firstattach-experiment/`) confirmed:
+  - there is no hidden authoritative readback path for DSP100 routing / compressor / FIR state; the official app when starting with no local cache offers only "Initialize to default Settings" or "Disconnect" — the same limitation as our shadow fallback model
+  - "Initialize to default Settings" is app-driven: the app reads defaults from its bundled XML and writes them via the `0x06` flash-block pipeline (2204 `0x06` writes in the captured session); there is no device-side reset opcode
+  - preset names are client-side XML only (`<customname>` in the app's local `setting*.xml`); zero device writes occur on a rename
+  - compressor bypass polarity confirmed: `2 = enabled`, `3 = bypassed/off` (distinct from routing polarity which uses `1/2`); our code at `minidsp/src/client.rs:1109-1110` already has the correct polarity
+  - compressor param addresses for all four outputs confirmed to match our `DSP100_OUTPUTS` table in `protocol/src/device/dsp.rs` exactly: threshold=`0x800028`, ratio=`0x80002a`, attack=`0x80002c`, release=`0x80002d`, status enable=`0x800016`
+  - our UDP discovery packets correctly advertise the daemon to the official Device Console; it treats the daemon as a legitimate network-attached MiniDSP
+  - experiment artifacts archived at `app/minidsp-snapshots/20260410-firstattach-experiment/` (HID capture `device-console-firstattach.jsonl`, Device Console cache states before and after)
 - Desktop `/devices/{id}/config` is fixed and verified on the physical 2x4 HD.
 - Desktop `GET /devices/{id}` was re-verified on 2026-04-10 on the physical 2x4 HD:
   - malformed DSP100 meter reads are now treated as best-effort and clamp to `-140 dB` silence instead of stalling the compatibility status surface
@@ -222,6 +235,7 @@ Permanent technical detail belongs in:
   - direct 2026-04-09 replay with upstream `minidsp-rs` on the same physical 2x4 HD matched this repo's result even with compressor bypass disabled first
   - the official app session log also repeatedly reports `setItemVal(COMP_3_0_*) has no change in value` around those edits while polling only the compressor meter path, so the remaining gap still looks like effect/readback semantics on the hardware path rather than a missing write opcode family
   - fresh-daemon 2026-04-10 checks still show low-address DSP100 reads are not authoritative enough to close this: `debug dump-word 43 1` returned `1` and FIR tap-count `debug dump-word 84 1` returned `0x4A039901` on the same physical 2x4 HD
+  - 2026-04-10: direct capture of the official Device Console editing Output 1 compressor on a clean-default preset confirmed our addresses and bypass polarity exactly match the captured writes: threshold=`0x800028`, ratio=`0x80002a`, attack=`0x80002c`, release=`0x80002d`, status enable=`0x800016` with value `2=on`/`3=off`. These match our `DSP100_OUTPUTS` table in `protocol/src/device/dsp.rs` exactly. The remaining gap is most likely test methodology — default threshold `-30 dB` is too quiet to trigger audible compression on the signal used in prior tests. The next step is an audible retest on loud material, not more protocol investigation.
 - [ ] Capture or otherwise verify the physical output duration of ESP32 `/play` on the real 2x4 HD now that software timing and repeated-play stability are characterized.
 - [ ] Validate the new shared `/play` default signal on the real sub and keep iterating until it sounds like a normal smooth low-frequency sweep:
   - the previous measurement-bundle default (`5-500 Hz`, `24-bit`, `2 s` preamble, `80 Hz` tone burst, `0.2 s` gap, `2 s` decay, hidden guard-band expansion) was retired after it produced repeated `BRAP` bursts on hardware
@@ -238,8 +252,10 @@ Permanent technical detail belongs in:
   - confirmed live on 2026-04-09: after the shared HID echo-decoder fix, ESP32 route writes made `/play` audible on physical output `3`
 - [x] Make DSP100 / 2x4 HD routing-state read-back survive fresh desktop daemon reconnects via persisted verified shadow keyed by device serial
 - [x] Make DSP100 / 2x4 HD FIR `active_taps` read-back survive fresh desktop daemon reconnects via persisted verified shadow keyed by device serial
-- [ ] Continue DSP100 / 2x4 HD authoritative-state reverse engineering so fresh-client `/devices/{id}/config` can eventually prefer real hardware readback over persisted shadow for routing and FIR tap count
-  - current 2026-04-10 boundary on the physical 2x4 HD: the daemon/app surfaces are usable and return sane values, and they can now fall back to token-matched official Device Console preset XML when available, but untouched low-address DSP100 runtime state is still not defensible as direct hardware readback without verified shadow or another stronger source than raw `0x14`
+- [x] ~~Continue DSP100 / 2x4 HD authoritative-state reverse engineering so fresh-client `/devices/{id}/config` can eventually prefer real hardware readback over persisted shadow for routing and FIR tap count~~
+  - **CLOSED 2026-04-10:** the first-attach experiment with the official Device Console against the physical 2x4 HD definitively proved no such authoritative readback path exists. When the official app has no local cache for a device, it offers only "Initialize to default Settings" or "Disconnect" — the same workaround rule we use: token-matched XML cache, fall back to "initialize defaults" if no cache. There is no hidden readback opcode to find.
+- [ ] Decide whether the desktop daemon's UDP discovery should advertise when bridging a local USB device. The 2026-04-10 experiment showed the official Device Console discovers the daemon via UDP broadcast and (until the TCP bridge fix) crashed when using the network path. Even with the TCP bridge fix, there is still a question of whether broadcasting a local-USB-bridge daemon is desirable behavior or should be opt-in (e.g., a `--no-advertise-local` flag).
+- Reference capture for 2026-04-10 Device Console first-attach findings: `app/minidsp-snapshots/20260410-firstattach-experiment/` (HID capture `device-console-firstattach.jsonl`, Device Console cache states before and after).
 - [ ] Implement the first pass of learnings from `app/minidsp-console-app-log.jsonl`
   - turn the canonical raw capture into labeled fixtures for the command families we already support (`0x04`, `0x05`, `0x06`, `0x07`, `0x13`, `0x19`, `0x25`, `0x30`, `0x34`, `0x40`, `0x42`)
   - diff those request/response pairs against the shared client and queue behavior and close any remaining opcode or response-shape drift

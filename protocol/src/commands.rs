@@ -94,6 +94,36 @@ pub const fn is_known_opcode(byte: u8) -> bool {
     )
 }
 
+/// Returns true if the opcode is a write/ack command that produces an unframed
+/// echo response starting with `0x01` on real DSP100 / 2x4 HD hardware.
+///
+/// This is used to trim the garbage tail from 64-byte HID echo responses before
+/// forwarding to TCP clients (official Device Console, minidsp-rs). The set
+/// exactly matches the `Some(0x01)` arm in `packet::decode_hid_response`.
+pub const fn is_write_command(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        CMD_WRITE_FLASH
+            | CMD_WRITE_FLASH_FULL_ADDR
+            | CMD_WRITE_DSP
+            | CMD_WRITE_BIQUAD
+            | CMD_SET_VOLUME
+            | CMD_SET_MUTE
+            | CMD_SET_SOURCE
+            | CMD_SET_CONFIG
+            | CMD_BYPASS_FILTER
+            | CMD_DIRAC_BYPASS
+            | CMD_SET_DISPLAY_BRIGHTNESS
+            | CMD_SET_DISPLAY_IDLE_TIME
+            | CMD_SET_DRE
+            | CMD_COPY_PRESET
+            | CMD_FIR_LOAD_DATA
+            | CMD_RELOAD_DSP_PARAM
+            | CMD_LOG_CONTROL
+            | CMD_SET_HDMI_SOURCE
+    )
+}
+
 /// Parsed hardware identity from ReadHardwareId response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HardwareId {
