@@ -61,4 +61,9 @@ pub struct DeviceProfile {
     pub has_volume_offsets: bool,
     /// Device exposes USB audio playback in addition to HID control.
     pub has_usb_audio: bool,
+    /// Runtime selector/status reads via `0x14` are not authoritative on this
+    /// device family.  When true, the client keeps verified shadow state for
+    /// routing, bypass, FIR tap count, and compressor fields and prefers it
+    /// over live reads that are known to collapse or return garbage values.
+    pub has_unreliable_selector_readback: bool,
 }

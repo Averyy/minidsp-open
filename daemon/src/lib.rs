@@ -1,5 +1,6 @@
 //! MiniDSP daemon — HTTP API, TCP bridge, UDP discovery, WebSocket.
 
+pub mod bridge;
 pub mod discovery;
 pub mod http;
 pub mod mdns;

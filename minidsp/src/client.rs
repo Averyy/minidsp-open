@@ -19,6 +19,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+#[path = "client/shadow.rs"]
+mod shadow;
+use shadow::*;
+
 /// Error type for client operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -81,6 +85,12 @@ pub struct DeviceShadowState {
 
 const MASTER_STATUS_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const MASTER_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MASTER_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const SET_CONFIG_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const RESET_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const RESET_VERIFY_TIMEOUT: Duration = Duration::from_secs(12);
+const RESET_STATUS_READ_TIMEOUT: Duration = Duration::from_millis(250);
+const RESET_MIN_OUTAGE: Duration = Duration::from_millis(500);
 const FIR_LOAD_END_TIMEOUT: Duration = Duration::from_secs(60);
 const GAIN_VERIFY_TOLERANCE_DB: f32 = 0.2;
 const SILENT_METER_DB: f32 = -140.0;
@@ -122,6 +132,9 @@ pub struct MiniDspClient {
     preset_tokens: Arc<Mutex<HashMap<u8, [u8; 4]>>>,
     /// Last observed active preset slot.
     active_preset: Mutex<Option<u8>>,
+    /// Serializes state transitions so overlapping preset/reset calls cannot
+    /// race against stale status while the device is still applying one.
+    state_transition_lock: Mutex<()>,
 }
 
 fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
@@ -164,187 +177,6 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
         }
     }
     shadow
-}
-
-async fn execute_peq_batch(
-    queue: &Arc<CommandQueue>,
-    dialect: &minidsp_protocol::dialect::Dialect,
-    peq_shadow: &Arc<Mutex<HashMap<u16, PeqShadow>>>,
-    bands: &[(u16, [f32; 5], bool)],
-) -> Result<(), ClientError> {
-    let mut phase1_cmds = Vec::with_capacity(bands.len());
-    for &(addr, _, _) in bands {
-        phase1_cmds.push(commands::bypass_filter(addr, true, dialect));
-    }
-    ensure_write_batch(
-        queue.execute_batch(phase1_cmds, Priority::Critical).await?,
-        "set peq bypass before batch write",
-    )?;
-
-    let mut phase2_cmds = Vec::with_capacity(bands.len());
-    for &(addr, ref coeffs, _) in bands {
-        phase2_cmds.push(commands::write_biquad(addr, coeffs, dialect));
-    }
-    ensure_write_batch(
-        queue.execute_batch(phase2_cmds, Priority::Critical).await?,
-        "write peq batch coefficients",
-    )?;
-
-    let mut phase3_cmds = Vec::with_capacity(bands.len());
-    for &(addr, _, bypass) in bands {
-        phase3_cmds.push(commands::bypass_filter(addr, bypass, dialect));
-    }
-    ensure_write_batch(
-        queue.execute_batch(phase3_cmds, Priority::Critical).await?,
-        "restore peq bypass after batch write",
-    )?;
-
-    let mut shadow = peq_shadow.lock().await;
-    for &(addr, coeffs, bypass) in bands {
-        shadow.insert(addr, PeqShadow { coeffs, bypass });
-    }
-
-    Ok(())
-}
-
-fn ensure_write_batch(responses: Vec<Response>, context: &str) -> Result<(), ClientError> {
-    for resp in responses {
-        MiniDspClient::ensure_write_response(resp, context)?;
-    }
-    Ok(())
-}
-
-async fn apply_peq_shadow_bypass(
-    peq_shadow: &Arc<Mutex<HashMap<u16, PeqShadow>>>,
-    bands: &[(u16, [f32; 5], bool)],
-    bypass: bool,
-) {
-    let mut shadow = peq_shadow.lock().await;
-    for &(addr, _, _) in bands {
-        if let Some(entry) = shadow.get_mut(&addr) {
-            entry.bypass = bypass;
-        }
-    }
-}
-
-fn parse_raw_write_biquad(
-    payload: &[u8],
-    dialect: &minidsp_protocol::dialect::Dialect,
-) -> Option<(u16, [f32; 5])> {
-    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 26 {
-        return None;
-    }
-    if payload[1] != 0x80 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    let mut coeffs = [0.0; 5];
-    let mut offset = 6;
-    for coeff in &mut coeffs {
-        let bytes: [u8; 4] = payload.get(offset..offset + 4)?.try_into().ok()?;
-        *coeff = minidsp_protocol::dialect::decode_value(&bytes, dialect);
-        offset += 4;
-    }
-    Some((addr, coeffs))
-}
-
-fn parse_raw_bypass_filter(payload: &[u8]) -> Option<(u16, bool)> {
-    if payload.first().copied()? != commands::CMD_BYPASS_FILTER || payload.len() < 6 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    let bypass = payload[1] & 0x80 != 0;
-    Some((addr, bypass))
-}
-
-fn parse_raw_selector_write(
-    payload: &[u8],
-    dialect: &minidsp_protocol::dialect::Dialect,
-) -> Option<(u16, u16)> {
-    if dialect.value_format != ValueFormat::Float32 {
-        return None;
-    }
-    if payload.first().copied()? != commands::CMD_WRITE_DSP || payload.len() < 8 {
-        return None;
-    }
-    if payload[1] != 0x80 {
-        return None;
-    }
-    if payload[6] != 0 || payload[7] != 0 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    let value = u16::from_le_bytes([payload[4], payload[5]]);
-    Some((addr, value))
-}
-
-fn parse_raw_linked_selector_write(
-    payload: &[u8],
-    dialect: &minidsp_protocol::dialect::Dialect,
-) -> Option<(u16, u16)> {
-    if dialect.value_format != ValueFormat::Float32 {
-        return None;
-    }
-    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 10 {
-        return None;
-    }
-    let ctrl = payload[1];
-    if ctrl < 0x80 {
-        return None;
-    }
-    let linked_count = (ctrl - 0x80) as usize;
-    let linked_bytes = if linked_count == 0 {
-        2
-    } else {
-        linked_count * 2
-    };
-    let value_offset = 4 + linked_bytes;
-    let value_bytes: [u8; 4] = payload
-        .get(value_offset..value_offset + 4)?
-        .try_into()
-        .ok()?;
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    Some((addr, u32::from_le_bytes(value_bytes) as u16))
-}
-
-async fn mirror_raw_command_to_shadow(
-    payload: &[u8],
-    dialect: &minidsp_protocol::dialect::Dialect,
-    peq_shadow: &Arc<Mutex<HashMap<u16, PeqShadow>>>,
-    scalar_shadow: &Arc<Mutex<HashMap<u16, u32>>>,
-    selector_shadow: &Arc<Mutex<HashMap<u16, u16>>>,
-) {
-    if let Some((addr, coeffs)) = parse_raw_write_biquad(payload, dialect) {
-        let mut shadow = peq_shadow.lock().await;
-        if let Some(entry) = shadow.get_mut(&addr) {
-            entry.coeffs = coeffs;
-        }
-        return;
-    }
-
-    if let Some((addr, bypass)) = parse_raw_bypass_filter(payload) {
-        let mut shadow = peq_shadow.lock().await;
-        if let Some(entry) = shadow.get_mut(&addr) {
-            entry.bypass = bypass;
-        }
-        return;
-    }
-
-    if let Some((addr, value)) = parse_raw_selector_write(payload, dialect)
-        .or_else(|| parse_raw_linked_selector_write(payload, dialect))
-    {
-        selector_shadow.lock().await.insert(addr, value);
-        return;
-    }
-
-    if dialect.value_format == ValueFormat::Float32
-        && payload.first().copied() == Some(commands::CMD_WRITE_DSP)
-        && payload.len() >= 8
-    {
-        let addr = u16::from_be_bytes([payload[2], payload[3]]);
-        let raw = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-        scalar_shadow.lock().await.insert(addr, raw);
-    }
 }
 
 impl MiniDspClient {
@@ -454,6 +286,7 @@ impl MiniDspClient {
             preset_shadows,
             preset_tokens,
             active_preset: Mutex::new(None),
+            state_transition_lock: Mutex::new(()),
         };
 
         // Seed the active preset cache early so shadow snapshots can stay
@@ -502,15 +335,25 @@ impl MiniDspClient {
         &self,
         priority: Priority,
     ) -> Result<eeprom::MasterStatusRaw, ClientError> {
+        self.get_master_status_with_timeout_and_priority(priority, MASTER_STATUS_COMMAND_TIMEOUT)
+            .await
+    }
+
+    async fn get_master_status_with_timeout_and_priority(
+        &self,
+        priority: Priority,
+        timeout: Duration,
+    ) -> Result<eeprom::MasterStatusRaw, ClientError> {
         let resp = self
             .queue
-            .execute(
+            .execute_with_timeout(
                 commands::read_flash(
                     eeprom::MASTER_STATUS_ADDR.0,
                     eeprom::MASTER_STATUS_ADDR.1,
                     4,
                 ),
                 priority,
+                timeout,
             )
             .await?;
         match resp {
@@ -529,86 +372,12 @@ impl MiniDspClient {
         self.get_master_status_with_priority(Priority::Normal).await
     }
 
-    async fn capture_active_shadow(&self) -> PresetShadowState {
-        let peq = self
-            .peq_shadow
-            .lock()
+    async fn get_master_status_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<eeprom::MasterStatusRaw, ClientError> {
+        self.get_master_status_with_timeout_and_priority(Priority::Normal, timeout)
             .await
-            .iter()
-            .map(|(&addr, entry)| {
-                (
-                    addr,
-                    CachedPeqShadow {
-                        coeffs: entry.coeffs,
-                        bypass: entry.bypass,
-                    },
-                )
-            })
-            .collect();
-        let selector = self.selector_shadow.lock().await.clone();
-        let scalar = self.scalar_shadow.lock().await.clone();
-        PresetShadowState {
-            peq,
-            selector,
-            scalar,
-        }
-    }
-
-    async fn apply_active_shadow_snapshot(&self, snapshot: Option<PresetShadowState>) {
-        {
-            let mut peq_shadow = self.peq_shadow.lock().await;
-            *peq_shadow = build_peq_shadow(&self.profile);
-            if let Some(snapshot) = &snapshot {
-                for (&addr, entry) in &snapshot.peq {
-                    peq_shadow.insert(
-                        addr,
-                        PeqShadow {
-                            coeffs: entry.coeffs,
-                            bypass: entry.bypass,
-                        },
-                    );
-                }
-            }
-        }
-        {
-            let mut selector_shadow = self.selector_shadow.lock().await;
-            selector_shadow.clear();
-            if let Some(snapshot) = &snapshot {
-                selector_shadow.extend(
-                    snapshot
-                        .selector
-                        .iter()
-                        .map(|(&addr, &value)| (addr, value)),
-                );
-            }
-        }
-        {
-            let mut scalar_shadow = self.scalar_shadow.lock().await;
-            scalar_shadow.clear();
-            if let Some(snapshot) = &snapshot {
-                scalar_shadow.extend(snapshot.scalar.iter().map(|(&addr, &value)| (addr, value)));
-            }
-        }
-    }
-
-    async fn update_active_preset(&self, preset: u8) {
-        let previous = {
-            let mut active_preset = self.active_preset.lock().await;
-            if *active_preset == Some(preset) {
-                return;
-            }
-            let previous = *active_preset;
-            *active_preset = Some(preset);
-            previous
-        };
-
-        if let Some(previous) = previous {
-            let snapshot = self.capture_active_shadow().await;
-            self.preset_shadows.lock().await.insert(previous, snapshot);
-        }
-
-        let snapshot = self.preset_shadows.lock().await.get(&preset).cloned();
-        self.apply_active_shadow_snapshot(snapshot).await;
     }
 
     async fn wait_for_master_status_until<F>(
@@ -643,6 +412,70 @@ impl MiniDspClient {
                 } else {
                     Err(ClientError::Timeout)
                 };
+            }
+
+            tokio::time::sleep(MASTER_STATUS_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_reset_recovery_until(
+        &self,
+        timeout: Duration,
+    ) -> Result<eeprom::MasterStatusRaw, ClientError> {
+        let deadline = Instant::now() + timeout;
+        let mut outage_started: Option<Instant> = None;
+        let mut transient_failures = 0usize;
+        let mut saw_disconnect = false;
+        let mut last_err = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last_err.unwrap_or_else(|| {
+                    ClientError::Protocol(
+                        "reset verification never observed device recovery".into(),
+                    )
+                }));
+            }
+
+            match self
+                .get_master_status_with_timeout(remaining.min(RESET_STATUS_READ_TIMEOUT))
+                .await
+            {
+                Ok(master) => {
+                    if let Some(started) = outage_started {
+                        let outage_duration = started.elapsed();
+                        if saw_disconnect
+                            || transient_failures >= 2
+                            || outage_duration >= RESET_MIN_OUTAGE
+                        {
+                            return Ok(master);
+                        }
+
+                        outage_started = None;
+                        transient_failures = 0;
+                        saw_disconnect = false;
+                        last_err = None;
+                    }
+                }
+                Err(err @ ClientError::Transport(TransportError::Disconnected)) => {
+                    saw_disconnect = true;
+                    transient_failures += 1;
+                    outage_started.get_or_insert_with(Instant::now);
+                    last_err = Some(err);
+                }
+                Err(
+                    err @ (ClientError::Transport(TransportError::Timeout)
+                    | ClientError::Transport(TransportError::Hid(_))
+                    | ClientError::Transport(TransportError::Io(_))
+                    | ClientError::Protocol(_)
+                    | ClientError::Timeout),
+                ) => {
+                    transient_failures += 1;
+                    outage_started.get_or_insert_with(Instant::now);
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
             }
 
             tokio::time::sleep(MASTER_STATUS_POLL_INTERVAL).await;
@@ -772,8 +605,20 @@ impl MiniDspClient {
         }
     }
 
-    /// Switch preset (0-3).
-    pub async fn set_config(&self, preset: u8) -> Result<(), ClientError> {
+    /// Switch preset (0-3) using the device's normal interactive mode.
+    pub async fn set_config(&self, preset: u8) -> Result<eeprom::MasterStatusRaw, ClientError> {
+        self.set_config_with_mode(preset, commands::PRESET_CHANGE_NORMAL)
+            .await
+    }
+
+    /// Switch preset (0-3) using an explicit device reset mode.
+    pub async fn set_config_with_mode(
+        &self,
+        preset: u8,
+        reset_mode: u8,
+    ) -> Result<eeprom::MasterStatusRaw, ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
+
         if preset >= self.profile.presets {
             return Err(ClientError::Protocol(format!(
                 "preset {} out of range (max {})",
@@ -783,16 +628,29 @@ impl MiniDspClient {
         }
         let before = self.get_master_status().await?;
         if before.preset == preset {
-            return Ok(());
+            return Ok(before);
         }
         self.queue.pause_levels();
         let result = async {
-            self.execute_write(
-                commands::set_config(preset, commands::PRESET_CHANGE_NORMAL),
-                Priority::Critical,
-                "set config",
-            )
-            .await?;
+            match self
+                .execute_write_with_timeout(
+                    commands::set_config(preset, reset_mode),
+                    Priority::Critical,
+                    SET_CONFIG_RESPONSE_TIMEOUT,
+                    "set config",
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(ClientError::Transport(TransportError::Timeout)) => {
+                    tracing::debug!(
+                        "set config response timed out for preset {} (mode {:#04x}); verifying via master status",
+                        preset,
+                        reset_mode
+                    );
+                }
+                Err(err) => return Err(err),
+            }
             let after = self
                 .wait_for_master_status_until(MASTER_STATUS_VERIFY_TIMEOUT, |master| {
                     master.preset == preset
@@ -800,12 +658,46 @@ impl MiniDspClient {
                 .await?;
 
             if after.preset == preset {
-                Ok(())
+                Ok(after)
             } else {
                 Err(ClientError::Protocol(format!(
                     "set config did not persist (before={}, expected={}, after={})",
                     before.preset, preset, after.preset
                 )))
+            }
+        }
+        .await;
+        self.queue.resume_levels();
+        result
+    }
+
+    /// Reset the device and verify that it becomes temporarily unavailable and
+    /// then responsive again when the hardware does not return `ResetComplete`.
+    pub async fn reset_with_verification(&self) -> Result<(), ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
+
+        self.queue.pause_levels();
+        let result = async {
+            match self
+                .execute_write_with_timeout(
+                    commands::reset(),
+                    Priority::Critical,
+                    RESET_RESPONSE_TIMEOUT,
+                    "reset",
+                )
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(ClientError::Transport(TransportError::Timeout))
+                | Err(ClientError::Timeout) => {
+                    tracing::debug!(
+                        "reset response timed out; verifying via master-status recovery"
+                    );
+                    self.wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT)
+                        .await?;
+                    Ok(())
+                }
+                Err(err) => Err(err),
             }
         }
         .await;
@@ -1603,176 +1495,6 @@ impl MiniDspClient {
         &self.queue
     }
 
-    /// Mirror the side effects of a successful raw-bridge write into the
-    /// client's shadow state so `/config` can reflect raw WS/TCP activity.
-    pub async fn mirror_raw_command_if_success(&self, payload: &[u8], raw_response: &[u8]) {
-        let parsed =
-            commands::parse_response_for_request(payload, raw_response, &self.profile.dialect);
-        if matches!(
-            parsed,
-            Response::Ack | Response::PresetComplete | Response::ResetComplete
-        ) {
-            mirror_raw_command_to_shadow(
-                payload,
-                &self.profile.dialect,
-                &self.peq_shadow,
-                &self.scalar_shadow,
-                &self.selector_shadow,
-            )
-            .await;
-        }
-    }
-
-    pub async fn export_shadow_state(&self) -> DeviceShadowState {
-        let active_shadow = self.capture_active_shadow().await;
-        let active_preset = *self.active_preset.lock().await;
-        let mut presets = self.preset_shadows.lock().await.clone();
-        if let Some(active_preset) = active_preset {
-            presets.insert(active_preset, active_shadow.clone());
-        }
-        let preset_tokens = self.preset_tokens.lock().await.clone();
-        DeviceShadowState {
-            presets,
-            peq: active_shadow.peq,
-            selector: active_shadow.selector,
-            scalar: active_shadow.scalar,
-            preset_tokens,
-        }
-    }
-
-    pub async fn apply_shadow_state(&self, state: &DeviceShadowState) {
-        let active_preset = *self.active_preset.lock().await;
-        let legacy_shadow = (!state.peq.is_empty()
-            || !state.selector.is_empty()
-            || !state.scalar.is_empty())
-        .then(|| PresetShadowState {
-            peq: state.peq.clone(),
-            selector: state.selector.clone(),
-            scalar: state.scalar.clone(),
-        });
-
-        {
-            let mut preset_shadows = self.preset_shadows.lock().await;
-            *preset_shadows = state.presets.clone();
-            if preset_shadows.is_empty()
-                && let Some(active_preset) = active_preset
-                && let Some(legacy_shadow) = legacy_shadow.clone()
-            {
-                preset_shadows.insert(active_preset, legacy_shadow);
-            }
-        }
-        {
-            let mut preset_tokens = self.preset_tokens.lock().await;
-            *preset_tokens = state.preset_tokens.clone();
-        }
-
-        let snapshot = if let Some(active_preset) = active_preset {
-            self.preset_shadows
-                .lock()
-                .await
-                .get(&active_preset)
-                .cloned()
-                .or(legacy_shadow)
-        } else {
-            legacy_shadow
-        };
-        self.apply_active_shadow_snapshot(snapshot).await;
-    }
-
-    fn prefers_scalar_shadow_for_addr(&self, addr: u16) -> bool {
-        if self.profile.dialect.value_format != ValueFormat::Float32
-            || self.profile.dsp_version != 100
-        {
-            return false;
-        }
-        let Some(table) = self.profile.dsp_table else {
-            return false;
-        };
-        if table
-            .inputs
-            .iter()
-            .filter_map(|input| input.gain)
-            .any(|gain| gain == addr)
-        {
-            return true;
-        }
-
-        if table.outputs.iter().any(|output| {
-            output.gain == addr
-                || output.delay == Some(addr)
-                || output.compressor.is_some_and(|comp| {
-                    [
-                        comp.threshold,
-                        comp.gain,
-                        comp.ratio,
-                        comp.knee,
-                        comp.attack,
-                        comp.release,
-                    ]
-                    .contains(&addr)
-                })
-        }) {
-            return true;
-        }
-
-        let routing_span = table.routing.rows as u16 * table.routing.cols as u16;
-        addr >= table.routing.gain_base && addr < table.routing.gain_base + routing_span
-    }
-
-    pub async fn refresh_modification_tokens(&self) -> Result<(), ClientError> {
-        let resp = self
-            .queue
-            .execute(
-                commands::read_flash(eeprom::TOKENS_ADDR.0, eeprom::TOKENS_ADDR.1, 16),
-                Priority::Normal,
-            )
-            .await?;
-        let Response::FlashData(data) = resp else {
-            return Err(ClientError::Protocol(
-                "unexpected response to read modification tokens".into(),
-            ));
-        };
-
-        let mut tokens = HashMap::new();
-        for (slot, chunk) in data.chunks(4).enumerate() {
-            if chunk.len() == 4 {
-                tokens.insert(slot as u8, [chunk[0], chunk[1], chunk[2], chunk[3]]);
-            }
-        }
-        *self.preset_tokens.lock().await = tokens;
-        Ok(())
-    }
-
-    pub async fn active_preset_token(&self) -> Result<(u8, [u8; 4]), ClientError> {
-        let preset = self.get_master_status().await?.preset;
-        self.refresh_modification_tokens().await?;
-        self.preset_tokens
-            .lock()
-            .await
-            .get(&preset)
-            .copied()
-            .map(|token| (preset, token))
-            .ok_or_else(|| {
-                ClientError::Protocol(format!(
-                    "missing modification token for active preset {preset}"
-                ))
-            })
-    }
-
-    pub async fn save_active_preset_token(&self) -> Result<(u8, [u8; 4]), ClientError> {
-        let preset = self.get_master_status().await?.preset;
-        let token = generate_modification_token()?;
-        let addr_lo = eeprom::TOKENS_ADDR.1 + preset.saturating_mul(4);
-        self.execute_write(
-            commands::write_flash(eeprom::TOKENS_ADDR.0, addr_lo, &token),
-            Priority::High,
-            "save modification token",
-        )
-        .await?;
-        self.preset_tokens.lock().await.insert(preset, token);
-        Ok((preset, token))
-    }
-
     /// Override the device profile (for --force-kind).
     pub async fn override_profile(&mut self, profile: DeviceProfile) {
         self.queue.set_dialect(profile.dialect).await;
@@ -1859,7 +1581,42 @@ impl MiniDspClient {
         &self,
         saved: &SavedPeqState,
     ) -> Result<(), ClientError> {
-        self.write_peq_batch(&saved.bands).await
+        let current_shadow = self.peq_shadow.lock().await.clone();
+        let (phase1_cmds, phase2_cmds, phase3_cmds) =
+            build_measurement_restore_batches(&current_shadow, &saved.bands, &self.profile.dialect);
+
+        if !phase1_cmds.is_empty() {
+            ensure_write_batch(
+                self.queue
+                    .execute_batch(phase1_cmds, Priority::Critical)
+                    .await?,
+                "measurement restore: bypass before coefficient write",
+            )?;
+        }
+
+        if !phase2_cmds.is_empty() {
+            ensure_write_batch(
+                self.queue
+                    .execute_batch(phase2_cmds, Priority::Critical)
+                    .await?,
+                "measurement restore: write coefficients",
+            )?;
+        }
+
+        if !phase3_cmds.is_empty() {
+            ensure_write_batch(
+                self.queue
+                    .execute_batch(phase3_cmds, Priority::Critical)
+                    .await?,
+                "measurement restore: restore bypass",
+            )?;
+        }
+
+        let mut shadow = self.peq_shadow.lock().await;
+        for &(addr, coeffs, bypass) in &saved.bands {
+            shadow.insert(addr, PeqShadow { coeffs, bypass });
+        }
+        Ok(())
     }
 
     /// Check if measurement mode state is currently saved.
@@ -1926,13 +1683,11 @@ impl MiniDspClient {
 
     /// Read 5 biquad coefficients from a PEQ band address.
     async fn read_peq_coeffs(&self, addr: u16) -> Result<[f32; 5], ClientError> {
-        if self.profile.dialect.value_format == ValueFormat::Float32
-            && self.profile.dsp_version == 100
-        {
-            // Live DSP100 / 2x4 HD PEQ and crossover coefficient reads are not
-            // authoritative on the tested hardware path. Prefer the shadow/default
-            // model directly so `/config` remains fast instead of timing out one
-            // band at a time on all-zero placeholder reads.
+        if self.profile.has_unreliable_selector_readback {
+            // Devices with unreliable selector readback also have non-authoritative
+            // PEQ/crossover coefficient reads. Prefer the shadow/default model
+            // directly so `/config` remains fast instead of timing out one band
+            // at a time on all-zero placeholder reads.
             let shadow = self.peq_shadow.lock().await;
             return Ok(shadow
                 .get(&addr)
@@ -2099,10 +1854,7 @@ impl MiniDspClient {
                 let fir = if let Some(fir) = output.fir {
                     let shadow_taps = self.selector_shadow_value(fir.taps_count).await;
                     let active_taps = match self.read_param_scalar_u32(fir.taps_count).await {
-                        Ok(value)
-                            if self.profile.dsp_version == 100
-                                && self.profile.dialect.value_format == ValueFormat::Float32 =>
-                        {
+                        Ok(value) if self.profile.has_unreliable_selector_readback => {
                             shadow_taps.or_else(|| {
                                 (1..=fir.max_taps as u32)
                                     .contains(&value)
@@ -2323,6 +2075,7 @@ mod tests {
     use minidsp_protocol::dialect::Dialect;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     struct DummyTransport;
 
@@ -2351,6 +2104,255 @@ mod tests {
 
         fn url(&self) -> String {
             "mock://shadow".into()
+        }
+    }
+
+    struct DelayedPresetTransport {
+        current_preset: Arc<AtomicU8>,
+        last_payload: Arc<Mutex<Vec<u8>>>,
+        set_config_targets: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl DelayedPresetTransport {
+        fn new(initial_preset: u8) -> Self {
+            Self {
+                current_preset: Arc::new(AtomicU8::new(initial_preset)),
+                last_payload: Arc::new(Mutex::new(Vec::new())),
+                set_config_targets: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl crate::transport::Transport for DelayedPresetTransport {
+        fn send_frame(
+            &self,
+            payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            let payload = payload.to_vec();
+            let current_preset = self.current_preset.clone();
+            let last_payload = self.last_payload.clone();
+            let set_config_targets = self.set_config_targets.clone();
+
+            Box::pin(async move {
+                if payload.first().copied() == Some(commands::CMD_SET_CONFIG) && payload.len() >= 2
+                {
+                    let target = payload[1];
+                    set_config_targets.lock().await.push(target);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        current_preset.store(target, Ordering::SeqCst);
+                    });
+                }
+
+                *last_payload.lock().await = payload;
+                Ok(())
+            })
+        }
+
+        fn recv_frame(
+            &self,
+            _timeout_ms: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            let current_preset = self.current_preset.clone();
+            let last_payload = self.last_payload.clone();
+
+            Box::pin(async move {
+                let payload = last_payload.lock().await.clone();
+                match payload.first().copied() {
+                    Some(commands::CMD_SET_CONFIG) => Ok(payload),
+                    Some(commands::CMD_READ_FLASH)
+                        if payload.len() >= 4
+                            && payload[1] == eeprom::MASTER_STATUS_ADDR.0
+                            && payload[2] == eeprom::MASTER_STATUS_ADDR.1 =>
+                    {
+                        Ok(vec![
+                            commands::CMD_READ_FLASH,
+                            current_preset.load(Ordering::SeqCst),
+                            0,
+                            0,
+                            0,
+                        ])
+                    }
+                    Some(opcode) => Err(TransportError::Io(format!(
+                        "unexpected transport payload {opcode:#04x}: {payload:02x?}"
+                    ))),
+                    None => Err(TransportError::Io("missing transport payload".into())),
+                }
+            })
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn url(&self) -> String {
+            "mock://preset-race".into()
+        }
+    }
+
+    struct TimeoutingPresetTransport {
+        current_preset: Arc<AtomicU8>,
+        last_payload: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl TimeoutingPresetTransport {
+        fn new(initial_preset: u8) -> Self {
+            Self {
+                current_preset: Arc::new(AtomicU8::new(initial_preset)),
+                last_payload: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl crate::transport::Transport for TimeoutingPresetTransport {
+        fn send_frame(
+            &self,
+            payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            let payload = payload.to_vec();
+            let current_preset = self.current_preset.clone();
+            let last_payload = self.last_payload.clone();
+
+            Box::pin(async move {
+                if payload.first().copied() == Some(commands::CMD_SET_CONFIG) && payload.len() >= 2
+                {
+                    let target = payload[1];
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        current_preset.store(target, Ordering::SeqCst);
+                    });
+                }
+
+                *last_payload.lock().await = payload;
+                Ok(())
+            })
+        }
+
+        fn recv_frame(
+            &self,
+            timeout_ms: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            let current_preset = self.current_preset.clone();
+            let last_payload = self.last_payload.clone();
+
+            Box::pin(async move {
+                let payload = last_payload.lock().await.clone();
+                match payload.first().copied() {
+                    Some(commands::CMD_SET_CONFIG) => {
+                        tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                        Err(TransportError::Timeout)
+                    }
+                    Some(commands::CMD_READ_FLASH)
+                        if payload.len() >= 4
+                            && payload[1] == eeprom::MASTER_STATUS_ADDR.0
+                            && payload[2] == eeprom::MASTER_STATUS_ADDR.1 =>
+                    {
+                        Ok(vec![
+                            commands::CMD_READ_FLASH,
+                            current_preset.load(Ordering::SeqCst),
+                            0,
+                            0,
+                            0,
+                        ])
+                    }
+                    Some(opcode) => Err(TransportError::Io(format!(
+                        "unexpected transport payload {opcode:#04x}: {payload:02x?}"
+                    ))),
+                    None => Err(TransportError::Io("missing transport payload".into())),
+                }
+            })
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn url(&self) -> String {
+            "mock://preset-timeout".into()
+        }
+    }
+
+    struct RecoveringResetTransport {
+        last_payload: Arc<Mutex<Vec<u8>>>,
+        read_timeouts_remaining: Arc<AtomicUsize>,
+    }
+
+    impl RecoveringResetTransport {
+        fn new(read_timeouts_remaining: usize) -> Self {
+            Self {
+                last_payload: Arc::new(Mutex::new(Vec::new())),
+                read_timeouts_remaining: Arc::new(AtomicUsize::new(read_timeouts_remaining)),
+            }
+        }
+    }
+
+    impl crate::transport::Transport for RecoveringResetTransport {
+        fn send_frame(
+            &self,
+            payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            let payload = payload.to_vec();
+            let last_payload = self.last_payload.clone();
+
+            Box::pin(async move {
+                *last_payload.lock().await = payload;
+                Ok(())
+            })
+        }
+
+        fn recv_frame(
+            &self,
+            timeout_ms: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            let last_payload = self.last_payload.clone();
+            let read_timeouts_remaining = self.read_timeouts_remaining.clone();
+
+            Box::pin(async move {
+                let payload = last_payload.lock().await.clone();
+                match payload.first().copied() {
+                    Some(commands::CMD_RESET) => {
+                        tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                        Err(TransportError::Timeout)
+                    }
+                    Some(commands::CMD_READ_FLASH)
+                        if payload.len() >= 4
+                            && payload[1] == eeprom::MASTER_STATUS_ADDR.0
+                            && payload[2] == eeprom::MASTER_STATUS_ADDR.1 =>
+                    {
+                        if read_timeouts_remaining.load(Ordering::SeqCst) > 0 {
+                            read_timeouts_remaining.fetch_sub(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                            Err(TransportError::Timeout)
+                        } else {
+                            Ok(vec![commands::CMD_READ_FLASH, 0, 0, 0, 0])
+                        }
+                    }
+                    Some(opcode) => Err(TransportError::Io(format!(
+                        "unexpected transport payload {opcode:#04x}: {payload:02x?}"
+                    ))),
+                    None => Err(TransportError::Io("missing transport payload".into())),
+                }
+            })
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn url(&self) -> String {
+            "mock://reset-timeout".into()
         }
     }
 
@@ -2435,6 +2437,57 @@ mod tests {
         let shadow = peq_shadow.lock().await;
         assert!(shadow.get(&8480).unwrap().bypass);
         assert!(shadow.get(&8485).unwrap().bypass);
+    }
+
+    #[test]
+    fn measurement_restore_batches_skip_unchanged_coefficients() {
+        let current_shadow = HashMap::from([
+            (
+                0x2000u16,
+                PeqShadow {
+                    coeffs: minidsp_protocol::biquad::BYPASS,
+                    bypass: true,
+                },
+            ),
+            (
+                0x2005u16,
+                PeqShadow {
+                    coeffs: minidsp_protocol::biquad::BYPASS,
+                    bypass: true,
+                },
+            ),
+        ]);
+        let saved = vec![
+            (0x2000u16, minidsp_protocol::biquad::BYPASS, false),
+            (0x2005u16, minidsp_protocol::biquad::BYPASS, true),
+        ];
+
+        let (phase1, phase2, phase3) =
+            build_measurement_restore_batches(&current_shadow, &saved, &Dialect::NEW);
+
+        assert!(phase1.is_empty());
+        assert!(phase2.is_empty());
+        assert_eq!(phase3, vec![commands::bypass_filter(0x2000, false, &Dialect::NEW)]);
+    }
+
+    #[test]
+    fn measurement_restore_batches_rewrite_changed_coefficients() {
+        let current_shadow = HashMap::from([(
+            0x2000u16,
+            PeqShadow {
+                coeffs: minidsp_protocol::biquad::BYPASS,
+                bypass: false,
+            },
+        )]);
+        let coeffs = [1.0, 0.5, 0.25, -0.5, 0.125];
+        let saved = vec![(0x2000u16, coeffs, false)];
+
+        let (phase1, phase2, phase3) =
+            build_measurement_restore_batches(&current_shadow, &saved, &Dialect::NEW);
+
+        assert_eq!(phase1, vec![commands::bypass_filter(0x2000, true, &Dialect::NEW)]);
+        assert_eq!(phase2, vec![commands::write_biquad(0x2000, &coeffs, &Dialect::NEW)]);
+        assert_eq!(phase3, vec![commands::bypass_filter(0x2000, false, &Dialect::NEW)]);
     }
 
     #[tokio::test]
@@ -2538,6 +2591,7 @@ mod tests {
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
             active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
         };
 
         let state = DeviceShadowState {
@@ -2612,6 +2666,7 @@ mod tests {
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
             active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
         };
 
         client
@@ -2686,6 +2741,7 @@ mod tests {
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
             active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
         };
 
         let table = client.profile.dsp_table.unwrap();
@@ -2704,6 +2760,143 @@ mod tests {
         assert!(client.prefers_scalar_shadow_for_addr(43));
         assert!(client.prefers_scalar_shadow_for_addr(44));
         assert!(client.prefers_scalar_shadow_for_addr(45));
+    }
+
+    #[tokio::test]
+    async fn concurrent_preset_switches_are_serialized() {
+        let transport = DelayedPresetTransport::new(3);
+        let current_preset = transport.current_preset.clone();
+        let set_config_targets = transport.set_config_targets.clone();
+        let client = MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(transport))),
+            transport_url: "mock://preset-race".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            active_preset: Mutex::new(Some(3)),
+            state_transition_lock: Mutex::new(()),
+        };
+
+        let (first, second) = tokio::join!(
+            async { client.set_config(2).await },
+            async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                client.set_config(3).await
+            }
+        );
+
+        first.expect("first preset switch should succeed");
+        second.expect("second preset switch should succeed");
+
+        assert_eq!(current_preset.load(Ordering::SeqCst), 3);
+        assert_eq!(set_config_targets.lock().await.as_slice(), &[2, 3]);
+    }
+
+    #[tokio::test]
+    async fn set_config_succeeds_when_transport_times_out_but_status_verifies() {
+        let transport = TimeoutingPresetTransport::new(0);
+        let current_preset = transport.current_preset.clone();
+        let client = Arc::new(MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(transport))),
+            transport_url: "mock://preset-timeout".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
+        });
+
+        let status = client
+            .set_config(2)
+            .await
+            .expect("master-status verification should recover from timeout");
+        assert_eq!(status.preset, 2);
+        assert_eq!(current_preset.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_reset_recovery_rejects_single_status_blip() {
+        let client = MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(1)))),
+            transport_url: "mock://reset-single-blip".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
+        };
+
+        let err = client
+            .wait_for_reset_recovery_until(Duration::from_millis(700))
+            .await
+            .expect_err("single transient read failure should not verify reset");
+        assert!(matches!(err, ClientError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn reset_succeeds_when_transport_times_out_but_status_recovers() {
+        let client = MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(2)))),
+            transport_url: "mock://reset-timeout".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
+        };
+
+        client
+            .reset_with_verification()
+            .await
+            .expect("reset recovery verification should accept sustained outage");
     }
 
     #[test]

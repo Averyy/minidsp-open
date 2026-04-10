@@ -175,30 +175,31 @@ Priority target where current behavior still appears to drift from minidsp-rs wi
 2. preset switching
    - the physical 2x4 HD returns an immediate raw `Ack` for `SetConfig`
    - the old shared queue logic waited for a second preset-only completion frame, which caused nested `--daemon-url` timeouts even when the preset had already changed
-   - the shared queue now returns the first valid preset response immediately, and `MiniDspClient::set_config()` verifies completion by polling master-status readback
-   - live desktop verification on 2026-04-09:
-     - `minidsp --daemon-url http://127.0.0.1:5380 config 0` completed in about `26 ms`, and `GET /devices/0` changed from preset `1` to `0`
-     - `minidsp --daemon-url http://127.0.0.1:5380 config 1` completed in about `26 ms`, and `GET /devices/0` changed back to preset `1`
-     - raw `debug send 250000` / `250100` both returned `Ack`, and the matching preset readback changed immediately
+   - the shared queue now returns the first valid preset response immediately, but `MiniDspClient::set_config()` and the daemon bridges only report success after master-status readback confirms that the requested preset is active
+   - live desktop verification on 2026-04-10 on the physical 2x4 HD:
+     - `POST /devices/0/preset/2` completed in about `5.02 s`
+     - `minidsp --daemon-url http://127.0.0.1:5382 config 3` completed in about `5.37 s`
+     - `minidsp --url tcp://127.0.0.1:5333 config 1` completed in about `5.38 s`
+     - compatibility `POST /devices/0 {"preset":0}` completed in about `5.32 s`
+     - a fresh-daemon `/config` read on presets `2` and `3` still returned sane routing/compressor/FIR state, proving the token-matched official XML import path is seeding the missing preset shadow correctly
 
 4. slow flash/state commands
    - the physical 2x4 HD does not treat every state-changing command like a fast `Ack` path
    - official Device Console evidence:
      - `CopyPreset (0x27 0x00)` was sent at `2026-04-08 15:14:04.417` and only got `Received OK` at `2026-04-08 15:14:27.284`
-   - live desktop verification on 2026-04-09 after the shared timeout fix:
-     - `POST /devices/0/preset/copy` returned `200` in `22.92 s` on the physical 2x4 HD, matching the official app timing instead of failing at the old `10 s` queue timeout
-     - `minidsp --daemon-url http://127.0.0.1:5380 debug send 03` returned `ResetComplete`
-     - the same live daemon log showed `HID OUT payload: [03]` at `22:29:42.994` and `HID IN payload: [aa]` at `22:29:49.557`, i.e. about `6.56 s`
-     - the daemon still answered `GET /devices/0` after that reset, so the slow reset path is now usable through the daemon bridge instead of requiring direct USB retries
+   - live desktop verification on 2026-04-10 after the reset-bridge follow-up fix:
+     - `POST /devices/0/preset/copy` returned `200` in `23.02 s` on the physical 2x4 HD, matching the official app timing instead of failing at the old `10 s` queue timeout
+     - the route returns an empty success body (`Content-Length: 0`); earlier harness failures here were test bugs caused by assuming JSON
+     - `minidsp --daemon-url http://127.0.0.1:5382 debug send 03` returned framed `aa` in about `6.7 s`
+     - the same live daemon log showed `HID OUT payload: [03]`, then `reset response timed out; verifying via master-status recovery`, then an undecodable `ff f1 ...` packet during the reset window, and finally normal `0xFFD8` reads recovering
+     - the daemon still answered `GET /devices/0` after that reset, so the slow reset path is now usable through the daemon bridge even when the device never yields a decodable raw `0xAA`
 
 5. websocket compatibility surfaces
-   - live desktop verification on 2026-04-09 with the physical 2x4 HD:
-     - `/devices/0?poll=true` sent an immediate status frame on connect and continued polling
-     - `/devices/0?levels=true&poll=true` kept streaming status/levels while `POST /devices/0/preset/0` and `/preset/1` both still succeeded
-     - clean reruns after aligning the websocket meter cadence to the official `500 ms` Device Console rhythm still showed those preset writes taking about `2.83 s` with the live polling socket attached, versus about `26 ms` without it
-     - the official raw capture shows the same behavior on this hardware: `0x25` acked immediately at `2026-04-09T19:30:52.875Z`, but the first follow-up `0x14` status reply only arrived at `2026-04-09T19:30:56.185Z`
-     - clean reruns on the same daemon/build showed `POST /devices/0/source/Usb` / `/source/Analog` still completing in about `11 ms` / `6 ms` with the live polling socket attached, so the slow path is preset switching rather than source switching
-     - the websocket stream reflected the state changes (`preset` seen transitioning `[1, 0]` and then `[0, 1]`)
+   - live desktop verification on 2026-04-10 with the physical 2x4 HD:
+     - `/devices/0?poll=true` sent an immediate status frame on connect
+     - `/devices/0?levels=true&poll=true` sent an immediate state/levels frame with `2` input levels and `4` output levels
+     - clean reruns on the same daemon/build still showed `POST /devices/0/source/Usb` / `/source/Analog` completing in about `5-8 ms`, so source switching remains fast while preset switching intentionally waits for the hardware apply window
+     - the official raw capture still explains that timing: `0x25` acked immediately at `2026-04-09T19:30:52.875Z`, but the first follow-up `0x14` status reply only arrived at `2026-04-09T19:30:56.185Z`
    - raw bridge verification on the same daemon:
      - `/devices/0/ws` ignored an incoming text frame and still returned the correct framed binary response to `ReadHardwareId`
 

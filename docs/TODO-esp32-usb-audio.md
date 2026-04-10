@@ -106,10 +106,11 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a
   - DSP100 `DGain_*_status` and `MixerNxMSmoothed1_*_status` semantics on the physical 2x4 HD are not fully decoded yet
   - our current readback still does not match the official app UI for all mute/routing states
   - continue treating modern mute/routing readback as a compatibility investigation item, not a solved surface
-- The shared `/play` default has now been changed to a plain subwoofer baseline instead of the old measurement bundle:
-  - in code, the default request is now `15-80 Hz`, `8 s`, `16-bit`, no preamble, no tone burst, no gap, no decay
-  - the generator now uses the exact requested sweep band instead of applying hidden guard-band expansion
-  - desktop direct-USB verification on 2026-04-09 confirmed the new shared default reaches the physical 2x4 HD cleanly with `sweepOffsetSamples=0` and unchanged source/routing before and after playback
+- The shared `/play` default has now been updated to match REW/MSO-style measurement conventions instead of the old measurement bundle:
+  - in code, the default request is now a `5-400 Hz`, `5.46 s`, `16-bit` sweep with `2 s` low-level dither pre-silence, `2 s` post-silence, and `20 ms` raised-cosine fade-in/out
+  - when the sweep starts below `10 Hz`, the generator follows REW's hybrid behavior: linear chirp from `5 Hz` to `10 Hz`, then logarithmic from `10 Hz` to `400 Hz`
+  - desktop direct-USB verification confirmed the current shared default reaches the physical 2x4 HD cleanly with `toneBurstOffsetSamples=96000`, `sweepOffsetSamples=96000`, and `totalSamples=454058` while keeping source/routing unchanged before and after playback
+  - the older measurement-bundle default (`5-500 Hz` with BRAP bursts) remains retired as historical context only
   - the remaining question is audible quality on the real sub, not whether the old measurement-bundle default should be defended
 
 **Performance note:** Use a **release** firmware build for any timing or glitch validation. Debug (`cargo build`) builds are dramatically slower in the sweep-generation hot path and are not representative for `/play`.
@@ -150,7 +151,7 @@ Goal: explain and, if possible, eliminate the remaining gap between nominal sign
 - [x] Update this doc and `PROGRESS.md` with the validated HID/UAC2 reconnect fix
 - [x] Finish repeated-play stress testing and document the results
 
-**Current conclusion:** the original `~13.6s` issue was a real app-side pacing bug caused by near-full-ring writes. That is fixed. The remaining `~12.29-12.56s` enqueue-finish metric depends on byte volume (`48/24` > `48/16` > `44.1/24`), stays at `TX_DONE=0`, and has negligible stop time, which is consistent with app-side enqueue timing against the driver ring buffer and `startedAtUs` semantics, not with a driver-side sample-clock defect. The old measurement-bundle default was then retired; the current remaining audible question is whether the new exact-band `15-80 Hz` / `16-bit` shared default sounds correct on the real sub.
+**Current conclusion:** the original `~13.6s` issue was a real app-side pacing bug caused by near-full-ring writes. That is fixed. The remaining `~12.29-12.56s` enqueue-finish metric depends on byte volume (`48/24` > `48/16` > `44.1/24`), stays at `TX_DONE=0`, and has negligible stop time, which is consistent with app-side enqueue timing against the driver ring buffer and `startedAtUs` semantics, not with a driver-side sample-clock defect. The old measurement-bundle default was then retired; the current remaining audible question is whether the new REW/MSO-style `5-400 Hz` / `16-bit` shared default sounds correct on the real sub.
 
 ## Definition of Done
 
@@ -359,11 +360,13 @@ Implement mathematical real-time audio generation. **No file transfer, no WAV fi
 
 **Current default signal structure:**
 ```
-[sweep: 8s Farina ESS]
-Total: ~8 seconds at 48kHz = ~383,918 samples after zero-crossing truncation on the current `15-80 Hz` default
+[2 s low-level dither pre-silence]
+[sweep: ~5.46 s REW/MSO-style hybrid ESS, linear 5-10 Hz then logarithmic 10-400 Hz]
+[2 s post-silence]
+Total: ~9.5 seconds at 48kHz = ~454,058 samples after zero-crossing truncation on the current shared default
 ```
 
-**Status note (2026-04-09):** the old measurement-bundle default is no longer the baseline. The shared code now defaults to a plain exact-band subwoofer sweep because the old default sounded wrong on hardware.
+**Status note (2026-04-10):** the old measurement-bundle default is no longer the baseline. The shared code now defaults to a REW/MSO-style measurement sweep because the old default sounded wrong on hardware.
 
 **Farina exponential sine sweep formula:**
 ```
@@ -371,18 +374,19 @@ x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
 ```
 
 **Default parameters** (overridable via API):
-- `f1 = 15 Hz` (exact sweep start)
-- `f2 = 80 Hz` (exact sweep stop)
-- `duration = 8 seconds`
+- `f1 = 5 Hz`
+- `f2 = 400 Hz`
+- `duration = 5.46 seconds` (REW-style `256k` sweep window at `48 kHz`, rounded in the API docs)
 - `fs = 48000 Hz`
 - `bitDepth = 16`
-- `preambleSec = 0`
+- `preambleSec = 2.0` (`-60 dBFS` dither for device lock-in, matching REW)
 - `toneBurst.cycles = 0`
 - `gapSec = 0`
-- `decaySec = 0`
-- Tukey fade-in: 0.02s
+- `decaySec = 2.0` (clean post-silence)
+- `fadeDuration = 0.02 seconds` on both ends (raised-cosine envelope)
+- hybrid sweep mode below `10 Hz`: linear `5-10 Hz`, then logarithmic `10-400 Hz`
 
-**REW comparison note:** REW's measurement sweep uses guard-band expansion for measurement purposes, but the current shared `/play` default is now intentionally an exact-band audible sanity-check sweep. If a caller wants a broader measurement profile, it should request that profile explicitly instead of relying on hidden expansion.
+**REW comparison note:** the current shared `/play` default is now intentionally aligned with REW/MSO measurement conventions: low-level dither before the sweep, a hybrid linear+log sweep below `20 Hz`, and a clean post-silence tail. The old measurement-bundle default with `BRAP` bursts stays retired; callers that want a different profile should request it explicitly instead of relying on hidden expansion or marker sections.
 
 **Implementation approach:**
 - Implement as a state machine / iterator that produces samples on demand
@@ -400,9 +404,9 @@ x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
 - `totalSamples` in the `/play` response reflects the truncated sweep length (plus preamble/tone burst/gap/decay)
 - This still gives a deterministic clean endpoint even though the current shared default no longer mirrors the old guard-band profile
 
-**Note on decay duration:** The default `decaySec` is now `0.0` for a plain audible sweep. Trailing silence is still supported via the API when a caller wants room-decay capture.
+**Note on decay duration:** The default `decaySec` is now `2.0` as a clean post-silence tail, matching the current REW-style baseline. Longer room-decay capture is still supported via the API when a caller wants it.
 
-**Preamble**: supported via API, but disabled by default because it made the old default harder to judge audibly on the real sub.
+**Preamble**: supported via API and enabled by default as low-level dither so the device locks in the same way REW does.
 
 **Tone burst**: supported via API, but disabled by default for the same reason.
 
@@ -430,18 +434,18 @@ Content-Type: application/json
 
 {
   "sweep": {
-    "f1": 15,
-    "f2": 80,
-    "duration": 8,
+    "f1": 5,
+    "f2": 400,
+    "duration": 5.46,
     "fadeDuration": 0.02
   },
   "toneBurst": {
     "frequency": 80,
     "cycles": 0
   },
-  "preambleSec": 0,
+  "preambleSec": 2,
   "gapSec": 0,
-  "decaySec": 0,
+  "decaySec": 2,
   "sampleRate": 48000,
   "bitDepth": 16
 }
@@ -453,9 +457,9 @@ All fields are optional — use defaults above when omitted.
 ```json
 {
   "startedAtUs": 1719482837291456,
-  "toneBurstOffsetSamples": 0,
-  "sweepOffsetSamples": 0,
-  "totalSamples": 383918,
+  "toneBurstOffsetSamples": 96000,
+  "sweepOffsetSamples": 96000,
+  "totalSamples": 454058,
   "sampleRate": 48000,
   "sourceChanged": true,
   "previousSource": "toslink"

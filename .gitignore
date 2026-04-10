@@ -2,3 +2,5 @@ app/
 .DS_Store
 .playwright-mcp/
 target/
+
+.codex-dobby/

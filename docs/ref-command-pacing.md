@@ -106,14 +106,19 @@ The official raw Device Console HID capture from 2026-04-09 also tightened two q
   - the desktop daemon now mirrors that behavior for `/config` and measurement-mode preset mutations before persisting shadow state
 - `CopyPreset (0x27)` is a genuinely long-running flash operation on this device family, not a fast-ack write:
   - official Device Console on the same physical 2x4 HD sent `0x27 0x00` at `2026-04-08 15:14:04.417` and only logged `Received OK` at `2026-04-08 15:14:27.284`
-  - this repo now gives `0x27` a longer shared queue deadline, which was live-verified on 2026-04-09 by `POST /devices/0/preset/copy` completing in `22.92 s`
+  - this repo now gives `0x27` a longer shared queue deadline, which was re-verified on 2026-04-10 by `POST /devices/0/preset/copy` completing in `23.02 s` and returning an empty success body (`Content-Length: 0`)
 - `Reset (0x03)` is also slow enough on the physical 2x4 HD to need a longer shared deadline:
-  - live desktop verification on 2026-04-09 showed `HID OUT payload: [03]` at `22:29:42.994` and `HID IN payload: [aa]` at `22:29:49.557`, i.e. about `6.56 s`
-  - this repo now gives `0x03` the same longer shared queue deadline so raw reset through the daemon bridge can complete instead of timing out at `10 s`
-- Live 2x4 HD websocket note from this repo: with `/devices/0?levels=true&poll=true` active on 2026-04-09, `POST /devices/0/preset/0` and `/preset/1` still succeeded, but each took about `2.83 s` instead of the `20-30 ms` seen without a live polling socket.
-  - clean reruns on the same daemon/build showed `POST /devices/0/source/Usb` / `/source/Analog` still completing in about `11 ms` / `6 ms` with the polling socket attached, so the slow path is specifically preset switching rather than all writes
+  - re-verification on 2026-04-10 showed the daemon bridge can no longer rely on a decodable device-side `0xAA`: `minidsp --daemon-url http://127.0.0.1:5382 debug send 03` returned framed `aa` in about `6.7 s`, but the live daemon log showed a timeout fallback into master-status polling, an undecodable `ff f1 ...` packet during the reset window, and then normal `0xFFD8` recovery
+  - the raw bridge now treats reset the same way as preset switching: short raw-response budget first, then verified recovery before synthesizing the compatibility completion frame
+- Live 2x4 HD control-surface note from this repo on 2026-04-10:
+  - verified preset-switch surfaces now all wait for the real hardware apply window, not the early `SetConfig` transport ack:
+    - `POST /devices/0/preset/2` completed in `5.02 s`
+    - `minidsp --daemon-url http://127.0.0.1:5382 config 3` completed in `5.37 s`
+    - `minidsp --url tcp://127.0.0.1:5333 config 1` completed in `5.38 s`
+    - compatibility `POST /devices/0 {"preset":0}` completed in `5.32 s`
+  - clean reruns on the same daemon/build still showed `POST /devices/0/source/Usb` / `/source/Analog` completing in about `5-8 ms`, so the slow path is specifically preset switching rather than all writes
   - the official raw Device Console capture shows the same preset-change pattern on the physical 2x4 HD: `0x25` was acknowledged immediately at `2026-04-09T19:30:52.875Z`, but the first follow-up `0x14` status reply did not arrive until `2026-04-09T19:30:56.185Z`
-  - this repo now matches the official websocket meter cadence (`500 ms`) and avoids the extra immediate post-connect poll, so the remaining preset latency on the tested path is device/apply-time behavior, not the old silent-failure queue bug
+  - this repo now matches the official websocket meter cadence (`500 ms`) and avoids the extra immediate post-connect poll, so the remaining preset latency on the tested path is device/apply-time behavior rather than queue starvation or a missing completion parser
 - Live 2x4 HD status note from this repo on 2026-04-10: low-priority DSP100 meter reads can still fail or return malformed data on the attached 2x4 HD, so the daemon now treats them as best-effort and clamps failed reads to `-140 dB` silence instead of letting `GET /devices/{id}` stall or fail.
 
 4. **Issue #765 (unreachable after standby):** After the device enters standby, the USB connection drops. minidsp-rs has no reconnection logic, so the daemon becomes permanently stuck.

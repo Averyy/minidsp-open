@@ -181,6 +181,19 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
                 return Some(payload);
             }
         }
+        Some(0xFF) => {
+            // The 2x4 HD can emit inbound packets with a leading 0xFF prefix
+            // in the preset-change window. Treat that byte like an alternate
+            // report ID so the queue can keep reading until it sees the real
+            // completion response instead of failing the whole command.
+            if data.len() > 1 && crate::commands::is_known_opcode(data[1]) {
+                return Some(data[1..].to_vec());
+            }
+
+            if let Some((payload, _)) = decode_response_frame(&data[1..]) {
+                return Some(payload);
+            }
+        }
         _ => {}
     }
 
@@ -346,6 +359,13 @@ mod tests {
         let report = [0x01, 0x04, 0xff, 0xc8, 0x5a, 0x4c, 0x1b, 0x2b];
         let decoded = decode_hid_response(&report).unwrap();
         assert_eq!(decoded, vec![0x04, 0xff, 0xc8, 0x5a, 0x4c, 0x1b, 0x2b]);
+    }
+
+    #[test]
+    fn hid_unframed_event_with_leading_ff_prefix() {
+        let report = [0xff, 0x02, 0x00, 0x02, 0x03, 0x00, 0x00, 0x00];
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(decoded, vec![0x02, 0x00, 0x02, 0x03, 0x00, 0x00, 0x00]);
     }
 
     #[test]

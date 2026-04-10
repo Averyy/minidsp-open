@@ -8,6 +8,7 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints to the desktop daemon, 
 
 - Reuse `sweep_gen.rs` (pure math, already desktop-testable)
 - Same `/play` request/response schema as ESP32 (see `docs/TODO-esp32-usb-audio.md`)
+- Same shared REW/MSO-style default profile as ESP32 (`5-400 Hz` hybrid sweep, `2 s` low-level dither pre-silence, `2 s` post-silence, `16-bit`)
 - Same `/sync` endpoint (trivial — just reads system clock)
 - Same source auto-switch + restore behavior via HID
 - Platform audio output via CPAL or similar crate — route audio to the miniDSP's USB audio input

@@ -118,6 +118,7 @@ fn profile_2x4hd() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: true,
+        has_unreliable_selector_readback: true,
     }
 }
 
@@ -140,6 +141,7 @@ fn profile_ddrc24() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -162,6 +164,7 @@ fn profile_flex() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: true,
     }
 }
 
@@ -184,6 +187,7 @@ fn profile_flex_dl() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -206,6 +210,7 @@ fn profile_shd() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -228,6 +233,7 @@ fn profile_shd_studio(hw_id: u8) -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -250,6 +256,7 @@ fn profile_shd_power() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -272,6 +279,7 @@ fn profile_flex_eight() -> DeviceProfile {
         has_dre: true,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -294,6 +302,7 @@ fn profile_flex_eight_dl() -> DeviceProfile {
         has_dre: true,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -316,6 +325,7 @@ fn profile_flex_ht_113() -> DeviceProfile {
         has_dre: true,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -338,6 +348,7 @@ fn profile_flex_ht_115() -> DeviceProfile {
         has_dre: true,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -360,6 +371,7 @@ fn profile_flex_htx_113() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -382,6 +394,7 @@ fn profile_flex_htx_115() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: true,
         has_usb_audio: true,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -406,6 +419,7 @@ fn profile_4x10hd() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -428,6 +442,7 @@ fn profile_10x10hd() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -450,6 +465,7 @@ fn profile_nanodigi_2x8() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -472,6 +488,7 @@ fn profile_2x4_nonhd() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -494,6 +511,7 @@ fn profile_msharc_4x8() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -516,6 +534,7 @@ fn profile_ddrc_88bm() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -538,6 +557,7 @@ fn profile_cdsp_8x12v2() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -560,6 +580,7 @@ fn profile_nanoavr() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -582,6 +603,7 @@ fn profile_nanoavr_hda() -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -604,6 +626,7 @@ fn profile_generic(hw_id: u8, dsp_version: u8) -> DeviceProfile {
         has_dre: false,
         has_volume_offsets: false,
         has_usb_audio: false,
+        has_unreliable_selector_readback: false,
     }
 }
 
@@ -692,6 +715,111 @@ mod tests {
                 p.tier,
                 CapabilityTier::Full,
                 "device hw_id={hw} dsp={dsp} ({}) should be Full tier",
+                p.name
+            );
+        }
+    }
+
+    /// Every known device profile has consistent internal state.
+    #[test]
+    fn all_profiles_are_internally_consistent() {
+        let all_devices: &[(u8, u8)] = &[
+            // Modern SHARC
+            (10, 100), (10, 101), (27, 100), (27, 101),
+            (14, 105), (17, 105), (18, 105), (21, 105),
+            (30, 110), (30, 111), (31, 113), (31, 115),
+            (32, 113), (32, 115),
+            // Legacy
+            (1, 0), (1, 51), (2, 54), (2, 22),
+            (4, 0), (6, 95), (11, 97),
+            // Basic
+            (7, 0), (8, 0),
+            // Unknown
+            (99, 99),
+        ];
+        for &(hw, dsp) in all_devices {
+            let p = identify(hw, dsp);
+            // Every profile must have a name
+            assert!(!p.name.is_empty(), "({hw},{dsp}) missing name");
+            // Full tier profiles must have a DSP table
+            if p.tier == CapabilityTier::Full {
+                assert!(
+                    p.dsp_table.is_some(),
+                    "({hw},{dsp}) {} is Full tier but has no DSP table",
+                    p.name
+                );
+            }
+            // If DSP table exists, table entries must not exceed profile channel counts.
+            // Table inputs/outputs can be fewer than profile channels (e.g. no input PEQ
+            // on DDRC-24 despite having 2 physical input channels).
+            if let Some(table) = p.dsp_table {
+                assert!(
+                    table.inputs.len() <= p.inputs as usize,
+                    "({hw},{dsp}) {} has more DSP table inputs ({}) than profile channels ({})",
+                    p.name, table.inputs.len(), p.inputs
+                );
+                assert_eq!(
+                    table.outputs.len(), p.outputs as usize,
+                    "({hw},{dsp}) {} output count mismatch: profile={} table={}",
+                    p.name, p.outputs, table.outputs.len()
+                );
+            }
+            // Must have at least 1 preset
+            assert!(p.presets >= 1, "({hw},{dsp}) {} has 0 presets", p.name);
+            // New dialect devices use Float32
+            if p.dialect == Dialect::NEW {
+                assert_eq!(
+                    p.dialect.value_format,
+                    crate::dialect::ValueFormat::Float32,
+                    "({hw},{dsp}) {} NEW dialect should be Float32",
+                    p.name
+                );
+            }
+            // unreliable_selector_readback should only be true for DSP100
+            if p.has_unreliable_selector_readback {
+                assert_eq!(
+                    p.dsp_version, 100,
+                    "({hw},{dsp}) {} has unreliable_selector_readback but dsp_version != 100",
+                    p.name
+                );
+            }
+            // USB audio devices should use new dialect
+            if p.has_usb_audio {
+                assert_eq!(
+                    p.dialect, Dialect::NEW,
+                    "({hw},{dsp}) {} has USB audio but old dialect",
+                    p.name
+                );
+            }
+        }
+    }
+
+    /// Legacy devices use old dialect (except SHARC-era legacy).
+    #[test]
+    fn legacy_adau_devices_use_old_dialect() {
+        let legacy_adau = [(1, 0), (1, 51), (2, 54), (2, 22)];
+        for (hw, dsp) in legacy_adau {
+            let p = identify(hw, dsp);
+            assert_eq!(
+                p.dialect, Dialect::OLD,
+                "({hw},{dsp}) {} should use old dialect",
+                p.name
+            );
+            assert!(!p.has_usb_audio, "({hw},{dsp}) {} should not have USB audio", p.name);
+            assert!(!p.has_unreliable_selector_readback,
+                "({hw},{dsp}) {} should not have unreliable selector readback", p.name);
+        }
+    }
+
+    /// SHARC-era legacy devices (miniSHARC, DDRC-88BM, C-DSP 8x12 v2) use new dialect.
+    #[test]
+    fn sharc_era_legacy_devices_use_new_dialect() {
+        let sharc_legacy = [(4, 0), (6, 95), (11, 97)];
+        for (hw, dsp) in sharc_legacy {
+            let p = identify(hw, dsp);
+            assert_eq!(
+                p.dialect, Dialect::NEW,
+                "({hw},{dsp}) {} should use new dialect",
                 p.name
             );
         }

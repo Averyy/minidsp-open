@@ -52,6 +52,48 @@ pub const RESP_RESET_COMPLETE: u8 = 0xAA;
 pub const RESP_PRESET_COMPLETE: u8 = 0xAB;
 pub const RESP_OVERFLOW: u8 = 0xFF;
 
+/// Returns true if the byte is a known MiniDSP command or response opcode.
+///
+/// Used by the HID decoder to recognize `0xFF`-prefixed unframed packets
+/// without maintaining a separate hand-coded allowlist.
+pub const fn is_known_opcode(byte: u8) -> bool {
+    matches!(
+        byte,
+        CMD_RESET
+            | CMD_WRITE_FLASH
+            | CMD_READ_FLASH
+            | CMD_WRITE_FLASH_BLOCK
+            | CMD_FINISH_FLASH_BLOCK
+            | CMD_WRITE_DSP
+            | CMD_READ_FLOATS
+            | CMD_SET_MUTE
+            | CMD_BYPASS_FILTER
+            | CMD_SET_DISPLAY_BRIGHTNESS
+            | CMD_SET_DISPLAY_IDLE_TIME
+            | CMD_SET_DRE
+            | CMD_SET_CONFIG
+            | CMD_COPY_PRESET
+            | CMD_WRITE_BIQUAD
+            | CMD_READ_HARDWARE_ID
+            | CMD_SET_SOURCE
+            | CMD_FIR_LOAD_START
+            | CMD_FIR_LOAD_DATA
+            | CMD_RELOAD_DSP_PARAM
+            | CMD_WRITE_FLASH_FULL_ADDR
+            | CMD_READ_FLASH_FULL_ADDR
+            | CMD_DIRAC_BYPASS
+            | CMD_READ_DSP_VERSION
+            | CMD_SET_VOLUME
+            | CMD_DIRAC_DELAY_GAIN
+            | CMD_SET_HDMI_SOURCE
+            | CMD_LOG_CONTROL
+            | RESP_OK
+            | RESP_EVENT
+            | RESP_RESET_COMPLETE
+            | RESP_PRESET_COMPLETE
+    )
+}
+
 /// Parsed hardware identity from ReadHardwareId response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HardwareId {
@@ -499,6 +541,16 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
 /// responses (`[0x05, addr_hi, addr_lo, data...]`), while the simulator and
 /// older assumptions use `[0x05, data...]`. This helper accepts both forms.
 pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect) -> Response {
+    if request.first() == Some(&CMD_SET_CONFIG)
+        && data.first() == Some(&RESP_EVENT)
+        && request.len() >= 3
+        && data.len() >= 3
+        && data[1] == request[1]
+        && data[2] == request[2]
+    {
+        return Response::PresetComplete;
+    }
+
     if request.first() == Some(&CMD_READ_FLASH_FULL_ADDR)
         && data.first() == Some(&CMD_READ_FLASH_FULL_ADDR)
     {
@@ -841,7 +893,11 @@ pub fn matches_response(cmd_opcode: u8, resp_opcode: u8) -> bool {
         CMD_READ_FLOATS => resp_opcode == CMD_READ_FLOATS,
         CMD_READ_FLASH => resp_opcode == CMD_READ_FLASH,
         CMD_READ_FLASH_FULL_ADDR => resp_opcode == CMD_READ_FLASH_FULL_ADDR,
-        CMD_SET_CONFIG => resp_opcode == CMD_SET_CONFIG || resp_opcode == RESP_PRESET_COMPLETE,
+        CMD_SET_CONFIG => {
+            resp_opcode == CMD_SET_CONFIG
+                || resp_opcode == RESP_PRESET_COMPLETE
+                || resp_opcode == RESP_EVENT
+        }
         CMD_RESET => resp_opcode == RESP_RESET_COMPLETE,
         CMD_FIR_LOAD_START => resp_opcode == CMD_FIR_LOAD_START,
         _ => {
@@ -1113,6 +1169,19 @@ mod tests {
     fn parse_preset_complete() {
         let resp = parse_response(&[RESP_PRESET_COMPLETE], &Dialect::NEW);
         assert_eq!(resp, Response::PresetComplete);
+    }
+
+    #[test]
+    fn parse_set_config_event_for_request_as_preset_complete() {
+        let req = set_config(0, PRESET_CHANGE_NORMAL);
+        let data = [RESP_EVENT, 0x00, PRESET_CHANGE_NORMAL, 0x03];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert_eq!(resp, Response::PresetComplete);
+    }
+
+    #[test]
+    fn set_config_matches_event_response_opcode() {
+        assert!(matches_response(CMD_SET_CONFIG, RESP_EVENT));
     }
 
     // -- Simulator-verified response tests --

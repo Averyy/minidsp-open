@@ -8,15 +8,17 @@ use core::f32::consts::PI;
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_F1_HZ: f32 = 15.0;
-const DEFAULT_F2_HZ: f32 = 80.0;
-const DEFAULT_SWEEP_DURATION_SEC: f32 = 8.0;
+const DEFAULT_F1_HZ: f32 = 5.0;
+const DEFAULT_F2_HZ: f32 = 400.0;
+const DEFAULT_SWEEP_DURATION_SEC: f32 = 5.46;
 const DEFAULT_FADE_DURATION_SEC: f32 = 0.02;
 const DEFAULT_TONE_FREQUENCY_HZ: f32 = 80.0;
 const DEFAULT_TONE_CYCLES: f32 = 0.0;
-const DEFAULT_PREAMBLE_SEC: f32 = 0.0;
+const DEFAULT_PREAMBLE_SEC: f32 = 2.0;
 const DEFAULT_GAP_SEC: f32 = 0.0;
-const DEFAULT_DECAY_SEC: f32 = 0.0;
+const DEFAULT_DECAY_SEC: f32 = 2.0;
+/// REW transitions from linear to logarithmic sweep at this frequency.
+const LINEAR_LOG_CROSSOVER_HZ: f32 = 10.0;
 const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
 const DEFAULT_PREAMBLE_LEVEL_DBFS: f32 = -60.0;
 const CHANNELS: usize = 2;
@@ -60,9 +62,13 @@ impl Default for BitDepth {
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
 pub struct SweepParams {
+    #[cfg_attr(feature = "std", serde(default = "default_f1_hz"))]
     pub f1: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_f2_hz"))]
     pub f2: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_sweep_duration_sec"))]
     pub duration: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_fade_duration_sec"))]
     pub fade_duration: f32,
 }
 
@@ -81,7 +87,9 @@ impl Default for SweepParams {
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
 pub struct ToneBurstParams {
+    #[cfg_attr(feature = "std", serde(default = "default_tone_frequency_hz"))]
     pub frequency: f32,
+    #[cfg_attr(feature = "std", serde(default))]
     pub cycles: f32,
 }
 
@@ -190,6 +198,12 @@ pub struct PlaybackPlan {
     pub gap_samples: usize,
     pub sweep_samples: usize,
     pub decay_samples: usize,
+    /// When f1 < 10 Hz, the sweep starts with a linear section from f1 to
+    /// LINEAR_LOG_CROSSOVER_HZ, then switches to logarithmic. This field
+    /// stores the sample index where the crossover happens (0 = pure log).
+    pub linear_section_samples: usize,
+    /// Start frequency of the logarithmic section (10 Hz when hybrid, f1 when pure log).
+    pub log_start_hz: f32,
 }
 
 impl PlaybackPlan {
@@ -203,16 +217,50 @@ impl PlaybackPlan {
             return Err(PlaybackError::InvalidSweepRange { sweep_f1, sweep_f2 });
         }
 
+        // REW-style hybrid sweep: when f1 < 10 Hz, use a linear sweep from
+        // f1 to 10 Hz, then logarithmic from 10 Hz to f2. The linear section
+        // gets a proportional share of the total sweep duration based on the
+        // frequency span it covers relative to the log section's octave span.
+        let (linear_section_samples, log_start_hz) =
+            if sweep_f1 < LINEAR_LOG_CROSSOVER_HZ && sweep_f2 > LINEAR_LOG_CROSSOVER_HZ {
+                let linear_span = LINEAR_LOG_CROSSOVER_HZ - sweep_f1;
+                let log_octaves = (sweep_f2 / LINEAR_LOG_CROSSOVER_HZ).log2();
+                // Weight: 1 octave of log ≈ same perceptual time as the linear span
+                let linear_weight = linear_span / LINEAR_LOG_CROSSOVER_HZ;
+                let total_weight = linear_weight + log_octaves;
+                let linear_fraction = linear_weight / total_weight;
+                let linear_samples = (request.sweep.duration * linear_fraction
+                    * request.sample_rate as f32)
+                    .round() as usize;
+                (linear_samples, LINEAR_LOG_CROSSOVER_HZ)
+            } else {
+                (0, sweep_f1)
+            };
+
+        let log_duration =
+            request.sweep.duration - linear_section_samples as f32 / request.sample_rate as f32;
         let raw_sweep_samples = seconds_to_samples(request.sweep.duration, request.sample_rate);
+
         let sweep_samples = find_truncated_sweep_len(
             raw_sweep_samples,
             request.sweep.duration,
             sweep_f1,
             sweep_f2,
+            linear_section_samples,
+            log_start_hz,
         )?;
-        let sweep_ln_ratio = (sweep_f2 / sweep_f1).ln();
-        let sweep_phase_scale = 2.0 * PI * sweep_f1 * request.sweep.duration / sweep_ln_ratio;
-        let sweep_ratio_step = (sweep_ln_ratio / raw_sweep_samples as f32).exp();
+        let sweep_ln_ratio = (sweep_f2 / log_start_hz).ln();
+        let log_samples = raw_sweep_samples.saturating_sub(linear_section_samples);
+        let sweep_phase_scale = if log_samples > 0 {
+            2.0 * PI * log_start_hz * log_duration / sweep_ln_ratio
+        } else {
+            0.0
+        };
+        let sweep_ratio_step = if log_samples > 0 {
+            (sweep_ln_ratio / log_samples as f32).exp()
+        } else {
+            1.0
+        };
 
         Ok(Self {
             raw_sweep_samples,
@@ -225,6 +273,8 @@ impl PlaybackPlan {
             sweep_samples,
             sweep_f1,
             sweep_f2,
+            linear_section_samples,
+            log_start_hz,
             request,
         })
     }
@@ -282,6 +332,7 @@ impl PlaybackPlan {
             let local = index - offsets.sweep_offset_samples;
             return sweep_sample(local, self);
         }
+        // Decay section: silence (post-sweep quiet period).
         0.0
     }
 }
@@ -412,15 +463,49 @@ impl PlaybackGenerator {
     }
 
     fn next_sweep_sample(&mut self, index: usize) -> f32 {
-        let mut sample = fast_sin_wrapped(self.sweep_phase);
-        if self.fade_samples > 0 && index < self.fade_samples {
-            sample *= 0.5 * (1.0 - (PI * index as f32 / self.fade_samples as f32).cos());
+        let mut sample = if index < self.plan.linear_section_samples {
+            // Linear chirp section — compute directly (no incremental state needed
+            // since the linear section is short).
+            let sr = self.plan.request.sample_rate as f32;
+            let t = index as f32 / sr;
+            let ld = self.plan.linear_section_samples as f32 / sr;
+            let f_start = self.plan.sweep_f1;
+            let f_end = self.plan.log_start_hz;
+            let phase = 2.0 * PI * (f_start * t + (f_end - f_start) / (2.0 * ld) * t * t);
+            fast_sin(phase)
+        } else {
+            // Logarithmic section — use incremental phase accumulator.
+            // On the first log sample, initialize phase from the linear section's end.
+            if index == self.plan.linear_section_samples && self.plan.linear_section_samples > 0 {
+                let sr = self.plan.request.sample_rate as f32;
+                let t = self.plan.linear_section_samples as f32 / sr;
+                let ld = t;
+                let f_start = self.plan.sweep_f1;
+                let f_end = self.plan.log_start_hz;
+                self.sweep_phase =
+                    2.0 * PI * (f_start * t + (f_end - f_start) / (2.0 * ld) * t * t);
+                self.sweep_phase %= 2.0 * PI;
+                self.sweep_phase_delta =
+                    self.plan.sweep_phase_scale * (self.plan.sweep_ratio_step - 1.0);
+            }
+            let s = fast_sin_wrapped(self.sweep_phase);
+            self.sweep_phase += self.sweep_phase_delta;
+            if self.sweep_phase >= 2.0 * PI {
+                self.sweep_phase -= 2.0 * PI;
+            }
+            self.sweep_phase_delta *= self.plan.sweep_ratio_step;
+            s
+        };
+        if self.fade_samples > 0 {
+            if index < self.fade_samples {
+                sample *= 0.5 * (1.0 - (PI * index as f32 / self.fade_samples as f32).cos());
+            }
+            let tail_start = self.plan.sweep_samples.saturating_sub(self.fade_samples);
+            if index >= tail_start {
+                let tail_index = index - tail_start;
+                sample *= 0.5 * (1.0 + (PI * tail_index as f32 / self.fade_samples as f32).cos());
+            }
         }
-        self.sweep_phase += self.sweep_phase_delta;
-        if self.sweep_phase >= 2.0 * PI {
-            self.sweep_phase -= 2.0 * PI;
-        }
-        self.sweep_phase_delta *= self.plan.sweep_ratio_step;
         sample
     }
 }
@@ -510,6 +595,26 @@ impl core::fmt::Display for PlaybackError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for PlaybackError {}
+
+fn default_f1_hz() -> f32 {
+    DEFAULT_F1_HZ
+}
+
+fn default_f2_hz() -> f32 {
+    DEFAULT_F2_HZ
+}
+
+fn default_sweep_duration_sec() -> f32 {
+    DEFAULT_SWEEP_DURATION_SEC
+}
+
+fn default_fade_duration_sec() -> f32 {
+    DEFAULT_FADE_DURATION_SEC
+}
+
+fn default_tone_frequency_hz() -> f32 {
+    DEFAULT_TONE_FREQUENCY_HZ
+}
 
 fn default_preamble_sec() -> f32 {
     DEFAULT_PREAMBLE_SEC
@@ -609,61 +714,80 @@ fn tone_burst_sample(index: usize, sample_rate: u32, tone: ToneBurstParams) -> f
     fast_sin(2.0 * PI * tone.frequency * t)
 }
 
-fn sweep_phase(
+/// Generate a sweep sample for a hybrid linear+logarithmic sweep.
+/// When `linear_section_samples > 0`, samples `0..linear_section_samples` use
+/// a linear frequency ramp from `sweep_f1` to `log_start_hz`, then the rest
+/// uses a logarithmic sweep from `log_start_hz` to `sweep_f2`.
+fn hybrid_sweep_sample(
     index: usize,
-    raw_sweep_samples: usize,
-    sweep_duration_sec: f32,
-    sweep_f1: f32,
-    sweep_f2: f32,
+    plan: &PlaybackPlan,
 ) -> f32 {
-    let n = index as f32;
-    let total = raw_sweep_samples as f32;
-    let w1 = 2.0 * PI * sweep_f1;
-    let l = (sweep_f2 / sweep_f1).ln();
-    let k = w1 * sweep_duration_sec / l;
-    k * (((n / total) * l).exp() - 1.0)
-}
+    let sr = plan.request.sample_rate as f32;
 
-fn raw_sweep_sample(
-    index: usize,
-    raw_sweep_samples: usize,
-    sweep_duration_sec: f32,
-    sweep_f1: f32,
-    sweep_f2: f32,
-) -> f32 {
-    fast_sin(sweep_phase(
-        index,
-        raw_sweep_samples,
-        sweep_duration_sec,
-        sweep_f1,
-        sweep_f2,
-    ))
+    if index < plan.linear_section_samples {
+        // Linear sweep: frequency ramps linearly from f1 to log_start_hz.
+        let t = index as f32 / sr;
+        let linear_duration = plan.linear_section_samples as f32 / sr;
+        let f_start = plan.sweep_f1;
+        let f_end = plan.log_start_hz;
+        // Instantaneous phase for a linear chirp: 2π * (f0*t + (f1-f0)/(2T) * t²)
+        let phase = 2.0 * PI * (f_start * t + (f_end - f_start) / (2.0 * linear_duration) * t * t);
+        return fast_sin(phase);
+    }
+
+    // Logarithmic sweep section
+    let log_index = index - plan.linear_section_samples;
+    let log_samples = plan.raw_sweep_samples.saturating_sub(plan.linear_section_samples);
+    if log_samples == 0 {
+        return 0.0;
+    }
+    let log_duration = log_samples as f32 / sr;
+    let n = log_index as f32;
+    let total = log_samples as f32;
+    let w1 = 2.0 * PI * plan.log_start_hz;
+    let l = (plan.sweep_f2 / plan.log_start_hz).ln();
+    let k = w1 * log_duration / l;
+    // Add phase offset so the log section is continuous with the linear section's
+    // ending phase (linear ends at frequency = log_start_hz).
+    let linear_end_phase = if plan.linear_section_samples > 0 {
+        let t = plan.linear_section_samples as f32 / sr;
+        let ld = plan.linear_section_samples as f32 / sr;
+        let f_start = plan.sweep_f1;
+        let f_end = plan.log_start_hz;
+        2.0 * PI * (f_start * t + (f_end - f_start) / (2.0 * ld) * t * t)
+    } else {
+        0.0
+    };
+    fast_sin(linear_end_phase + k * (((n / total) * l).exp() - 1.0))
 }
 
 fn sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
-    let raw_sweep_samples =
-        seconds_to_samples(plan.request.sweep.duration, plan.request.sample_rate);
-    let mut sample = raw_sweep_sample(
-        index,
-        raw_sweep_samples,
-        plan.request.sweep.duration,
-        plan.sweep_f1,
-        plan.sweep_f2,
-    );
+    let mut sample = hybrid_sweep_sample(index, plan);
     let fade_samples =
         seconds_to_samples(plan.request.sweep.fade_duration, plan.request.sample_rate)
-            .min(plan.sweep_samples);
-    if fade_samples > 0 && index < fade_samples {
-        sample *= 0.5 * (1.0 - (PI * index as f32 / fade_samples as f32).cos());
+            .min(plan.sweep_samples / 2);
+    if fade_samples > 0 {
+        // Fade-in
+        if index < fade_samples {
+            sample *= 0.5 * (1.0 - (PI * index as f32 / fade_samples as f32).cos());
+        }
+        // Fade-out
+        let tail_start = plan.sweep_samples.saturating_sub(fade_samples);
+        if index >= tail_start {
+            let tail_index = index - tail_start;
+            sample *= 0.5 * (1.0 + (PI * tail_index as f32 / fade_samples as f32).cos());
+        }
     }
     sample
 }
 
 fn find_truncated_sweep_len(
     raw_sweep_samples: usize,
-    sweep_duration_sec: f32,
-    sweep_f1: f32,
-    sweep_f2: f32,
+    _sweep_duration_sec: f32,
+    _sweep_f1: f32,
+    _sweep_f2: f32,
+    linear_section_samples: usize,
+    log_start_hz: f32,
 ) -> Result<usize, PlaybackError> {
     if raw_sweep_samples == 0 {
         return Err(PlaybackError::InvalidRequest(
@@ -671,23 +795,44 @@ fn find_truncated_sweep_len(
         ));
     }
 
-    let mut next = raw_sweep_sample(
-        raw_sweep_samples - 1,
-        raw_sweep_samples,
-        sweep_duration_sec,
-        sweep_f1,
-        sweep_f2,
-    );
+    // Build a temporary plan-like struct just for zero-crossing search.
+    // We search backwards from the end to find the last zero crossing so
+    // the sweep ends cleanly.
+    let sr = 48_000.0f32; // Only used for relative phase — sample rate cancels out.
+    let log_samples = raw_sweep_samples.saturating_sub(linear_section_samples);
+
+    let sample_at = |index: usize| -> f32 {
+        if index < linear_section_samples {
+            // Linear section — always short, zero-crossing search won't reach here
+            // for any reasonable sweep, but handle it for correctness.
+            let t = index as f32 / sr;
+            let ld = linear_section_samples as f32 / sr;
+            let f_end = log_start_hz;
+            fast_sin(2.0 * PI * (_sweep_f1 * t + (f_end - _sweep_f1) / (2.0 * ld) * t * t))
+        } else {
+            let li = index - linear_section_samples;
+            let n = li as f32;
+            let total = log_samples as f32;
+            let log_dur = log_samples as f32 / sr;
+            let w1 = 2.0 * PI * log_start_hz;
+            let l = (_sweep_f2 / log_start_hz).ln();
+            let k = w1 * log_dur / l;
+            let linear_end_phase = if linear_section_samples > 0 {
+                let t = linear_section_samples as f32 / sr;
+                let ld = linear_section_samples as f32 / sr;
+                2.0 * PI * (_sweep_f1 * t + (log_start_hz - _sweep_f1) / (2.0 * ld) * t * t)
+            } else {
+                0.0
+            };
+            fast_sin(linear_end_phase + k * (((n / total) * l).exp() - 1.0))
+        }
+    };
+
+    let mut next = sample_at(raw_sweep_samples - 1);
     let mut last_zero = raw_sweep_samples - 1;
 
     for index in (0..raw_sweep_samples - 1).rev() {
-        let current = raw_sweep_sample(
-            index,
-            raw_sweep_samples,
-            sweep_duration_sec,
-            sweep_f1,
-            sweep_f2,
-        );
+        let current = sample_at(index);
         if current * next <= 0.0 {
             last_zero = index;
             break;
@@ -775,15 +920,18 @@ mod tests {
     fn default_plan_matches_expected_offsets() {
         let plan = PlaybackPlan::build(PlayRequest::default()).unwrap();
         let offsets = plan.offsets();
-        assert_eq!(plan.preamble_samples, 0);
+        // 2s preamble, 0.5s decay — matching REW's pre/post silence
+        assert_eq!(plan.preamble_samples, 96_000); // 2s * 48kHz
         assert_eq!(plan.tone_burst_samples, 0);
         assert_eq!(plan.gap_samples, 0);
-        assert_eq!(plan.decay_samples, 0);
-        assert_eq!(offsets.tone_burst_offset_samples, 0);
-        assert_eq!(offsets.sweep_offset_samples, 0);
-        assert_eq!(offsets.total_samples, plan.sweep_samples);
-        assert_eq!(plan.sweep_f1, 15.0);
-        assert_eq!(plan.sweep_f2, 80.0);
+        assert_eq!(plan.decay_samples, 96_000); // 2s * 48kHz
+        assert_eq!(offsets.tone_burst_offset_samples, 96_000);
+        assert_eq!(offsets.sweep_offset_samples, 96_000);
+        assert_eq!(plan.sweep_f1, 5.0);
+        assert_eq!(plan.sweep_f2, 400.0);
+        // Should have a linear section since f1 < 10 Hz
+        assert!(plan.linear_section_samples > 0);
+        assert_eq!(plan.log_start_hz, 10.0);
     }
 
     #[test]

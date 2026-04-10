@@ -4,7 +4,6 @@
 //! 64-byte chunking mode. Non-zero padding between frames is skipped.
 
 use crate::state::DaemonState;
-use minidsp::queue::Priority;
 use minidsp_protocol::packet;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,13 +48,14 @@ pub async fn serve(addr: &str, state: Arc<DaemonState>) -> std::io::Result<()> {
 
                         if let Some(payload) = payload {
                             if let Some(client) = state.get_device(0).await {
-                                let request = payload.clone();
-                                match client.queue().execute_raw(payload, Priority::Normal).await {
+                                match crate::bridge::execute_raw_bridge_command(
+                                    &state,
+                                    &client,
+                                    payload,
+                                )
+                                .await
+                                {
                                     Ok(raw_resp) => {
-                                        client
-                                            .mirror_raw_command_if_success(&request, &raw_resp)
-                                            .await;
-                                        state.persist_device_shadow(&client).await;
                                         // Respond in 64-byte padded frame for WI-DG
                                         let frame = packet::encode_frame(&raw_resp);
                                         let mut padded = vec![0u8; 64];
@@ -80,17 +80,14 @@ pub async fn serve(addr: &str, state: Arc<DaemonState>) -> std::io::Result<()> {
                                 read_buf.drain(..consumed);
 
                                 if let Some(client) = state.get_device(0).await {
-                                    let request = payload.clone();
-                                    match client
-                                        .queue()
-                                        .execute_raw(payload, Priority::Normal)
-                                        .await
+                                    match crate::bridge::execute_raw_bridge_command(
+                                        &state,
+                                        &client,
+                                        payload,
+                                    )
+                                    .await
                                     {
                                         Ok(raw_resp) => {
-                                            client
-                                                .mirror_raw_command_if_success(&request, &raw_resp)
-                                                .await;
-                                            state.persist_device_shadow(&client).await;
                                             let frame = packet::encode_tcp_response(&raw_resp);
                                             if let Err(e) = stream.write_all(&frame).await {
                                                 tracing::warn!("TCP bridge write error: {e}");

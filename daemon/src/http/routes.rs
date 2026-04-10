@@ -243,18 +243,14 @@ async fn ws_raw_handler(
     client: Arc<minidsp::client::MiniDspClient>,
     state: Arc<DaemonState>,
 ) {
-    use minidsp::queue::Priority;
-
     while let Some(msg) = socket.recv().await {
         match msg {
             Ok(Message::Binary(data)) => {
                 // Decode frame and execute
                 if let Some(payload) = minidsp_protocol::packet::decode_frame(&data) {
-                    let request = payload.clone();
-                    match client.queue().execute_raw(payload, Priority::Normal).await {
+                    match crate::bridge::execute_raw_bridge_command(&state, &client, payload).await
+                    {
                         Ok(resp) => {
-                            client.mirror_raw_command_if_success(&request, &resp).await;
-                            state.persist_device_shadow(&client).await;
                             let frame = minidsp_protocol::packet::encode_frame(&resp);
                             if socket.send(Message::Binary(frame.into())).await.is_err() {
                                 return;
@@ -582,13 +578,8 @@ async fn set_preset(
     Path((id, preset)): Path<(usize, u8)>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
-    client
-        .set_config(preset)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     let master = client
-        .get_master_status()
+        .set_config(preset)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let source_name = client

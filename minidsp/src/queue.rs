@@ -36,7 +36,7 @@ struct QueuedCommand {
     allow_unknown_response: bool,
     #[allow(dead_code)]
     batch_id: Option<u64>,
-    deadline: Instant,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +190,7 @@ impl CommandQueue {
                 response_tx: tx,
                 allow_unknown_response,
                 batch_id: None,
-                deadline: Instant::now() + timeout,
+                timeout,
             });
         }
         self.notify.notify_one();
@@ -220,7 +220,7 @@ impl CommandQueue {
                     response_tx: tx,
                     allow_unknown_response: false,
                     batch_id: Some(batch_id),
-                    deadline: Instant::now() + Duration::from_secs(30),
+                    timeout: Duration::from_secs(30),
                 });
                 receivers.push(rx);
             }
@@ -282,12 +282,6 @@ impl CommandQueue {
 
         let Some(cmd) = cmd else { return };
 
-        // Check deadline
-        if Instant::now() > cmd.deadline {
-            let _ = cmd.response_tx.send(Err(TransportError::Timeout));
-            return;
-        }
-
         loop {
             match self.execute_queued_command(&cmd).await {
                 Ok(response) => {
@@ -313,6 +307,7 @@ impl CommandQueue {
         cmd: &QueuedCommand,
     ) -> Result<QueueResponse, TransportError> {
         let transport = self.transport.lock().await;
+        let deadline = Instant::now() + cmd.timeout;
         let request_opcode = cmd
             .payload
             .first()
@@ -323,7 +318,7 @@ impl CommandQueue {
 
         loop {
             let raw = match transport
-                .recv_frame(remaining_timeout_ms(cmd.deadline)?.min(500))
+                .recv_frame(remaining_timeout_ms(deadline)?.min(500))
                 .await
             {
                 Ok(raw) => raw,
@@ -829,6 +824,46 @@ mod tests {
             .expect("queue should keep polling until ack arrives before the deadline");
 
         assert!(matches!(resp, Response::Ack));
+    }
+
+    #[tokio::test]
+    async fn queued_commands_start_timeout_when_dispatched() {
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([
+            Ok(vec![commands::RESP_OK]),
+            Ok(vec![commands::RESP_OK]),
+        ])));
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+
+        {
+            let mut queues = queue.queues.lock().await;
+            queues[Priority::High as usize].push_back(QueuedCommand {
+                payload: commands::set_source(1),
+                priority: Priority::High,
+                response_tx: tx1,
+                allow_unknown_response: false,
+                batch_id: None,
+                timeout: Duration::from_millis(5),
+            });
+            queues[Priority::High as usize].push_back(QueuedCommand {
+                payload: commands::set_source(2),
+                priority: Priority::High,
+                response_tx: tx2,
+                allow_unknown_response: false,
+                batch_id: None,
+                timeout: Duration::from_millis(5),
+            });
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        queue.process_next().await;
+        queue.process_next().await;
+
+        let first = rx1.await.expect("first response channel");
+        let second = rx2.await.expect("second response channel");
+        assert!(matches!(first.expect("first response"), QueueResponse { parsed: Response::Ack, .. }));
+        assert!(matches!(second.expect("second response"), QueueResponse { parsed: Response::Ack, .. }));
     }
 
     #[test]

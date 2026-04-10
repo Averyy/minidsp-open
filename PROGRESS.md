@@ -23,6 +23,7 @@ Permanent technical detail belongs in:
   - fresh low-address DSP100 reads can still return bogus raw words like `0x4A039901` at compressor/FIR slots, so `/config` now clamps those fields to verified shadow or conservative `0` instead of surfacing garbage values
   - when local shadow is missing for a preset, the daemon can now import the official Device Console `setting*.xml` snapshot for that preset if its XML timestamp matches the live hardware modification token, which lets fresh daemon attaches recover sane routing/FIR/compressor state from the official app's own saved preset data instead of guessing
 - Desktop `/devices/{id}/play` is now implemented with the shared `PlaybackPlan` / `PlaybackGenerator` path used by ESP32.
+- Desktop `/play` now uses the shared REW/MSO-style measurement sweep defaults (`5-400 Hz` hybrid sweep, `2 s` low-level dither pre-silence, `2 s` post-silence, `16-bit`) instead of the retired subwoofer-only baseline.
 - Desktop playback backend is smoke-tested on local speakers: the default sweep plays audibly through the CPAL path and reports a real `startedAtUs` timestamp.
 - Desktop queue reconnect now re-acquires transports on disconnect and replays idempotent pending PEQ batch writes after reconnect.
 - Measurement-mode saved PEQ state now persists in daemon state so restore survives client rebuild/reconnect.
@@ -33,11 +34,12 @@ Permanent technical detail belongs in:
   - clean `/play` runs on physical output `2` complete with exact expected byte counts and `TX_DONE=0`, but the default signal still sounds like repeated `BRAP` bursts instead of a smooth subwoofer sweep
   - a cleaner custom request (`16-bit`, no preamble/tone burst/gap/decay, `50-80 Hz`) sounds slightly better but is still wrong / too high-pitched
   - that keeps the current suspicion on our generated signal shape and/or PCM formatting, not on a driver underrun or sample-clock bug
-- Shared `/play` defaults were then changed to a plain exact-band subwoofer baseline:
-  - default request is now `15-80 Hz`, `8 s`, `16-bit`, no preamble, no tone burst, no gap, no decay
-  - the generator now uses the exact requested sweep band instead of silently expanding to `f1/2 .. 2*f2`
-  - desktop direct-USB `/play` on the physical 2x4 HD now returns `sweepOffsetSamples=0`, `toneBurstOffsetSamples=0`, and `totalSamples=383918` with source/routing unchanged before and after playback
-  - audible confirmation on the real sub is still required before treating the new default as fully validated
+- Shared `/play` defaults were then updated again to match REW/MSO-style measurement conventions:
+  - default request is now a `5-400 Hz`, `5.46 s`, `16-bit` sweep with `2 s` low-level dither pre-silence, `2 s` post-silence, and `20 ms` raised-cosine fade-in/out
+  - when the sweep starts below `10 Hz`, the generator now follows REW's hybrid behavior: linear chirp from `5 Hz` to `10 Hz`, then logarithmic from `10 Hz` to `400 Hz`
+  - desktop direct-USB `/play` on the physical 2x4 HD now uses `toneBurstOffsetSamples=96000`, `sweepOffsetSamples=96000`, and `totalSamples=454058` while keeping source/routing unchanged before and after playback
+  - the older measurement-bundle default (`5-500 Hz` with BRAP bursts) remains retired as historical context only
+  - audible confirmation on the real sub is still required before treating the current default as fully validated
 - ESP32 HID and UAC2 reconnect now recover on the physical 2x4 HD across the three important attach cases:
   - unplug/replug while the ESP32 stays up
   - MiniDSP appears later while the ESP32 is already running
@@ -83,12 +85,16 @@ Permanent technical detail belongs in:
   - on the physical 2x4 HD, writing `0.5 ms` now lands as `48` samples and reads back as `0.5 ms`
 - Live direct-USB verification on 2026-04-09 also fixed desktop preset-switch semantics on the physical 2x4 HD:
   - the real device returns an immediate raw `Ack` for `SetConfig`; the old shared queue behavior that waited for a second preset-only completion frame was wrong for this path
-  - the shared queue now returns the first valid `SetConfig` response immediately, and high-level `set_config()` verifies the change by polling master-status readback until the requested preset is active
-  - live desktop checks on the physical 2x4 HD now show `config 0`, `config 1`, raw `debug send 250000/250100`, and `POST /devices/0/preset/{preset}` all completing in about `20-30 ms` with matching before/after preset readback
+  - the shared queue now returns the first valid `SetConfig` response immediately, but high-level control surfaces intentionally wait for master-status confirmation before reporting success
+  - re-verification on 2026-04-10 on the same physical 2x4 HD showed the real apply window is about `5.0-5.4 s` across every tested surface:
+    - `POST /devices/0/preset/2` in `5.02 s`
+    - `minidsp --daemon-url http://127.0.0.1:5382 config 3` in `5.37 s`
+    - `minidsp --url tcp://127.0.0.1:5333 config 1` in `5.38 s`
+    - compatibility `POST /devices/0 {"preset":0}` in `5.32 s`
 - Live direct-USB verification on 2026-04-09 also fixed long-running desktop flash/state commands on the physical 2x4 HD:
   - the shared queue now gives `CopyPreset (0x27)` and `Reset (0x03)` a longer default deadline instead of the generic `10 s` command timeout
-  - `POST /devices/0/preset/copy` now returns `200` in `22.92 s`, matching the official Device Console session that took about `22.87 s` from `0x27` send to `Received OK`
-  - raw reset through the daemon path now returns `ResetComplete` in about `6.56 s`, and the daemon remained healthy enough to serve `GET /devices/0` immediately afterward
+  - `POST /devices/0/preset/copy` returned `200` in `23.02 s` on 2026-04-10 with an empty body (`Content-Length: 0`), matching the official Device Console session that took about `22.87 s` from `0x27` send to `Received OK`
+  - raw reset through the daemon path now returns framed `aa` in about `6.7 s`; on 2026-04-10 the live daemon log showed `HID OUT payload: [03]`, a timeout fallback into master-status polling, an undecodable `ff f1 ...` packet during the reset window, and then normal `0xFFD8` recovery instead of a decodable device-side `0xAA`
   - the preset-copy route now persists refreshed daemon shadow/token state after the successful flash save instead of leaving the cache stale
 - Live direct-USB verification on 2026-04-09 also fixed desktop source-switch semantics on the physical 2x4 HD:
   - the device emits a stale `ReadFlash`-shaped `0xFFA9` notification after source changes, and also reuses the short-form `ReadFloats` meter reply shape
@@ -137,10 +143,13 @@ Permanent technical detail belongs in:
   - `/devices/0?poll=true` sending an immediate status frame on connect
   - `/devices/0?levels=true&poll=true` continuing to stream state/levels while source writes stay fast and preset writes still return `200`
   - clean live reruns on 2026-04-09 showed `POST /devices/0/source/Usb` / `/source/Analog` still completing in about `11 ms` / `6 ms` with the polling socket attached
-  - the same live reruns showed `POST /devices/0/preset/0` / `/preset/1` taking about `2.83 s` with the polling socket attached instead of the `20-30 ms` seen without it
   - the official raw Device Console capture shows the same preset-change shape on this hardware: `0x25` acknowledged immediately at `2026-04-09T19:30:52.875Z`, but the first follow-up `0x14` status reply did not arrive until `2026-04-09T19:30:56.185Z`
   - the websocket meter cadence now matches the official app's `500 ms` polling rhythm and no longer injects an extra immediate post-connect tick
   - `/devices/0/ws` ignoring text frames and still returning the correct framed binary reply to a `ReadHardwareId` request
+  - manual stdlib WebSocket checks on 2026-04-10 re-verified `/devices/0?poll=true`, `/devices/0?levels=true&poll=true`, and `/devices/0/ws` on the live daemon:
+    - `/devices/0?poll=true` delivered an immediate status frame with the current preset/source
+    - `/devices/0?levels=true&poll=true` delivered an immediate state/levels frame with `2` input levels and `4` output levels
+    - `/devices/0/ws` ignored a text frame and still returned the correct framed `ReadHardwareId` reply
 - Live direct-USB verification on 2026-04-09 also fixed the desktop DSP100 / 2x4 HD FIR load path:
   - the shared DSP100 output profile now includes FIR definitions for all four outputs, so output FIR is no longer treated as unsupported on the 2x4 HD
   - the real device returns `FirLoadStart` size bytes as big-endian; on the tested 2x4 HD, `[0x39, 0x08, 0x00]` means `0x0800 = 2048` coefficients, not `8`
@@ -212,7 +221,8 @@ Permanent technical detail belongs in:
 - [ ] Capture or otherwise verify the physical output duration of ESP32 `/play` on the real 2x4 HD now that software timing and repeated-play stability are characterized.
 - [ ] Validate the new shared `/play` default signal on the real sub and keep iterating until it sounds like a normal smooth low-frequency sweep:
   - the previous measurement-bundle default (`5-500 Hz`, `24-bit`, `2 s` preamble, `80 Hz` tone burst, `0.2 s` gap, `2 s` decay, hidden guard-band expansion) was retired after it produced repeated `BRAP` bursts on hardware
-  - the current shared default is now an exact-band `15-80 Hz`, `8 s`, `16-bit` sweep with no extra marker sections
+  - the current shared default is now a REW/MSO-style `5-400 Hz`, `5.46 s`, `16-bit` hybrid sweep with `2 s` low-level dither pre-silence, `2 s` post-silence, and `20 ms` raised-cosine fade-in/out
+  - below `10 Hz`, the current default intentionally uses a linear `5-10 Hz` section before switching to logarithmic `10-400 Hz`
   - if the new default is still wrong, the next suspect is PCM/sample-format behavior rather than routing or HID transport
 - [ ] Verify remaining `/play` compatibility edges on hardware where possible:
   - malformed request handling

@@ -196,20 +196,35 @@ impl Transport for HidTransport {
                 let dev = device
                     .lock()
                     .map_err(|e| TransportError::Hid(e.to_string()))?;
-                let mut buf = [0u8; packet::HID_REPORT_SIZE];
-                let timeout = timeout_ms.min(i32::MAX as u64) as i32;
-                let n = dev
-                    .read_timeout(&mut buf, timeout)
-                    .map_err(|e| map_hid_error(e.to_string()))?;
-                if n == 0 {
-                    return Err(TransportError::Timeout);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(TransportError::Timeout);
+                    }
+
+                    let mut buf = [0u8; packet::HID_REPORT_SIZE];
+                    let timeout = remaining.as_millis().min(i32::MAX as u128) as i32;
+                    let n = dev
+                        .read_timeout(&mut buf, timeout)
+                        .map_err(|e| map_hid_error(e.to_string()))?;
+                    if n == 0 {
+                        return Err(TransportError::Timeout);
+                    }
+                    tracing::debug!("HID IN raw ({}): {:02x?}", n, &buf[..n]);
+                    let decoded = packet::decode_hid_response(&buf[..n]);
+                    if let Some(ref payload) = decoded {
+                        tracing::debug!("HID IN payload: {:02x?}", payload);
+                        return Ok(payload.clone());
+                    }
+
+                    tracing::warn!(
+                        "HID: undecodable input packet ({} bytes), skipping",
+                        n
+                    );
                 }
-                tracing::debug!("HID IN raw ({}): {:02x?}", n, &buf[..n]);
-                let decoded = packet::decode_hid_response(&buf[..n]);
-                if let Some(ref payload) = decoded {
-                    tracing::debug!("HID IN payload: {:02x?}", payload);
-                }
-                decoded.ok_or_else(|| TransportError::Hid("failed to decode HID response".into()))
             })
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?

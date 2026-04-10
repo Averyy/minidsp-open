@@ -10,6 +10,7 @@ Current planning note:
 - use this checklist for compatibility verification, and use `PROGRESS.md`, `docs/ref-device-coverage.md`, `docs/ref-devices.md`, and `docs/ref-legacy-devices.md` to track importer-driven support expansion
 - if imported matrix assumptions conflict with live 2x4 HD behavior, treat the 2x4 HD result as authoritative until the conflict is explained
 - keep `/play` audio-quality investigation separate from routing/control verification so audible sweep bugs do not get misdiagnosed as HID/config bugs
+- when judging `/play` audio quality, use the current shared REW/MSO-style default (`5-400 Hz` hybrid sweep with `2 s` low-level dither pre-silence and `2 s` post-silence), not the retired `BRAP`-bundle default
 
 ## Exit Criteria
 
@@ -167,6 +168,7 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
   Updated 2026-04-09 daemon finding: `POST /devices/0/config` changed output-0 compressor state on the physical 2x4 HD and a fresh daemon restart still returned the same values, so desktop app/daemon visibility for these fields is now covered by token-gated scalar shadow restore even though live authoritative readback is still incomplete.
   Updated 2026-04-09 token-model finding: a no-op compressor `/config` write now also advances the active preset modification token through the daemon, matching the official app's explicit token-save behavior instead of relying on raw DSP writes to touch `0xFFC8`.
   Updated 2026-04-10 recovery-model finding: if the local daemon cache is missing a preset, the desktop daemon can now import the matching official Device Console `setting*.xml` snapshot when its `<timestamp>` matches the hardware token for that preset, so fresh attach still recovers sane controller-side compressor state without pretending raw low-address `0x14` became authoritative.
+  Re-verified on 2026-04-10 on the physical 2x4 HD: after starting the daemon with a fresh config home, switching to presets `2` and `3` still produced sane `/devices/0/config` compressor/FIR state, confirming that token-matched official XML import is closing those missing-shadow presets on live hardware.
 - [x] FIR subcommand
   Verified on 2026-04-09 on the physical 2x4 HD:
   desktop `POST /devices/0/config` with output FIR coefficients returned `200`, raw coeff readback at `4183..` matched the requested six-tap pattern, and same-client `GET /devices/0/config` reported `active_taps: 6` with `bypass: false`.
@@ -227,13 +229,13 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 - [x] `POST /devices/{id}/config`
   Verified on 2026-04-09 on the physical 2x4 HD across both input rows, outputs `2` and `3`, and all eight routing edges with before/after readback through `GET /devices/0/config`.
 - [x] `GET /devices/{id}/config`
-  Re-verified on 2026-04-10: output-0 compressor `knee` now falls back to `0.0` and output-0 FIR `active_taps` now fall back to `0` instead of surfacing bogus low-address DSP100 words when no verified shadow is present after a fresh daemon restart.
+  Re-verified on 2026-04-10: output-0 compressor `knee` now falls back to `0.0` and output-0 FIR `active_taps` now fall back to `0` instead of surfacing bogus low-address DSP100 words when no verified shadow is present after a fresh daemon restart. The same fresh-daemon run also recovered sane routing/compressor/FIR state on presets `2` and `3`, confirming the token-matched official XML import path for missing preset shadow.
 - [x] `POST /devices/{id}/volume/{direction}`
 - [x] `POST /devices/{id}/source/{source}`
 - [x] `POST /devices/{id}/preset/{preset}`
-  Verified on 2026-04-09 on the physical 2x4 HD: `POST /devices/0/preset/0` / `1` returned `200` in about `23 ms` with matching before/after preset readback.
+  Re-verified on 2026-04-10 on the physical 2x4 HD: verified preset-switch surfaces now intentionally wait for master-status confirmation instead of returning on the transport ack. `POST /devices/0/preset/2` completed in `5.02 s`, `minidsp --daemon-url http://127.0.0.1:5382 config 3` completed in `5.37 s`, `minidsp --url tcp://127.0.0.1:5333 config 1` completed in `5.38 s`, and compatibility `POST /devices/0 {"preset":0}` completed in `5.32 s`.
 - [x] `POST /devices/{id}/preset/copy`
-  Verified on 2026-04-09 on the physical 2x4 HD: `POST /devices/0/preset/copy` returned `200` in `22.92 s`, matching the official Device Console `0x27` timing (`2026-04-08 15:14:04.417` send -> `2026-04-08 15:14:27.284` OK).
+  Re-verified on 2026-04-10 on the physical 2x4 HD: `POST /devices/0/preset/copy` returned `200` in `23.02 s`, matching the official Device Console `0x27` timing (`2026-04-08 15:14:04.417` send -> `2026-04-08 15:14:27.284` OK), and the route correctly returned an empty success body (`Content-Length: 0`).
 
 ### 3.3 Response-shape checks
 
@@ -248,29 +250,29 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 - [x] `/devices/{id}?levels=true&poll=true`
 - [x] initial status is sent immediately on connect
 - [x] level polling and state polling both work without breaking write operations
-  Verified on 2026-04-09 on the physical 2x4 HD: `/devices/0?poll=true` sent an immediate status frame, `/devices/0?levels=true&poll=true` streamed state/levels, `POST /devices/0/source/Usb` / `/source/Analog` still completed in about `11 ms` / `6 ms`, and `POST /devices/0/preset/0` / `/preset/1` still returned `200` while the polling socket was live. On the tested path those preset writes took about `2.83 s`, which matches the captured official Device Console pattern (`0x25` ack immediately, first follow-up `0x14` status reply about `3.31 s` later).
+  Re-verified on 2026-04-10 on the physical 2x4 HD: manual WebSocket handshakes showed `/devices/0?poll=true` returning an immediate status frame and `/devices/0?levels=true&poll=true` returning an immediate state/levels frame with `2` input levels and `4` output levels. Sequential live reruns on the same daemon/build still showed `POST /devices/0/source/Usb` / `/source/Analog` completing in about `5-8 ms`; preset-switch surfaces now wait for the full hardware apply window (`~5 s`) rather than the early transport ack.
 
 ### 3.5 Raw frame bridge
 
 - [x] `/devices/{id}/ws` accepts framed binary commands
 - [x] binary response framing is correct
 - [x] text behavior does not break compatibility clients
-  Verified on 2026-04-09 on the physical 2x4 HD: `/devices/0/ws` ignored an incoming text frame and still returned the correct framed binary `ReadHardwareId` response.
+  Re-verified on 2026-04-10 on the physical 2x4 HD: `/devices/0/ws` ignored an incoming text frame and still returned the correct framed binary `ReadHardwareId` response.
 - [x] slow raw state commands survive the daemon bridge timeout budget
-  Verified on 2026-04-09 on the physical 2x4 HD: `minidsp --daemon-url http://127.0.0.1:5380 debug send 03` returned `ResetComplete`; the live daemon log showed `HID OUT payload: [03]` at `22:29:42.994` and `HID IN payload: [aa]` at `22:29:49.557`.
+  Re-verified on 2026-04-10 on the physical 2x4 HD: `minidsp --daemon-url http://127.0.0.1:5382 debug send 03` returned framed `aa` in about `6.7 s`. The live daemon log showed `HID OUT payload: [03]`, then timeout fallback into master-status polling, then an undecodable `ff f1 ...` packet before normal `0xFFD8` reads recovered, so the bridge no longer depends on the device returning a decodable raw `0xAA`.
 
 ### 3.6 Unix socket
 
 - [x] CLI preflight via `--daemon-sock` works.
 - [x] direct daemon discovery over Unix socket works.
 - [x] WebSocket upgrade over Unix socket works.
-  Verified on 2026-04-09 via `minidsp --daemon-sock /tmp/minidsp.sock status` and default `minidsp status` against the local desktop daemon on the physical 2x4 HD.
+  Re-verified on 2026-04-10 via `minidsp --daemon-sock /tmp/minidsp.sock status` against the local desktop daemon on the physical 2x4 HD.
 
 ### 3.7 Daemon URL
 
 - [x] CLI preflight via `--daemon-url` works.
 - [x] direct WS connect through daemon URL works.
-  Verified on 2026-04-09 by live `config 0` / `config 1` and raw `debug send 250000` / `250100` against the physical 2x4 HD.
+  Re-verified on 2026-04-10 by live `config 3`, raw `debug send 31`, and raw `debug send 03` against the physical 2x4 HD.
 - [x] device index validation works.
   Verified on 2026-04-09 via `MINIDSPD_URL=http://127.0.0.1:5380 MINIDSP_INDEX=1 minidsp status`, which correctly returned `device index 1 out of range (found 1 device)`.
 
