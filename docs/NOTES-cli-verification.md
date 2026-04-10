@@ -253,10 +253,11 @@ Before doing another broad CLI validation pass:
 
 ### TCP bridge write-ack framing fix
 
-- **Bug closed.** The official Device Console crashed with `Error: Unexpected DSP command code 1` on every write command when connecting to the daemon via TCP bridge. Root cause: `protocol/src/packet.rs::decode_hid_response` for the `0x01`-prefix unframed-echo case returned `data[1..].to_vec()` — all 63 trailing HID buffer bytes — instead of trimming to the actual echo length.
-- Fix at `minidsp/src/queue.rs::execute_queued_command`: when the request opcode is a write command and the oversized response first byte matches the request opcode, truncate to `cmd.payload.len()`. Same trim in `app-esp32/src/device.rs::raw_command`.
-- Python TCP client verification on the physical 2x4 HD: `WriteDSP` 64→9 bytes, `SetVolume` 64→3 bytes, `SetMute` 64→3 bytes. Read responses unchanged.
+- **Wire-format bug fixed.** The official Device Console crashed with `Error: Unexpected DSP command code 1` on every write command when connecting to the daemon via TCP bridge (screen capture in `app/minidsp-snapshots/20260410-firstattach-experiment/`). Root cause: `protocol/src/packet.rs::decode_hid_response` for the `0x01`-prefix unframed-echo case returned `data[1..].to_vec()` — all 63 trailing HID buffer bytes — instead of trimming to the actual echo length. The oversized payload contained stale HID garbage, and the Device Console's parser hit a literal `0x01` byte inside the trailing junk.
+- Fix at `minidsp/src/queue.rs::execute_queued_command`: when the request opcode is a write command and the oversized response first byte matches the request opcode, truncate to `cmd.payload.len()`. Same trim in `app-esp32/src/device.rs::raw_command`. Shared `is_write_command` helper added in `protocol/src/commands.rs`.
+- Python TCP client verification on the physical 2x4 HD: `WriteDSP` 64→9 bytes, `SetVolume` 64→3 bytes, `SetMute` 64→3 bytes. Read responses unchanged at 12 bytes each. All response length bytes are now self-consistent and all first-payload bytes are valid DSP opcodes.
 - Two new unit tests added to `minidsp/src/queue.rs`: `write_dsp_response_trimmed_to_request_length` and `read_floats_response_not_trimmed`.
+- **Pending (end-to-end verification):** the actual official Device Console Electron app has not yet been exercised against the fixed daemon. The Python wire-level fix is a strong signal that the specific parser crash can no longer occur, but Device Console may have additional format expectations we have not tested. Tracked under Active Work in `PROGRESS.md` and `docs/todo-checker.md` Section 4.2.
 
 ### DSP100 authoritative-state investigation — CLOSED
 
@@ -276,5 +277,5 @@ Before doing another broad CLI validation pass:
 - Device Console writes compressor edits through the same `0x13` DSP100 slots this repo already uses and still polls only the compressor meter path nearby.
 - Device Console also compares XML/device modification tokens and explicitly writes a fresh active-preset token after preset-content updates; the desktop daemon now mirrors that behavior for `/config` and measurement-mode mutations.
 - **DSP100 authoritative-state reverse engineering task is closed (2026-04-10).** The official app has the same workaround rule we do; there is no stronger readback path to find.
-- **TCP bridge write-ack framing bug is fixed (2026-04-10).** Official Device Console now connects without crashing.
+- **TCP bridge write-ack framing wire-format bug is fixed (2026-04-10).** Python TCP client confirms response sizes and first-byte opcodes are now valid. End-to-end verification against the official Device Console Electron app is still pending.
 - Remaining DSP100 gap: compressor parameter effect/readback parity beyond threshold/gain. Addresses and polarity are now confirmed correct; the remaining issue is most likely test methodology rather than protocol mismatch.

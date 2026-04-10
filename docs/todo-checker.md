@@ -289,9 +289,13 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 
 ### 4.2 Device Console compatibility
 
-- [ ] Device Console discovers the daemon/device through UDP discovery.
+- [x] Device Console discovers the daemon/device through UDP discovery.
+  - Verified 2026-04-10 on macOS: the official MiniDSP Device Console (patched capture build in `app/MiniDSP Device Console.app/`) displayed our `minidsp server` daemon as a network device at the Mac's LAN IP with matching serial `12345`. Our UDP broadcast packet format is close enough to the real hardware's format that the app treats it as a legitimate network-attached 2x4 HD. See `app/minidsp-snapshots/20260410-firstattach-experiment/device-console-firstattach.jsonl`.
 - [ ] Device Console connects through the TCP bridge.
+  - **Wire-format fix landed 2026-04-10** (`minidsp/src/queue.rs::execute_queued_command`, `app-esp32/src/device.rs::raw_command`, helper `protocol/src/commands.rs::is_write_command`). Python TCP client verification on the physical 2x4 HD confirmed write-ack response sizes are now correct (`WriteDSP` 64→9, `SetVolume` 64→3, `SetMute` 64→3) and the specific `Unexpected DSP command code 1` crash signature can no longer be produced by our TCP bridge. Tests added in `minidsp/src/queue.rs`: `write_dsp_response_trimmed_to_request_length`, `read_floats_response_not_trimmed`.
+  - **Still unchecked:** the actual official Device Console Electron app has not yet been exercised against the fixed daemon. Launch the daemon, open the app, click the network device entry, confirm the connection completes without a JS error.
 - [ ] Device Console can perform normal interactive operations through the bridge.
+  - **Required once the basic connect succeeds:** read master status, change volume, toggle mute, switch source, switch preset, view routing matrix, view/edit PEQ bands, view/edit compressor params. Record each via the HID capture log (`MINIDSP_DC_HID_LOG=/tmp/minidsp-bridge-verify.jsonl`) and confirm the app does not crash or show state corruption.
 
 ### 4.3 Coexistence / arbitration
 
