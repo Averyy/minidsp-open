@@ -230,32 +230,14 @@ pub fn start(
                 // Inline sine test: bypass PlaybackGenerator and PSRAM entirely.
                 // Generates sin(2πft) into a stack buffer in a tight write loop,
                 // identical to the standalone driver test harness.
-                let usb_index = match dev.profile().sources.index_for_source(Source::Usb) {
-                    Some(index) => index,
-                    None => {
-                        audio.finish_playback();
-                        return send_error(req, 500, "USB source missing from device profile");
-                    }
-                };
-                let (source_changed, previous_source, restore_source) = {
-                    let _op = dev.begin_operation();
-                    let current_source = match dev.current_source() {
-                        Ok(Some(source)) => source,
-                        _ => {
+                let (source_changed, previous_source, restore_source) =
+                    match switch_to_usb_source(&dev) {
+                        Ok(result) => result,
+                        Err((code, msg)) => {
                             audio.finish_playback();
-                            return send_error(req, 500, "current source unavailable");
+                            return send_error(req, code, &msg);
                         }
                     };
-                    if current_source == Source::Usb {
-                        (false, None, None)
-                    } else {
-                        if let Err(err) = dev.set_source(usb_index) {
-                            audio.finish_playback();
-                            return send_error(req, 500, &format!("set_source: {err}"));
-                        }
-                        (true, Some(current_source.to_string()), Some(current_source))
-                    }
-                };
 
                 let (tx, rx) = mpsc::sync_channel(1);
                 let dev_for_thread = dev.clone();
@@ -328,42 +310,14 @@ pub fn start(
                 }
             };
 
-            let usb_index = match dev.profile().sources.index_for_source(Source::Usb) {
-                Some(index) => index,
-                None => {
-                    audio.finish_playback();
-                    return send_error(req, 500, "USB source missing from device profile");
-                }
-            };
-
-            let (source_changed, previous_source, restore_source) = {
-                let _op = dev.begin_operation();
-                let current_source = match dev.current_source() {
-                    Ok(Some(source)) => source,
-                    Ok(None) => {
+            let (source_changed, previous_source, restore_source) =
+                match switch_to_usb_source(&dev) {
+                    Ok(result) => result,
+                    Err((code, msg)) => {
                         audio.finish_playback();
-                        return send_error(req, 500, "current source unavailable");
-                    }
-                    Err(err) => {
-                        audio.finish_playback();
-                        return send_error(req, 500, &format!("read source: {err}"));
+                        return send_error(req, code, &msg);
                     }
                 };
-
-                if current_source == Source::Usb {
-                    (false, None, None)
-                } else {
-                    if let Err(err) = dev.set_source(usb_index) {
-                        audio.finish_playback();
-                        return send_error(req, 500, &format!("set_source: {err}"));
-                    }
-                    (
-                        true,
-                        Some(current_source.to_string()),
-                        Some(current_source),
-                    )
-                }
-            };
 
             let (tx, rx) = mpsc::sync_channel(1);
             let dev_for_thread = dev.clone();
@@ -1630,6 +1584,59 @@ fn master_status_json(status: &StatusSummary) -> String {
     serde_json::to_string(&map).unwrap_or_default()
 }
 
+/// Switch the device source to USB for playback, returning the previous source
+/// info needed to restore it after playback completes.
+fn switch_to_usb_source(
+    dev: &Arc<DeviceState>,
+) -> Result<(bool, Option<String>, Option<Source>), (u16, String)> {
+    let usb_index = dev
+        .profile()
+        .sources
+        .index_for_source(Source::Usb)
+        .ok_or((500, "USB source missing from device profile".to_string()))?;
+
+    let _op = dev.begin_operation();
+    let current_source = dev
+        .current_source()
+        .ok()
+        .flatten()
+        .ok_or((500, "current source unavailable".to_string()))?;
+
+    if current_source == Source::Usb {
+        return Ok((false, None, None));
+    }
+
+    dev.set_source(usb_index)
+        .map_err(|err| (500, format!("set_source: {err}")))?;
+
+    Ok((
+        true,
+        Some(current_source.to_string()),
+        Some(current_source),
+    ))
+}
+
+/// RAII guard that disables WiFi power save on creation and restores it on drop.
+/// Ensures PS is always restored even on early returns or panics.
+struct WifiPsGuard;
+
+impl WifiPsGuard {
+    fn disable_ps() -> Self {
+        unsafe {
+            esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
+        }
+        Self
+    }
+}
+
+impl Drop for WifiPsGuard {
+    fn drop(&mut self) {
+        unsafe {
+            esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
+        }
+    }
+}
+
 fn run_playback_thread(
     dev: Arc<DeviceState>,
     audio_state: usb_audio::SharedAudioState,
@@ -1642,9 +1649,7 @@ fn run_playback_thread(
 ) {
     // Disable WiFi power save during playback — beacon wakeups cause
     // ~1-2 ms CPU stalls that can disrupt USB isochronous timing.
-    unsafe {
-        esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
-    }
+    let _wifi_ps = WifiPsGuard::disable_ps();
 
     // Pre-generate the entire sweep into memory before starting the USB
     // audio stream. ESP32 float math (sin/cos/ln) is too slow to keep up
@@ -1663,16 +1668,27 @@ fn run_playback_thread(
     let mut pcm_data = vec![0u8; total_bytes];
     let mut generator = plan.generator();
     let mut offset = 0;
+    // Generate in 10ms slices so fill_pcm_bytes returns after each chunk
+    // instead of consuming the entire remaining buffer in one call.
+    // Without this, IDLE starves for the full pre-gen duration (~11s),
+    // triggering the task watchdog. yield_now() only yields to equal/
+    // higher priority tasks so IDLE never runs — sleep(10ms) crosses a
+    // FreeRTOS tick boundary and calls vTaskDelay, letting IDLE reset
+    // the watchdog.
+    let gen_chunk_bytes = (plan.request.sample_rate as usize / 100) * plan.layout().frame_bytes();
     let mut yield_counter = 0u32;
     while !generator.is_finished() && offset < pcm_data.len() {
-        let written = generator.fill_pcm_bytes(&mut pcm_data[offset..]);
+        let end = (offset + gen_chunk_bytes).min(pcm_data.len());
+        let written = generator.fill_pcm_bytes(&mut pcm_data[offset..end]);
         if written == 0 {
             break;
         }
         offset += written;
         yield_counter += 1;
-        if yield_counter % 100 == 0 {
-            std::thread::yield_now();
+        if yield_counter % 50 == 0 {
+            // 10ms minimum to cross one FreeRTOS tick boundary and
+            // actually call vTaskDelay — sub-tick sleeps busy-wait.
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     let pcm_data = &pcm_data[..offset];
@@ -1712,7 +1728,8 @@ fn run_playback_thread(
             // before writing to the ring buffer. xRingbufferSend holds a
             // critical section during memcpy — PSRAM SPI latency inside
             // that section can block the USB host task.
-            let mut sram_buf = [0u8; 1920];
+            // Max 10ms chunk: 480 frames × 2ch × 3 bytes (24-bit) = 2880.
+            let mut sram_buf = [0u8; 2880];
             let mut pos = start.first_write_bytes;
             while pos < pcm_data.len() {
                 let end = (pos + chunk_bytes).min(pcm_data.len());
@@ -1795,11 +1812,7 @@ fn run_playback_thread(
     }
 
     audio_state.finish_playback();
-
-    // Restore WiFi power save after playback
-    unsafe {
-        esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
-    }
+    // _wifi_ps guard restores WiFi PS on drop
 }
 
 /// Inline sine test: generates sin(2πft) on the stack and writes to USB
@@ -1820,15 +1833,13 @@ fn run_inline_sine_test(
     const FRAMES_PER_CHUNK: usize = (SAMPLE_RATE / (1000 / CHUNK_MS)) as usize; // 480
     const FRAME_BYTES: usize = 4; // 2ch × 16-bit
     const CHUNK_BYTES: usize = FRAMES_PER_CHUNK * FRAME_BYTES; // 1920
-    const FREQUENCY_HZ: f32 = 1000.0;
+    const FREQUENCY_HZ: f32 = 50.0;
     const AMPLITUDE: f32 = 0.5;
     const DURATION_SEC: u32 = 5;
     const TOTAL_CHUNKS: u32 = DURATION_SEC * (1000 / CHUNK_MS);
     const PREFILL_CHUNKS: u32 = 5; // 50ms
 
-    unsafe {
-        esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
-    }
+    let _wifi_ps = WifiPsGuard::disable_ps();
 
     info!(
         "inline sine test: {} Hz, {} sec, {} Hz/{}-bit stereo",
@@ -1839,9 +1850,6 @@ fn run_inline_sine_test(
     if let Err(err) = audio_device.start_stream(SAMPLE_RATE, BitDepth::Pcm16) {
         let _ = started_tx.send(Err(err.to_string()));
         audio_state.finish_playback();
-        unsafe {
-            esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
-        }
         return;
     }
 
@@ -1856,9 +1864,6 @@ fn run_inline_sine_test(
             let _ = audio_device.stop_stream();
             let _ = started_tx.send(Err(format!("prefill write: {err}")));
             audio_state.finish_playback();
-            unsafe {
-                esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
-            }
             return;
         }
     }
@@ -1925,9 +1930,7 @@ fn run_inline_sine_test(
     }
 
     audio_state.finish_playback();
-    unsafe {
-        esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM);
-    }
+    // _wifi_ps guard restores WiFi PS on drop
 }
 
 /// Fill a buffer with 16-bit stereo sine samples (same algorithm as
@@ -1977,7 +1980,7 @@ fn start_playback_pregenerated(
     // loop starts, matching the standalone driver test harness.
     let prefill_end = (chunk_bytes * 5).min(pcm_data.len());
     let mut prefill_pos = 0;
-    let mut prefill_sram = [0u8; 1920];
+    let mut prefill_sram = [0u8; 2880];
     let first_write_started_us = usb_audio::server_time_us();
     while prefill_pos < prefill_end {
         let end = (prefill_pos + chunk_bytes).min(prefill_end);
