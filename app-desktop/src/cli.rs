@@ -11,7 +11,7 @@ use minidsp::client::MiniDspClient;
 use minidsp::transport::hid;
 use minidsp::transport::tcp::TcpTransport;
 use minidsp::transport::ws::WsTransport;
-use minidsp_daemon::http::json::DeviceJson;
+use minidsp_daemon::http::json::{DeviceJson, VersionJson};
 use minidsp_protocol::device::probe;
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::DeviceInfo;
@@ -123,6 +123,43 @@ fn print_discovered_devices<T: ProbeDeviceView>(devices: &[T]) -> bool {
     !devices.is_empty()
 }
 
+fn device_json_from_info(info: &DeviceInfo) -> DeviceJson {
+    DeviceJson {
+        url: info.url.clone(),
+        version: VersionJson {
+            hw_id: info.version.hw_id,
+            fw_major: info.version.fw_major,
+            fw_minor: info.version.fw_minor,
+            dsp_version: info.version.dsp_version,
+            serial: info.version.serial,
+        },
+        product_name: info.product_name.clone(),
+    }
+}
+
+fn render_probe_devices(
+    devices: &[DeviceJson],
+    format: Option<&str>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if devices.is_empty() {
+        return Ok(false);
+    }
+
+    match format {
+        Some("jsonline") => {
+            for device in devices {
+                println!("{}", serde_json::to_string(device)?);
+            }
+        }
+        Some("json") => println!("{}", serde_json::to_string_pretty(devices)?),
+        _ => {
+            print_discovered_devices(devices);
+        }
+    }
+
+    Ok(true)
+}
+
 /// Print device status.
 pub async fn status(
     client: &MiniDspClient,
@@ -140,7 +177,7 @@ pub async fn status(
 
 /// Enumerate connected devices.
 pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let mut printed = false;
+    let mut devices_out = Vec::new();
     let env_sock = std::env::var("MINIDSP_SOCK").ok();
     let env_tcp = std::env::var("MINIDSP_TCP").ok();
     let env_url = std::env::var("MINIDSP_URL").ok();
@@ -150,53 +187,24 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = cli.daemon_sock.as_deref().or(env_sock.as_deref()) {
         #[cfg(unix)]
         {
-            let devices = discover_daemon_unix(path).await?;
-            printed = print_discovered_devices(&devices);
+            devices_out.extend(discover_daemon_unix(path).await?);
         }
     } else if let Some(addr) = cli.tcp.as_deref().or(env_tcp.as_deref()) {
         let client = MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
-        let info = client.device_info();
-        print_probe_device(
-            0,
-            &info.product_name,
-            info.version.serial,
-            &info.url,
-            info.version.hw_id,
-            info.version.dsp_version,
-        );
-        printed = true;
+        devices_out.push(device_json_from_info(&client.device_info()));
     } else if let Some(url) = cli.url.as_deref().or(env_url.as_deref()) {
         if url.starts_with("tcp://") {
             let addr = &url["tcp://".len()..];
             let client =
                 MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
-            let info = client.device_info();
-            print_probe_device(
-                0,
-                &info.product_name,
-                info.version.serial,
-                &info.url,
-                info.version.hw_id,
-                info.version.dsp_version,
-            );
-            printed = true;
+            devices_out.push(device_json_from_info(&client.device_info()));
         } else if (url.starts_with("http://") || url.starts_with("ws://")) && !url.ends_with("/ws")
         {
-            let devices = discover_daemon_tcp(url).await?;
-            printed = print_discovered_devices(&devices);
+            devices_out.extend(discover_daemon_tcp(url).await?);
         } else if url.starts_with("http://") || url.starts_with("ws://") {
             let client =
                 MiniDspClient::connect(Box::new(WsTransport::connect(url, 0).await?)).await?;
-            let info = client.device_info();
-            print_probe_device(
-                0,
-                &info.product_name,
-                info.version.serial,
-                &info.url,
-                info.version.hw_id,
-                info.version.dsp_version,
-            );
-            printed = true;
+            devices_out.push(device_json_from_info(&client.device_info()));
         } else if url.starts_with("usb://") || url.starts_with("usb:") {
             let path = if let Some(rest) = url.strip_prefix("usb://") {
                 urlencoding::decode(rest.split('?').next().unwrap_or(rest))?.into_owned()
@@ -206,67 +214,42 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             let transport = hid::HidTransport::open(&path)?;
             let client = MiniDspClient::connect(Box::new(transport)).await?;
-            let info = client.device_info();
-            print_probe_device(
-                0,
-                &info.product_name,
-                info.version.serial,
-                &info.url,
-                info.version.hw_id,
-                info.version.dsp_version,
-            );
-            printed = true;
+            devices_out.push(device_json_from_info(&client.device_info()));
         }
     } else if let Some(url) = cli.daemon_url.as_deref().or(env_daemon_url.as_deref()) {
-        let devices = discover_daemon_tcp(url).await?;
-        printed = print_discovered_devices(&devices);
+        devices_out.extend(discover_daemon_tcp(url).await?);
     } else if let Some(path) = cli.usb.as_deref().or(env_usb.as_deref()) {
         let transport = hid::HidTransport::open(path)?;
         let client = MiniDspClient::connect(Box::new(transport)).await?;
-        let info = client.device_info();
-        print_probe_device(
-            0,
-            &info.product_name,
-            info.version.serial,
-            &info.url,
-            info.version.hw_id,
-            info.version.dsp_version,
-        );
-        printed = true;
+        devices_out.push(device_json_from_info(&client.device_info()));
     } else {
         let devices = hid::enumerate()?;
         for (i, dev) in devices.iter().enumerate() {
             match hid::HidTransport::open(&dev.path) {
                 Ok(transport) => match MiniDspClient::connect(Box::new(transport)).await {
                     Ok(client) => {
-                        let name = probe::product_name(client.hw_id().hw_id, client.dsp_version());
-                        let url = format!(
-                            "usb:{}?vid={:04x}&pid={:04x}",
-                            urlencoding::encode(&dev.path),
-                            dev.vendor_id,
-                            dev.product_id,
-                        );
-                        print_probe_device(
-                            i,
-                            &name,
-                            client.serial(),
-                            &url,
-                            client.hw_id().hw_id,
-                            client.dsp_version(),
-                        );
+                        devices_out.push(device_json_from_info(&client.device_info()));
                     }
                     Err(e) => {
-                        println!("{i}: Device at {} (open failed: {e})", dev.path);
+                        if cli.output.as_deref() != Some("json")
+                            && cli.output.as_deref() != Some("jsonline")
+                        {
+                            println!("{i}: Device at {} (open failed: {e})", dev.path);
+                        }
                     }
                 },
                 Err(e) => {
-                    println!("{i}: Device at {} (open failed: {e})", dev.path);
+                    if cli.output.as_deref() != Some("json")
+                        && cli.output.as_deref() != Some("jsonline")
+                    {
+                        println!("{i}: Device at {} (open failed: {e})", dev.path);
+                    }
                 }
             }
         }
-        printed = !devices.is_empty();
     }
 
+    let printed = render_probe_devices(&devices_out, cli.output.as_deref())?;
     if !printed {
         println!("No MiniDSP devices found");
     }
@@ -938,12 +921,9 @@ pub async fn channel_command(
                     }
                 }
                 CrossoverCommand::Bypass { state } => {
-                    // Bypass all 4 biquads in both LPF and HPF groups
+                    // Crossover bypass is group-level; write the group base only.
                     for base in [xover.lpf_addr, xover.hpf_addr] {
-                        for i in 0..4 {
-                            let addr = base + (i * 5) as u16;
-                            client.bypass_filter(addr, *state).await?;
-                        }
+                        client.bypass_filter(base, *state).await?;
                     }
                 }
             }
@@ -965,8 +945,7 @@ pub async fn channel_command(
                 .ok_or("output channel does not have compressor")?;
             match cmd {
                 CompressorCommand::Bypass { state } => {
-                    let val = if *state { 1.0 } else { 0.0 };
-                    client.write_dsp(comp.bypass, val, true).await?;
+                    client.set_status_bypass(comp.bypass, *state).await?;
                 }
                 CompressorCommand::Set {
                     threshold,
@@ -980,11 +959,25 @@ pub async fn channel_command(
                     if *ratio < 1.0 {
                         return Err("ratio must be >= 1.0".into());
                     }
-                    // DSP registers store raw values: threshold in dBFS, attack/release in ms
-                    client.write_dsp(comp.threshold, *threshold, true).await?;
-                    client.write_dsp(comp.ratio, *ratio, true).await?;
-                    client.write_dsp(comp.attack, *attack, true).await?;
-                    client.write_dsp(comp.release, *release, true).await?;
+                    // Verify the suspect scalar fields first so a 2x4 HD no-op
+                    // fails before we partially apply threshold.
+                    client
+                        .write_dsp_verified(comp.ratio, *ratio, true, "set compressor ratio")
+                        .await?;
+                    client
+                        .write_dsp_verified(comp.attack, *attack, true, "set compressor attack")
+                        .await?;
+                    client
+                        .write_dsp_verified(comp.release, *release, true, "set compressor release")
+                        .await?;
+                    client
+                        .write_dsp_verified(
+                            comp.threshold,
+                            *threshold,
+                            true,
+                            "set compressor threshold",
+                        )
+                        .await?;
                 }
             }
         }
@@ -1010,8 +1003,7 @@ pub async fn channel_command(
             };
             match cmd {
                 FirCommand::Bypass { state } => {
-                    let val = if *state { 1.0 } else { 0.0 };
-                    client.write_dsp(fir.bypass, val, true).await?;
+                    client.set_status_bypass(fir.bypass, *state).await?;
                 }
                 FirCommand::Load { file } => {
                     let contents = std::fs::read_to_string(file)?;
@@ -1020,38 +1012,15 @@ pub async fn channel_command(
                         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
                         .map(|l| l.trim().parse::<f32>())
                         .collect::<Result<Vec<_>, _>>()?;
-                    if coeffs.len() > fir.max_taps as usize {
-                        return Err(format!(
-                            "FIR has {} taps but device maximum is {}",
-                            coeffs.len(),
-                            fir.max_taps
-                        )
-                        .into());
-                    }
-                    // Use FIR load protocol: start, then send chunks
-                    use minidsp_protocol::commands;
-                    client
-                        .raw_command(
-                            commands::fir_load_start(channel),
-                            minidsp::queue::Priority::High,
-                        )
-                        .await?;
-                    for chunk in coeffs.chunks(14) {
-                        client
-                            .raw_command(
-                                commands::fir_load_data(channel, chunk),
-                                minidsp::queue::Priority::High,
-                            )
-                            .await?;
-                    }
-                    // Write tap count
-                    client
-                        .write_dsp(fir.taps_count, coeffs.len() as f32, true)
-                        .await?;
+                    client.load_fir_coefficients(fir, &coeffs).await?;
                 }
             }
         }
-        ChannelCommand::Routing { output, gain_db, off } => {
+        ChannelCommand::Routing {
+            output,
+            gain_db,
+            off,
+        } => {
             if !is_input {
                 return Err("routing only available on input channels".into());
             }

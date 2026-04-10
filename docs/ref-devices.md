@@ -39,7 +39,10 @@ Verification tiers used in practice:
 
 Current reality:
 - 2x4 HD is the only device with direct live hardware validation in this workspace
+- the physical 2x4 HD is the golden device for shared protocol/control debugging right now
+- official-app imports and `minidsp-rs` references define the intended matrix, but they do not overrule live 2x4 HD read/write behavior when the shared implementation disagrees
 - broader support claims must stay tied to extracted official-app evidence until more hardware exists
+- the daemon now also uses token-matched official Device Console `setting*.xml` files as a state-recovery source for DSP100-style fresh-attach gaps, but that is still controller-side reconstruction, not a blanket claim that every device has authoritative live readback
 - all 13 exact modern Device Console HW/DSP pairs are currently represented in `probe.rs`
 - the importer-backed protocol tests already caught and corrected DSP 100 and DSP 101/105 table mistakes, so the generated artifacts are now an active guardrail rather than passive notes
 - the generated legacy metadata now captures source-backed FIR/compressor/meter/PEQ coverage plus inferred old-dialect topology from cached `config.xml` files
@@ -110,7 +113,7 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | Outputs | 4 | 4 |
 | Input PEQ | 10 per channel | 10 per channel |
 | Output PEQ | 10 per channel | 10 per channel |
-| FIR | Yes (4096 max taps) | No |
+| FIR | Yes (4096 total taps, 2048 per output FIR) | No |
 | Compressor | Yes (per output) | Yes (per output) |
 | Crossover | Yes (per output) | Yes (per output) |
 | Dirac | No | Yes |
@@ -361,7 +364,7 @@ Note: `voloffsets` = Device Console XML `voloffsets="true"` on `<AUDIO_IN_SOURCE
 
 | DSP ID | Used by | Freq | In/Out | Input PEQ | FIR | Key difference |
 |--------|---------|------|--------|-----------|-----|----------------|
-| 100 | 2x4 HD, Flex | 96kHz | 2/4 | Yes (10) | Yes (4096 taps) | Base structure |
+| 100 | 2x4 HD, Flex | 96kHz | 2/4 | Yes (10) | Yes (4096 total taps, 2048 per output FIR) | Base structure |
 | 101 | DDRC-24, Flex DL | 48kHz | 2/4 | Yes (10) | No | Dirac variant of 100 |
 | 105 | SHD, SHD Studio, SHD Power | 96kHz | 2/4 | No | No | Dirac-only, no input PEQ |
 | 110 | Flex Eight | 96kHz | 2/8 | Yes (10) | Yes (4096 taps) | 8 outputs |

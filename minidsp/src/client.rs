@@ -2,17 +2,21 @@
 
 use crate::queue::{CommandQueue, Priority};
 use crate::transport::{Transport, TransportError};
+use getrandom::getrandom;
 use minidsp_protocol::commands::{self, HardwareId, Response};
 use minidsp_protocol::device::DeviceProfile;
+use minidsp_protocol::device::dsp::FirFilter;
 use minidsp_protocol::device::probe;
 use minidsp_protocol::dialect::ValueFormat;
 use minidsp_protocol::eeprom;
 use minidsp_protocol::status::{
-    BiquadCoeffs, CompressorConfig, DeviceConfig, DeviceInfo, DeviceVersion, InputChannelConfig,
-    MasterStatusView, OutputChannelConfig, PeqBandConfig, RoutingConfig, StatusSummary,
+    BiquadCoeffs, CompressorConfig, CrossoverGroupConfig, DeviceConfig, DeviceInfo, DeviceVersion,
+    FirConfig, IndexedBiquadConfig, InputChannelConfig, MasterStatusView, OutputChannelConfig,
+    PeqBandConfig, RoutingConfig, StatusSummary,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// Error type for client operations.
@@ -48,6 +52,49 @@ struct PeqShadow {
     bypass: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedPeqShadow {
+    pub coeffs: [f32; 5],
+    pub bypass: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PresetShadowState {
+    pub peq: HashMap<u16, CachedPeqShadow>,
+    pub selector: HashMap<u16, u16>,
+    pub scalar: HashMap<u16, u32>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DeviceShadowState {
+    #[serde(default)]
+    pub presets: HashMap<u8, PresetShadowState>,
+    #[serde(default)]
+    pub peq: HashMap<u16, CachedPeqShadow>,
+    #[serde(default)]
+    pub selector: HashMap<u16, u16>,
+    #[serde(default)]
+    pub scalar: HashMap<u16, u32>,
+    #[serde(default)]
+    pub preset_tokens: HashMap<u8, [u8; 4]>,
+}
+
+const MASTER_STATUS_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const MASTER_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FIR_LOAD_END_TIMEOUT: Duration = Duration::from_secs(60);
+const GAIN_VERIFY_TOLERANCE_DB: f32 = 0.2;
+const SILENT_METER_DB: f32 = -140.0;
+const DSP_READ_TIMEOUT: Duration = Duration::from_millis(750);
+const METER_READ_TIMEOUT: Duration = Duration::from_millis(750);
+
+fn generate_modification_token() -> Result<[u8; 4], ClientError> {
+    let mut token = [0u8; 4];
+    getrandom(&mut token).map_err(|err| {
+        ClientError::Protocol(format!("failed to generate modification token: {err}"))
+    })?;
+    Ok(token)
+}
+
 /// Connected MiniDSP device client.
 pub struct MiniDspClient {
     queue: Arc<CommandQueue>,
@@ -62,6 +109,19 @@ pub struct MiniDspClient {
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     /// Shadow state for PEQ bands when the device does not expose live coeff readback.
     peq_shadow: Arc<Mutex<HashMap<u16, PeqShadow>>>,
+    /// Shadow state for selector-style integer slots and other SHARC integer
+    /// controls whose live DSP100 readback can collapse or stay at `0`.
+    selector_shadow: Arc<Mutex<HashMap<u16, u16>>>,
+    /// Shadow state for scalar float32 config writes on paths where live
+    /// DSP100 readback is not authoritative.
+    scalar_shadow: Arc<Mutex<HashMap<u16, u32>>>,
+    /// Shadow state snapshots keyed by preset slot so non-authoritative DSP100
+    /// values do not leak across preset switches.
+    preset_shadows: Arc<Mutex<HashMap<u8, PresetShadowState>>>,
+    /// Last observed raw modification-token bytes per preset slot.
+    preset_tokens: Arc<Mutex<HashMap<u8, [u8; 4]>>>,
+    /// Last observed active preset slot.
+    active_preset: Mutex<Option<u8>>,
 }
 
 fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
@@ -88,6 +148,19 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
                     },
                 );
             }
+            if let Some(crossover) = output.crossover {
+                for base in [crossover.lpf_addr, crossover.hpf_addr] {
+                    for i in 0..4u16 {
+                        shadow.insert(
+                            base + i * 5,
+                            PeqShadow {
+                                coeffs: minidsp_protocol::biquad::BYPASS,
+                                bypass: false,
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
     shadow
@@ -103,19 +176,28 @@ async fn execute_peq_batch(
     for &(addr, _, _) in bands {
         phase1_cmds.push(commands::bypass_filter(addr, true, dialect));
     }
-    queue.execute_batch(phase1_cmds, Priority::Critical).await?;
+    ensure_write_batch(
+        queue.execute_batch(phase1_cmds, Priority::Critical).await?,
+        "set peq bypass before batch write",
+    )?;
 
     let mut phase2_cmds = Vec::with_capacity(bands.len());
     for &(addr, ref coeffs, _) in bands {
         phase2_cmds.push(commands::write_biquad(addr, coeffs, dialect));
     }
-    queue.execute_batch(phase2_cmds, Priority::Critical).await?;
+    ensure_write_batch(
+        queue.execute_batch(phase2_cmds, Priority::Critical).await?,
+        "write peq batch coefficients",
+    )?;
 
     let mut phase3_cmds = Vec::with_capacity(bands.len());
     for &(addr, _, bypass) in bands {
         phase3_cmds.push(commands::bypass_filter(addr, bypass, dialect));
     }
-    queue.execute_batch(phase3_cmds, Priority::Critical).await?;
+    ensure_write_batch(
+        queue.execute_batch(phase3_cmds, Priority::Critical).await?,
+        "restore peq bypass after batch write",
+    )?;
 
     let mut shadow = peq_shadow.lock().await;
     for &(addr, coeffs, bypass) in bands {
@@ -123,6 +205,146 @@ async fn execute_peq_batch(
     }
 
     Ok(())
+}
+
+fn ensure_write_batch(responses: Vec<Response>, context: &str) -> Result<(), ClientError> {
+    for resp in responses {
+        MiniDspClient::ensure_write_response(resp, context)?;
+    }
+    Ok(())
+}
+
+async fn apply_peq_shadow_bypass(
+    peq_shadow: &Arc<Mutex<HashMap<u16, PeqShadow>>>,
+    bands: &[(u16, [f32; 5], bool)],
+    bypass: bool,
+) {
+    let mut shadow = peq_shadow.lock().await;
+    for &(addr, _, _) in bands {
+        if let Some(entry) = shadow.get_mut(&addr) {
+            entry.bypass = bypass;
+        }
+    }
+}
+
+fn parse_raw_write_biquad(
+    payload: &[u8],
+    dialect: &minidsp_protocol::dialect::Dialect,
+) -> Option<(u16, [f32; 5])> {
+    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 26 {
+        return None;
+    }
+    if payload[1] != 0x80 {
+        return None;
+    }
+    let addr = u16::from_be_bytes([payload[2], payload[3]]);
+    let mut coeffs = [0.0; 5];
+    let mut offset = 6;
+    for coeff in &mut coeffs {
+        let bytes: [u8; 4] = payload.get(offset..offset + 4)?.try_into().ok()?;
+        *coeff = minidsp_protocol::dialect::decode_value(&bytes, dialect);
+        offset += 4;
+    }
+    Some((addr, coeffs))
+}
+
+fn parse_raw_bypass_filter(payload: &[u8]) -> Option<(u16, bool)> {
+    if payload.first().copied()? != commands::CMD_BYPASS_FILTER || payload.len() < 6 {
+        return None;
+    }
+    let addr = u16::from_be_bytes([payload[2], payload[3]]);
+    let bypass = payload[1] & 0x80 != 0;
+    Some((addr, bypass))
+}
+
+fn parse_raw_selector_write(
+    payload: &[u8],
+    dialect: &minidsp_protocol::dialect::Dialect,
+) -> Option<(u16, u16)> {
+    if dialect.value_format != ValueFormat::Float32 {
+        return None;
+    }
+    if payload.first().copied()? != commands::CMD_WRITE_DSP || payload.len() < 8 {
+        return None;
+    }
+    if payload[1] != 0x80 {
+        return None;
+    }
+    if payload[6] != 0 || payload[7] != 0 {
+        return None;
+    }
+    let addr = u16::from_be_bytes([payload[2], payload[3]]);
+    let value = u16::from_le_bytes([payload[4], payload[5]]);
+    Some((addr, value))
+}
+
+fn parse_raw_linked_selector_write(
+    payload: &[u8],
+    dialect: &minidsp_protocol::dialect::Dialect,
+) -> Option<(u16, u16)> {
+    if dialect.value_format != ValueFormat::Float32 {
+        return None;
+    }
+    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 10 {
+        return None;
+    }
+    let ctrl = payload[1];
+    if ctrl < 0x80 {
+        return None;
+    }
+    let linked_count = (ctrl - 0x80) as usize;
+    let linked_bytes = if linked_count == 0 {
+        2
+    } else {
+        linked_count * 2
+    };
+    let value_offset = 4 + linked_bytes;
+    let value_bytes: [u8; 4] = payload
+        .get(value_offset..value_offset + 4)?
+        .try_into()
+        .ok()?;
+    let addr = u16::from_be_bytes([payload[2], payload[3]]);
+    Some((addr, u32::from_le_bytes(value_bytes) as u16))
+}
+
+async fn mirror_raw_command_to_shadow(
+    payload: &[u8],
+    dialect: &minidsp_protocol::dialect::Dialect,
+    peq_shadow: &Arc<Mutex<HashMap<u16, PeqShadow>>>,
+    scalar_shadow: &Arc<Mutex<HashMap<u16, u32>>>,
+    selector_shadow: &Arc<Mutex<HashMap<u16, u16>>>,
+) {
+    if let Some((addr, coeffs)) = parse_raw_write_biquad(payload, dialect) {
+        let mut shadow = peq_shadow.lock().await;
+        if let Some(entry) = shadow.get_mut(&addr) {
+            entry.coeffs = coeffs;
+        }
+        return;
+    }
+
+    if let Some((addr, bypass)) = parse_raw_bypass_filter(payload) {
+        let mut shadow = peq_shadow.lock().await;
+        if let Some(entry) = shadow.get_mut(&addr) {
+            entry.bypass = bypass;
+        }
+        return;
+    }
+
+    if let Some((addr, value)) = parse_raw_selector_write(payload, dialect)
+        .or_else(|| parse_raw_linked_selector_write(payload, dialect))
+    {
+        selector_shadow.lock().await.insert(addr, value);
+        return;
+    }
+
+    if dialect.value_format == ValueFormat::Float32
+        && payload.first().copied() == Some(commands::CMD_WRITE_DSP)
+        && payload.len() >= 8
+    {
+        let addr = u16::from_be_bytes([payload[2], payload[3]]);
+        let raw = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        scalar_shadow.lock().await.insert(addr, raw);
+    }
 }
 
 impl MiniDspClient {
@@ -145,6 +367,20 @@ impl MiniDspClient {
         context: &str,
     ) -> Result<(), ClientError> {
         let resp = self.queue.execute(payload, priority).await?;
+        Self::ensure_write_response(resp, context)
+    }
+
+    async fn execute_write_with_timeout(
+        &self,
+        payload: Vec<u8>,
+        priority: Priority,
+        timeout: Duration,
+        context: &str,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .queue
+            .execute_with_timeout(payload, priority, timeout)
+            .await?;
         Self::ensure_write_response(resp, context)
     }
 
@@ -198,8 +434,12 @@ impl MiniDspClient {
 
         let peq_shadow = Arc::new(Mutex::new(build_peq_shadow(&profile)));
         let pending_write = Arc::new(Mutex::new(None));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let preset_shadows = Arc::new(Mutex::new(HashMap::new()));
+        let preset_tokens = Arc::new(Mutex::new(HashMap::new()));
 
-        Ok(Self {
+        let client = Self {
             queue,
             transport_url,
             profile,
@@ -209,7 +449,18 @@ impl MiniDspClient {
             saved_peq: Mutex::new(None),
             pending_write,
             peq_shadow,
-        })
+            selector_shadow,
+            scalar_shadow,
+            preset_shadows,
+            preset_tokens,
+            active_preset: Mutex::new(None),
+        };
+
+        // Seed the active preset cache early so shadow snapshots can stay
+        // preset-scoped even before the daemon starts polling status.
+        let _ = client.get_master_status().await;
+
+        Ok(client)
     }
 
     pub fn profile(&self) -> &DeviceProfile {
@@ -247,8 +498,10 @@ impl MiniDspClient {
         &self.transport_url
     }
 
-    /// Read master status from EEPROM.
-    pub async fn get_master_status(&self) -> Result<eeprom::MasterStatusRaw, ClientError> {
+    async fn get_master_status_with_priority(
+        &self,
+        priority: Priority,
+    ) -> Result<eeprom::MasterStatusRaw, ClientError> {
         let resp = self
             .queue
             .execute(
@@ -257,19 +510,150 @@ impl MiniDspClient {
                     eeprom::MASTER_STATUS_ADDR.1,
                     4,
                 ),
-                Priority::Normal,
+                priority,
             )
             .await?;
         match resp {
-            Response::FlashData(data) => eeprom::MasterStatusRaw::from_bytes(&data)
-                .ok_or_else(|| ClientError::Protocol("failed to parse master status".into())),
+            Response::FlashData(data) => {
+                let master = eeprom::MasterStatusRaw::from_bytes(&data)
+                    .ok_or_else(|| ClientError::Protocol("failed to parse master status".into()))?;
+                self.update_active_preset(master.preset).await;
+                Ok(master)
+            }
             _ => Err(ClientError::Protocol("unexpected response".into())),
         }
     }
 
-    /// Get full status summary (compatible with minidsp-rs StatusSummary).
-    pub async fn get_status_summary(&self) -> Result<StatusSummary, ClientError> {
-        let master = self.get_master_status().await?;
+    /// Read master status from EEPROM.
+    pub async fn get_master_status(&self) -> Result<eeprom::MasterStatusRaw, ClientError> {
+        self.get_master_status_with_priority(Priority::Normal).await
+    }
+
+    async fn capture_active_shadow(&self) -> PresetShadowState {
+        let peq = self
+            .peq_shadow
+            .lock()
+            .await
+            .iter()
+            .map(|(&addr, entry)| {
+                (
+                    addr,
+                    CachedPeqShadow {
+                        coeffs: entry.coeffs,
+                        bypass: entry.bypass,
+                    },
+                )
+            })
+            .collect();
+        let selector = self.selector_shadow.lock().await.clone();
+        let scalar = self.scalar_shadow.lock().await.clone();
+        PresetShadowState {
+            peq,
+            selector,
+            scalar,
+        }
+    }
+
+    async fn apply_active_shadow_snapshot(&self, snapshot: Option<PresetShadowState>) {
+        {
+            let mut peq_shadow = self.peq_shadow.lock().await;
+            *peq_shadow = build_peq_shadow(&self.profile);
+            if let Some(snapshot) = &snapshot {
+                for (&addr, entry) in &snapshot.peq {
+                    peq_shadow.insert(
+                        addr,
+                        PeqShadow {
+                            coeffs: entry.coeffs,
+                            bypass: entry.bypass,
+                        },
+                    );
+                }
+            }
+        }
+        {
+            let mut selector_shadow = self.selector_shadow.lock().await;
+            selector_shadow.clear();
+            if let Some(snapshot) = &snapshot {
+                selector_shadow.extend(
+                    snapshot
+                        .selector
+                        .iter()
+                        .map(|(&addr, &value)| (addr, value)),
+                );
+            }
+        }
+        {
+            let mut scalar_shadow = self.scalar_shadow.lock().await;
+            scalar_shadow.clear();
+            if let Some(snapshot) = &snapshot {
+                scalar_shadow.extend(snapshot.scalar.iter().map(|(&addr, &value)| (addr, value)));
+            }
+        }
+    }
+
+    async fn update_active_preset(&self, preset: u8) {
+        let previous = {
+            let mut active_preset = self.active_preset.lock().await;
+            if *active_preset == Some(preset) {
+                return;
+            }
+            let previous = *active_preset;
+            *active_preset = Some(preset);
+            previous
+        };
+
+        if let Some(previous) = previous {
+            let snapshot = self.capture_active_shadow().await;
+            self.preset_shadows.lock().await.insert(previous, snapshot);
+        }
+
+        let snapshot = self.preset_shadows.lock().await.get(&preset).cloned();
+        self.apply_active_shadow_snapshot(snapshot).await;
+    }
+
+    async fn wait_for_master_status_until<F>(
+        &self,
+        timeout: Duration,
+        mut matches: F,
+    ) -> Result<eeprom::MasterStatusRaw, ClientError>
+    where
+        F: FnMut(&eeprom::MasterStatusRaw) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        let mut last_status = None;
+
+        loop {
+            match self.get_master_status().await {
+                Ok(master) => {
+                    let matched = matches(&master);
+                    last_status = Some(master);
+                    if matched {
+                        return Ok(last_status.expect("just set"));
+                    }
+                }
+                Err(err @ ClientError::Transport(TransportError::Disconnected)) => {
+                    return Err(err);
+                }
+                Err(_) => {}
+            }
+
+            if Instant::now() >= deadline {
+                return if let Some(status) = last_status {
+                    Ok(status)
+                } else {
+                    Err(ClientError::Timeout)
+                };
+            }
+
+            tokio::time::sleep(MASTER_STATUS_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn get_status_summary_with_priority(
+        &self,
+        priority: Priority,
+    ) -> Result<StatusSummary, ClientError> {
+        let master = self.get_master_status_with_priority(priority).await?;
         let source_name = self
             .profile
             .sources
@@ -279,8 +663,12 @@ impl MiniDspClient {
 
         // Read level meters if available
         let (input_levels, output_levels) = if let Some(table) = self.profile.dsp_table {
-            let input_levels = self.read_meters(&table.meters.input).await?;
-            let output_levels = self.read_meters(&table.meters.output).await?;
+            let input_levels = self
+                .read_status_meters_with_priority(&table.meters.input, priority)
+                .await;
+            let output_levels = self
+                .read_status_meters_with_priority(&table.meters.output, priority)
+                .await;
             (input_levels, output_levels)
         } else {
             (vec![], vec![])
@@ -290,7 +678,7 @@ impl MiniDspClient {
             // Read Dirac bypass state from EEPROM 0xFFE0
             let dirac_resp = self
                 .queue
-                .execute(commands::read_flash(0xFF, 0xE0, 1), Priority::Normal)
+                .execute(commands::read_flash(0xFF, 0xE0, 1), priority)
                 .await;
             match dirac_resp {
                 Ok(Response::FlashData(data)) if !data.is_empty() => {
@@ -315,10 +703,40 @@ impl MiniDspClient {
         })
     }
 
+    /// Get full status summary (compatible with minidsp-rs StatusSummary).
+    pub async fn get_status_summary(&self) -> Result<StatusSummary, ClientError> {
+        self.get_status_summary_with_priority(Priority::Normal)
+            .await
+    }
+
+    /// Get a status summary using the specified queue priority.
+    pub async fn get_status_summary_polled(&self) -> Result<StatusSummary, ClientError> {
+        self.get_status_summary_with_priority(Priority::Low).await
+    }
+
     /// Set volume (raw byte value, gain = -0.5 * value).
     pub async fn set_volume(&self, value: u8) -> Result<(), ClientError> {
+        let before = self.get_master_status().await?;
+        if before.volume == value {
+            return Ok(());
+        }
+
         self.execute_write(commands::set_volume(value), Priority::High, "set volume")
-            .await
+            .await?;
+        let after = self
+            .wait_for_master_status_until(MASTER_STATUS_VERIFY_TIMEOUT, |master| {
+                master.volume == value
+            })
+            .await?;
+
+        if after.volume == value {
+            Ok(())
+        } else {
+            Err(ClientError::Protocol(format!(
+                "set volume did not persist (before={}, expected={}, after={})",
+                before.volume, value, after.volume
+            )))
+        }
     }
 
     /// Set volume in dB.
@@ -329,8 +747,29 @@ impl MiniDspClient {
 
     /// Set mute state.
     pub async fn set_mute(&self, muted: bool) -> Result<(), ClientError> {
+        let before = self.get_master_status().await?;
+        if before.is_muted() == muted {
+            return Ok(());
+        }
+
         self.execute_write(commands::set_mute(muted), Priority::High, "set mute")
-            .await
+            .await?;
+        let after = self
+            .wait_for_master_status_until(MASTER_STATUS_VERIFY_TIMEOUT, |master| {
+                master.is_muted() == muted
+            })
+            .await?;
+
+        if after.is_muted() == muted {
+            Ok(())
+        } else {
+            Err(ClientError::Protocol(format!(
+                "set mute did not persist (before={}, expected={}, after={})",
+                before.is_muted(),
+                muted,
+                after.is_muted()
+            )))
+        }
     }
 
     /// Switch preset (0-3).
@@ -342,18 +781,67 @@ impl MiniDspClient {
                 self.profile.presets - 1
             )));
         }
-        self.execute_write(
-            commands::set_config(preset, 0),
-            Priority::Critical,
-            "set config",
-        )
-        .await
+        let before = self.get_master_status().await?;
+        if before.preset == preset {
+            return Ok(());
+        }
+        self.queue.pause_levels();
+        let result = async {
+            self.execute_write(
+                commands::set_config(preset, commands::PRESET_CHANGE_NORMAL),
+                Priority::Critical,
+                "set config",
+            )
+            .await?;
+            let after = self
+                .wait_for_master_status_until(MASTER_STATUS_VERIFY_TIMEOUT, |master| {
+                    master.preset == preset
+                })
+                .await?;
+
+            if after.preset == preset {
+                Ok(())
+            } else {
+                Err(ClientError::Protocol(format!(
+                    "set config did not persist (before={}, expected={}, after={})",
+                    before.preset, preset, after.preset
+                )))
+            }
+        }
+        .await;
+        self.queue.resume_levels();
+        result
     }
 
     /// Set source by index.
     pub async fn set_source(&self, source: u8) -> Result<(), ClientError> {
-        self.execute_write(commands::set_source(source), Priority::High, "set source")
-            .await
+        let before = self.get_master_status().await?;
+        if before.source == source {
+            return Ok(());
+        }
+
+        self.queue.pause_levels();
+        let result = async {
+            self.execute_write(commands::set_source(source), Priority::High, "set source")
+                .await?;
+            let after = self
+                .wait_for_master_status_until(MASTER_STATUS_VERIFY_TIMEOUT, |master| {
+                    master.source == source
+                })
+                .await?;
+
+            if after.source == source {
+                Ok(())
+            } else {
+                Err(ClientError::Protocol(format!(
+                    "set source did not persist (before={}, expected={}, after={})",
+                    before.source, source, after.source
+                )))
+            }
+        }
+        .await;
+        self.queue.resume_levels();
+        result
     }
 
     /// Set Dirac bypass state.
@@ -373,13 +861,18 @@ impl MiniDspClient {
     pub async fn set_channel_mute(&self, addr: u16, muted: bool) -> Result<(), ClientError> {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => {
+                let before = self.read_param_word(addr).await? as u16;
+                let previous_shadow = self.selector_shadow_value(addr).await;
                 // Mute status: 1=muted, 2=unmuted (matches minidsp-rs WriteInt).
-                // Uses 0x13 with LE u32 value — same path as routing.
-                let val = if muted { 1u32 } else { 2u32 };
-                self.execute_write(
-                    commands::write_dsp_u32_le_with_ctrl(addr, val, 0x80),
-                    Priority::High,
+                self.write_selector_int(addr, if muted { 1 } else { 2 }, "set channel mute")
+                    .await?;
+                self.verify_selector_write_raw(
+                    addr,
+                    before,
+                    previous_shadow,
                     "set channel mute",
+                    if muted { "1" } else { "2" },
+                    |raw| raw == if muted { 1 } else { 2 },
                 )
                 .await?;
             }
@@ -401,13 +894,27 @@ impl MiniDspClient {
 
     /// Set channel gain using dialect-aware encoding.
     pub async fn set_channel_gain(&self, addr: u16, db: f32) -> Result<(), ClientError> {
+        let before = self.read_config_gain_db(addr).await?;
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => self.write_dsp(addr, db, false).await,
+            ValueFormat::Float32 => self.write_dsp(addr, db, false).await?,
             ValueFormat::FixedPoint => {
                 let gain_linear = 10.0f32.powf(db / 20.0);
-                self.write_dsp(addr, gain_linear, true).await
+                self.write_dsp(addr, gain_linear, true).await?;
             }
         }
+        let after = self.read_config_gain_db(addr).await?;
+        if (after - db).abs() > GAIN_VERIFY_TOLERANCE_DB {
+            if self.prefers_scalar_shadow_for_addr(addr) {
+                tracing::info!(
+                    "accepting shadow-backed gain write at addr {addr} despite non-authoritative live readback (before={before:.6}, expected={db:.6}, after={after:.6})"
+                );
+                return Ok(());
+            }
+            return Err(ClientError::Protocol(format!(
+                "set channel gain at addr {addr} did not persist (before={before:.6}, expected={db:.6}, after={after:.6})"
+            )));
+        }
+        Ok(())
     }
 
     /// Set one input->output routing entry.
@@ -434,19 +941,40 @@ impl MiniDspClient {
         self.set_channel_gain(gain_addr, gain_db).await?;
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => {
+                let before = self.read_param_word(status_addr).await? as u16;
+                let previous_shadow = self.selector_shadow_value(status_addr).await;
                 // Mixer status: 2=enabled, 1=disabled (matches minidsp-rs WriteInt).
-                // Uses 0x13 (LoadDspParam) with u32 LE value — audio-verified on 2x4 HD.
-                let val = if enabled { 2u32 } else { 1u32 };
-                self.execute_write(
-                    commands::write_dsp_u32_le_with_ctrl(status_addr, val, 0x80),
-                    Priority::High,
+                self.write_selector_int(
+                    status_addr,
+                    if enabled { 2 } else { 1 },
                     "set routing status",
                 )
                 .await?;
+                let after = self.read_param_word(status_addr).await? as u16;
+                if after == 0 {
+                    self.restore_selector_shadow(status_addr, previous_shadow)
+                        .await;
+                    return Err(ClientError::Protocol(format!(
+                        "set routing status at addr {status_addr} did not persist (before={before}, expected={}, after={after})",
+                        if enabled {
+                            "non-zero / enabled"
+                        } else {
+                            "1 / disabled"
+                        }
+                    )));
+                }
             }
             ValueFormat::FixedPoint => {
+                let before = self.read_param_scalar_u32(status_addr).await?;
                 self.write_dsp(status_addr, if enabled { 1.0 } else { 0.0 }, true)
                     .await?;
+                let after = self.read_param_scalar_u32(status_addr).await?;
+                let expected = if enabled { 1 } else { 0 };
+                if after != expected {
+                    return Err(ClientError::Protocol(format!(
+                        "set routing status at addr {status_addr} did not persist (before={before}, expected={expected}, after={after})"
+                    )));
+                }
             }
         }
         Ok(())
@@ -455,19 +983,19 @@ impl MiniDspClient {
     /// Write biquad coefficients to a PEQ band.
     /// Warns (but does not reject) unstable filters for minidsp-rs compatibility.
     pub async fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), ClientError> {
-        if !minidsp_protocol::biquad::is_stable(coeffs) {
+        if !minidsp_protocol::biquad::is_stable_any_convention(coeffs) {
             tracing::warn!(
                 "writing potentially unstable biquad at addr {addr}: a1={}, a2={}",
                 coeffs[3],
                 coeffs[4]
             );
         }
-        self.queue
-            .execute(
-                commands::write_biquad(addr, coeffs, &self.profile.dialect),
-                Priority::High,
-            )
-            .await?;
+        self.execute_write(
+            commands::write_biquad(addr, coeffs, &self.profile.dialect),
+            Priority::High,
+            "write biquad",
+        )
+        .await?;
         let mut shadow = self.peq_shadow.lock().await;
         let entry = shadow.entry(addr).or_insert(PeqShadow {
             coeffs: minidsp_protocol::biquad::BYPASS,
@@ -479,12 +1007,12 @@ impl MiniDspClient {
 
     /// Set PEQ bypass state.
     pub async fn bypass_filter(&self, addr: u16, bypass: bool) -> Result<(), ClientError> {
-        self.queue
-            .execute(
-                commands::bypass_filter(addr, bypass, &self.profile.dialect),
-                Priority::High,
-            )
-            .await?;
+        self.execute_write(
+            commands::bypass_filter(addr, bypass, &self.profile.dialect),
+            Priority::High,
+            "set peq bypass",
+        )
+        .await?;
         let mut shadow = self.peq_shadow.lock().await;
         let entry = shadow.entry(addr).or_insert(PeqShadow {
             coeffs: minidsp_protocol::biquad::BYPASS,
@@ -498,13 +1026,29 @@ impl MiniDspClient {
     pub async fn set_invert(&self, addr: u16, inverted: bool) -> Result<(), ClientError> {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => {
-                self.write_dsp_u32(addr, if inverted { 1 } else { 0 }, false)
-                    .await
+                let before = self.read_channel_invert(addr).await?;
+                self.write_dsp_int(addr, if inverted { 1 } else { 0 }, "set invert")
+                    .await?;
+                let after = self.read_channel_invert(addr).await?;
+                if after != inverted {
+                    return Err(ClientError::Protocol(format!(
+                        "set invert at addr {addr} did not persist (before={before}, expected={inverted}, after={after})"
+                    )));
+                }
+                Ok(())
             }
             ValueFormat::FixedPoint => {
+                let before = self.read_channel_invert(addr).await?;
                 let val =
                     minidsp_protocol::dialect::polarity_value(inverted, &self.profile.dialect);
-                self.write_dsp(addr, val, true).await
+                self.write_dsp(addr, val, true).await?;
+                let after = self.read_channel_invert(addr).await?;
+                if after != inverted {
+                    return Err(ClientError::Protocol(format!(
+                        "set invert at addr {addr} did not persist (before={before}, expected={inverted}, after={after})"
+                    )));
+                }
+                Ok(())
             }
         }
     }
@@ -516,7 +1060,91 @@ impl MiniDspClient {
             Priority::High,
             "write dsp",
         )
+        .await?;
+        if self.profile.dialect.value_format == ValueFormat::Float32 {
+            self.scalar_shadow
+                .lock()
+                .await
+                .insert(addr, value.to_bits());
+        }
+        Ok(())
+    }
+
+    /// Write a float DSP/config parameter and verify the typed word readback on
+    /// modern float32 devices.
+    pub async fn write_dsp_verified(
+        &self,
+        addr: u16,
+        value: f32,
+        save: bool,
+        context: &str,
+    ) -> Result<(), ClientError> {
+        if self.profile.dialect.value_format != ValueFormat::Float32 {
+            return self.write_dsp(addr, value, save).await;
+        }
+
+        let before = self.read_param_word(addr).await?;
+        let expected = value.to_bits();
+
+        self.write_dsp(addr, value, save).await?;
+
+        let after = self.read_param_word(addr).await?;
+        if after != expected {
+            if self.prefers_scalar_shadow_for_addr(addr) {
+                tracing::info!(
+                    "accepting shadow-backed scalar write at addr {addr} despite non-authoritative live readback (before=0x{before:08X}, expected=0x{expected:08X}, after=0x{after:08X})"
+                );
+                return Ok(());
+            }
+            return Err(ClientError::Protocol(format!(
+                "{context} at addr {addr} did not persist (before=0x{before:08X}, expected=0x{expected:08X}, after=0x{after:08X})"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Write an integer DSP/config parameter using the modern little-endian
+    /// `WriteInt` encoding used by `minidsp-rs` on SHARC devices.
+    pub async fn write_dsp_int(
+        &self,
+        addr: u16,
+        value: u16,
+        context: &str,
+    ) -> Result<(), ClientError> {
+        self.execute_write(
+            commands::write_dsp_int(addr, value),
+            Priority::High,
+            context,
+        )
         .await
+    }
+
+    /// Write an integer DSP/config parameter and verify the typed word readback
+    /// on modern float32 devices.
+    pub async fn write_dsp_int_verified(
+        &self,
+        addr: u16,
+        value: u16,
+        context: &str,
+    ) -> Result<(), ClientError> {
+        if self.profile.dialect.value_format != ValueFormat::Float32 {
+            return self.write_dsp_int(addr, value, context).await;
+        }
+
+        let before = self.read_param_word(addr).await?;
+        let expected = value as u32;
+
+        self.write_dsp_int(addr, value, context).await?;
+
+        let after = self.read_param_word(addr).await?;
+        if after != expected {
+            return Err(ClientError::Protocol(format!(
+                "{context} at addr {addr} did not persist (before=0x{before:08X}, expected=0x{expected:08X}, after=0x{after:08X})"
+            )));
+        }
+
+        Ok(())
     }
 
     /// Write a raw 32-bit DSP/config parameter word.
@@ -532,6 +1160,86 @@ impl MiniDspClient {
             "write dsp u32",
         )
         .await
+    }
+
+    async fn write_selector_int(
+        &self,
+        addr: u16,
+        value: u16,
+        context: &str,
+    ) -> Result<(), ClientError> {
+        self.execute_write(
+            commands::write_dsp_u32_le_with_ctrl(addr, value as u32, 0x80),
+            Priority::High,
+            context,
+        )
+        .await?;
+        self.selector_shadow.lock().await.insert(addr, value);
+        Ok(())
+    }
+
+    async fn restore_selector_shadow(&self, addr: u16, previous: Option<u16>) {
+        let mut shadow = self.selector_shadow.lock().await;
+        if let Some(value) = previous {
+            shadow.insert(addr, value);
+        } else {
+            shadow.remove(&addr);
+        }
+    }
+
+    async fn verify_selector_write_raw<F>(
+        &self,
+        addr: u16,
+        before: u16,
+        previous_shadow: Option<u16>,
+        context: &str,
+        expected: &str,
+        matches_expected: F,
+    ) -> Result<(), ClientError>
+    where
+        F: Fn(u16) -> bool,
+    {
+        let after = self.read_param_word(addr).await? as u16;
+        if matches_expected(after) {
+            return Ok(());
+        }
+        self.restore_selector_shadow(addr, previous_shadow).await;
+        Err(ClientError::Protocol(format!(
+            "{context} at addr {addr} did not persist (before={before}, expected={expected}, after={after})"
+        )))
+    }
+
+    pub async fn set_status_bypass(&self, addr: u16, bypass: bool) -> Result<(), ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
+                let before = self.read_param_word(addr).await? as u16;
+                let previous_shadow = self.selector_shadow_value(addr).await;
+                // Compressor/FIR bypass status uses 3=bypassed, 2=enabled on DSP100.
+                self.write_selector_int(addr, if bypass { 3 } else { 2 }, "set bypass status")
+                    .await?;
+                self.verify_selector_write_raw(
+                    addr,
+                    before,
+                    previous_shadow,
+                    "set bypass status",
+                    if bypass { "1 or 3" } else { "2" },
+                    |raw| {
+                        if bypass {
+                            matches!(raw, 1 | 3)
+                        } else {
+                            raw == 2
+                        }
+                    },
+                )
+                .await
+            }
+            ValueFormat::FixedPoint => {
+                // Keep the existing legacy path until live old-dialect hardware
+                // proves a stronger typed-selector rule.
+                self.write_dsp(addr, if bypass { 1.0 } else { 0.0 }, true)
+                    .await
+            }
+        }
     }
 
     /// Write a DSP selector/status word using the official app's raw scalar
@@ -562,13 +1270,36 @@ impl MiniDspClient {
 
     /// Read float values from DSP memory.
     pub async fn read_floats(&self, addr: u16, count: u8) -> Result<Vec<f32>, ClientError> {
-        let resp = self
-            .queue
-            .execute(
-                commands::read_floats(addr, count, &self.profile.dialect),
-                Priority::Normal,
-            )
-            .await?;
+        self.read_floats_with_priority(addr, count, Priority::Normal)
+            .await
+    }
+
+    async fn read_floats_with_priority(
+        &self,
+        addr: u16,
+        count: u8,
+        priority: Priority,
+    ) -> Result<Vec<f32>, ClientError> {
+        self.read_floats_with_timeout(addr, count, priority, Some(DSP_READ_TIMEOUT))
+            .await
+    }
+
+    async fn read_floats_with_timeout(
+        &self,
+        addr: u16,
+        count: u8,
+        priority: Priority,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<f32>, ClientError> {
+        let payload = commands::read_floats(addr, count, &self.profile.dialect);
+        let resp = match timeout {
+            Some(timeout) => {
+                self.queue
+                    .execute_with_timeout(payload, priority, timeout)
+                    .await?
+            }
+            None => self.queue.execute(payload, priority).await?,
+        };
         match resp {
             Response::Floats(values) => Ok(values),
             _ => Err(ClientError::Protocol(
@@ -582,11 +1313,39 @@ impl MiniDspClient {
         let req = commands::read_floats(addr, count, &self.profile.dialect);
         let raw = self
             .queue
-            .execute_raw(req.clone(), Priority::Normal)
+            .execute_raw_with_timeout(req.clone(), Priority::Normal, DSP_READ_TIMEOUT)
             .await?;
         commands::parse_param_words_response_for_request(&req, &raw).ok_or_else(|| {
             ClientError::Protocol("unexpected raw response to typed ReadFloats".into())
         })
+    }
+
+    async fn read_param_words_be(&self, addr: u16, count: u8) -> Result<Vec<u32>, ClientError> {
+        let req = commands::read_floats(addr, count, &self.profile.dialect);
+        let raw = self
+            .queue
+            .execute_raw_with_timeout(req.clone(), Priority::Normal, DSP_READ_TIMEOUT)
+            .await?;
+        commands::parse_param_words_be_response_for_request(&req, &raw).ok_or_else(|| {
+            ClientError::Protocol("unexpected raw response to big-endian ReadFloats".into())
+        })
+    }
+
+    /// Read raw bytes from the device's full flash-address space.
+    pub async fn read_flash_full_addr(&self, addr: u32, count: u8) -> Result<Vec<u8>, ClientError> {
+        let resp = self
+            .queue
+            .execute(
+                commands::read_flash_full_addr(addr, count),
+                Priority::Normal,
+            )
+            .await?;
+        match resp {
+            Response::FlashData(data) => Ok(data),
+            _ => Err(ClientError::Protocol(
+                "unexpected response to ReadFlashFullAddr".into(),
+            )),
+        }
     }
 
     pub async fn set_channel_delay_samples(
@@ -594,10 +1353,38 @@ impl MiniDspClient {
         addr: u16,
         samples: u32,
     ) -> Result<(), ClientError> {
-        match self.profile.dialect.value_format {
-            ValueFormat::Float32 => self.write_dsp_u32(addr, samples, false).await,
-            ValueFormat::FixedPoint => self.write_dsp(addr, samples as f32, true).await,
+        let before = self.read_param_scalar_u32(addr).await?;
+        let expected = match self.profile.dialect.value_format {
+            ValueFormat::Float32 => samples.min(u16::MAX as u32),
+            ValueFormat::FixedPoint => samples,
+        };
+        self.execute_write(
+            commands::write_dsp_delay(
+                addr,
+                samples,
+                self.profile.dialect.value_format == ValueFormat::FixedPoint,
+                &self.profile.dialect,
+            ),
+            Priority::High,
+            "write dsp delay",
+        )
+        .await?;
+        if self.profile.dialect.value_format == ValueFormat::Float32 {
+            self.scalar_shadow.lock().await.insert(addr, expected);
         }
+        let after = self.read_param_scalar_u32(addr).await?;
+        if after != expected {
+            if self.prefers_scalar_shadow_for_addr(addr) {
+                tracing::info!(
+                    "accepting shadow-backed delay write at addr {addr} despite non-authoritative live readback (before={before}, expected={expected}, after={after})"
+                );
+                return Ok(());
+            }
+            return Err(ClientError::Protocol(format!(
+                "set channel delay at addr {addr} did not persist (before={before}, expected={expected}, after={after})"
+            )));
+        }
+        Ok(())
     }
 
     async fn read_param_word(&self, addr: u16) -> Result<u32, ClientError> {
@@ -608,9 +1395,34 @@ impl MiniDspClient {
             .ok_or_else(|| ClientError::Protocol("empty typed param response".into()))
     }
 
+    async fn read_param_scalar_u32(&self, addr: u16) -> Result<u32, ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.read_param_word(addr).await,
+            ValueFormat::FixedPoint => self
+                .read_param_words_be(addr, 1)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| ClientError::Protocol("empty integer param response".into())),
+        }
+    }
+
     async fn read_config_gain_db(&self, addr: u16) -> Result<f32, ClientError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => Ok(f32::from_bits(self.read_param_word(addr).await?)),
+            ValueFormat::Float32 => {
+                if self.prefers_scalar_shadow_for_addr(addr) {
+                    if let Some(raw) = self.scalar_shadow.lock().await.get(&addr).copied() {
+                        return Ok(f32::from_bits(raw));
+                    }
+                }
+                let raw = self.read_param_word(addr).await?;
+                if self.prefers_scalar_shadow_for_addr(addr) {
+                    if let Some(value) = sanitize_shadow_preferred_scalar(raw) {
+                        return Ok(value);
+                    }
+                }
+                Ok(f32::from_bits(raw))
+            }
             ValueFormat::FixedPoint => {
                 let linear = self
                     .read_floats(addr, 1)
@@ -625,7 +1437,7 @@ impl MiniDspClient {
 
     async fn read_config_mute(&self, addr: u16) -> Result<bool, ClientError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => Ok(self.read_param_word(addr).await? == 1),
+            ValueFormat::Float32 => Ok(self.read_selector_word(addr).await? == 1),
             ValueFormat::FixedPoint => {
                 let value = self
                     .read_floats(addr, 1)
@@ -638,20 +1450,59 @@ impl MiniDspClient {
         }
     }
 
+    async fn read_config_bypass(&self, addr: u16) -> Result<bool, ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => Ok(matches!(self.read_selector_word(addr).await?, 1 | 3)),
+            ValueFormat::FixedPoint => self.read_config_mute(addr).await,
+        }
+    }
+
+    async fn read_selector_word(&self, addr: u16) -> Result<u16, ClientError> {
+        let raw = self.read_param_word(addr).await? as u16;
+        if raw == 1 {
+            if let Some(&shadow) = self.selector_shadow.lock().await.get(&addr) {
+                if shadow != 1 {
+                    return Ok(shadow);
+                }
+            }
+        }
+        Ok(raw)
+    }
+
+    async fn selector_shadow_value(&self, addr: u16) -> Option<u16> {
+        self.selector_shadow.lock().await.get(&addr).copied()
+    }
+
+    async fn read_routing_enabled(&self, addr: u16) -> Result<bool, ClientError> {
+        if let Some(shadow) = self.selector_shadow_value(addr).await {
+            return Ok(shadow == 2);
+        }
+        Ok(self.read_param_word(addr).await? != 0)
+    }
+
     async fn read_config_delay_ms(&self, addr: u16) -> Result<f32, ClientError> {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => {
-                let samples = self.read_param_word(addr).await? as f32;
+                let samples = if self.prefers_scalar_shadow_for_addr(addr) {
+                    if let Some(raw) = self.scalar_shadow.lock().await.get(&addr).copied() {
+                        raw as f32
+                    } else {
+                        let raw = self.read_param_word(addr).await?;
+                        if raw <= 2 { 0.0 } else { raw as f32 }
+                    }
+                } else {
+                    self.read_param_word(addr).await? as f32
+                };
                 Ok(samples * 1000.0 / self.profile.sample_rate as f32)
             }
             ValueFormat::FixedPoint => {
                 let samples = self
-                    .read_floats(addr, 1)
+                    .read_param_words_be(addr, 1)
                     .await?
                     .into_iter()
                     .next()
                     .ok_or_else(|| ClientError::Protocol("empty delay response".into()))?;
-                Ok(samples * 1000.0 / self.profile.sample_rate as f32)
+                Ok(samples as f32 * 1000.0 / self.profile.sample_rate as f32)
             }
         }
     }
@@ -671,6 +1522,73 @@ impl MiniDspClient {
         }
     }
 
+    /// Load FIR coefficients using the device's staged FIR transfer protocol.
+    pub async fn load_fir_coefficients(
+        &self,
+        fir: FirFilter,
+        coeffs: &[f32],
+    ) -> Result<(), ClientError> {
+        if coeffs.len() > fir.max_taps as usize {
+            return Err(ClientError::Protocol(format!(
+                "FIR has {} taps but device maximum is {}",
+                coeffs.len(),
+                fir.max_taps
+            )));
+        }
+
+        let master = self.get_master_status().await?;
+        self.execute_write(
+            commands::write_dsp_int(fir.taps_count, coeffs.len() as u16),
+            Priority::Critical,
+            "set fir tap count",
+        )
+        .await?;
+        let max_coeffs = match self
+            .raw_command(commands::fir_load_start(fir.index), Priority::Critical)
+            .await?
+        {
+            Response::FirLoadInfo { max_coeffs } => max_coeffs,
+            Response::Error(data) => {
+                return Err(ClientError::Protocol(format!(
+                    "fir load start: device error {data:02x?}"
+                )));
+            }
+            other => {
+                return Err(ClientError::Protocol(format!(
+                    "fir load start: unexpected response {other:?}"
+                )));
+            }
+        };
+        if coeffs.len() > max_coeffs as usize {
+            return Err(ClientError::Protocol(format!(
+                "FIR has {} taps but device reported runtime maximum {}",
+                coeffs.len(),
+                max_coeffs
+            )));
+        }
+        for chunk in coeffs.chunks(14) {
+            self.execute_write(
+                commands::fir_load_data(fir.index, chunk),
+                Priority::Critical,
+                "fir load data",
+            )
+            .await?;
+        }
+        self.execute_write_with_timeout(
+            commands::fir_load_end(),
+            Priority::Critical,
+            FIR_LOAD_END_TIMEOUT,
+            "fir load end",
+        )
+        .await?;
+        self.selector_shadow
+            .lock()
+            .await
+            .insert(fir.taps_count, coeffs.len() as u16);
+        self.set_mute(master.is_muted()).await?;
+        Ok(())
+    }
+
     /// Send raw command payload. For advanced/raw access.
     pub async fn raw_command(
         &self,
@@ -683,6 +1601,176 @@ impl MiniDspClient {
     /// Access the command queue directly.
     pub fn queue(&self) -> &Arc<CommandQueue> {
         &self.queue
+    }
+
+    /// Mirror the side effects of a successful raw-bridge write into the
+    /// client's shadow state so `/config` can reflect raw WS/TCP activity.
+    pub async fn mirror_raw_command_if_success(&self, payload: &[u8], raw_response: &[u8]) {
+        let parsed =
+            commands::parse_response_for_request(payload, raw_response, &self.profile.dialect);
+        if matches!(
+            parsed,
+            Response::Ack | Response::PresetComplete | Response::ResetComplete
+        ) {
+            mirror_raw_command_to_shadow(
+                payload,
+                &self.profile.dialect,
+                &self.peq_shadow,
+                &self.scalar_shadow,
+                &self.selector_shadow,
+            )
+            .await;
+        }
+    }
+
+    pub async fn export_shadow_state(&self) -> DeviceShadowState {
+        let active_shadow = self.capture_active_shadow().await;
+        let active_preset = *self.active_preset.lock().await;
+        let mut presets = self.preset_shadows.lock().await.clone();
+        if let Some(active_preset) = active_preset {
+            presets.insert(active_preset, active_shadow.clone());
+        }
+        let preset_tokens = self.preset_tokens.lock().await.clone();
+        DeviceShadowState {
+            presets,
+            peq: active_shadow.peq,
+            selector: active_shadow.selector,
+            scalar: active_shadow.scalar,
+            preset_tokens,
+        }
+    }
+
+    pub async fn apply_shadow_state(&self, state: &DeviceShadowState) {
+        let active_preset = *self.active_preset.lock().await;
+        let legacy_shadow = (!state.peq.is_empty()
+            || !state.selector.is_empty()
+            || !state.scalar.is_empty())
+        .then(|| PresetShadowState {
+            peq: state.peq.clone(),
+            selector: state.selector.clone(),
+            scalar: state.scalar.clone(),
+        });
+
+        {
+            let mut preset_shadows = self.preset_shadows.lock().await;
+            *preset_shadows = state.presets.clone();
+            if preset_shadows.is_empty()
+                && let Some(active_preset) = active_preset
+                && let Some(legacy_shadow) = legacy_shadow.clone()
+            {
+                preset_shadows.insert(active_preset, legacy_shadow);
+            }
+        }
+        {
+            let mut preset_tokens = self.preset_tokens.lock().await;
+            *preset_tokens = state.preset_tokens.clone();
+        }
+
+        let snapshot = if let Some(active_preset) = active_preset {
+            self.preset_shadows
+                .lock()
+                .await
+                .get(&active_preset)
+                .cloned()
+                .or(legacy_shadow)
+        } else {
+            legacy_shadow
+        };
+        self.apply_active_shadow_snapshot(snapshot).await;
+    }
+
+    fn prefers_scalar_shadow_for_addr(&self, addr: u16) -> bool {
+        if self.profile.dialect.value_format != ValueFormat::Float32
+            || self.profile.dsp_version != 100
+        {
+            return false;
+        }
+        let Some(table) = self.profile.dsp_table else {
+            return false;
+        };
+        if table
+            .inputs
+            .iter()
+            .filter_map(|input| input.gain)
+            .any(|gain| gain == addr)
+        {
+            return true;
+        }
+
+        if table.outputs.iter().any(|output| {
+            output.gain == addr
+                || output.delay == Some(addr)
+                || output.compressor.is_some_and(|comp| {
+                    [
+                        comp.threshold,
+                        comp.gain,
+                        comp.ratio,
+                        comp.knee,
+                        comp.attack,
+                        comp.release,
+                    ]
+                    .contains(&addr)
+                })
+        }) {
+            return true;
+        }
+
+        let routing_span = table.routing.rows as u16 * table.routing.cols as u16;
+        addr >= table.routing.gain_base && addr < table.routing.gain_base + routing_span
+    }
+
+    pub async fn refresh_modification_tokens(&self) -> Result<(), ClientError> {
+        let resp = self
+            .queue
+            .execute(
+                commands::read_flash(eeprom::TOKENS_ADDR.0, eeprom::TOKENS_ADDR.1, 16),
+                Priority::Normal,
+            )
+            .await?;
+        let Response::FlashData(data) = resp else {
+            return Err(ClientError::Protocol(
+                "unexpected response to read modification tokens".into(),
+            ));
+        };
+
+        let mut tokens = HashMap::new();
+        for (slot, chunk) in data.chunks(4).enumerate() {
+            if chunk.len() == 4 {
+                tokens.insert(slot as u8, [chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        *self.preset_tokens.lock().await = tokens;
+        Ok(())
+    }
+
+    pub async fn active_preset_token(&self) -> Result<(u8, [u8; 4]), ClientError> {
+        let preset = self.get_master_status().await?.preset;
+        self.refresh_modification_tokens().await?;
+        self.preset_tokens
+            .lock()
+            .await
+            .get(&preset)
+            .copied()
+            .map(|token| (preset, token))
+            .ok_or_else(|| {
+                ClientError::Protocol(format!(
+                    "missing modification token for active preset {preset}"
+                ))
+            })
+    }
+
+    pub async fn save_active_preset_token(&self) -> Result<(u8, [u8; 4]), ClientError> {
+        let preset = self.get_master_status().await?.preset;
+        let token = generate_modification_token()?;
+        let addr_lo = eeprom::TOKENS_ADDR.1 + preset.saturating_mul(4);
+        self.execute_write(
+            commands::write_flash(eeprom::TOKENS_ADDR.0, addr_lo, &token),
+            Priority::High,
+            "save modification token",
+        )
+        .await?;
+        self.preset_tokens.lock().await.insert(preset, token);
+        Ok((preset, token))
     }
 
     /// Override the device profile (for --force-kind).
@@ -735,9 +1823,13 @@ impl MiniDspClient {
         for &(addr, _, _) in &bands {
             bypass_cmds.push(commands::bypass_filter(addr, true, &self.profile.dialect));
         }
-        self.queue
-            .execute_batch(bypass_cmds, Priority::Critical)
-            .await?;
+        ensure_write_batch(
+            self.queue
+                .execute_batch(bypass_cmds, Priority::Critical)
+                .await?,
+            "enter measurement mode bypass",
+        )?;
+        apply_peq_shadow_bypass(&self.peq_shadow, &bands, true).await;
 
         tracing::info!(
             "measurement mode: saved and bypassed {} PEQ bands",
@@ -834,6 +1926,20 @@ impl MiniDspClient {
 
     /// Read 5 biquad coefficients from a PEQ band address.
     async fn read_peq_coeffs(&self, addr: u16) -> Result<[f32; 5], ClientError> {
+        if self.profile.dialect.value_format == ValueFormat::Float32
+            && self.profile.dsp_version == 100
+        {
+            // Live DSP100 / 2x4 HD PEQ and crossover coefficient reads are not
+            // authoritative on the tested hardware path. Prefer the shadow/default
+            // model directly so `/config` remains fast instead of timing out one
+            // band at a time on all-zero placeholder reads.
+            let shadow = self.peq_shadow.lock().await;
+            return Ok(shadow
+                .get(&addr)
+                .map(|s| s.coeffs)
+                .unwrap_or(minidsp_protocol::biquad::BYPASS));
+        }
+
         let values = self.read_floats(addr, 5).await.unwrap_or_default();
         if values.len() >= 5 {
             let coeffs = [values[0], values[1], values[2], values[3], values[4]];
@@ -918,17 +2024,18 @@ impl MiniDspClient {
                         let flat_idx = ch_idx as u16 * routing.cols as u16 + output as u16;
                         let status_addr = routing.status_base + flat_idx;
                         let gain_addr = routing.gain_base + flat_idx;
-                        let status = self.read_param_word(status_addr).await.unwrap_or(0);
                         let enabled = match self.profile.dialect.value_format {
                             // DSP100 mixer status readback via 0x14 is boolean-
-                            // collapsed: write values 2 (enabled) and 1 (disabled)
-                            // both read back as 1. Only 0 reads back as 0. So we
-                            // cannot distinguish enabled from disabled via readback
-                            // alone. Treat non-zero as enabled — callers that need
-                            // authoritative state should use the saved preset or
-                            // the audio test instead.
-                            ValueFormat::Float32 => status != 0,
-                            ValueFormat::FixedPoint => status != 0,
+                            // collapsed, so prefer the selector shadow after any
+                            // successful write on this client. Fall back to the
+                            // raw non-zero check only when no shadow exists yet.
+                            ValueFormat::Float32 => self
+                                .read_routing_enabled(status_addr)
+                                .await
+                                .unwrap_or(false),
+                            ValueFormat::FixedPoint => {
+                                self.read_param_word(status_addr).await.unwrap_or(0) != 0
+                            }
                         };
                         let gain_db = self.read_config_gain_db(gain_addr).await.unwrap_or(0.0);
                         routing_entries.push(RoutingConfig {
@@ -968,8 +2075,55 @@ impl MiniDspClient {
                     }
                 }
 
+                let mut crossover = Vec::new();
+                if let Some(xover) = output.crossover {
+                    for (group_idx, base_addr) in [(0u8, xover.lpf_addr), (1u8, xover.hpf_addr)] {
+                        let mut filters = Vec::new();
+                        for band_idx in 0..4u8 {
+                            let addr = base_addr + band_idx as u16 * 5;
+                            if let Ok(coeffs) = self.read_peq_coeffs(addr).await {
+                                filters.push(IndexedBiquadConfig {
+                                    index: band_idx,
+                                    coeff: BiquadCoeffs::from_array(&coeffs),
+                                });
+                            }
+                        }
+                        crossover.push(CrossoverGroupConfig {
+                            index: group_idx,
+                            filters,
+                            bypass: self.read_peq_bypass(base_addr).await.unwrap_or(false),
+                        });
+                    }
+                }
+
+                let fir = if let Some(fir) = output.fir {
+                    let shadow_taps = self.selector_shadow_value(fir.taps_count).await;
+                    let active_taps = match self.read_param_scalar_u32(fir.taps_count).await {
+                        Ok(value)
+                            if self.profile.dsp_version == 100
+                                && self.profile.dialect.value_format == ValueFormat::Float32 =>
+                        {
+                            shadow_taps.or_else(|| {
+                                (1..=fir.max_taps as u32)
+                                    .contains(&value)
+                                    .then_some(value as u16)
+                            })
+                        }
+                        Ok(value) if (1..=fir.max_taps as u32).contains(&value) => {
+                            Some(value as u16)
+                        }
+                        _ => shadow_taps,
+                    };
+                    Some(FirConfig {
+                        bypass: self.read_config_bypass(fir.bypass).await.unwrap_or(false),
+                        active_taps: active_taps.unwrap_or(0),
+                    })
+                } else {
+                    None
+                };
+
                 let compressor = if let Some(comp) = &output.compressor {
-                    let bypass = self.read_config_mute(comp.bypass).await.unwrap_or(false);
+                    let bypass = self.read_config_bypass(comp.bypass).await.unwrap_or(false);
                     let threshold = self
                         .read_config_gain_db(comp.threshold)
                         .await
@@ -998,6 +2152,8 @@ impl MiniDspClient {
                     mute: mute_val,
                     delay: delay_val,
                     peq,
+                    crossover,
+                    fir,
                     compressor,
                 });
             }
@@ -1010,8 +2166,11 @@ impl MiniDspClient {
         })
     }
 
-    // Internal: read meter values from an array of addresses.
-    async fn read_meters(&self, addrs: &[u16]) -> Result<Vec<f32>, ClientError> {
+    async fn read_meters_with_priority(
+        &self,
+        addrs: &[u16],
+        priority: Priority,
+    ) -> Result<Vec<f32>, ClientError> {
         if addrs.is_empty() {
             return Ok(vec![]);
         }
@@ -1021,8 +2180,10 @@ impl MiniDspClient {
         let is_contiguous = addrs.len() <= 14 && addrs.windows(2).all(|w| w[1] == w[0] + 1);
 
         if is_contiguous {
-            let values = self.read_floats(addrs[0], addrs.len() as u8).await?;
-            all_values.extend(values);
+            all_values.extend(
+                self.read_meter_run_best_effort(addrs[0], addrs.len(), priority)
+                    .await,
+            );
         } else {
             // Find contiguous runs and read each run in bulk
             let mut i = 0;
@@ -1032,28 +2193,540 @@ impl MiniDspClient {
                     i += 1;
                 }
                 let count = (i - start + 1).min(14);
-                let values = self.read_floats(addrs[start], count as u8).await?;
-                all_values.extend(values);
+                all_values.extend(
+                    self.read_meter_run_best_effort(addrs[start], count, priority)
+                        .await,
+                );
                 i += 1;
             }
         }
 
-        // SHARC-family meter registers already report dB-like float values.
-        // Re-applying log10() here turns valid negative readings like -120 dB
-        // into misleading positive numbers (~41.58). Return the raw meter
-        // values and only clamp pathological silence / NaN cases.
-        let db_values: Vec<f32> = all_values
-            .iter()
-            .map(|&v| {
-                if !v.is_finite() {
-                    -140.0
-                } else if v <= -140.0 || v.abs() < 1e-10 {
-                    -140.0
-                } else {
-                    v
+        Ok(sanitize_meter_values(&all_values))
+    }
+
+    async fn read_status_meters_with_priority(
+        &self,
+        addrs: &[u16],
+        priority: Priority,
+    ) -> Vec<f32> {
+        match self.read_meters_with_priority(addrs, priority).await {
+            Ok(values) => values,
+            Err(err) => {
+                tracing::warn!(
+                    transport = %self.transport_url,
+                    ?addrs,
+                    ?priority,
+                    "status meter read failed, using silence fallback: {err}"
+                );
+                vec![SILENT_METER_DB; addrs.len()]
+            }
+        }
+    }
+
+    async fn read_meter_run_with_priority(
+        &self,
+        addr: u16,
+        count: usize,
+        priority: Priority,
+    ) -> Result<Vec<f32>, ClientError> {
+        let values = self
+            .read_floats_with_timeout(addr, count as u8, priority, Some(METER_READ_TIMEOUT))
+            .await?;
+        if values.len() != count {
+            return Err(ClientError::Protocol(format!(
+                "meter read at addr {addr} returned {} values, expected {count}",
+                values.len()
+            )));
+        }
+        Ok(values)
+    }
+
+    async fn read_meter_run_best_effort(
+        &self,
+        addr: u16,
+        count: usize,
+        priority: Priority,
+    ) -> Vec<f32> {
+        match self
+            .read_meter_run_with_priority(addr, count, priority)
+            .await
+        {
+            Ok(values) => values,
+            Err(err) => {
+                tracing::warn!(
+                    transport = %self.transport_url,
+                    addr,
+                    count,
+                    ?priority,
+                    "bulk meter read failed, retrying per-address: {err}"
+                );
+                let mut values = Vec::with_capacity(count);
+                for offset in 0..count {
+                    let current_addr = addr + offset as u16;
+                    match self
+                        .read_meter_run_with_priority(current_addr, 1, priority)
+                        .await
+                    {
+                        Ok(mut single) => values.push(single.remove(0)),
+                        Err(single_err) => {
+                            tracing::warn!(
+                                transport = %self.transport_url,
+                                addr = current_addr,
+                                ?priority,
+                                "single meter read failed, using silence fallback: {single_err}"
+                            );
+                            values.push(SILENT_METER_DB);
+                        }
+                    }
                 }
-            })
-            .collect();
-        Ok(db_values)
+                values
+            }
+        }
+    }
+}
+
+fn sanitize_meter_values(values: &[f32]) -> Vec<f32> {
+    // SHARC-family meter registers already report dB-like float values.
+    // Re-applying log10() here turns valid negative readings like -120 dB
+    // into misleading positive numbers (~41.58). Return the raw meter
+    // values and only clamp pathological silence / NaN cases.
+    values
+        .iter()
+        .map(|&v| {
+            if !v.is_finite() {
+                SILENT_METER_DB
+            } else if v <= SILENT_METER_DB || v.abs() < 1e-10 {
+                SILENT_METER_DB
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
+fn sanitize_shadow_preferred_scalar(raw: u32) -> Option<f32> {
+    if raw <= 2 {
+        return Some(0.0);
+    }
+
+    let value = f32::from_bits(raw);
+    if !value.is_finite() || value.abs() > 10_000.0 {
+        return Some(0.0);
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minidsp_protocol::dialect::Dialect;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct DummyTransport;
+
+    impl crate::transport::Transport for DummyTransport {
+        fn send_frame(
+            &self,
+            _payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recv_frame(
+            &self,
+            _timeout_ms: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            Box::pin(async { Err(TransportError::Timeout) })
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn url(&self) -> String {
+            "mock://shadow".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_raw_biquad_write_updates_shadow() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::from([(
+            8480u16,
+            PeqShadow {
+                coeffs: minidsp_protocol::biquad::BYPASS,
+                bypass: false,
+            },
+        )])));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let coeffs = [0.1, 0.2, 0.3, 0.4, 0.5];
+        let payload = commands::write_biquad(8480, &coeffs, &Dialect::NEW);
+
+        mirror_raw_command_to_shadow(
+            &payload,
+            &Dialect::NEW,
+            &peq_shadow,
+            &scalar_shadow,
+            &selector_shadow,
+        )
+        .await;
+
+        let shadow = peq_shadow.lock().await;
+        assert_eq!(shadow.get(&8480).unwrap().coeffs, coeffs);
+    }
+
+    #[tokio::test]
+    async fn mirror_raw_bypass_write_updates_shadow() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::from([(
+            8480u16,
+            PeqShadow {
+                coeffs: minidsp_protocol::biquad::BYPASS,
+                bypass: false,
+            },
+        )])));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let payload = commands::bypass_filter(8480, true, &Dialect::NEW);
+
+        mirror_raw_command_to_shadow(
+            &payload,
+            &Dialect::NEW,
+            &peq_shadow,
+            &scalar_shadow,
+            &selector_shadow,
+        )
+        .await;
+
+        let shadow = peq_shadow.lock().await;
+        assert!(shadow.get(&8480).unwrap().bypass);
+    }
+
+    #[tokio::test]
+    async fn apply_peq_shadow_bypass_updates_all_bands() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::from([
+            (
+                8480u16,
+                PeqShadow {
+                    coeffs: minidsp_protocol::biquad::BYPASS,
+                    bypass: false,
+                },
+            ),
+            (
+                8485u16,
+                PeqShadow {
+                    coeffs: minidsp_protocol::biquad::BYPASS,
+                    bypass: false,
+                },
+            ),
+        ])));
+        let bands = vec![
+            (8480u16, minidsp_protocol::biquad::BYPASS, false),
+            (8485u16, minidsp_protocol::biquad::BYPASS, false),
+        ];
+
+        apply_peq_shadow_bypass(&peq_shadow, &bands, true).await;
+
+        let shadow = peq_shadow.lock().await;
+        assert!(shadow.get(&8480).unwrap().bypass);
+        assert!(shadow.get(&8485).unwrap().bypass);
+    }
+
+    #[tokio::test]
+    async fn mirror_raw_selector_write_updates_shadow() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let payload = commands::write_dsp_int(24, 3);
+
+        mirror_raw_command_to_shadow(
+            &payload,
+            &Dialect::NEW,
+            &peq_shadow,
+            &scalar_shadow,
+            &selector_shadow,
+        )
+        .await;
+
+        let shadow = selector_shadow.lock().await;
+        assert_eq!(shadow.get(&24), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn mirror_raw_linked_selector_write_updates_shadow() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let payload = commands::write_dsp_linked_u32(22, 2, &[]);
+
+        mirror_raw_command_to_shadow(
+            &payload,
+            &Dialect::NEW,
+            &peq_shadow,
+            &scalar_shadow,
+            &selector_shadow,
+        )
+        .await;
+
+        let shadow = selector_shadow.lock().await;
+        assert_eq!(shadow.get(&22), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn mirror_raw_scalar_write_updates_shadow() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let payload = commands::write_dsp(42, 9.9, true, &Dialect::NEW);
+
+        mirror_raw_command_to_shadow(
+            &payload,
+            &Dialect::NEW,
+            &peq_shadow,
+            &scalar_shadow,
+            &selector_shadow,
+        )
+        .await;
+
+        let shadow = scalar_shadow.lock().await;
+        assert_eq!(shadow.get(&42), Some(&9.9f32.to_bits()));
+    }
+
+    #[tokio::test]
+    async fn mirror_raw_zero_float_write_stays_scalar_not_selector() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let payload = commands::write_dsp(28, 0.0, false, &Dialect::NEW);
+
+        mirror_raw_command_to_shadow(
+            &payload,
+            &Dialect::NEW,
+            &peq_shadow,
+            &scalar_shadow,
+            &selector_shadow,
+        )
+        .await;
+
+        assert_eq!(scalar_shadow.lock().await.get(&28), Some(&0.0f32.to_bits()));
+        assert!(selector_shadow.lock().await.get(&28).is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_shadow_state_roundtrips() {
+        let client = MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(DummyTransport))),
+            transport_url: "mock://shadow".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(HashMap::new())),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            active_preset: Mutex::new(Some(0)),
+        };
+
+        let state = DeviceShadowState {
+            presets: HashMap::from([(
+                0,
+                PresetShadowState {
+                    peq: HashMap::from([(
+                        8480,
+                        CachedPeqShadow {
+                            coeffs: [0.1, 0.2, 0.3, 0.4, 0.5],
+                            bypass: true,
+                        },
+                    )]),
+                    selector: HashMap::from([(8, 1), (4182, 6)]),
+                    scalar: HashMap::from([(42, 9.9f32.to_bits())]),
+                },
+            )]),
+            peq: HashMap::from([(
+                8480,
+                CachedPeqShadow {
+                    coeffs: [0.1, 0.2, 0.3, 0.4, 0.5],
+                    bypass: true,
+                },
+            )]),
+            selector: HashMap::from([(8, 1), (4182, 6)]),
+            scalar: HashMap::from([(42, 9.9f32.to_bits())]),
+            preset_tokens: HashMap::from([(0, [0x80, 0x97, 0x81, 0xc9])]),
+        };
+
+        client.apply_shadow_state(&state).await;
+        let exported = client.export_shadow_state().await;
+
+        assert_eq!(
+            exported.peq.get(&8480).unwrap().coeffs,
+            [0.1, 0.2, 0.3, 0.4, 0.5]
+        );
+        assert!(exported.peq.get(&8480).unwrap().bypass);
+        assert_eq!(exported.selector.get(&8), Some(&1));
+        assert_eq!(exported.selector.get(&4182), Some(&6));
+        assert_eq!(exported.scalar.get(&42), Some(&9.9f32.to_bits()));
+        assert_eq!(
+            exported.preset_tokens.get(&0),
+            Some(&[0x80, 0x97, 0x81, 0xc9])
+        );
+        assert_eq!(
+            exported
+                .presets
+                .get(&0)
+                .and_then(|preset| preset.scalar.get(&42)),
+            Some(&9.9f32.to_bits())
+        );
+    }
+
+    #[tokio::test]
+    async fn preset_shadow_switching_keeps_non_authoritative_values_scoped() {
+        let client = MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(DummyTransport))),
+            transport_url: "mock://shadow".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            active_preset: Mutex::new(Some(0)),
+        };
+
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(42, 9.5f32.to_bits());
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(44, 99.0f32.to_bits());
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(45, 999.0f32.to_bits());
+        client.selector_shadow.lock().await.insert(6, 1);
+
+        client.update_active_preset(1).await;
+
+        assert_eq!(client.scalar_shadow.lock().await.get(&42), None);
+        assert_eq!(client.scalar_shadow.lock().await.get(&44), None);
+        assert_eq!(client.scalar_shadow.lock().await.get(&45), None);
+        assert_eq!(client.selector_shadow.lock().await.get(&6), None);
+
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(42, 3.5f32.to_bits());
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(44, 12.0f32.to_bits());
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(45, 240.0f32.to_bits());
+        client.selector_shadow.lock().await.insert(6, 2);
+
+        client.update_active_preset(0).await;
+
+        let scalar_shadow = client.scalar_shadow.lock().await;
+        assert_eq!(scalar_shadow.get(&42), Some(&9.5f32.to_bits()));
+        assert_eq!(scalar_shadow.get(&44), Some(&99.0f32.to_bits()));
+        assert_eq!(scalar_shadow.get(&45), Some(&999.0f32.to_bits()));
+        drop(scalar_shadow);
+        assert_eq!(client.selector_shadow.lock().await.get(&6), Some(&1));
+    }
+
+    #[test]
+    fn prefers_scalar_shadow_for_non_authoritative_dsp100_scalar_fields() {
+        let client = MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(DummyTransport))),
+            transport_url: "mock://shadow".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(HashMap::new())),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            active_preset: Mutex::new(Some(0)),
+        };
+
+        let table = client.profile.dsp_table.unwrap();
+        assert!(
+            client.prefers_scalar_shadow_for_addr(table.inputs[0].gain.expect("input gain addr"))
+        );
+        assert!(client.prefers_scalar_shadow_for_addr(table.outputs[0].gain));
+        assert!(
+            client
+                .prefers_scalar_shadow_for_addr(table.outputs[0].delay.expect("output delay addr"))
+        );
+        assert!(client.prefers_scalar_shadow_for_addr(table.routing.gain_base));
+        assert!(client.prefers_scalar_shadow_for_addr(40));
+        assert!(client.prefers_scalar_shadow_for_addr(41));
+        assert!(client.prefers_scalar_shadow_for_addr(42));
+        assert!(client.prefers_scalar_shadow_for_addr(43));
+        assert!(client.prefers_scalar_shadow_for_addr(44));
+        assert!(client.prefers_scalar_shadow_for_addr(45));
+    }
+
+    #[test]
+    fn sanitize_meter_values_clamps_invalid_and_tiny_values() {
+        let values = sanitize_meter_values(&[f32::NAN, -200.0, 0.0, 1e-20, -87.5, 3.2]);
+        assert_eq!(
+            values,
+            vec![
+                SILENT_METER_DB,
+                SILENT_METER_DB,
+                SILENT_METER_DB,
+                SILENT_METER_DB,
+                -87.5,
+                3.2,
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_shadow_preferred_scalar_clamps_placeholder_and_absurd_values() {
+        assert_eq!(sanitize_shadow_preferred_scalar(0), Some(0.0));
+        assert_eq!(sanitize_shadow_preferred_scalar(2), Some(0.0));
+        assert_eq!(sanitize_shadow_preferred_scalar(0x4A03_9901), Some(0.0));
+        assert_eq!(sanitize_shadow_preferred_scalar(9.5f32.to_bits()), None);
     }
 }

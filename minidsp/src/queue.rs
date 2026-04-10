@@ -33,6 +33,7 @@ struct QueuedCommand {
     #[allow(dead_code)]
     priority: Priority,
     response_tx: oneshot::Sender<Result<QueueResponse, TransportError>>,
+    allow_unknown_response: bool,
     #[allow(dead_code)]
     batch_id: Option<u64>,
     deadline: Instant,
@@ -48,6 +49,15 @@ enum QueueState {
 
 /// Maximum queue depth before returning a busy error.
 pub const MAX_QUEUE_DEPTH: usize = 64;
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
+
+fn default_timeout_for_payload(payload: &[u8]) -> Duration {
+    match payload.first().copied() {
+        Some(commands::CMD_COPY_PRESET | commands::CMD_RESET) => DEFAULT_SLOW_COMMAND_TIMEOUT,
+        _ => DEFAULT_COMMAND_TIMEOUT,
+    }
+}
 
 /// Per-device command queue with priority scheduling.
 pub struct CommandQueue {
@@ -113,7 +123,23 @@ impl CommandQueue {
         payload: Vec<u8>,
         priority: Priority,
     ) -> Result<Response, TransportError> {
-        let qr = self.execute_inner(payload, priority).await?;
+        let timeout = default_timeout_for_payload(&payload);
+        let qr = self
+            .execute_inner(payload, priority, false, timeout)
+            .await?;
+        Ok(qr.parsed)
+    }
+
+    /// Execute a single command with a custom timeout and return the parsed response.
+    pub async fn execute_with_timeout(
+        &self,
+        payload: Vec<u8>,
+        priority: Priority,
+        timeout: Duration,
+    ) -> Result<Response, TransportError> {
+        let qr = self
+            .execute_inner(payload, priority, false, timeout)
+            .await?;
         Ok(qr.parsed)
     }
 
@@ -123,7 +149,19 @@ impl CommandQueue {
         payload: Vec<u8>,
         priority: Priority,
     ) -> Result<Vec<u8>, TransportError> {
-        let qr = self.execute_inner(payload, priority).await?;
+        let timeout = default_timeout_for_payload(&payload);
+        let qr = self.execute_inner(payload, priority, true, timeout).await?;
+        Ok(qr.raw)
+    }
+
+    /// Execute a command with a custom timeout and return raw response bytes.
+    pub async fn execute_raw_with_timeout(
+        &self,
+        payload: Vec<u8>,
+        priority: Priority,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, TransportError> {
+        let qr = self.execute_inner(payload, priority, true, timeout).await?;
         Ok(qr.raw)
     }
 
@@ -131,6 +169,8 @@ impl CommandQueue {
         &self,
         payload: Vec<u8>,
         priority: Priority,
+        allow_unknown_response: bool,
+        timeout: Duration,
     ) -> Result<QueueResponse, TransportError> {
         // Check queue depth before enqueuing
         {
@@ -148,8 +188,9 @@ impl CommandQueue {
                 payload,
                 priority,
                 response_tx: tx,
+                allow_unknown_response,
                 batch_id: None,
-                deadline: Instant::now() + Duration::from_secs(10),
+                deadline: Instant::now() + timeout,
             });
         }
         self.notify.notify_one();
@@ -177,6 +218,7 @@ impl CommandQueue {
                     payload,
                     priority,
                     response_tx: tx,
+                    allow_unknown_response: false,
                     batch_id: Some(batch_id),
                     deadline: Instant::now() + Duration::from_secs(30),
                 });
@@ -211,6 +253,16 @@ impl CommandQueue {
     pub fn is_levels_paused(&self) -> bool {
         self.levels_paused
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn pause_levels(&self) {
+        self.levels_paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn resume_levels(&self) {
+        self.levels_paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn reconnect_epoch(&self) -> u64 {
@@ -261,39 +313,79 @@ impl CommandQueue {
         cmd: &QueuedCommand,
     ) -> Result<QueueResponse, TransportError> {
         let transport = self.transport.lock().await;
+        let request_opcode = cmd
+            .payload
+            .first()
+            .copied()
+            .ok_or_else(|| TransportError::Io("empty command payload".into()))?;
 
         transport.send_frame(&cmd.payload).await?;
 
-        let raw = transport.recv_frame(500).await?;
-        let dialect = self.dialect.lock().await;
-        let response = commands::parse_response_for_request(&cmd.payload, &raw, &dialect);
+        loop {
+            let raw = match transport
+                .recv_frame(remaining_timeout_ms(cmd.deadline)?.min(500))
+                .await
+            {
+                Ok(raw) => raw,
+                Err(TransportError::Timeout) => continue,
+                Err(err) => return Err(err),
+            };
+            let response = {
+                let dialect = self.dialect.lock().await;
+                commands::parse_response_for_request(&cmd.payload, &raw, &dialect)
+            };
+            let response_opcode = raw.first().copied().unwrap_or(commands::RESP_OK);
 
-        // Handle preset change: wait for PresetComplete
-        if cmd.payload.first() == Some(&commands::CMD_SET_CONFIG)
-            && matches!(response, Response::Ack)
-        {
-            match transport.recv_frame(5000).await {
-                Ok(raw2) => {
-                    let resp2 = commands::parse_response_for_request(&cmd.payload, &raw2, &dialect);
-                    return Ok(QueueResponse {
-                        parsed: resp2,
-                        raw: raw2,
-                    });
-                }
-                Err(TransportError::Disconnected) => return Err(TransportError::Disconnected),
-                Err(_) => {
-                    return Ok(QueueResponse {
-                        parsed: response,
+            if !commands::matches_response(request_opcode, response_opcode) {
+                tracing::debug!(
+                    "queue: skipping stale response {:02x?} for request {:02x?}",
+                    raw,
+                    cmd.payload
+                );
+                continue;
+            }
+
+            if matches!(response, Response::Unknown(_))
+                && request_opcode == commands::CMD_READ_FLOATS
+            {
+                let matches_typed_read = {
+                    let dialect = self.dialect.lock().await;
+                    match dialect.value_format {
+                        minidsp_protocol::dialect::ValueFormat::Float32 => {
+                            commands::parse_param_words_response_for_request(&cmd.payload, &raw)
+                                .is_some()
+                        }
+                        minidsp_protocol::dialect::ValueFormat::FixedPoint => {
+                            commands::parse_param_words_be_response_for_request(&cmd.payload, &raw)
+                                .is_some()
+                        }
+                    }
+                };
+
+                if !matches_typed_read {
+                    tracing::debug!(
+                        "queue: skipping unknown readfloats response {:02x?} for request {:02x?}",
                         raw,
-                    });
+                        cmd.payload
+                    );
+                    continue;
                 }
             }
-        }
 
-        Ok(QueueResponse {
-            parsed: response,
-            raw,
-        })
+            if matches!(response, Response::Unknown(_)) && !cmd.allow_unknown_response {
+                tracing::debug!(
+                    "queue: skipping unknown request-specific response {:02x?} for request {:02x?}",
+                    raw,
+                    cmd.payload
+                );
+                continue;
+            }
+
+            return Ok(QueueResponse {
+                parsed: response,
+                raw,
+            });
+        }
     }
 
     async fn reconnect_transport(&self) -> Result<(), TransportError> {
@@ -331,6 +423,19 @@ impl CommandQueue {
             }
         }
     }
+}
+
+fn remaining_timeout_ms(deadline: Instant) -> Result<u64, TransportError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(TransportError::Timeout);
+    }
+
+    Ok(remaining
+        .as_millis()
+        .clamp(1, u64::MAX as u128)
+        .try_into()
+        .unwrap_or(u64::MAX))
 }
 
 async fn open_transport(url: &str) -> Result<Box<dyn Transport>, TransportError> {
@@ -437,4 +542,316 @@ fn parse_usb_url(rest: &str) -> Result<ParsedUsbUrl, TransportError> {
         vid: vid.ok_or_else(|| TransportError::Io("missing usb vid in transport url".into()))?,
         pid: pid.ok_or_else(|| TransportError::Io("missing usb pid in transport url".into()))?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minidsp_protocol::commands;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    struct FakeTransport {
+        sent: Arc<StdMutex<Vec<Vec<u8>>>>,
+        responses: Arc<StdMutex<VecDeque<Result<Vec<u8>, TransportError>>>>,
+        recv_calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeTransport {
+        fn new(responses: impl IntoIterator<Item = Result<Vec<u8>, TransportError>>) -> Self {
+            Self {
+                sent: Arc::new(StdMutex::new(Vec::new())),
+                responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
+                recv_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl Transport for FakeTransport {
+        fn send_frame(
+            &self,
+            payload: &[u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>,
+        > {
+            let sent = self.sent.clone();
+            let payload = payload.to_vec();
+            Box::pin(async move {
+                sent.lock().unwrap().push(payload);
+                Ok(())
+            })
+        }
+
+        fn recv_frame(
+            &self,
+            _timeout_ms: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>,
+        > {
+            let responses = self.responses.clone();
+            let recv_calls = self.recv_calls.clone();
+            Box::pin(async move {
+                recv_calls.fetch_add(1, Ordering::Relaxed);
+                responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Err(TransportError::Timeout))
+            })
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn close(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn url(&self) -> String {
+            "fake://queue-test".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn set_config_returns_first_ack_without_waiting_for_second_frame() {
+        let transport = FakeTransport::new([Ok(vec![commands::CMD_SET_CONFIG])]);
+        let recv_calls = transport.recv_calls.clone();
+        let queue = CommandQueue::new(Box::new(transport));
+
+        let resp = queue
+            .execute(
+                commands::set_config(1, commands::PRESET_CHANGE_NORMAL),
+                Priority::Critical,
+            )
+            .await
+            .expect("set_config should accept opcode ack");
+
+        assert!(matches!(resp, Response::Ack));
+        assert_eq!(recv_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn set_config_accepts_preset_complete_frame() {
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(vec![
+            commands::RESP_PRESET_COMPLETE,
+        ])])));
+
+        let resp = queue
+            .execute(
+                commands::set_config(2, commands::PRESET_CHANGE_NORMAL),
+                Priority::Critical,
+            )
+            .await
+            .expect("set_config should accept preset complete");
+
+        assert!(matches!(resp, Response::PresetComplete));
+    }
+
+    #[tokio::test]
+    async fn set_source_skips_stale_flash_response_and_accepts_ack() {
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([
+            Ok(vec![
+                commands::CMD_READ_FLASH,
+                0xFF,
+                0xD8,
+                0x01,
+                0x00,
+                0x00,
+                0x00,
+            ]),
+            Ok(vec![commands::CMD_SET_SOURCE, 0x02]),
+        ])));
+
+        let resp = queue
+            .execute(commands::set_source(2), Priority::High)
+            .await
+            .expect("set_source should ignore stale flash data");
+
+        assert!(matches!(resp, Response::Ack));
+    }
+
+    #[tokio::test]
+    async fn read_after_source_change_skips_official_stale_flash_notification() {
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([
+            Ok(vec![commands::CMD_SET_SOURCE, 0x02, 0x4a, 0x00, 0x00, 0x00]),
+            Ok(vec![commands::CMD_READ_FLASH, 0xff, 0xa9, 0x02]),
+            Ok(vec![
+                commands::CMD_READ_FLOATS,
+                0x00,
+                0x44,
+                0xd0,
+                0x8f,
+                0x00,
+                0xc3,
+                0xd0,
+                0x8f,
+                0x00,
+                0xc3,
+            ]),
+        ])));
+
+        let set_source_resp = queue
+            .execute(commands::set_source(2), Priority::High)
+            .await
+            .expect("set_source should accept official opcode echo");
+        assert!(matches!(set_source_resp, Response::Ack));
+
+        let read_resp = queue
+            .execute(
+                commands::read_floats(0x0044, 2, &Dialect::NEW),
+                Priority::Normal,
+            )
+            .await
+            .expect("next read should skip stale source flash notification");
+
+        match read_resp {
+            Response::Floats(values) => {
+                assert_eq!(values.len(), 2);
+                let expected = f32::from_le_bytes([0xd0, 0x8f, 0x00, 0xc3]);
+                assert_eq!(values[0].to_bits(), expected.to_bits());
+                assert_eq!(values[1].to_bits(), expected.to_bits());
+            }
+            other => panic!("expected floats after stale flash skip, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_flash_accepts_official_opcode_echo_ack() {
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(vec![
+            commands::CMD_WRITE_FLASH,
+            0xff,
+            0xc8,
+            0x5a,
+            0x4c,
+            0x1b,
+            0x2b,
+        ])])));
+
+        let resp = queue
+            .execute(
+                commands::write_flash(0xff, 0xc8, &[0x5a, 0x4c, 0x1b, 0x2b]),
+                Priority::High,
+            )
+            .await
+            .expect("write_flash should accept official opcode echo ack");
+
+        assert!(matches!(resp, Response::Ack));
+    }
+
+    #[tokio::test]
+    async fn execute_raw_returns_matching_unknown_readfloats_frame() {
+        let raw = vec![
+            commands::CMD_READ_FLOATS,
+            0x00,
+            0x16,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(raw.clone())])));
+
+        let resp = queue
+            .execute_raw(
+                commands::read_floats(0x0016, 2, &Dialect::NEW),
+                Priority::Normal,
+            )
+            .await
+            .expect("execute_raw should return matching raw frame even if float parser rejects it");
+
+        assert_eq!(resp, raw);
+    }
+
+    #[tokio::test]
+    async fn execute_raw_skips_wrong_address_unknown_readfloats_frame() {
+        let stale = vec![
+            commands::CMD_READ_FLOATS,
+            0x00,
+            0x4a,
+            0x08,
+            0x99,
+            0x03,
+            0x4a,
+            0xd3,
+            0xdc,
+            0x42,
+            0xfd,
+        ];
+        let expected = vec![
+            commands::CMD_READ_FLOATS,
+            0x00,
+            0x16,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([
+            Ok(stale),
+            Ok(expected.clone()),
+        ])));
+
+        let resp = queue
+            .execute_raw(
+                commands::read_floats(0x0016, 2, &Dialect::NEW),
+                Priority::Normal,
+            )
+            .await
+            .expect("execute_raw should skip stale unknown readfloats frames that do not match the request");
+
+        assert_eq!(resp, expected);
+    }
+
+    #[tokio::test]
+    async fn execute_retries_after_recv_timeout_until_ack_arrives() {
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([
+            Err(TransportError::Timeout),
+            Ok(vec![commands::RESP_OK]),
+        ])));
+
+        let resp = queue
+            .execute(commands::set_source(2), Priority::High)
+            .await
+            .expect("queue should keep polling until ack arrives before the deadline");
+
+        assert!(matches!(resp, Response::Ack));
+    }
+
+    #[test]
+    fn copy_preset_uses_extended_default_timeout() {
+        assert_eq!(
+            default_timeout_for_payload(&commands::copy_preset(true)),
+            DEFAULT_SLOW_COMMAND_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn reset_uses_extended_default_timeout() {
+        assert_eq!(
+            default_timeout_for_payload(&commands::reset()),
+            DEFAULT_SLOW_COMMAND_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn regular_commands_keep_standard_default_timeout() {
+        assert_eq!(
+            default_timeout_for_payload(&commands::set_source(2)),
+            DEFAULT_COMMAND_TIMEOUT
+        );
+    }
 }

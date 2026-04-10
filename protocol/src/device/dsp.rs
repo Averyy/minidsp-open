@@ -38,6 +38,7 @@ pub struct Compressor {
 /// FIR filter addresses.
 #[derive(Debug, Clone, Copy)]
 pub struct FirFilter {
+    pub index: u8,
     pub bypass: u16,
     pub taps_count: u16,
     pub data_start: u16,
@@ -156,7 +157,13 @@ static DSP100_OUTPUTS: [OutputChannel; 4] = [
         delay: Some(64),
         polarity: Some(80),
         peq: &DSP100_OUT0_PEQ,
-        fir: None,
+        fir: Some(FirFilter {
+            index: 0,
+            bypass: 14,
+            taps_count: 84,
+            data_start: 85,
+            max_taps: 2048,
+        }),
         crossover: Some(Crossover {
             lpf_addr: 8580,
             hpf_addr: 8600,
@@ -177,7 +184,13 @@ static DSP100_OUTPUTS: [OutputChannel; 4] = [
         delay: Some(65),
         polarity: Some(81),
         peq: &DSP100_OUT1_PEQ,
-        fir: None,
+        fir: Some(FirFilter {
+            index: 1,
+            bypass: 15,
+            taps_count: 2133,
+            data_start: 2134,
+            max_taps: 2048,
+        }),
         crossover: Some(Crossover {
             lpf_addr: 8620,
             hpf_addr: 8640,
@@ -198,7 +211,13 @@ static DSP100_OUTPUTS: [OutputChannel; 4] = [
         delay: Some(66),
         polarity: Some(82),
         peq: &DSP100_OUT2_PEQ,
-        fir: None,
+        fir: Some(FirFilter {
+            index: 2,
+            bypass: 16,
+            taps_count: 4182,
+            data_start: 4183,
+            max_taps: 2048,
+        }),
         crossover: Some(Crossover {
             lpf_addr: 8660,
             hpf_addr: 8680,
@@ -219,7 +238,13 @@ static DSP100_OUTPUTS: [OutputChannel; 4] = [
         delay: Some(67),
         polarity: Some(83),
         peq: &DSP100_OUT3_PEQ,
-        fir: None,
+        fir: Some(FirFilter {
+            index: 3,
+            bypass: 17,
+            taps_count: 6231,
+            data_start: 6232,
+            max_taps: 2048,
+        }),
         crossover: Some(Crossover {
             lpf_addr: 8700,
             hpf_addr: 8720,
@@ -423,6 +448,7 @@ static DSP110_INPUTS: [InputChannel; 2] = [
         polarity: Some(70),
         peq: &DSP110_INPUT_PEQ_0,
         fir: Some(FirFilter {
+            index: 0,
             bypass: 67,
             taps_count: 71,
             data_start: 72,
@@ -435,6 +461,7 @@ static DSP110_INPUTS: [InputChannel; 2] = [
         polarity: Some(2174),
         peq: &DSP110_INPUT_PEQ_1,
         fir: Some(FirFilter {
+            index: 1,
             bypass: 2171,
             taps_count: 2175,
             data_start: 2176,
@@ -847,6 +874,7 @@ static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
         polarity: Some(193),
         peq: &LEGACY_MSHARC_OUT_PEQ[0],
         fir: Some(FirFilter {
+            index: 0,
             bypass: 44,
             taps_count: 200,
             data_start: 201,
@@ -870,6 +898,7 @@ static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
         polarity: Some(194),
         peq: &LEGACY_MSHARC_OUT_PEQ[1],
         fir: Some(FirFilter {
+            index: 1,
             bypass: 45,
             taps_count: 2249,
             data_start: 2250,
@@ -893,6 +922,7 @@ static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
         polarity: Some(195),
         peq: &LEGACY_MSHARC_OUT_PEQ[2],
         fir: Some(FirFilter {
+            index: 2,
             bypass: 46,
             taps_count: 4298,
             data_start: 4299,
@@ -916,6 +946,7 @@ static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
         polarity: Some(196),
         peq: &LEGACY_MSHARC_OUT_PEQ[3],
         fir: Some(FirFilter {
+            index: 3,
             bypass: 47,
             taps_count: 6347,
             data_start: 6348,
@@ -939,6 +970,7 @@ static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
         polarity: Some(197),
         peq: &LEGACY_MSHARC_OUT_PEQ[4],
         fir: Some(FirFilter {
+            index: 4,
             bypass: 48,
             taps_count: 8396,
             data_start: 8397,
@@ -962,6 +994,7 @@ static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
         polarity: Some(198),
         peq: &LEGACY_MSHARC_OUT_PEQ[5],
         fir: Some(FirFilter {
+            index: 5,
             bypass: 49,
             taps_count: 10445,
             data_start: 10446,
@@ -985,6 +1018,7 @@ static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
         polarity: Some(199),
         peq: &LEGACY_MSHARC_OUT_PEQ[6],
         fir: Some(FirFilter {
+            index: 6,
             bypass: 50,
             taps_count: 12494,
             data_start: 12495,
@@ -1008,6 +1042,7 @@ static LEGACY_MSHARC_OUTPUTS: [OutputChannel; 8] = [
         polarity: None,
         peq: &LEGACY_MSHARC_OUT_PEQ[7],
         fir: Some(FirFilter {
+            index: 7,
             bypass: 51,
             taps_count: 14543,
             data_start: 14544,

@@ -367,6 +367,7 @@ pub fn register_routes(
                 Some(d) => d,
                 None => return send_json(req, 200, "{}"),
             };
+            let _op = dev.begin_operation();
             let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
             let json = device_state_json_rest(&dev, &beq_guard);
             send_json(req, 200, &json)
@@ -417,6 +418,7 @@ pub fn register_routes(
             } else {
                 raw_author
             };
+            let _op = dev.begin_operation();
 
             match load_filter(&dev, digest, title, author) {
                 Ok(mv_adjust) => {
@@ -470,6 +472,7 @@ pub fn register_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
+            let _op = dev.begin_operation();
 
             match clear_filter(&dev) {
                 Ok(()) => {
@@ -503,6 +506,7 @@ pub fn register_routes(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
+            let _op = dev.begin_operation();
 
             if let Some(vol) = json.get("masterVolume").and_then(|v| v.as_f64()) {
                 if let Err(e) = dev.set_volume_db(vol as f32) {
@@ -536,6 +540,7 @@ pub fn register_routes(
                     Ok(v) => v,
                     Err(_) => return send_error(req, 400, "invalid JSON"),
                 };
+                let _op = dev.begin_operation();
 
                 // Handle "overwrite" command (copy current preset to flash)
                 if json

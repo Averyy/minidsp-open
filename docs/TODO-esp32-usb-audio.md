@@ -18,15 +18,18 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a
 - Shared protocol fixes that came out of the `/play` investigation:
   - direct-USB HID write ACKs on the 2x4 HD can arrive as report-ID-prefixed unframed echoes (`0x01 ...`); the old decoder misclassified successful writes as failures
   - typed `ReadFloats` parsing for modern 5-byte headers was reading from the wrong offset
+  - the HID decoder was still too permissive after that first fix: it accepted `0x01`-prefixed unframed echoes for read commands as well as writes, which allowed stale read replies to poison later write transactions
+  - restricting the `0x01` unframed-echo special case to write/ack-like commands fixed the remaining `FlashData([255, 169, 2])` route-write failure on both the shared desktop HID path and the ESP32 host path
 - Current DSP100 / 2x4 HD routing conclusion from the same investigation:
   - route-gain cells (`32..39`) are live and writable
   - the official app's saved default preset XML is stereo one-hot at selector addresses `6..13`: input 1 only to output 1, input 2 only to output 2, outputs 3/4 disabled
   - live hardware still reads selector addresses `6..13` back as all `1`, even after the preset reset
   - the old shared routing write path was only half-working on the real 2x4 HD: the gain write landed, but the follow-up selector/status write timed out
-  - extracted official-app code now proves the live per-route mixer toggle path is `setMultipleMixerBypass()` -> `GetSetLinkedIntValCmd` (`0x30` linked-int), not the generic `LoadDspParam` (`0x13`) path
-  - desktop and ESP32 shared routing writes now use that same linked-int `0x30` status-write shape for modern route-enable writes
+  - an earlier reverse-engineering note claimed the per-route mixer toggle path used `GetSetLinkedIntValCmd` (`0x30` linked-int), but live desktop testing on the 2x4 HD found the opposite outcome: `0x13` worked and `0x30` did not
+  - the shared desktop and ESP32 routing code therefore remains on the `0x13` status-write path for DSP100 until stronger hardware evidence says otherwise
   - therefore silent `/play` troubleshooting must not assume selector read-back is authoritative for modern routing enable state
-  - the remaining `/play` audibility risk is now specifically the USB route-enable path, not general sweep generation or USB transport
+  - after the shared HID echo-decoder fix, ESP32 `POST /devices/0/config` successfully forced `Input 1 -> Output 3 = enabled`, `Input 2 -> Output 3 = disabled`, and a clean `/play` run became audible on physical output `3`
+  - that moves the remaining `/play` audibility risk away from USB route-enable and onto the signal itself
 - Default `POST /devices/0/play` response arrives in about `0.35s` when already on `Usb`, and about `0.4-0.5s` when `/play` first switches from `Toslink` to `Usb`
 - Near-full-ring chunking was the first confirmed root cause: `~8190` byte writes into an `8192` byte TX ring stretched completion to about `13.6s`
 - Half-ring chunking (`4092` byte writes) fixed the main pacing bug:
@@ -65,6 +68,14 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a
   - `48kHz / 16-bit / stereo`: `tx_need_data=0`, `last_write_after_start≈12.39s`
   - `44.1kHz / 24-bit / stereo`: `tx_need_data=0`, `last_write_after_start≈12.29s`
   - conclusion: once underruns are eliminated, the remaining delta scales with byte rate and enqueue timing; it is not evidence of a UAC2 driver clock/stretch bug
+- Additional live audible testing on 2026-04-09 changed the remaining `/play` diagnosis:
+  - clean `/devices/0/play` runs on the known-good output-`2` path are audible, but the default signal sounds like repeated `BRAP` bursts rather than a smooth subwoofer sweep
+  - a narrower custom request (`16-bit`, no preamble/tone burst/gap/decay, `50-80 Hz`, `6 s`) sounds slightly better but is still too high-pitched / not REW-like
+  - this was reproduced on clean runs with no concurrent status polling, so the audible defect is not explained by my test harness interfering with playback
+  - the current evidence therefore points at our app-side signal design and/or PCM formatting, not at the UAC2 driver's pacing: clean runs still show exact expected byte counts, `tx_need_data=0`, and negligible stop time
+- Concurrent HID polling during playback is still unsafe as a sound-quality test method:
+  - issuing repeated `GET /devices/0` requests during `/play` triggered `input meter read failed: protocol: read_floats: FlashData([255, 216, 1, 2, 0, 0])`
+  - those readback failures do not explain the clean-run audible defect, but they do mean we should avoid live meter polling while judging playback quality
 - Official-app comparison on the physical 2x4 HD established a known-good audible USB-audio baseline:
   - MiniDSP app UI preset `2` corresponds to our zero-based `preset: 1`
   - source `USB`, master volume `0 dB`, master mute off
@@ -86,12 +97,20 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a
   - the official app uses `GetSetLinkedIntValCmd` for modern mute and mixer-status writes
   - that command writes the final scalar field as little-endian 32-bit (`writeUInt32LE`), not the generic big-endian raw-word form we had inferred earlier
   - extracted `streamDevice.js` now proves that both `setMultipleChnMute()` and `setMultipleMixerBypass()` instantiate `GetSetLinkedIntValCmd` directly
-  - shared desktop + ESP32 code now matches that builder for modern route-enable writes; the unresolved part is hardware outcome, not builder selection
+  - despite that extracted-app note, live desktop testing on the physical 2x4 HD found `0x13` route-enable writes working where `0x30` did not, so the extracted-app interpretation is not sufficient proof for this device/path
+  - the apparent route-write rejection turned out not to be a routing-opcode problem: the shared HID decoder was misclassifying stale `ReadFlash` echoes as the next write response
+  - after fixing that decoder path, forcing `Input 1 -> Output 3` and disabling `Input 2 -> Output 3` via `POST /devices/0/config` worked live on the ESP32 and `/play` became audible on physical output `3`
+  - `GET /devices/0/config` may still over-report enabled modern routes, so runtime routing readback remains a state-introspection problem even though live route writes now work
   - live mute writes also confirm DSP100 mute polarity is `1 = muted`, `2 = unmuted`
 - One modern-device config-read issue remains open:
   - DSP100 `DGain_*_status` and `MixerNxMSmoothed1_*_status` semantics on the physical 2x4 HD are not fully decoded yet
   - our current readback still does not match the official app UI for all mute/routing states
   - continue treating modern mute/routing readback as a compatibility investigation item, not a solved surface
+- The shared `/play` default has now been changed to a plain subwoofer baseline instead of the old measurement bundle:
+  - in code, the default request is now `15-80 Hz`, `8 s`, `16-bit`, no preamble, no tone burst, no gap, no decay
+  - the generator now uses the exact requested sweep band instead of applying hidden guard-band expansion
+  - desktop direct-USB verification on 2026-04-09 confirmed the new shared default reaches the physical 2x4 HD cleanly with `sweepOffsetSamples=0` and unchanged source/routing before and after playback
+  - the remaining question is audible quality on the real sub, not whether the old measurement-bundle default should be defended
 
 **Performance note:** Use a **release** firmware build for any timing or glitch validation. Debug (`cargo build`) builds are dramatically slower in the sweep-generation hot path and are not representative for `/play`.
 
@@ -131,17 +150,19 @@ Goal: explain and, if possible, eliminate the remaining gap between nominal sign
 - [x] Update this doc and `PROGRESS.md` with the validated HID/UAC2 reconnect fix
 - [x] Finish repeated-play stress testing and document the results
 
-**Current conclusion:** the original `~13.6s` issue was a real app-side pacing bug caused by near-full-ring writes. That is fixed. The remaining `~12.29-12.56s` enqueue-finish metric depends on byte volume (`48/24` > `48/16` > `44.1/24`), stays at `TX_DONE=0`, and has negligible stop time, which is consistent with app-side enqueue timing against the driver ring buffer and `startedAtUs` semantics, not with a driver-side sample-clock defect.
+**Current conclusion:** the original `~13.6s` issue was a real app-side pacing bug caused by near-full-ring writes. That is fixed. The remaining `~12.29-12.56s` enqueue-finish metric depends on byte volume (`48/24` > `48/16` > `44.1/24`), stays at `TX_DONE=0`, and has negligible stop time, which is consistent with app-side enqueue timing against the driver ring buffer and `startedAtUs` semantics, not with a driver-side sample-clock defect. The old measurement-bundle default was then retired; the current remaining audible question is whether the new exact-band `15-80 Hz` / `16-bit` shared default sounds correct on the real sub.
 
 ## Definition of Done
 
 The feature is complete when:
-- [ ] `curl -X POST http://<esp32>:5380/devices/0/play` plays a ~12-second measurement sweep through the miniDSP's analog outputs
-- [ ] A single route-enable written by our code on DSP100 / 2x4 HD is enough to make USB playback audible on the targeted output, without requiring the official app as a follow-up step
+- [ ] `curl -X POST http://<esp32>:5380/devices/0/play` plays the current default shared sweep through the miniDSP's analog outputs
+- [x] A single `0x13` route-enable written by our code on DSP100 / 2x4 HD is enough to make USB playback audible on the targeted output, without requiring the official app as a follow-up step
+  - confirmed live on 2026-04-09 on physical output `3` after the shared HID echo-decoder fix
 - [ ] The response arrives within ~200ms (before playback finishes) and contains a real `startedAtUs` hardware timestamp plus correct sample offsets
 - [ ] `curl -X POST http://<esp32>:5380/sync -d '{"clientTimeUs":0}'` returns an ESP32 timestamp (works with or without a miniDSP connected)
 - [ ] HID control (volume, mute, config, etc.) continues working normally during and after audio playback
-- [ ] Audio playback at 48kHz/24-bit/stereo has no audible glitches over the full sweep duration
+- [ ] Audio playback at the current documented default parameters has no audible glitches over the full sweep duration
+- [ ] The default or documented subwoofer `/play` profile sounds like a normal smooth low-frequency sweep on the real sub, not a bursty `BRAP` pattern
 - [ ] USB disconnect mid-playback doesn't crash — cleans up gracefully
 - [ ] The sweep generator has desktop unit tests (`cargo test` in the workspace, no ESP32 needed)
 - [ ] The firmware builds and boots cleanly with zero new warnings
@@ -336,11 +357,13 @@ pub type SharedAudioState = Arc<AudioState>;
 
 Implement mathematical real-time audio generation. **No file transfer, no WAV files, no storage. Generate sample-by-sample.**
 
-**Signal structure:**
+**Current default signal structure:**
 ```
-[preamble: 2s low-level dither] [tone burst: 3 cycles @ 80Hz] [gap: 200ms silence] [sweep: 8s Farina ESS] [decay: 2s silence]
-Total: ~12.24 seconds at 48kHz = ~588,288 samples
+[sweep: 8s Farina ESS]
+Total: ~8 seconds at 48kHz = ~383,918 samples after zero-crossing truncation on the current `15-80 Hz` default
 ```
+
+**Status note (2026-04-09):** the old measurement-bundle default is no longer the baseline. The shared code now defaults to a plain exact-band subwoofer sweep because the old default sounded wrong on hardware.
 
 **Farina exponential sine sweep formula:**
 ```
@@ -348,11 +371,18 @@ x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
 ```
 
 **Default parameters** (overridable via API):
-- `f1 = 5 Hz` (display start; actual sweep starts at f1/2 = 2.5 Hz for guard band)
-- `f2 = 500 Hz` (display stop; actual sweep goes to min(2*f2, fs/2) = 1000 Hz)
+- `f1 = 15 Hz` (exact sweep start)
+- `f2 = 80 Hz` (exact sweep stop)
 - `duration = 8 seconds`
 - `fs = 48000 Hz`
+- `bitDepth = 16`
+- `preambleSec = 0`
+- `toneBurst.cycles = 0`
+- `gapSec = 0`
+- `decaySec = 0`
 - Tukey fade-in: 0.02s
+
+**REW comparison note:** REW's measurement sweep uses guard-band expansion for measurement purposes, but the current shared `/play` default is now intentionally an exact-band audible sanity-check sweep. If a caller wants a broader measurement profile, it should request that profile explicitly instead of relying on hidden expansion.
 
 **Implementation approach:**
 - Implement as a state machine / iterator that produces samples on demand
@@ -362,19 +392,19 @@ x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
 - At 240 MHz with hardware FPU, `sin(exp(x))` is ~50-100 cycles per sample = ~4% CPU at 48kHz stereo. Trivially feasible.
 - **This module must have zero ESP-IDF dependencies** (`no use esp_idf_*`) — it's pure math + PCM encoding. This is what makes it desktop-testable via `cargo test`.
 
-**Zero-crossing truncation** (must match `open-sub-optimizer/src/sweep-gen.ts`):
+**Zero-crossing truncation**:
 - Generate the raw sweep for `round(duration * fs)` samples
 - Walk backward from the end to find the last sign change (where `raw[n] * raw[n+1] <= 0`)
 - Truncate the sweep at that zero crossing (`nSamples = lastZero + 1`)
 - Apply the Tukey fade-in to the truncated sweep (same order as the TypeScript reference)
 - `totalSamples` in the `/play` response reflects the truncated sweep length (plus preamble/tone burst/gap/decay)
-- This ensures deconvolution window alignment matches the existing `open-sub-optimizer` client
+- This still gives a deterministic clean endpoint even though the current shared default no longer mirrors the old guard-band profile
 
-**Note on decay duration:** The default `decaySec` is 2.0 seconds (vs. `open-sub-optimizer`'s 1.5s default for trailing silence). 2s is more conservative for room decay capture. The difference is intentional but the parameter is overridable via the API, so clients can request 1.5s if they prefer parity.
+**Note on decay duration:** The default `decaySec` is now `0.0` for a plain audible sweep. Trailing silence is still supported via the API when a caller wants room-decay capture.
 
-**Preamble**: Low-level white noise or dither (-60 dBFS). Purpose: stabilize miniDSP ASRC lock (~2 seconds).
+**Preamble**: supported via API, but disabled by default because it made the old default harder to judge audibly on the real sub.
 
-**Tone burst**: `sin(2pi * 80 * t)` for 3 cycles (37.5ms). Purpose: timing marker for cross-correlation alignment.
+**Tone burst**: supported via API, but disabled by default for the same reason.
 
 **PCM encoding:**
 - 24-bit: pack each `f32` sample as 3 bytes little-endian (multiply by 2^23 - 1, clamp, take lower 3 bytes)
@@ -385,7 +415,7 @@ x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
 - [ ] A module (`app-esp32/src/sweep_gen.rs`) that generates the complete signal
 - [ ] Configurable parameters: f1, f2, duration, fade, tone burst frequency/cycles, preamble/gap/decay durations, sample rate, bit depth
 - [ ] Produces PCM bytes on demand (iterator/callback pattern, not allocating the entire signal)
-- [ ] 24-bit stereo PCM at 48kHz by default
+- [ ] 16-bit stereo PCM at 48kHz by default
 - [ ] Total sample count is deterministic and known before generation starts
 - [ ] Unit-testable: can run on desktop (`cargo test`) by testing the math/PCM encoding without USB
 
@@ -400,20 +430,20 @@ Content-Type: application/json
 
 {
   "sweep": {
-    "f1": 5,
-    "f2": 500,
+    "f1": 15,
+    "f2": 80,
     "duration": 8,
     "fadeDuration": 0.02
   },
   "toneBurst": {
     "frequency": 80,
-    "cycles": 3
+    "cycles": 0
   },
-  "preambleSec": 2,
-  "gapSec": 0.2,
-  "decaySec": 2,
+  "preambleSec": 0,
+  "gapSec": 0,
+  "decaySec": 0,
   "sampleRate": 48000,
-  "bitDepth": 24
+  "bitDepth": 16
 }
 ```
 
@@ -423,9 +453,9 @@ All fields are optional — use defaults above when omitted.
 ```json
 {
   "startedAtUs": 1719482837291456,
-  "toneBurstOffsetSamples": 96000,
-  "sweepOffsetSamples": 105600,
-  "totalSamples": 588288,
+  "toneBurstOffsetSamples": 0,
+  "sweepOffsetSamples": 0,
+  "totalSamples": 383918,
   "sampleRate": 48000,
   "sourceChanged": true,
   "previousSource": "toslink"
@@ -463,13 +493,14 @@ All fields are optional — use defaults above when omitted.
 **Sample rate note:** The `/play` `sampleRate` parameter defaults to **48000 Hz** regardless of `DeviceProfile.sample_rate`. `DeviceProfile.sample_rate` describes the DSP's internal processing rate (e.g., 96kHz for SHD family). USB playback rate is negotiated separately with the UAC2 device. The implementation must NOT use `profile.sample_rate` as the playback default.
 
 **Important design decisions:**
-- The HTTP response returns as soon as streaming starts (after `device_start` + first write), NOT after all 12 seconds of audio finish. The caller needs the timing info early to align their capture.
+- The HTTP response returns as soon as streaming starts (after `device_start` + first write), NOT after playback finishes. The caller needs the timing info early to align their capture.
 - Use `AudioState.playing` (AtomicBool) to prevent concurrent playback requests.
 - Playback runs in a dedicated thread. The HTTP handler spawns it, gets the start timestamp back via a channel or shared state, then responds.
 - If the USB device disconnects mid-playback, the write calls will fail — clean up gracefully (clear `playing`, skip source restore).
 
 **Acceptance criteria:**
-- [ ] `POST /devices/{id}/play` with default parameters plays a ~12s sweep through the miniDSP's audio interface
+- [ ] `POST /devices/{id}/play` with default parameters plays the documented shared default sweep through the miniDSP's audio interface
+- [ ] The default parameters are actually suitable for subwoofer measurement sanity checks on real hardware, not just mathematically convenient
 - [ ] Response is returned within ~200ms of the request (not 12 seconds later)
 - [ ] `startedAtUs` value is a real ESP32 hardware timer reading, not a fake timestamp
 - [ ] `toneBurstOffsetSamples` and `sweepOffsetSamples` are correct (match the actual signal structure)

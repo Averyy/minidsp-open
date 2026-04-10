@@ -861,6 +861,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "getrandom 0.2.17",
  "hidapi",
  "minidsp-protocol",
  "serde",

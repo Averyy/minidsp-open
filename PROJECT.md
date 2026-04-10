@@ -9,7 +9,7 @@ We need a dual-target architecture (Linux + ESP32) from day one, and we have aut
 minidsp-open adds:
 - ESP32-S3 target (WiFi MiniDSP controller, no computer needed)
 - All missing device definitions (Flex Eight, Flex HT, SHD Power) + all legacy devices
-- Config read-back (save/restore full device state)
+- Config inspection and restore surfaces, with verified-shadow fallback on DSP100 paths where live runtime readback is not authoritative
 - Connection resilience (auto-reconnect, exponential backoff)
 - ezBEQ on ESP32 (phase 2 — after core is verified)
 - 12V trigger / power control via ESP32 GPIO (future — see `docs/FUTURE-12v-trigger.md`)
@@ -39,7 +39,7 @@ minidsp-rs is an upstream protocol reference (one maintainer, 10 stale dependabo
 
 Also: MiniDSP's WI-DG WiFi module is $75 for a MediaTek SoC running OpenWrt that just bridges TCP↔USB HID. Our ESP32-S3 target does the same thing (and more — full HTTP API, plus ezBEQ UI in phase 2) on a $10 dev board.
 
-Plus features minidsp-rs never had: config read-back, measurement mode, display control, DRE, modification tokens, ESP32 target, ezBEQ integration, `llms.txt` for AI discoverability. Preset import/export, per-source volume offsets deferred to post-v1.
+Plus features minidsp-rs never had: config inspection/restore APIs, measurement mode, display control, DRE, modification tokens, ESP32 target, ezBEQ integration, `llms.txt` for AI discoverability. Preset import/export, per-source volume offsets deferred to post-v1.
 
 ## Current Delivery Strategy
 
@@ -342,8 +342,8 @@ No high-level read function exists in minidsp-rs, but the primitives are there:
 - Use for: backup before modification, verification after write, measurement mode save/restore
 
 Verification note:
-- Desktop config read-back is implemented.
-- ESP32 physical-hardware config read-back is now verified end to end on the live 2x4 HD for typed scalar reads/writes and PEQ write/readback through the shared PEQ shadow/default model.
+- Desktop config inspection is implemented, and live 2026-04-10 daemon checks on the physical DSP100 / 2x4 HD restored fast `GET /devices/{id}` / `GET /devices/{id}/config` behavior. Some fields still come from verified shadow/token-backed restore rather than universal authoritative live hardware readback, and low-address DSP100 scalar/tap reads now clamp to shadow or conservative zero when the device returns bogus raw words instead of real state. When local preset shadow is missing, the daemon can also seed it from token-matched official Device Console `setting*.xml` snapshots, which is a stronger controller-side source than stale cache but still not the same thing as authoritative live DSP readback.
+- ESP32 physical-hardware config read-back is only partially verified on the live 2x4 HD so far: typed scalar reads/writes and PEQ write/readback work through the shared PEQ shadow/default model, but the broader DSP100 authoritative-state gaps remain open.
 
 ### Config write constraints
 - **Cannot write to non-active preset.** All DSP writes go to currently active state. Must switch preset first (causes brief audio interruption).
@@ -496,7 +496,7 @@ Comprehensive review of all minidsp-rs complaints from the ezBEQ thread (7,200+ 
 | 4 | ARM .deb broken on Bookworm (glibc mismatch) | COMMON | We ship native static binaries for all platforms | Solved |
 | 5 | Multi-device setup extremely difficult (#662) | COMMON | Per-device connection isolation, no global lock | Planned |
 | 6 | HTx firmware update breaks minidsp-rs (#701) | MODERATE | DSP 115 definition, auto-detect hw_id, `--force-kind` escape hatch | Planned |
-| 7 | Cannot read config back from device | VERY COMMON | Full config read-back via cmd 0x14 (`ReadFloats`) plus PEQ shadow/default fallback where live PEQ reads are zero-placeholder only | Implemented and verified on desktop + ESP32 for the physical 2x4 HD |
+| 7 | Cannot read config back from device | VERY COMMON | Full config inspection via cmd 0x14 (`ReadFloats`) where the device exposes usable values, plus verified shadow/default fallback for the known DSP100 gaps | Partially implemented and live-verified on desktop; ESP32 still only has the typed-scalar/PEQ path closed on the physical 2x4 HD |
 | 8 | HID error on newer platforms (RPi5, newer kernels) | MODERATE | Test hidapi on RPi5 + newer kernels during dev | **NEW — needs testing** |
 | 9 | Version upgrade breaks config / bind defaults | COMMON | Design config format from scratch, sane defaults (bind 0.0.0.0) | Planned |
 | 10 | Windows config file location undocumented | MODERATE | Unified config across platforms, XDG/well-known paths | Planned |
@@ -614,7 +614,7 @@ Use cases:
 - **Version control** — save configs as JSON files in git
 - **Measurement mode** — save state, flatten all EQ, measure, restore
 
-Modification tokens (EEPROM 0xFFC8, 4 × u32 per preset) detect if another client changed the device since last read. Use for cache invalidation and multi-client coordination.
+Modification tokens (EEPROM `0xFFC8`, 4 × `u32` per preset) are useful freshness markers only when the controlling client explicitly updates them after preset-content writes. On the tested DSP100 / 2x4 HD, raw runtime routing/bypass/compressor DSP writes do not auto-advance these EEPROM tokens. The official Device Console session log shows the desktop app comparing device/XML tokens and then writing a fresh active-preset token after audio-proc updates, and the desktop daemon now mirrors that behavior for `/config` and measurement-mode preset mutations. The same model also makes the official app's saved `setting*.xml` files useful for fresh daemon recovery: if the XML `<timestamp>` matches the device token for that slot, the daemon can import that preset snapshot as current controller-side state. Use tokens for cache invalidation and multi-client coordination only with that explicit-write model in mind.
 
 ## Resolved Technical Questions
 
@@ -752,7 +752,7 @@ unknown             → None (generic source names)
 | Tier | Requirements | What works |
 |------|-------------|-----------|
 | Universal | Always | Volume, mute, preset, source by index, hardware info, flash read/write |
-| DspKnown | Known dsp_version | + Full PEQ/crossover/delay/compressor/FIR/metering, config read-back |
+| DspKnown | Known dsp_version | + Full PEQ/crossover/delay/compressor/FIR/metering, config inspection |
 | Full | Known hw_id | + Source names, display control, DRE, Dirac, per-source volume offsets |
 
 A new hw_id that reuses an existing DSP structure (e.g., hypothetical Flex Eight-N with DSP 110) automatically gets Tier 2 — full PEQ/crossover/delay/metering — even though we don't know its source names. minidsp-rs would drop it to Generic and lose everything.

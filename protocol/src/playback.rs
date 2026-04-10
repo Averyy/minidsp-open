@@ -8,15 +8,15 @@ use core::f32::consts::PI;
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_F1_HZ: f32 = 5.0;
-const DEFAULT_F2_HZ: f32 = 500.0;
+const DEFAULT_F1_HZ: f32 = 15.0;
+const DEFAULT_F2_HZ: f32 = 80.0;
 const DEFAULT_SWEEP_DURATION_SEC: f32 = 8.0;
 const DEFAULT_FADE_DURATION_SEC: f32 = 0.02;
 const DEFAULT_TONE_FREQUENCY_HZ: f32 = 80.0;
-const DEFAULT_TONE_CYCLES: f32 = 3.0;
-const DEFAULT_PREAMBLE_SEC: f32 = 2.0;
-const DEFAULT_GAP_SEC: f32 = 0.2;
-const DEFAULT_DECAY_SEC: f32 = 2.0;
+const DEFAULT_TONE_CYCLES: f32 = 0.0;
+const DEFAULT_PREAMBLE_SEC: f32 = 0.0;
+const DEFAULT_GAP_SEC: f32 = 0.0;
+const DEFAULT_DECAY_SEC: f32 = 0.0;
 const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
 const DEFAULT_PREAMBLE_LEVEL_DBFS: f32 = -60.0;
 const CHANNELS: usize = 2;
@@ -52,7 +52,7 @@ impl BitDepth {
 
 impl Default for BitDepth {
     fn default() -> Self {
-        Self::Pcm24
+        Self::Pcm16
     }
 }
 
@@ -197,8 +197,8 @@ impl PlaybackPlan {
         validate_request(&request)?;
 
         let sample_rate = request.sample_rate as f32;
-        let sweep_f1 = request.sweep.f1 * 0.5;
-        let sweep_f2 = (request.sweep.f2 * 2.0).min(sample_rate * 0.5);
+        let sweep_f1 = request.sweep.f1;
+        let sweep_f2 = request.sweep.f2.min(sample_rate * 0.5);
         if sweep_f1 >= sweep_f2 {
             return Err(PlaybackError::InvalidSweepRange { sweep_f1, sweep_f2 });
         }
@@ -219,10 +219,7 @@ impl PlaybackPlan {
             sweep_phase_scale,
             sweep_ratio_step,
             preamble_samples: seconds_to_samples(request.preamble_sec, request.sample_rate),
-            tone_burst_samples: seconds_to_samples(
-                request.tone_burst.cycles / request.tone_burst.frequency,
-                request.sample_rate,
-            ),
+            tone_burst_samples: tone_burst_samples(&request),
             gap_samples: seconds_to_samples(request.gap_sec, request.sample_rate),
             decay_samples: seconds_to_samples(request.decay_sec, request.sample_rate),
             sweep_samples,
@@ -505,10 +502,7 @@ impl core::fmt::Display for PlaybackError {
         match self {
             Self::InvalidRequest(msg) => write!(f, "{msg}"),
             Self::InvalidSweepRange { sweep_f1, sweep_f2 } => {
-                write!(
-                    f,
-                    "invalid guard-band sweep range: {sweep_f1} >= {sweep_f2}"
-                )
+                write!(f, "invalid sweep range: {sweep_f1} >= {sweep_f2}")
             }
         }
     }
@@ -550,14 +544,14 @@ fn validate_request(request: &PlayRequest) -> Result<(), PlaybackError> {
             "sweep.fadeDuration must be >= 0",
         ));
     }
-    if request.tone_burst.frequency <= 0.0 {
+    if request.tone_burst.cycles < 0.0 {
         return Err(PlaybackError::InvalidRequest(
-            "toneBurst.frequency must be > 0",
+            "toneBurst.cycles must be >= 0",
         ));
     }
-    if request.tone_burst.cycles <= 0.0 {
+    if request.tone_burst.cycles > 0.0 && request.tone_burst.frequency <= 0.0 {
         return Err(PlaybackError::InvalidRequest(
-            "toneBurst.cycles must be > 0",
+            "toneBurst.frequency must be > 0 when toneBurst.cycles > 0",
         ));
     }
     if request.sample_rate == 0 {
@@ -573,6 +567,16 @@ fn validate_request(request: &PlayRequest) -> Result<(), PlaybackError> {
 
 fn seconds_to_samples(seconds: f32, sample_rate: u32) -> usize {
     (seconds * sample_rate as f32).round() as usize
+}
+
+fn tone_burst_samples(request: &PlayRequest) -> usize {
+    if request.tone_burst.cycles <= 0.0 {
+        return 0;
+    }
+    seconds_to_samples(
+        request.tone_burst.cycles / request.tone_burst.frequency,
+        request.sample_rate,
+    )
 }
 
 fn preamble_noise(index: usize) -> f32 {
@@ -771,16 +775,31 @@ mod tests {
     fn default_plan_matches_expected_offsets() {
         let plan = PlaybackPlan::build(PlayRequest::default()).unwrap();
         let offsets = plan.offsets();
-        assert_eq!(plan.preamble_samples, 96_000);
-        assert_eq!(plan.tone_burst_samples, 1_800);
-        assert_eq!(plan.gap_samples, 9_600);
-        assert_eq!(plan.decay_samples, 96_000);
-        assert_eq!(plan.sweep_samples, 383_982);
-        assert_eq!(offsets.tone_burst_offset_samples, 96_000);
-        assert_eq!(offsets.sweep_offset_samples, 107_400);
-        assert_eq!(offsets.total_samples, 587_382);
-        assert_eq!(plan.sweep_f1, 2.5);
-        assert_eq!(plan.sweep_f2, 1_000.0);
+        assert_eq!(plan.preamble_samples, 0);
+        assert_eq!(plan.tone_burst_samples, 0);
+        assert_eq!(plan.gap_samples, 0);
+        assert_eq!(plan.decay_samples, 0);
+        assert_eq!(offsets.tone_burst_offset_samples, 0);
+        assert_eq!(offsets.sweep_offset_samples, 0);
+        assert_eq!(offsets.total_samples, plan.sweep_samples);
+        assert_eq!(plan.sweep_f1, 15.0);
+        assert_eq!(plan.sweep_f2, 80.0);
+    }
+
+    #[test]
+    fn requested_band_is_used_exactly() {
+        let request = PlayRequest {
+            sweep: SweepParams {
+                f1: 50.0,
+                f2: 80.0,
+                duration: 6.0,
+                fade_duration: 0.02,
+            },
+            ..PlayRequest::default()
+        };
+        let plan = PlaybackPlan::build(request).unwrap();
+        assert_eq!(plan.sweep_f1, 50.0);
+        assert_eq!(plan.sweep_f2, 80.0);
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub struct DeviceState {
     hw_id: HardwareId,
     dsp_version: u8,
     serial: u32,
+    operation_lock: Mutex<()>,
     peq_shadow: Mutex<HashMap<u16, PeqShadow>>,
 }
 
@@ -185,8 +186,17 @@ impl DeviceState {
             hw_id,
             dsp_version,
             serial,
+            operation_lock: Mutex::new(()),
             peq_shadow: Mutex::new(peq_shadow),
         })
+    }
+
+    /// Serialize whole logical operations so multi-command reads/writes cannot
+    /// interleave with background polling or bridge traffic.
+    pub fn begin_operation(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.operation_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
     }
 
     // -- Accessors --
@@ -424,6 +434,14 @@ impl DeviceState {
             .ok_or_else(|| UsbHidError::Protocol("typed read_floats parse failed".into()))
     }
 
+    fn read_param_words_be(&self, addr: u16, count: u8) -> Result<Vec<u32>, UsbHidError> {
+        let req = commands::read_floats(addr, count, self.dialect());
+        let resp = self.bus.command(&req)?;
+        commands::parse_param_words_be_response_for_request(&req, &resp).ok_or_else(|| {
+            UsbHidError::Protocol("big-endian typed read_floats parse failed".into())
+        })
+    }
+
     pub fn read_dsp_words(&self, addr: u16, count: u8) -> Result<Vec<u32>, UsbHidError> {
         self.read_param_words(addr, count)
     }
@@ -488,10 +506,11 @@ impl DeviceState {
         let samples = match self.profile.dialect.value_format {
             ValueFormat::Float32 => self.read_param_word(addr)? as f32,
             ValueFormat::FixedPoint => self
-                .read_floats(addr, 1)?
+                .read_param_words_be(addr, 1)?
                 .into_iter()
                 .next()
-                .ok_or_else(|| UsbHidError::Protocol("empty delay response".into()))?,
+                .ok_or_else(|| UsbHidError::Protocol("empty delay response".into()))?
+                as f32,
         };
         Ok(std::time::Duration::from_secs_f32(
             samples / self.profile.sample_rate as f32,
@@ -615,10 +634,10 @@ impl DeviceState {
     #[allow(dead_code)]
     pub fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), UsbHidError> {
         info!("write_biquad start addr=0x{addr:04x}");
-        let save = matches!(self.profile.dialect.value_format, ValueFormat::FixedPoint);
-        for (offset, coeff) in coeffs.iter().enumerate() {
-            self.write_dsp(addr + offset as u16, *coeff, save)?;
-        }
+        self.expect_write_ok(
+            &commands::write_biquad(addr, coeffs, self.dialect()),
+            "write biquad",
+        )?;
         info!("write_biquad done addr=0x{addr:04x}");
         if let Ok(mut shadow) = self.peq_shadow.lock() {
             let entry = shadow.entry(addr).or_insert(PeqShadow {
@@ -633,8 +652,10 @@ impl DeviceState {
     #[allow(dead_code)]
     pub fn bypass_filter(&self, addr: u16, bypass: bool) -> Result<(), UsbHidError> {
         info!("bypass_filter start addr=0x{addr:04x} bypass={bypass}");
-        self.bus
-            .command_no_reply(&commands::bypass_filter(addr, bypass, self.dialect()))?;
+        self.expect_write_ok(
+            &commands::bypass_filter(addr, bypass, self.dialect()),
+            "bypass filter",
+        )?;
         info!("bypass_filter done addr=0x{addr:04x} bypass={bypass}");
         if let Ok(mut shadow) = self.peq_shadow.lock() {
             let entry = shadow.entry(addr).or_insert(PeqShadow {
@@ -657,6 +678,14 @@ impl DeviceState {
     #[allow(dead_code)]
     pub fn write_dsp_u32(&self, addr: u16, value: u32, save: bool) -> Result<(), UsbHidError> {
         self.expect_write_ok(&commands::write_dsp_u32(addr, value, save), "write dsp u32")
+    }
+
+    #[allow(dead_code)]
+    pub fn write_dsp_delay(&self, addr: u16, samples: u32, save: bool) -> Result<(), UsbHidError> {
+        self.expect_write_ok(
+            &commands::write_dsp_delay(addr, samples, save, self.dialect()),
+            "write dsp delay",
+        )
     }
 
     #[allow(dead_code)]
@@ -719,7 +748,9 @@ impl DeviceState {
                 let val = if enabled { 2u32 } else { 1u32 };
                 self.write_dsp_selector_u32(status_addr, val)
             }
-            ValueFormat::FixedPoint => self.write_dsp(status_addr, if enabled { 1.0 } else { 0.0 }, true),
+            ValueFormat::FixedPoint => {
+                self.write_dsp(status_addr, if enabled { 1.0 } else { 0.0 }, true)
+            }
         }
     }
 
@@ -754,8 +785,8 @@ impl DeviceState {
     #[allow(dead_code)]
     pub fn set_channel_delay_samples(&self, addr: u16, samples: u32) -> Result<(), UsbHidError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => self.write_dsp_u32(addr, samples, false),
-            ValueFormat::FixedPoint => self.write_dsp(addr, samples as f32, true),
+            ValueFormat::Float32 => self.write_dsp_delay(addr, samples, false),
+            ValueFormat::FixedPoint => self.write_dsp_delay(addr, samples, true),
         }
     }
 

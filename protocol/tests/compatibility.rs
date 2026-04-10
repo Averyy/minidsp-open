@@ -113,17 +113,17 @@ fn frame_encoding_matches_minidsp_rs() {
 
 #[test]
 fn hid_report_format() {
-    // HID report: [0x00 report_id] [frame] [0xFF padding to 65 bytes]
+    // HID report: [0x00 report_id] [frame] [0xFF padding to 64 bytes total]
     let report = packet::encode_hid(&[0x31]);
     assert_eq!(report[0], 0x00); // report ID
     assert_eq!(report[1], 0x02); // frame length
     assert_eq!(report[2], 0x31); // payload
     assert_eq!(report[3], 0x33); // checksum
     // Rest is 0xFF padding
-    for i in 4..65 {
+    for i in 4..64 {
         assert_eq!(report[i], 0xFF, "byte {i} should be 0xFF padding");
     }
-    assert_eq!(report.len(), 65);
+    assert_eq!(report.len(), 64);
 }
 
 #[test]
@@ -167,9 +167,10 @@ fn set_volume_wire_format() {
 
 #[test]
 fn set_config_wire_format() {
-    // SetConfig: [0x25, preset, reset_flag]
-    let cmd = set_config(2, 0);
-    assert_eq!(cmd, vec![0x25, 0x02, 0x00]);
+    // Official Device Console uses mode 0x02 for normal interactive preset
+    // changes on the captured 2x4 HD session.
+    let cmd = set_config(2, PRESET_CHANGE_NORMAL);
+    assert_eq!(cmd, vec![0x25, 0x02, 0x02]);
 }
 
 #[test]
@@ -181,6 +182,12 @@ fn write_dsp_new_dialect_wire_format() {
     assert_eq!(cmd[2], 0x00); // addr_hi
     assert_eq!(cmd[3], 0x42); // addr_lo
     assert_eq!(&cmd[4..8], &1.0f32.to_le_bytes()); // value as float32 LE
+}
+
+#[test]
+fn write_dsp_int_new_dialect_wire_format() {
+    let cmd = write_dsp_int(0x0006, 2);
+    assert_eq!(cmd, vec![0x13, 0x80, 0x00, 0x06, 0x02, 0x00, 0x00, 0x00]);
 }
 
 #[test]
@@ -262,6 +269,196 @@ fn reset_complete_response() {
 fn overflow_response() {
     let resp = parse_response(&[0xFF], &Dialect::NEW);
     assert_eq!(resp, Response::Overflow);
+}
+
+// ============================================================
+// Official app capture compatibility
+// ============================================================
+
+#[test]
+fn official_app_capture_request_builders_match_supported_payloads() {
+    assert_eq!(read_hardware_id(), vec![0x31]);
+    assert_eq!(read_flash(0xff, 0xa1, 1), vec![0x05, 0xff, 0xa1, 0x01]);
+    assert_eq!(
+        read_flash_full_addr(0x00ffc8, 4),
+        vec![0x3d, 0x00, 0xff, 0xc8, 0x04]
+    );
+    assert_eq!(
+        read_floats(0x0044, 2, &Dialect::NEW),
+        vec![0x14, 0x00, 0x44, 0x02]
+    );
+    assert_eq!(set_volume(0x36), vec![0x42, 0x36]);
+    assert_eq!(set_source(0x02), vec![0x34, 0x02]);
+    assert_eq!(set_config(0x01, 0x02), vec![0x25, 0x01, 0x02]);
+    assert_eq!(
+        write_dsp_int(0x0000, 1),
+        vec![0x13, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+    );
+    assert_eq!(
+        bypass_filter(0x2184, false, &Dialect::NEW),
+        vec![0x19, 0x00, 0x21, 0x84, 0x00, 0x00]
+    );
+
+    let coeffs = [
+        f32::from_le_bytes([0x99, 0x15, 0x80, 0x3f]),
+        f32::from_le_bytes([0x10, 0x12, 0xff, 0xbf]),
+        f32::from_le_bytes([0xb0, 0xfd, 0x7d, 0x3f]),
+        f32::from_le_bytes([0x66, 0x12, 0xff, 0x3f]),
+        f32::from_le_bytes([0x35, 0x28, 0x7e, 0xbf]),
+    ];
+    assert_eq!(
+        write_biquad(0x20bc, &coeffs, &Dialect::NEW),
+        vec![
+            0x30, 0x80, 0x20, 0xbc, 0x00, 0x00, 0x99, 0x15, 0x80, 0x3f, 0x10, 0x12, 0xff, 0xbf,
+            0xb0, 0xfd, 0x7d, 0x3f, 0x66, 0x12, 0xff, 0x3f, 0x35, 0x28, 0x7e, 0xbf,
+        ]
+    );
+}
+
+#[test]
+fn official_app_capture_responses_parse_like_live_device_frames() {
+    let flash_req = read_flash(0xff, 0xa1, 1);
+    let flash_resp =
+        parse_response_for_request(&flash_req, &[0x05, 0xff, 0xa1, 0x64], &Dialect::NEW);
+    assert_eq!(flash_resp, Response::FlashData(vec![0x64]));
+
+    let flash_full_req = read_flash_full_addr(0x00ffc8, 4);
+    let flash_full_resp = parse_response_for_request(
+        &flash_full_req,
+        &[0x3d, 0x00, 0xff, 0xc8, 0x33, 0x81, 0xf0, 0x02],
+        &Dialect::NEW,
+    );
+    assert_eq!(
+        flash_full_resp,
+        Response::FlashData(vec![0x33, 0x81, 0xf0, 0x02])
+    );
+
+    let floats_req = read_floats(0x0044, 2, &Dialect::NEW);
+    let floats_resp = parse_response_for_request(
+        &floats_req,
+        &[
+            0x14, 0x00, 0x44, 0x4f, 0x6e, 0x00, 0xc3, 0x4f, 0x6e, 0x00, 0xc3,
+        ],
+        &Dialect::NEW,
+    );
+    match floats_resp {
+        Response::Floats(values) => {
+            assert_eq!(values.len(), 2);
+            let expected = f32::from_le_bytes([0x4f, 0x6e, 0x00, 0xc3]);
+            assert_eq!(values[0].to_bits(), expected.to_bits());
+            assert_eq!(values[1].to_bits(), expected.to_bits());
+        }
+        other => panic!("expected Floats from official short-header response, got {other:?}"),
+    }
+
+    assert_eq!(
+        parse_response(&[0x31, 0x01, 0x55, 0x0a, 0x00, 0x00, 0x00], &Dialect::NEW),
+        Response::HardwareId(HardwareId {
+            fw_major: 0x01,
+            fw_minor: 0x55,
+            hw_id: 0x0a,
+        })
+    );
+    assert_eq!(
+        parse_response(&[0x40, 0x20, 0x00], &Dialect::NEW),
+        Response::Unknown(vec![0x40, 0x20, 0x00])
+    );
+    assert_eq!(parse_response(&[0x42, 0x36], &Dialect::NEW), Response::Ack);
+    assert_eq!(parse_response(&[0x34, 0x02], &Dialect::NEW), Response::Ack);
+    assert_eq!(
+        parse_response(&[0x25, 0x01, 0x02], &Dialect::NEW),
+        Response::Ack
+    );
+    assert_eq!(
+        parse_response(&[0x04, 0xff, 0xc8, 0x5a, 0x4c, 0x1b, 0x2b], &Dialect::NEW),
+        Response::Ack
+    );
+}
+
+#[test]
+fn official_app_capture_dsp100_compressor_writes_match_tables() {
+    use minidsp_protocol::device::dsp::DSP_100;
+
+    let compressor = DSP_100.outputs[0]
+        .compressor
+        .expect("DSP100 output 0 should expose compressor data");
+
+    // Captured Device Console session on the physical 2x4 HD:
+    // 0x16 toggled between 2/3, then 0x28/0x2a/0x2c/0x2d were written as
+    // threshold/ratio/attack/release on output 0.
+    assert_eq!(compressor.bypass, 22);
+    assert_eq!(compressor.threshold, 40);
+    assert_eq!(compressor.ratio, 42);
+    assert_eq!(compressor.attack, 44);
+    assert_eq!(compressor.release, 45);
+    assert_eq!(DSP_100.meters.compressor[0], 70);
+
+    assert_eq!(
+        write_dsp_int(compressor.bypass, 2),
+        vec![0x13, 0x80, 0x00, 0x16, 0x02, 0x00, 0x00, 0x00]
+    );
+    assert_eq!(
+        write_dsp(compressor.threshold, -35.0, true, &Dialect::NEW),
+        vec![0x13, 0x80, 0x00, 0x28, 0x00, 0x00, 0x0c, 0xc2]
+    );
+    assert_eq!(
+        write_dsp(compressor.ratio, 9.9, true, &Dialect::NEW),
+        vec![0x13, 0x80, 0x00, 0x2a, 0x66, 0x66, 0x1e, 0x41]
+    );
+    assert_eq!(
+        write_dsp(compressor.attack, 30.0, true, &Dialect::NEW),
+        vec![0x13, 0x80, 0x00, 0x2c, 0x00, 0x00, 0xf0, 0x41]
+    );
+    assert_eq!(
+        write_dsp(compressor.release, 220.0, true, &Dialect::NEW),
+        vec![0x13, 0x80, 0x00, 0x2d, 0x00, 0x00, 0x5c, 0x43]
+    );
+
+    let meter_req = read_floats(DSP_100.meters.compressor[0], 1, &Dialect::NEW);
+    assert_eq!(meter_req, vec![0x14, 0x00, 0x46, 0x01]);
+    match parse_response_for_request(
+        &meter_req,
+        &[0x14, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00],
+        &Dialect::NEW,
+    ) {
+        Response::Floats(values) => assert_eq!(values, vec![0.0]),
+        other => panic!("expected compressor meter poll to parse as floats, got {other:?}"),
+    }
+}
+
+#[test]
+fn official_app_capture_preset_save_flash_pipeline_matches_builders() {
+    assert_eq!(read_dsp_version(), vec![0x40]);
+
+    assert_eq!(
+        write_flash_block(0x02, &[0x05, 0x00, 0xcf], true),
+        vec![0x06, 0x02, 0x05, 0x00, 0xcf]
+    );
+
+    assert_eq!(
+        write_flash_block(
+            0x02,
+            &[
+                0x01, 0x20, 0x58, 0x01, 0x20, 0x5d, 0x01, 0x20, 0x62, 0x01, 0x20, 0x67, 0x01, 0x20,
+                0x6c, 0x01, 0x20, 0x71, 0x01, 0x20, 0x76, 0x01, 0x20, 0x7b, 0x01, 0x20, 0x80, 0x01,
+                0x20, 0x85,
+            ],
+            false
+        ),
+        vec![
+            0x06, 0x82, 0x01, 0x20, 0x58, 0x01, 0x20, 0x5d, 0x01, 0x20, 0x62, 0x01, 0x20, 0x67,
+            0x01, 0x20, 0x6c, 0x01, 0x20, 0x71, 0x01, 0x20, 0x76, 0x01, 0x20, 0x7b, 0x01, 0x20,
+            0x80, 0x01, 0x20, 0x85,
+        ]
+    );
+
+    assert_eq!(finish_flash_block(0x02), vec![0x07, 0x02]);
+    assert_eq!(read_flash(0xff, 0xa3, 1), vec![0x05, 0xff, 0xa3, 0x01]);
+    assert_eq!(
+        write_flash(0xff, 0xc8, &[0xda, 0x1c, 0xa7, 0x62]),
+        vec![0x04, 0xff, 0xc8, 0xda, 0x1c, 0xa7, 0x62]
+    );
+    assert_eq!(set_config(0x00, 0x01), vec![0x25, 0x00, 0x01]);
 }
 
 // ============================================================
@@ -414,9 +611,9 @@ fn fixed_point_codec() {
 fn mute_encoding_compatibility() {
     use minidsp_protocol::dialect::*;
 
-    // New dialect: muted=2, unmuted=1 (u16 LE)
-    assert_eq!(encode_mute(true, &Dialect::NEW), vec![0x02, 0x00]);
-    assert_eq!(encode_mute(false, &Dialect::NEW), vec![0x01, 0x00]);
+    // New dialect on the live DSP100 / 2x4 HD: muted=1, unmuted=2 (u16 LE)
+    assert_eq!(encode_mute(true, &Dialect::NEW), vec![0x01, 0x00]);
+    assert_eq!(encode_mute(false, &Dialect::NEW), vec![0x02, 0x00]);
 
     // Old dialect: muted=0x00000000, unmuted=0x00800000 (u32 BE)
     assert_eq!(

@@ -10,6 +10,8 @@ use crate::dialect::{self, Dialect};
 pub const CMD_RESET: u8 = 0x03;
 pub const CMD_WRITE_FLASH: u8 = 0x04;
 pub const CMD_READ_FLASH: u8 = 0x05;
+pub const CMD_WRITE_FLASH_BLOCK: u8 = 0x06;
+pub const CMD_FINISH_FLASH_BLOCK: u8 = 0x07;
 pub const CMD_WRITE_DSP: u8 = 0x13;
 pub const CMD_READ_FLOATS: u8 = 0x14;
 pub const CMD_SET_MUTE: u8 = 0x17;
@@ -25,11 +27,21 @@ pub const CMD_SET_SOURCE: u8 = 0x34;
 pub const CMD_FIR_LOAD_START: u8 = 0x39;
 pub const CMD_FIR_LOAD_DATA: u8 = 0x3A;
 pub const CMD_RELOAD_DSP_PARAM: u8 = 0x3B;
+pub const CMD_WRITE_FLASH_FULL_ADDR: u8 = 0x3C;
+pub const CMD_READ_FLASH_FULL_ADDR: u8 = 0x3D;
 pub const CMD_DIRAC_BYPASS: u8 = 0x3F;
+pub const CMD_READ_DSP_VERSION: u8 = 0x40;
 pub const CMD_SET_VOLUME: u8 = 0x42;
 pub const CMD_DIRAC_DELAY_GAIN: u8 = 0x45;
 pub const CMD_SET_HDMI_SOURCE: u8 = 0x49;
 pub const CMD_LOG_CONTROL: u8 = 0x54;
+
+/// Official Device Console uses mode `0x02` for normal interactive preset
+/// changes on the 2x4 HD. A separate mode `0x00` is used by its converter flow
+/// when it explicitly changes presets "without reset".
+pub const PRESET_CHANGE_NORMAL: u8 = 0x02;
+pub const PRESET_CHANGE_WITHOUT_RESET: u8 = 0x00;
+pub const FLASH_FULL_ADDR_CHUNK_MAX: u8 = 0x3A;
 
 // -- Response types --
 
@@ -126,6 +138,63 @@ pub fn write_flash(addr_hi: u8, addr_lo: u8, data: &[u8]) -> Vec<u8> {
     cmd
 }
 
+/// Build the official app's ReadFlashFullAddr command.
+pub fn read_flash_full_addr(addr: u32, count: u8) -> Vec<u8> {
+    let addr = addr.to_be_bytes();
+    vec![
+        CMD_READ_FLASH_FULL_ADDR,
+        addr[1],
+        addr[2],
+        addr[3],
+        count.min(FLASH_FULL_ADDR_CHUNK_MAX),
+    ]
+}
+
+/// Build the official app's WriteFlashFullAddr command.
+pub fn write_flash_full_addr(addr: u32, data: &[u8], offset: usize) -> Vec<u8> {
+    let addr_bytes = addr.to_be_bytes();
+    let size = FLASH_FULL_ADDR_CHUNK_MAX as usize;
+    let end = data.len().min(offset.saturating_add(size));
+    let mut cmd = vec![
+        CMD_WRITE_FLASH_FULL_ADDR,
+        addr_bytes[1],
+        addr_bytes[2],
+        addr_bytes[3],
+    ];
+    if offset < end {
+        cmd.extend_from_slice(&data[offset..end]);
+    }
+    cmd
+}
+
+/// Build the official app's WriteFlashBlock command.
+///
+/// Device Console uses this during preset-save persistence. The first chunk of
+/// a block uses the plain block id; continuation chunks set bit 7 on that id.
+/// Payloads are limited to 32 bytes per chunk.
+pub fn write_flash_block(block_id: u8, data: &[u8], begin_block: bool) -> Vec<u8> {
+    let mut cmd = vec![
+        CMD_WRITE_FLASH_BLOCK,
+        if begin_block {
+            block_id
+        } else {
+            block_id | 0x80
+        },
+    ];
+    cmd.extend_from_slice(&data[..data.len().min(0x20)]);
+    cmd
+}
+
+/// Build the official app's FinishFlashBlock command.
+pub fn finish_flash_block(block_id: u8) -> Vec<u8> {
+    vec![CMD_FINISH_FLASH_BLOCK, block_id]
+}
+
+/// Build a DSP version query command.
+pub fn read_dsp_version() -> Vec<u8> {
+    vec![CMD_READ_DSP_VERSION]
+}
+
 /// Build a WriteDSP command.
 ///
 /// `save`: true = 0x80 (persist to flash), false = 0xA0 (RAM only).
@@ -159,6 +228,28 @@ pub fn write_dsp_u32(addr: u16, value: u32, save: bool) -> Vec<u8> {
     ]
 }
 
+/// Build a delay-slot `WriteDSP` command using the device's native integer
+/// encoding.
+///
+/// Modern SHARC devices use a 16-bit little-endian sample count padded to
+/// 32 bits. Legacy ADAU devices use a raw 32-bit big-endian sample count.
+pub fn write_dsp_delay(addr: u16, samples: u32, save: bool, dialect: &Dialect) -> Vec<u8> {
+    let mut cmd = vec![CMD_WRITE_DSP, if save { 0x80 } else { 0xA0 }];
+    match dialect.value_format {
+        crate::dialect::ValueFormat::Float32 => {
+            let samples = samples.min(u16::MAX as u32) as u16;
+            cmd.extend_from_slice(&[(addr >> 8) as u8, addr as u8]);
+            cmd.extend_from_slice(&samples.to_le_bytes());
+            cmd.extend_from_slice(&[0x00, 0x00]);
+        }
+        crate::dialect::ValueFormat::FixedPoint => {
+            cmd.extend_from_slice(&dialect::encode_addr(addr, true, dialect));
+            cmd.extend_from_slice(&samples.to_be_bytes());
+        }
+    }
+    cmd
+}
+
 /// Build a WriteDSP command with a raw 32-bit scalar payload encoded
 /// little-endian and an explicit control byte.
 ///
@@ -177,6 +268,16 @@ pub fn write_dsp_u32_le_with_ctrl(addr: u16, value: u32, ctrl: u8) -> Vec<u8> {
         bytes[2],
         bytes[3],
     ]
+}
+
+/// Build a modern integer-status `WriteDSP` command.
+///
+/// This matches the working DSP100 / 2x4 HD path used by `minidsp-rs` for
+/// mute, routing enable, FIR bypass, and compressor bypass style selector
+/// slots: `0x13`, control/address prefix, then little-endian `u16` padded to
+/// 32 bits.
+pub fn write_dsp_int(addr: u16, value: u16) -> Vec<u8> {
+    write_dsp_u32_le_with_ctrl(addr, value as u32, 0x80)
 }
 
 /// Build the official app's linked-int `0x30` payload shape.
@@ -284,13 +385,20 @@ pub fn fir_load_start(index: u8) -> Vec<u8> {
     vec![CMD_FIR_LOAD_START, index]
 }
 
-/// Build a FirLoadData command. Up to 15 float32 coefficients per packet.
+/// Build a FirLoadData command. Up to 14 float32 coefficients per packet.
 pub fn fir_load_data(index: u8, coeffs: &[f32]) -> Vec<u8> {
     let mut cmd = vec![CMD_FIR_LOAD_DATA, index];
-    for &c in &coeffs[..coeffs.len().min(15)] {
+    for &c in &coeffs[..coeffs.len().min(14)] {
         cmd.extend_from_slice(&c.to_le_bytes());
     }
     cmd
+}
+
+/// Build a FirLoadEnd command.
+///
+/// The device uses the same one-byte opcode shape as ReloadDspParam.
+pub fn fir_load_end() -> Vec<u8> {
+    vec![CMD_RELOAD_DSP_PARAM]
 }
 
 /// Build a ReloadDspParam command.
@@ -343,9 +451,17 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
 
         CMD_READ_FLASH => Response::FlashData(data[1..].to_vec()),
 
+        CMD_READ_FLASH_FULL_ADDR => {
+            if data.len() >= 4 {
+                Response::FlashData(data[4..].to_vec())
+            } else {
+                Response::Unknown(data.to_vec())
+            }
+        }
+
         CMD_FIR_LOAD_START => {
             if data.len() >= 3 {
-                let max_coeffs = u16::from_le_bytes([data[1], data[2]]);
+                let max_coeffs = u16::from_be_bytes([data[1], data[2]]);
                 Response::FirLoadInfo { max_coeffs }
             } else {
                 Response::Unknown(data.to_vec())
@@ -353,7 +469,9 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
         }
 
         // Ack-like responses for various commands
-        CMD_WRITE_DSP
+        CMD_WRITE_FLASH
+        | CMD_WRITE_FLASH_FULL_ADDR
+        | CMD_WRITE_DSP
         | CMD_WRITE_BIQUAD
         | CMD_SET_VOLUME
         | CMD_SET_MUTE
@@ -381,6 +499,21 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
 /// responses (`[0x05, addr_hi, addr_lo, data...]`), while the simulator and
 /// older assumptions use `[0x05, data...]`. This helper accepts both forms.
 pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect) -> Response {
+    if request.first() == Some(&CMD_READ_FLASH_FULL_ADDR)
+        && data.first() == Some(&CMD_READ_FLASH_FULL_ADDR)
+    {
+        if request.len() >= 5 && data.len() >= 5 {
+            let count = request[4] as usize;
+            let body = &data[1..];
+
+            if body.len() >= count + 3 && body[..3] == request[1..4] {
+                return Response::FlashData(body[3..3 + count].to_vec());
+            }
+        }
+
+        return Response::Unknown(data.to_vec());
+    }
+
     if request.first() == Some(&CMD_READ_FLASH) && data.first() == Some(&CMD_READ_FLASH) {
         if request.len() >= 4 && data.len() >= 2 {
             let addr_hi = request[1];
@@ -392,9 +525,11 @@ pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect
                 return Response::FlashData(body[2..2 + count].to_vec());
             }
 
-            if body.len() >= count {
+            if body.len() == count {
                 return Response::FlashData(body[..count].to_vec());
             }
+
+            return Response::Unknown(data.to_vec());
         }
     }
 
@@ -443,6 +578,35 @@ pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect
 
             return Response::Unknown(data.to_vec());
         }
+
+        if request.len() >= 4
+            && data.len() >= 4
+            && data[1] == request[1]
+            && data[2] == request[2]
+            && data[3] == request[3]
+        {
+            let count = request[3] as usize;
+            let needed = count.saturating_mul(4);
+            if data.len() >= 4 + needed {
+                return Response::Floats(decode_float_chunks(&data[4..4 + needed], count, dialect));
+            }
+
+            return Response::Unknown(data.to_vec());
+        }
+
+        if request.len() >= 4 && data.len() >= 3 && data[1] == request[1] && data[2] == request[2] {
+            let count = request[3] as usize;
+            let remaining = &data[3..];
+
+            if let Some(values) = decode_float_block_with_offset(remaining, count, dialect, request)
+            {
+                return Response::Floats(values);
+            }
+
+            return Response::Unknown(data.to_vec());
+        }
+
+        return Response::Unknown(data.to_vec());
     }
 
     parse_response(data, dialect)
@@ -492,8 +656,21 @@ fn decode_word_chunks(data: &[u8], count: usize) -> Vec<u32> {
     words
 }
 
-/// Parse a raw `ReadFloats` reply into typed 32-bit words instead of float32.
-pub fn parse_param_words_response_for_request(request: &[u8], data: &[u8]) -> Option<Vec<u32>> {
+fn decode_word_chunks_be(data: &[u8], count: usize) -> Vec<u32> {
+    let mut words = Vec::new();
+    for chunk in data.chunks(4).take(count) {
+        if chunk.len() == 4 {
+            words.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+    }
+    words
+}
+
+fn parse_param_words_response_impl(
+    request: &[u8],
+    data: &[u8],
+    decode_words: fn(&[u8], usize) -> Vec<u32>,
+) -> Option<Vec<u32>> {
     if request.first().copied() != Some(CMD_READ_FLOATS) {
         return None;
     }
@@ -514,7 +691,18 @@ pub fn parse_param_words_response_for_request(request: &[u8], data: &[u8]) -> Op
         && data.get(4) == request.get(3)
         && data.len() >= 5 + needed
     {
-        return Some(decode_word_chunks(&data[5..5 + needed], count));
+        return Some(decode_words(&data[5..5 + needed], count));
+    }
+
+    if data.len() >= 4
+        && data.first().copied() == Some(CMD_READ_FLOATS)
+        && request.len() >= 4
+        && data.get(1) == request.get(1)
+        && data.get(2) == request.get(2)
+        && data.get(3) == request.get(3)
+        && data.len() >= 4 + needed
+    {
+        return Some(decode_words(&data[4..4 + needed], count));
     }
 
     if data.len() >= 3
@@ -524,21 +712,27 @@ pub fn parse_param_words_response_for_request(request: &[u8], data: &[u8]) -> Op
         && data.get(2) == request.get(2)
         && data.len() >= 3 + needed
     {
-        return Some(decode_word_chunks(&data[3..3 + needed], count));
+        return Some(decode_words(&data[3..3 + needed], count));
     }
 
     if data.starts_with(request) && data.len() >= request.len() + needed {
-        return Some(decode_word_chunks(
+        return Some(decode_words(
             &data[request.len()..request.len() + needed],
             count,
         ));
     }
 
-    if data.first().copied() == Some(CMD_READ_FLOATS) && data.len() >= 1 + needed {
-        return Some(decode_word_chunks(&data[1..1 + needed], count));
-    }
-
     None
+}
+
+/// Parse a raw `ReadFloats` reply into typed 32-bit words instead of float32.
+pub fn parse_param_words_response_for_request(request: &[u8], data: &[u8]) -> Option<Vec<u32>> {
+    parse_param_words_response_impl(request, data, decode_word_chunks)
+}
+
+/// Parse a raw `ReadFloats` reply into big-endian typed 32-bit words.
+pub fn parse_param_words_be_response_for_request(request: &[u8], data: &[u8]) -> Option<Vec<u32>> {
+    parse_param_words_response_impl(request, data, decode_word_chunks_be)
 }
 
 fn decode_float_block_with_offset(
@@ -624,6 +818,16 @@ fn score_float_candidate(
         }
     }
 
+    // Prefer immediately aligned float blocks when multiple candidate decodes
+    // look plausible. This keeps direct count-echo replies from being
+    // outscored by stray trailer bytes while still allowing later offsets when
+    // the leading bytes clearly are not float payload.
+    if offset == 0 {
+        score += 3;
+    } else if offset % 4 == 0 {
+        score += 1;
+    }
+
     Some(score)
 }
 
@@ -636,6 +840,7 @@ pub fn matches_response(cmd_opcode: u8, resp_opcode: u8) -> bool {
         CMD_READ_HARDWARE_ID => resp_opcode == CMD_READ_HARDWARE_ID,
         CMD_READ_FLOATS => resp_opcode == CMD_READ_FLOATS,
         CMD_READ_FLASH => resp_opcode == CMD_READ_FLASH,
+        CMD_READ_FLASH_FULL_ADDR => resp_opcode == CMD_READ_FLASH_FULL_ADDR,
         CMD_SET_CONFIG => resp_opcode == CMD_SET_CONFIG || resp_opcode == RESP_PRESET_COMPLETE,
         CMD_RESET => resp_opcode == RESP_RESET_COMPLETE,
         CMD_FIR_LOAD_START => resp_opcode == CMD_FIR_LOAD_START,
@@ -671,8 +876,8 @@ mod tests {
 
     #[test]
     fn set_config_cmd() {
-        let cmd = set_config(2, 0);
-        assert_eq!(cmd, vec![0x25, 0x02, 0x00]);
+        let cmd = set_config(2, PRESET_CHANGE_NORMAL);
+        assert_eq!(cmd, vec![0x25, 0x02, 0x02]);
     }
 
     #[test]
@@ -693,6 +898,84 @@ mod tests {
             cmd,
             vec![CMD_WRITE_DSP, 0x80, 0x00, 0x42, 0x00, 0x00, 0x00, 0x02]
         );
+    }
+
+    #[test]
+    fn write_dsp_delay_new_dialect() {
+        let cmd = write_dsp_delay(0x0042, 2, false, &Dialect::NEW);
+        assert_eq!(
+            cmd,
+            vec![CMD_WRITE_DSP, 0xA0, 0x00, 0x42, 0x02, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn write_dsp_delay_old_dialect() {
+        let cmd = write_dsp_delay(0x0042, 2, true, &Dialect::OLD);
+        assert_eq!(
+            cmd,
+            vec![CMD_WRITE_DSP, 0x80, 0x80, 0x42, 0x00, 0x00, 0x00, 0x02]
+        );
+    }
+
+    #[test]
+    fn write_dsp_int_new_dialect() {
+        let cmd = write_dsp_int(0x0006, 2);
+        assert_eq!(
+            cmd,
+            vec![CMD_WRITE_DSP, 0x80, 0x00, 0x06, 0x02, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn write_flash_block_begin_chunk() {
+        let cmd = write_flash_block(0x02, &[0x05, 0x00, 0xcf], true);
+        assert_eq!(cmd, vec![CMD_WRITE_FLASH_BLOCK, 0x02, 0x05, 0x00, 0xcf]);
+    }
+
+    #[test]
+    fn read_flash_full_addr_cmd() {
+        assert_eq!(
+            read_flash_full_addr(0x00ffc8, 0x40),
+            vec![CMD_READ_FLASH_FULL_ADDR, 0x00, 0xff, 0xc8, 0x3a]
+        );
+    }
+
+    #[test]
+    fn write_flash_full_addr_cmd() {
+        let cmd = write_flash_full_addr(0x0c0000, &[0x11, 0x22, 0x33, 0x44], 1);
+        assert_eq!(
+            cmd,
+            vec![
+                CMD_WRITE_FLASH_FULL_ADDR,
+                0x0c,
+                0x00,
+                0x00,
+                0x22,
+                0x33,
+                0x44
+            ]
+        );
+    }
+
+    #[test]
+    fn write_flash_block_continuation_chunk_is_capped() {
+        let data = [0x11; 0x21];
+        let cmd = write_flash_block(0x02, &data, false);
+        assert_eq!(cmd[0], CMD_WRITE_FLASH_BLOCK);
+        assert_eq!(cmd[1], 0x82);
+        assert_eq!(cmd.len(), 34);
+        assert!(cmd[2..].iter().all(|&byte| byte == 0x11));
+    }
+
+    #[test]
+    fn finish_flash_block_cmd() {
+        assert_eq!(finish_flash_block(0x02), vec![CMD_FINISH_FLASH_BLOCK, 0x02]);
+    }
+
+    #[test]
+    fn read_dsp_version_cmd() {
+        assert_eq!(read_dsp_version(), vec![CMD_READ_DSP_VERSION]);
     }
 
     #[test]
@@ -762,6 +1045,15 @@ mod tests {
         assert_eq!(cmd[1], 0x00);
         assert_eq!(cmd[2], 0x30);
         assert_eq!(cmd[3], 4); // count
+    }
+
+    #[test]
+    fn fir_load_data_caps_at_14_coefficients() {
+        let coeffs: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let cmd = fir_load_data(2, &coeffs);
+        assert_eq!(cmd[0], CMD_FIR_LOAD_DATA);
+        assert_eq!(cmd[1], 2);
+        assert_eq!(cmd.len(), 2 + 14 * 4);
     }
 
     #[test]
@@ -881,6 +1173,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_flash_read_for_request_rejects_wrong_flash_address() {
+        let req = read_flash(0xFF, 0xD8, 4);
+        let data = [0x05, 0xFF, 0xA9, 0x00];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert!(matches!(resp, Response::Unknown(_)));
+    }
+
+    #[test]
+    fn parse_flash_full_addr_read_for_request_with_echoed_address() {
+        let req = read_flash_full_addr(0x00ffc8, 4);
+        let data = [0x3d, 0x00, 0xff, 0xc8, 0x33, 0x81, 0xf0, 0x02];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        match resp {
+            Response::FlashData(bytes) => {
+                assert_eq!(bytes, vec![0x33, 0x81, 0xf0, 0x02]);
+            }
+            _ => panic!("expected FlashData"),
+        }
+    }
+
+    #[test]
+    fn parse_flash_full_addr_read_rejects_wrong_address() {
+        let req = read_flash_full_addr(0x00ffc8, 4);
+        let data = [0x3d, 0x00, 0xff, 0xd8, 0x00, 0x81, 0xf0, 0x02];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert!(matches!(resp, Response::Unknown(_)));
+    }
+
+    #[test]
     fn parse_read_floats_for_request_with_echoed_prefix() {
         let req = read_floats(0x0FC8, 1, &Dialect::NEW);
         let mut data = req.clone();
@@ -890,6 +1211,23 @@ mod tests {
             Response::Floats(values) => {
                 assert_eq!(values.len(), 1);
                 assert!((values[0] - 1.0).abs() < 0.0001);
+            }
+            _ => panic!("expected Floats response"),
+        }
+    }
+
+    #[test]
+    fn parse_read_floats_for_request_with_short_address_header() {
+        let req = read_floats(0x0044, 2, &Dialect::NEW);
+        let mut data = vec![0x14, 0x00, 0x44];
+        data.extend_from_slice(&(-106.44f32).to_le_bytes());
+        data.extend_from_slice(&(-106.66f32).to_le_bytes());
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        match resp {
+            Response::Floats(values) => {
+                assert_eq!(values.len(), 2);
+                assert!((values[0] + 106.44).abs() < 0.05);
+                assert!((values[1] + 106.66).abs() < 0.05);
             }
             _ => panic!("expected Floats response"),
         }
@@ -966,9 +1304,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_read_floats_rejects_wrong_address_payload() {
+        let req = read_floats(0x0044, 2, &Dialect::NEW);
+        let data = [
+            0x14, 0x00, 0x4A, 0x89, 0x81, 0x00, 0xC3, 0x89, 0x81, 0x00, 0xC3,
+        ];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert!(matches!(resp, Response::Unknown(_)));
+    }
+
+    #[test]
     fn parse_param_words_response_for_integer_slot() {
         let req = read_floats(0x0002, 1, &Dialect::NEW);
         let data = [0x14, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00];
+
+        let words = parse_param_words_response_for_request(&req, &data).unwrap();
+        assert_eq!(words, vec![2]);
+    }
+
+    #[test]
+    fn parse_param_words_response_for_unframed_count_echo_integer_slot() {
+        let req = read_floats(0x0002, 1, &Dialect::NEW);
+        let data = [0x14, 0x00, 0x02, 0x01, 0x02, 0x00, 0x00, 0x00, 0x24, 0x33];
 
         let words = parse_param_words_response_for_request(&req, &data).unwrap();
         assert_eq!(words, vec![2]);
@@ -984,10 +1341,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_param_words_be_response_for_integer_slot() {
+        let req = read_floats(0x0002, 1, &Dialect::OLD);
+        let data = [0x14, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02];
+
+        let words = parse_param_words_be_response_for_request(&req, &data).unwrap();
+        assert_eq!(words, vec![2]);
+    }
+
+    #[test]
+    fn parse_readfloats_response_for_unframed_count_echo_scalar() {
+        let req = read_floats(0x0028, 1, &Dialect::NEW);
+        let data = [
+            0x14, 0x00, 0x28, 0x01, 0x00, 0x00, 0xf0, 0xc1, 0x24, 0x33, 0x81, 0xf0,
+        ];
+
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        match resp {
+            Response::Floats(values) => assert_eq!(values, vec![-30.0]),
+            other => panic!("expected Floats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_param_words_rejects_wrong_address_payload() {
+        let req = read_floats(0x0016, 2, &Dialect::NEW);
+        let data = [
+            0x14, 0x00, 0x4a, 0x08, 0x99, 0x03, 0x4a, 0xd3, 0xdc, 0x42, 0xfd,
+        ];
+
+        let words = parse_param_words_response_for_request(&req, &data);
+        assert!(words.is_none());
+    }
+
+    #[test]
     fn parse_ack_responses() {
         // All write commands return [0x01] ACK
         for &cmd in &[
             0x01,
+            CMD_WRITE_FLASH,
             CMD_SET_VOLUME,
             CMD_SET_MUTE,
             CMD_SET_SOURCE,
@@ -998,6 +1390,12 @@ mod tests {
             let resp = parse_response(&[cmd], &Dialect::NEW);
             assert_eq!(resp, Response::Ack, "cmd 0x{:02x} should parse as Ack", cmd);
         }
+    }
+
+    #[test]
+    fn parse_fir_load_start_response_uses_big_endian_runtime_size() {
+        let resp = parse_response(&[CMD_FIR_LOAD_START, 0x08, 0x00], &Dialect::NEW);
+        assert_eq!(resp, Response::FirLoadInfo { max_coeffs: 2048 });
     }
 
     #[test]

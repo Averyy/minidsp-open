@@ -4,8 +4,8 @@ use crate::http::json::*;
 use crate::playback;
 use crate::state::DaemonState;
 use axum::{
-    body::Bytes,
     Json, Router,
+    body::Bytes,
     extract::{
         FromRequest, Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -167,6 +167,17 @@ async fn device_get_or_ws(
     Ok(Json(status).into_response())
 }
 
+fn ws_state_interval_ms(poll: bool, levels: bool) -> u64 {
+    if levels {
+        // Match the official Device Console meter cadence on the 2x4 HD.
+        500
+    } else if poll {
+        1000
+    } else {
+        5000
+    }
+}
+
 /// WebSocket: state + level streaming (compatibility endpoint on /devices/{id}).
 async fn ws_state_levels(
     mut socket: WebSocket,
@@ -174,17 +185,13 @@ async fn ws_state_levels(
     poll: bool,
     levels: bool,
 ) {
-    let interval_ms = if levels {
-        250
-    } else if poll {
-        1000
-    } else {
-        5000
-    };
+    let interval_ms = ws_state_interval_ms(poll, levels);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
 
     // Send initial status immediately so clients don't wait for first tick
-    if let Ok(status) = client.get_status_summary().await {
+    if let Ok(status) = client.get_status_summary_polled().await {
         let json = serde_json::to_string(&status).unwrap_or_default();
         if socket.send(Message::Text(json.into())).await.is_err() {
             return;
@@ -195,7 +202,10 @@ async fn ws_state_levels(
         tokio::select! {
             // Send status on each tick
             _ = tick.tick() => {
-                match client.get_status_summary().await {
+                if client.queue().is_levels_paused() {
+                    continue;
+                }
+                match client.get_status_summary_polled().await {
                     Ok(status) => {
                         // Use serde_json::to_string for correct f32 precision and dirac skip_serializing_if
                         let json = serde_json::to_string(&status).unwrap_or_default();
@@ -225,10 +235,14 @@ async fn ws_raw_bridge(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
-    Ok(ws.on_upgrade(move |socket| ws_raw_handler(socket, client)))
+    Ok(ws.on_upgrade(move |socket| ws_raw_handler(socket, client, state)))
 }
 
-async fn ws_raw_handler(mut socket: WebSocket, client: Arc<minidsp::client::MiniDspClient>) {
+async fn ws_raw_handler(
+    mut socket: WebSocket,
+    client: Arc<minidsp::client::MiniDspClient>,
+    state: Arc<DaemonState>,
+) {
     use minidsp::queue::Priority;
 
     while let Some(msg) = socket.recv().await {
@@ -236,8 +250,11 @@ async fn ws_raw_handler(mut socket: WebSocket, client: Arc<minidsp::client::Mini
             Ok(Message::Binary(data)) => {
                 // Decode frame and execute
                 if let Some(payload) = minidsp_protocol::packet::decode_frame(&data) {
+                    let request = payload.clone();
                     match client.queue().execute_raw(payload, Priority::Normal).await {
                         Ok(resp) => {
+                            client.mirror_raw_command_if_success(&request, &resp).await;
+                            state.persist_device_shadow(&client).await;
                             let frame = minidsp_protocol::packet::encode_frame(&resp);
                             if socket.send(Message::Binary(frame.into())).await.is_err() {
                                 return;
@@ -465,7 +482,9 @@ async fn play_device(
         .await
         .map_err(|_| ApiError::internal("playback thread ended unexpectedly"))?
         .map_err(ApiError::internal)?;
-    Ok(Json(serde_json::to_value(response).expect("play response serializes")))
+    Ok(Json(
+        serde_json::to_value(response).expect("play response serializes"),
+    ))
 }
 
 async fn volume_direction(
@@ -754,10 +773,134 @@ async fn write_config(
                             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                     }
                 }
+                if let Some(crossover_groups) = output.crossover
+                    && let Some(xover) = output_ch.crossover
+                {
+                    for group in crossover_groups {
+                        let base_addr = match group.index {
+                            0 => xover.lpf_addr,
+                            1 => xover.hpf_addr,
+                            _ => return Err(StatusCode::BAD_REQUEST),
+                        };
+                        if let Some(filters) = group.filters {
+                            for filter in filters {
+                                if filter.index >= 4 {
+                                    return Err(StatusCode::BAD_REQUEST);
+                                }
+                                if let Some(coeff) = filter.coeff {
+                                    let coeffs = [coeff.b0, coeff.b1, coeff.b2, coeff.a1, coeff.a2];
+                                    client
+                                        .write_biquad(base_addr + filter.index as u16 * 5, &coeffs)
+                                        .await
+                                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                                }
+                            }
+                        }
+                        if let Some(bypass) = group.bypass {
+                            client
+                                .bypass_filter(base_addr, bypass)
+                                .await
+                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        }
+                    }
+                }
+                if let Some(fir) = output.fir
+                    && let Some(fir_def) = output_ch.fir
+                {
+                    if let Some(bypass) = fir.bypass {
+                        client
+                            .set_status_bypass(fir_def.bypass, bypass)
+                            .await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    }
+                    if let Some(coefficients) = fir.coefficients {
+                        client
+                            .load_fir_coefficients(fir_def, &coefficients)
+                            .await
+                            .map_err(client_error_to_status)?;
+                    }
+                }
+                if let Some(compressor) = output.compressor
+                    && let Some(comp) = &output_ch.compressor
+                {
+                    if let Some(bypass) = compressor.bypass {
+                        client
+                            .set_status_bypass(comp.bypass, bypass)
+                            .await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    }
+                    if let Some(ratio) = compressor.ratio {
+                        client
+                            .write_dsp_verified(comp.ratio, ratio, true, "set compressor ratio")
+                            .await
+                            .map_err(|err| {
+                                tracing::warn!("compressor ratio write failed: {err}");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            })?;
+                    }
+                    if let Some(knee) = compressor.knee {
+                        client
+                            .write_dsp_verified(comp.knee, knee, true, "set compressor knee")
+                            .await
+                            .map_err(|err| {
+                                tracing::warn!("compressor knee write failed: {err}");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            })?;
+                    }
+                    if let Some(attack) = compressor.attack {
+                        client
+                            .write_dsp_verified(comp.attack, attack, true, "set compressor attack")
+                            .await
+                            .map_err(|err| {
+                                tracing::warn!("compressor attack write failed: {err}");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            })?;
+                    }
+                    if let Some(release) = compressor.release {
+                        client
+                            .write_dsp_verified(
+                                comp.release,
+                                release,
+                                true,
+                                "set compressor release",
+                            )
+                            .await
+                            .map_err(|err| {
+                                tracing::warn!("compressor release write failed: {err}");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            })?;
+                    }
+                    if let Some(threshold) = compressor.threshold {
+                        client
+                            .write_dsp_verified(
+                                comp.threshold,
+                                threshold,
+                                true,
+                                "set compressor threshold",
+                            )
+                            .await
+                            .map_err(|err| {
+                                tracing::warn!("compressor threshold write failed: {err}");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            })?;
+                    }
+                    if let Some(gain) = compressor.gain {
+                        client
+                            .write_dsp_verified(comp.gain, gain, true, "set compressor gain")
+                            .await
+                            .map_err(|err| {
+                                tracing::warn!("compressor gain write failed: {err}");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            })?;
+                    }
+                }
             }
         }
     }
 
+    state
+        .persist_device_shadow_after_preset_mutation(&client)
+        .await;
     Ok(StatusCode::OK)
 }
 
@@ -846,10 +989,61 @@ async fn read_config(
             mute: Some(output.mute),
             delay: Some(std::time::Duration::from_secs_f32(output.delay / 1000.0)),
             invert,
+            crossover: if output.crossover.is_empty() {
+                None
+            } else {
+                Some(
+                    output
+                        .crossover
+                        .into_iter()
+                        .map(|group| CrossoverConfigJson {
+                            index: group.index,
+                            filters: Some(
+                                group
+                                    .filters
+                                    .into_iter()
+                                    .map(|filter| IndexedBiquadJson {
+                                        index: filter.index,
+                                        coeff: Some(BiquadCoeffJson {
+                                            b0: filter.coeff.b0,
+                                            b1: filter.coeff.b1,
+                                            b2: filter.coeff.b2,
+                                            a1: filter.coeff.a1,
+                                            a2: filter.coeff.a2,
+                                        }),
+                                    })
+                                    .collect(),
+                            ),
+                            bypass: Some(group.bypass),
+                        })
+                        .collect(),
+                )
+            },
+            fir: output.fir.map(|fir| FirConfigJson {
+                bypass: Some(fir.bypass),
+                coefficients: None,
+                active_taps: Some(fir.active_taps),
+            }),
+            compressor: output.compressor.map(|compressor| CompressorConfigJson {
+                bypass: Some(compressor.bypass),
+                threshold: Some(compressor.threshold),
+                gain: Some(compressor.gain),
+                ratio: Some(compressor.ratio),
+                knee: Some(compressor.knee),
+                attack: Some(compressor.attack),
+                release: Some(compressor.release),
+            }),
         });
     }
 
     Ok(Json(serde_json::json!({
+        "master_status": {
+            "preset": config.master_status.preset,
+            "source": config.master_status.source,
+            "volume": config.master_status.volume,
+            "mute": config.master_status.mute,
+            "dirac": config.master_status.dirac,
+        },
         "inputs": inputs,
         "outputs": outputs,
     }))
@@ -996,6 +1190,7 @@ async fn copy_preset(
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.persist_device_shadow(&client).await;
     Ok(StatusCode::OK)
 }
 
@@ -1013,6 +1208,9 @@ async fn enter_measurement_mode(
         .await
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     state.set_saved_peq(id, saved).await;
+    state
+        .persist_device_shadow_after_preset_mutation(&client)
+        .await;
     Ok(Json(
         serde_json::json!({ "status": "measurement_mode_active" }),
     ))
@@ -1030,6 +1228,9 @@ async fn restore_measurement_mode(
         .map_err(client_error_to_status)?;
     client.set_saved_measurement_state(None).await;
     state.clear_saved_peq(id).await;
+    state
+        .persist_device_shadow_after_preset_mutation(&client)
+        .await;
     Ok(Json(
         serde_json::json!({ "status": "measurement_mode_restored" }),
     ))
@@ -1203,4 +1404,19 @@ async fn llms_txt() -> impl IntoResponse {
         StatusCode::OK,
         "# minidsp-open\n\nMiniDSP controller HTTP API.\nSee /openapi.json for endpoints.\n",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ws_state_interval_ms;
+
+    #[test]
+    fn ws_levels_interval_matches_official_meter_cadence() {
+        assert_eq!(ws_state_interval_ms(true, true), 500);
+    }
+
+    #[test]
+    fn ws_poll_without_levels_keeps_one_second_interval() {
+        assert_eq!(ws_state_interval_ms(true, false), 1000);
+    }
 }

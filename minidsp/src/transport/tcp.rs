@@ -51,6 +51,8 @@ impl Transport for TcpTransport {
     ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
         let stream = self.stream.clone();
         let frame = packet::encode_frame(payload);
+        tracing::debug!("TCP OUT payload: {:02x?}", payload);
+        tracing::trace!("TCP OUT frame: {:02x?}", frame);
         Box::pin(async move {
             let mut stream = stream.lock().await;
             stream.write_all(&frame).await.map_err(map_io_error)?;
@@ -74,6 +76,8 @@ impl Transport for TcpTransport {
                 {
                     let mut buf = read_buf.lock().await;
                     if let Some((payload, consumed)) = packet::decode_tcp_response(&buf) {
+                        tracing::trace!("TCP IN frame: {:02x?}", &buf[..consumed]);
+                        tracing::debug!("TCP IN payload: {:02x?}", payload);
                         buf.drain(..consumed);
                         return Ok(payload);
                     }

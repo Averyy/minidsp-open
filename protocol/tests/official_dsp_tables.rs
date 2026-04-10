@@ -11,6 +11,22 @@ struct DeviceMatrix {
     modern_devices: Vec<ModernDeviceRow>,
 }
 
+#[test]
+fn dsp100_output_fir_metadata_matches_verified_2x4hd_runtime_contract() {
+    let profile = probe::identify(10, 100);
+    let table = profile
+        .dsp_table
+        .expect("missing dsp table for dsp100 / 2x4hd");
+
+    for (index, output) in table.outputs.iter().enumerate() {
+        let fir = output
+            .fir
+            .unwrap_or_else(|| panic!("missing fir metadata for dsp100 output {}", index));
+        assert_eq!(fir.index, index as u8);
+        assert_eq!(fir.max_taps, 2048);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ModernDeviceRow {
     hw_id: u8,
@@ -193,6 +209,24 @@ fn assert_channel_control_indexes_known(
                 "output.crossover.hpf",
                 channel,
                 crossover.hpf_addr,
+                known_indexes,
+            );
+        }
+        if let Some(fir) = output.fir {
+            assert_known_index(
+                profile_name,
+                dsp_version,
+                "output.fir.bypass",
+                channel,
+                fir.bypass,
+                known_indexes,
+            );
+            assert_known_index(
+                profile_name,
+                dsp_version,
+                "output.fir.taps_count",
+                channel,
+                fir.taps_count,
                 known_indexes,
             );
         }

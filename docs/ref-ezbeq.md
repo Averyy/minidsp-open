@@ -17,7 +17,7 @@ This file describes ezBEQ-facing behavior and architecture. It is not the place 
 
 2. **Filter writer.** When user selects a movie, ezBEQ translates the filter profile into biquad coefficient writes for the correct PEQ slots on the connected MiniDSP. It shells out to the `minidsp` CLI binary to do the actual writes.
 
-3. **State tracker.** Since no existing software reads config back from MiniDSP hardware (a limitation we fix), ezBEQ tracks which filters are loaded in which slot via JSON files on disk. This state survives restarts.
+3. **State tracker.** Since exact MiniDSP config readback is still incomplete on some device/field combinations, ezBEQ tracks which filters are loaded in which slot via JSON files on disk. This state survives restarts.
 
 4. **Multi-device router.** Supports multiple simultaneous MiniDSPs and other DSP platforms (HTP-1, JRiver, CamillaDSP, Q-Sys). Each device has its own slot allocation, routing config, and state.
 
@@ -389,20 +389,23 @@ On desktop (Linux/macOS/Windows), the target user experience is still binary swa
 
 No catalogue index, no web UI, no GitHub Actions involved. ezBEQ runs on the same machine and shells out to our `minidsp` binary exactly as it does to minidsp-rs today.
 
-## Config Read-Back: We Fix the Root Cause
+## Config Read-Back: Improved, Not Universal
 
 The ezBEQ docs warn:
 
 > "Bear in mind that, so far, settings cannot be read back from the MiniDSP 2x4HD. This means that no applications are able to show your currently loaded configs."
 
-**This is now verified on the live 2x4 HD across desktop and ESP32 for the implemented path.** The MiniDSP protocol has command `0x14` (`ReadFloats`) that reads DSP registers, and minidsp-open uses that mechanism for typed scalar config read-back. PEQ state on the physical 2x4 HD still requires the shadow/default model because live PEQ `0x14` reads return the all-zero placeholder even though writes succeed. Even MiniDSP's own Device Console doesn't read config back — it uses modification tokens and local XML cache.
+The MiniDSP protocol has command `0x14` (`ReadFloats`) that reads DSP registers, and minidsp-open uses that mechanism where the hardware exposes usable values. On the physical DSP100 / 2x4 HD path, that is not universal: PEQ state still requires the shadow/default model because live PEQ `0x14` reads return the all-zero placeholder even though writes succeed, routing and FIR tap count still need verified shadow fallback across reconnects, and the official Device Console capture confirms compressor writes without proving an authoritative compressor-parameter readback path. Even MiniDSP's own Device Console does not appear to rely on direct parameter readback here; it uses local state plus explicit modification-token writes and additional flash/token command families (`0x06`, `0x07`, `0x40`) that are now identified and do not provide the missing runtime readback.
 
-Implemented target behavior:
-- Read every biquad coefficient, gain, delay, mute state, compressor param, mixer routing
+Long-term target behavior:
+- Read every biquad coefficient, gain, delay, mute state, compressor param, mixer routing directly from hardware when the device exposes authoritative state
 - Expose via `GET /devices/{id}/config` returning full state as JSON
 - Enable true status display, measurement mode (save/flatten/measure/restore), preset export, and write verification
 
 Verified reality today:
-- Desktop still tracks this as implemented behavior.
+- Desktop implements the config surface, but some DSP100 fields still come from verified shadow state instead of authoritative live hardware readback.
+- Desktop daemon preset-content writes now also mirror the official app's explicit active-preset token save, so that verified shadow state has the same freshness marker the official app relies on when direct runtime readback is missing.
+- Desktop daemon can now also import missing preset shadow from the official Device Console `setting*.xml` files when the XML timestamp matches the live preset token, so a fresh attach can recover sane controller-side state even for presets the daemon did not write itself.
+- Desktop status reads also stay compatible on the physical 2x4 HD when DSP100 meter polling misbehaves: the daemon now treats those meter reads as best-effort and clamps failures to `-140 dB` silence instead of breaking `minidsp -o jsonline` / `GET /devices/{id}` consumers.
 - ESP32 physical-hardware validation has only closed status/meter/basic-control paths so far.
 - This removes the previous ESP32 config-route parity blocker on the physical 2x4 HD. Broader device-matrix coverage still depends on the importer/codegen work tracked in `PROGRESS.md`, `docs/ref-device-coverage.md`, and the permanent device reference docs.

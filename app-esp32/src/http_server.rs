@@ -97,6 +97,7 @@ pub fn start(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
+            let _op = dev.begin_operation();
             match dev.get_status_summary() {
                 Ok(status) => send_json(req, 200, &status_json(&status)),
                 Err(e) => send_error(req, 500, &e.to_string()),
@@ -118,6 +119,7 @@ pub fn start(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
+            let _op = dev.begin_operation();
 
             if let Some(vol) = json.get("volume").and_then(|v| v.as_f64()) {
                 if let Err(e) = dev.set_volume_db(vol as f32) {
@@ -239,17 +241,6 @@ pub fn start(
                 }
             };
 
-            let current_source = match dev.current_source() {
-                Ok(Some(source)) => source,
-                Ok(None) => {
-                    audio.finish_playback();
-                    return send_error(req, 500, "current source unavailable");
-                }
-                Err(err) => {
-                    audio.finish_playback();
-                    return send_error(req, 500, &format!("read source: {err}"));
-                }
-            };
             let usb_index = match dev.profile().sources.index_for_source(Source::Usb) {
                 Some(index) => index,
                 None => {
@@ -258,18 +249,34 @@ pub fn start(
                 }
             };
 
-            let mut source_changed = false;
-            let mut previous_source = None;
-            let mut restore_source = None;
-            if current_source != Source::Usb {
-                if let Err(err) = dev.set_source(usb_index) {
-                    audio.finish_playback();
-                    return send_error(req, 500, &format!("set_source: {err}"));
+            let (source_changed, previous_source, restore_source) = {
+                let _op = dev.begin_operation();
+                let current_source = match dev.current_source() {
+                    Ok(Some(source)) => source,
+                    Ok(None) => {
+                        audio.finish_playback();
+                        return send_error(req, 500, "current source unavailable");
+                    }
+                    Err(err) => {
+                        audio.finish_playback();
+                        return send_error(req, 500, &format!("read source: {err}"));
+                    }
+                };
+
+                if current_source == Source::Usb {
+                    (false, None, None)
+                } else {
+                    if let Err(err) = dev.set_source(usb_index) {
+                        audio.finish_playback();
+                        return send_error(req, 500, &format!("set_source: {err}"));
+                    }
+                    (
+                        true,
+                        Some(current_source.to_string()),
+                        Some(current_source),
+                    )
                 }
-                source_changed = true;
-                previous_source = Some(current_source.to_string());
-                restore_source = Some(current_source);
-            }
+            };
 
             let (tx, rx) = mpsc::sync_channel(1);
             let dev_for_thread = dev.clone();
@@ -292,6 +299,7 @@ pub fn start(
             {
                 if let Some(source) = restore_source {
                     if let Some(index) = dev.profile().sources.index_for_source(source) {
+                        let _op = dev.begin_operation();
                         if let Err(restore_err) = dev.set_source(index) {
                             warn!(
                                 "failed to restore source after playback spawn failure: {restore_err}"
@@ -328,6 +336,7 @@ pub fn start(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
+            let _op = dev.begin_operation();
             match dev.read_config() {
                 Ok(config) => {
                     let body = serde_json::to_string(&config).unwrap_or_else(|_| "{}".into());
@@ -351,7 +360,9 @@ pub fn start(
             };
             let body = match read_request_body(&mut req, 8192) {
                 Ok(body) => body,
-                Err("request body too large") => return send_error(req, 413, "request body too large"),
+                Err("request body too large") => {
+                    return send_error(req, 413, "request body too large")
+                }
                 Err(_) => return send_error(req, 400, "failed to read request body"),
             };
 
@@ -360,6 +371,7 @@ pub fn start(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
+            let _op = dev.begin_operation();
 
             // master_status: {preset, volume, mute, source, dirac}
             if let Some(ms) = json.get("master_status") {
@@ -504,35 +516,29 @@ pub fn start(
                                         )
                                     }
                                 };
-                                let enabled =
-                                    match route.get("enabled").and_then(|v| v.as_bool()) {
-                                        Some(v) => v,
-                                        None => {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                "routing missing 'enabled' field",
-                                            )
-                                        }
-                                    };
-                                let gain_db =
-                                    match route.get("gain_db").and_then(|v| v.as_f64()) {
-                                        Some(v) if v.is_finite() => v as f32,
-                                        Some(_) => {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                "routing gain must be finite",
-                                            )
-                                        }
-                                        None => {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                "routing missing 'gain_db' field",
-                                            )
-                                        }
-                                    };
+                                let enabled = match route.get("enabled").and_then(|v| v.as_bool()) {
+                                    Some(v) => v,
+                                    None => {
+                                        return send_error(
+                                            req,
+                                            400,
+                                            "routing missing 'enabled' field",
+                                        )
+                                    }
+                                };
+                                let gain_db = match route.get("gain_db").and_then(|v| v.as_f64()) {
+                                    Some(v) if v.is_finite() => v as f32,
+                                    Some(_) => {
+                                        return send_error(req, 400, "routing gain must be finite")
+                                    }
+                                    None => {
+                                        return send_error(
+                                            req,
+                                            400,
+                                            "routing missing 'gain_db' field",
+                                        )
+                                    }
+                                };
                                 if let Err(e) = dev.set_routing(idx as u8, output, enabled, gain_db)
                                 {
                                     return send_error(req, 500, &format!("set_routing: {e}"));
@@ -663,7 +669,7 @@ pub fn start(
             }
 
             info!("POST /devices/0/config completed");
-            send_json(req, 200, r#"{"status":"ok"}"#)
+            send_empty_200(req)
         })?;
     }
 
@@ -943,6 +949,7 @@ fn register_debug_routes(
             let Some(addr) = addr else {
                 return send_error(req, 400, "missing addr query parameter");
             };
+            let _op = dev.begin_operation();
 
             let body = match format {
                 "words" => match dev.read_dsp_words(addr, count) {
@@ -1110,6 +1117,7 @@ fn register_volume_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
+            let _op = dev.begin_operation();
             let ms = match dev.get_master_status() {
                 Ok(ms) => ms,
                 Err(e) => return send_error(req, 500, &e.to_string()),
@@ -1149,6 +1157,7 @@ fn register_source_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
+            let _op = dev.begin_operation();
             // Resolve source name to index via the device profile
             let src = match minidsp_protocol::source::Source::from_str_lowercase(&source_name) {
                 Some(s) => s,
@@ -1182,6 +1191,7 @@ fn register_preset_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
+            let _op = dev.begin_operation();
             if let Err(e) = dev.set_preset(preset) {
                 return send_error(req, 500, &e.to_string());
             }
@@ -1209,6 +1219,7 @@ fn register_device_feature_routes(
                 }
                 Some(d) => d,
             };
+            let _op = dev.begin_operation();
             match dev.read_display() {
                 Ok((idle_time, brightness)) => {
                     let body = format!(r#"{{"idle_time":{idle_time},"brightness":{brightness}}}"#);
@@ -1232,6 +1243,7 @@ fn register_device_feature_routes(
             };
             let mut buf = [0u8; 256];
             let len = req.read(&mut buf).unwrap_or(0);
+            let _op = dev.begin_operation();
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
                 if let Some(b) = json.get("brightness").and_then(|v| v.as_u64()) {
                     let _ = dev.set_display_brightness(b as u8);
@@ -1255,6 +1267,7 @@ fn register_device_feature_routes(
                 }
                 Some(d) => d,
             };
+            let _op = dev.begin_operation();
             match dev.read_dre() {
                 Ok(enabled) => {
                     let body = format!(r#"{{"enabled":{enabled}}}"#);
@@ -1278,6 +1291,7 @@ fn register_device_feature_routes(
             };
             let mut buf = [0u8; 256];
             let len = req.read(&mut buf).unwrap_or(0);
+            let _op = dev.begin_operation();
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
                 if let Some(enabled) = json.get("enabled").and_then(|v| v.as_bool()) {
                     let _ = dev.set_dre(enabled);
@@ -1295,6 +1309,7 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
+            let _op = dev.begin_operation();
             match dev.read_tokens() {
                 Ok(tokens) => {
                     let body = serde_json::to_string(&serde_json::json!({"tokens": tokens}))
@@ -1314,6 +1329,7 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
+            let _op = dev.begin_operation();
             match dev.copy_preset() {
                 Ok(()) => send_json(req, 200, r#"{"status":"ok"}"#),
                 Err(e) => send_error(req, 500, &e.to_string()),
@@ -1635,6 +1651,7 @@ fn run_playback_thread(
 
     if let Some(source) = restore_source {
         if let Some(index) = dev.profile().sources.index_for_source(source) {
+            let _op = dev.begin_operation();
             if let Err(err) = dev.set_source(index) {
                 warn!("failed to restore source after playback: {err}");
             } else {
@@ -1774,13 +1791,19 @@ fn register_ws_routes(
                 if !unsafe { ws_is_upgrade(raw_req) } {
                     // Regular GET — send JSON status response via raw httpd API
                     let (status, json) = match get_device(&st) {
-                        Some(dev) => match dev.get_status_summary() {
-                            Ok(s) => (200, status_json(&s)),
-                            Err(e) => (
-                                500,
-                                format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "\\\"")),
-                            ),
-                        },
+                        Some(dev) => {
+                            let _op = dev.begin_operation();
+                            match dev.get_status_summary() {
+                                Ok(s) => (200, status_json(&s)),
+                                Err(e) => (
+                                    500,
+                                    format!(
+                                        r#"{{"error":"{}"}}"#,
+                                        e.to_string().replace('"', "\\\"")
+                                    ),
+                                ),
+                            }
+                        }
                         None => (503, r#"{"error":"no device"}"#.to_string()),
                     };
                     unsafe { ws_send_http_json(raw_req, status, &json) };
@@ -1844,10 +1867,13 @@ fn register_ws_routes(
             match ws.recv(&mut buf) {
                 Ok((FrameType::Text(_), _)) | Ok((FrameType::Binary(_), _)) => {
                     let json = match get_device(&st) {
-                        Some(dev) => match dev.get_status_summary() {
-                            Ok(status) => status_json(&status),
-                            Err(_) => r#"{"error":"device read failed"}"#.to_string(),
-                        },
+                        Some(dev) => {
+                            let _op = dev.begin_operation();
+                            match dev.get_status_summary() {
+                                Ok(status) => status_json(&status),
+                                Err(_) => r#"{"error":"device read failed"}"#.to_string(),
+                            }
+                        }
                         None => r#"{"error":"no device"}"#.to_string(),
                     };
                     let _ = ws.send(FrameType::Text(false), json.as_bytes());
@@ -1888,7 +1914,10 @@ fn register_ws_routes(
                     // Raw frame bridge: decode framed packet, forward payload to device
                     if let Some(payload) = minidsp_protocol::packet::decode_frame(&buf[..len]) {
                         match get_device(&st) {
-                            Some(dev) => match dev.raw_command(&payload) {
+                            Some(dev) => match {
+                                let _op = dev.begin_operation();
+                                dev.raw_command(&payload)
+                            } {
                                 Ok(resp) => {
                                     let frame = minidsp_protocol::packet::encode_frame(&resp);
                                     let _ = ws.send(FrameType::Binary(false), &frame);
@@ -1908,10 +1937,13 @@ fn register_ws_routes(
                 Ok((FrameType::Text(_), _)) => {
                     // Text frames: return status JSON (compat with clients that send text)
                     let json = match get_device(&st) {
-                        Some(dev) => match dev.get_status_summary() {
-                            Ok(status) => status_json(&status),
-                            Err(_) => r#"{"error":"device read failed"}"#.to_string(),
-                        },
+                        Some(dev) => {
+                            let _op = dev.begin_operation();
+                            match dev.get_status_summary() {
+                                Ok(status) => status_json(&status),
+                                Err(_) => r#"{"error":"device read failed"}"#.to_string(),
+                            }
+                        }
                         None => r#"{"error":"no device"}"#.to_string(),
                     };
                     let _ = ws.send(FrameType::Text(false), json.as_bytes());
@@ -1994,6 +2026,7 @@ fn ws_poll_loop(
 
     // Send initial status immediately so clients don't wait for first tick
     if let Some(dev) = get_device(&state) {
+        let _op = dev.begin_operation();
         if let Ok(status) = dev.get_status_summary() {
             let json = status_json(&status);
             if sender
@@ -2013,10 +2046,13 @@ fn ws_poll_loop(
         }
 
         let json = match get_device(&state) {
-            Some(dev) => match dev.get_status_summary() {
-                Ok(status) => status_json(&status),
-                Err(_) => continue,
-            },
+            Some(dev) => {
+                let _op = dev.begin_operation();
+                match dev.get_status_summary() {
+                    Ok(status) => status_json(&status),
+                    Err(_) => continue,
+                }
+            }
             None => r#"{"error":"no device"}"#.to_string(),
         };
 
@@ -2072,6 +2108,7 @@ fn register_ezbeq_ws(
 
             // Send initial DeviceState
             if let Some(dev) = get_device(&st) {
+                let _op = dev.begin_operation();
                 let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
                 let state_json = crate::ezbeq::device_state_json(&dev, &beq_guard);
                 let _ = ws.send(FrameType::Text(false), state_json.as_bytes());
@@ -2249,27 +2286,30 @@ fn push_levels(
         }
 
         let json = match get_device(&state) {
-            Some(dev) => match dev.get_status_summary() {
-                Ok(status) => {
-                    let mut levels = serde_json::Map::new();
-                    for (i, &v) in status.input_levels.iter().enumerate() {
-                        levels.insert(format!("I{i}"), serde_json::Value::from(v));
-                    }
-                    for (i, &v) in status.output_levels.iter().enumerate() {
-                        levels.insert(format!("O{i}"), serde_json::Value::from(v));
-                    }
-                    serde_json::to_string(&serde_json::json!({
-                        "message": "Levels",
-                        "data": {
-                            "name": "master",
-                            "ts": 0,
-                            "levels": levels,
+            Some(dev) => {
+                let _op = dev.begin_operation();
+                match dev.get_status_summary() {
+                    Ok(status) => {
+                        let mut levels = serde_json::Map::new();
+                        for (i, &v) in status.input_levels.iter().enumerate() {
+                            levels.insert(format!("I{i}"), serde_json::Value::from(v));
                         }
-                    }))
-                    .unwrap_or_default()
+                        for (i, &v) in status.output_levels.iter().enumerate() {
+                            levels.insert(format!("O{i}"), serde_json::Value::from(v));
+                        }
+                        serde_json::to_string(&serde_json::json!({
+                            "message": "Levels",
+                            "data": {
+                                "name": "master",
+                                "ts": 0,
+                                "levels": levels,
+                            }
+                        }))
+                        .unwrap_or_default()
+                    }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
-            },
+            }
             None => continue,
         };
 

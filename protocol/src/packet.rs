@@ -15,14 +15,18 @@
 //!
 //! HID request wrapping adds report ID `0x00` and `0xFF` padding to 65 bytes.
 
-/// Maximum payload size in a single HID report (64 bytes data - 1 length - 1 checksum).
-pub const MAX_PAYLOAD: usize = 62;
+/// Maximum payload size in a single HID report.
+///
+/// Official Device Console writes fixed 64-byte HID reports total, including
+/// the leading report ID byte. That leaves 63 bytes for `[len][payload][ck]`,
+/// so the payload itself tops out at 61 bytes.
+pub const MAX_PAYLOAD: usize = 61;
 
-/// HID report size: 1 byte report ID + 64 bytes data.
-pub const HID_REPORT_SIZE: usize = 65;
+/// HID report size: 64 bytes total, including the leading report ID.
+pub const HID_REPORT_SIZE: usize = 64;
 
 /// HID data portion size (excluding report ID).
-pub const HID_DATA_SIZE: usize = 64;
+pub const HID_DATA_SIZE: usize = 63;
 
 /// Encode a command payload into a length-prefixed, checksummed frame.
 ///
@@ -46,9 +50,10 @@ pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Wrap an encoded frame into a 65-byte HID report.
+/// Wrap an encoded frame into a 64-byte HID report.
 ///
-/// Prepends report ID 0x00 and pads with 0xFF to fill 65 bytes.
+/// Prepends report ID `0x00` and pads with `0xFF` to fill the remaining
+/// 63-byte data area. This matches the official Device Console USB path.
 pub fn wrap_hid(frame: &[u8]) -> [u8; HID_REPORT_SIZE] {
     let mut report = [0xFF; HID_REPORT_SIZE];
     report[0] = 0x00; // report ID
@@ -109,38 +114,74 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
 
     // Some real devices prepend a report ID on IN packets even though the
     // logical MiniDSP response still begins at the next byte.
-    if matches!(data.first().copied(), Some(0x00) | Some(0x01)) {
-        // Real hardware can also return an unframed payload echo with a
-        // leading report ID, notably `0x01` for direct-USB write ACKs.
-        if matches!(
-            data.get(1).copied(),
-            Some(crate::commands::CMD_READ_HARDWARE_ID)
-                | Some(crate::commands::CMD_READ_FLOATS)
-                | Some(crate::commands::CMD_READ_FLASH)
-                | Some(crate::commands::CMD_WRITE_DSP)
-                | Some(crate::commands::CMD_WRITE_BIQUAD)
-                | Some(crate::commands::CMD_SET_VOLUME)
-                | Some(crate::commands::CMD_SET_MUTE)
-                | Some(crate::commands::CMD_SET_SOURCE)
-                | Some(crate::commands::CMD_SET_CONFIG)
-                | Some(crate::commands::CMD_BYPASS_FILTER)
-                | Some(crate::commands::CMD_DIRAC_BYPASS)
-                | Some(crate::commands::CMD_SET_DISPLAY_BRIGHTNESS)
-                | Some(crate::commands::CMD_SET_DISPLAY_IDLE_TIME)
-                | Some(crate::commands::CMD_SET_DRE)
-                | Some(crate::commands::CMD_COPY_PRESET)
-                | Some(crate::commands::CMD_FIR_LOAD_DATA)
-                | Some(crate::commands::CMD_RELOAD_DSP_PARAM)
-                | Some(crate::commands::CMD_LOG_CONTROL)
-                | Some(crate::commands::CMD_SET_HDMI_SOURCE)
-                | Some(crate::commands::RESP_EVENT)
-        ) {
-            return Some(data[1..].to_vec());
-        }
+    match data.first().copied() {
+        Some(0x00) => {
+            if matches!(
+                data.get(1).copied(),
+                Some(crate::commands::CMD_READ_HARDWARE_ID)
+                    | Some(crate::commands::CMD_READ_FLOATS)
+                    | Some(crate::commands::CMD_READ_FLASH)
+                    | Some(crate::commands::CMD_READ_FLASH_FULL_ADDR)
+                    | Some(crate::commands::CMD_WRITE_DSP)
+                    | Some(crate::commands::CMD_WRITE_FLASH_FULL_ADDR)
+                    | Some(crate::commands::CMD_WRITE_BIQUAD)
+                    | Some(crate::commands::CMD_SET_VOLUME)
+                    | Some(crate::commands::CMD_SET_MUTE)
+                    | Some(crate::commands::CMD_SET_SOURCE)
+                    | Some(crate::commands::CMD_SET_CONFIG)
+                    | Some(crate::commands::CMD_BYPASS_FILTER)
+                    | Some(crate::commands::CMD_DIRAC_BYPASS)
+                    | Some(crate::commands::CMD_SET_DISPLAY_BRIGHTNESS)
+                    | Some(crate::commands::CMD_SET_DISPLAY_IDLE_TIME)
+                    | Some(crate::commands::CMD_SET_DRE)
+                    | Some(crate::commands::CMD_COPY_PRESET)
+                    | Some(crate::commands::CMD_FIR_LOAD_DATA)
+                    | Some(crate::commands::CMD_RELOAD_DSP_PARAM)
+                    | Some(crate::commands::CMD_LOG_CONTROL)
+                    | Some(crate::commands::CMD_SET_HDMI_SOURCE)
+                    | Some(crate::commands::RESP_EVENT)
+            ) {
+                return Some(data[1..].to_vec());
+            }
 
-        if let Some((payload, _)) = decode_response_frame(&data[1..]) {
-            return Some(payload);
+            if let Some((payload, _)) = decode_response_frame(&data[1..]) {
+                return Some(payload);
+            }
         }
+        Some(0x01) => {
+            // Real hardware can return a report-ID-prefixed unframed echo for
+            // successful writes. Restrict that special case to write/ack-like
+            // commands so late read-command echoes cannot poison the next
+            // request/response exchange.
+            if matches!(
+                data.get(1).copied(),
+                Some(crate::commands::CMD_WRITE_FLASH)
+                    | Some(crate::commands::CMD_WRITE_FLASH_FULL_ADDR)
+                    | Some(crate::commands::CMD_WRITE_DSP)
+                    | Some(crate::commands::CMD_WRITE_BIQUAD)
+                    | Some(crate::commands::CMD_SET_VOLUME)
+                    | Some(crate::commands::CMD_SET_MUTE)
+                    | Some(crate::commands::CMD_SET_SOURCE)
+                    | Some(crate::commands::CMD_SET_CONFIG)
+                    | Some(crate::commands::CMD_BYPASS_FILTER)
+                    | Some(crate::commands::CMD_DIRAC_BYPASS)
+                    | Some(crate::commands::CMD_SET_DISPLAY_BRIGHTNESS)
+                    | Some(crate::commands::CMD_SET_DISPLAY_IDLE_TIME)
+                    | Some(crate::commands::CMD_SET_DRE)
+                    | Some(crate::commands::CMD_COPY_PRESET)
+                    | Some(crate::commands::CMD_FIR_LOAD_DATA)
+                    | Some(crate::commands::CMD_RELOAD_DSP_PARAM)
+                    | Some(crate::commands::CMD_LOG_CONTROL)
+                    | Some(crate::commands::CMD_SET_HDMI_SOURCE)
+            ) {
+                return Some(data[1..].to_vec());
+            }
+
+            if let Some((payload, _)) = decode_response_frame(&data[1..]) {
+                return Some(payload);
+            }
+        }
+        _ => {}
     }
 
     None
@@ -216,12 +257,26 @@ mod tests {
     fn hid_request_format() {
         let payload = &[0x42, 0x10]; // SetVolume, value=0x10
         let report = encode_hid(payload);
+        assert_eq!(report.len(), 64);
         assert_eq!(report[0], 0x00); // report ID
         // Remaining bytes after frame should be 0xFF padding
         let frame_len = payload.len() + 2; // len + payload + checksum
         for &b in &report[1 + frame_len..] {
             assert_eq!(b, 0xFF);
         }
+    }
+
+    #[test]
+    fn hid_max_payload_matches_official_64_byte_reports() {
+        let payload = vec![0xaa; MAX_PAYLOAD];
+        let report = encode_hid(&payload);
+        assert_eq!(report.len(), HID_REPORT_SIZE);
+        assert_eq!(report[0], 0x00);
+        assert_eq!(report[1], (payload.len() + 1) as u8);
+        let expected_checksum = report[1..HID_REPORT_SIZE - 1]
+            .iter()
+            .fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(report[HID_REPORT_SIZE - 1], expected_checksum);
     }
 
     #[test]
@@ -280,7 +335,23 @@ mod tests {
         report[..9].copy_from_slice(&[0x01, 0x13, 0xA0, 0x00, 0x1D, 0x00, 0x00, 0x80, 0xC0]);
 
         let decoded = decode_hid_response(&report).unwrap();
-        assert_eq!(&decoded[..8], &[0x13, 0xA0, 0x00, 0x1D, 0x00, 0x00, 0x80, 0xC0]);
+        assert_eq!(
+            &decoded[..8],
+            &[0x13, 0xA0, 0x00, 0x1D, 0x00, 0x00, 0x80, 0xC0]
+        );
+    }
+
+    #[test]
+    fn hid_unframed_write_flash_echo_with_leading_one_report_id() {
+        let report = [0x01, 0x04, 0xff, 0xc8, 0x5a, 0x4c, 0x1b, 0x2b];
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(decoded, vec![0x04, 0xff, 0xc8, 0x5a, 0x4c, 0x1b, 0x2b]);
+    }
+
+    #[test]
+    fn hid_unframed_read_echo_with_leading_one_report_id_is_rejected() {
+        let report = [0x01, 0x05, 0xff, 0xa9, 0x02];
+        assert!(decode_hid_response(&report).is_none());
     }
 
     #[test]

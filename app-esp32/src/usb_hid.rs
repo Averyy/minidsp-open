@@ -723,16 +723,17 @@ fn open_device_at_addr(
 
     if !is_official_usb_device(vid, pid) {
         unsafe { usb_host_device_close(client_hdl, dev_hdl) };
-        warn!(
-            "USB: skipping non-MiniDSP device addr={dev_addr} VID=0x{vid:04X} PID=0x{pid:04X}"
-        );
+        warn!("USB: skipping non-MiniDSP device addr={dev_addr} VID=0x{vid:04X} PID=0x{pid:04X}");
         return Ok(None);
     }
     info!("MiniDSP device: addr={dev_addr} VID=0x{vid:04X} PID=0x{pid:04X}");
 
     let (hid_intf, ep_in, ep_out) = unsafe {
         let mut config_ptr: *const usb_config_desc_t = ptr::null();
-        match esp_ok(usb_host_get_active_config_descriptor(dev_hdl, &mut config_ptr)) {
+        match esp_ok(usb_host_get_active_config_descriptor(
+            dev_hdl,
+            &mut config_ptr,
+        )) {
             Ok(()) => find_hid_endpoints(config_ptr)?,
             Err(e) => {
                 usb_host_device_close(client_hdl, dev_hdl);

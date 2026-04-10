@@ -291,7 +291,8 @@ fn probe_device_with_retries(
     let final_err = loop {
         attempt += 1;
         info!("USB state: probing protocol (attempt {attempt})");
-        let err = match device::DeviceState::probe_with_timeout(bus.clone(), PROBE_COMMAND_TIMEOUT) {
+        let err = match device::DeviceState::probe_with_timeout(bus.clone(), PROBE_COMMAND_TIMEOUT)
+        {
             Ok(state) => {
                 info!("USB state: protocol ready after {attempt} attempt(s)");
                 return Ok(state);
@@ -321,8 +322,12 @@ fn probe_device_with_retries(
                 if bus.is_connected() || bus.has_present_device().unwrap_or(false) {
                     warn!("USB state: HID session dropped during probe, retrying attach");
                     match bus.reopen_present_device() {
-                        Ok(Some((_vid, _pid))) => info!("USB state: reopened HID session after disconnect"),
-                        Ok(None) => warn!("USB state: no present device found while reopening after disconnect"),
+                        Ok(Some((_vid, _pid))) => {
+                            info!("USB state: reopened HID session after disconnect")
+                        }
+                        Ok(None) => warn!(
+                            "USB state: no present device found while reopening after disconnect"
+                        ),
                         Err(err) => warn!("USB state: HID reopen after disconnect failed: {err}"),
                     }
                     usb_hid::UsbHidError::Disconnected
@@ -480,8 +485,12 @@ fn tcp_bridge(state: http_server::SharedDeviceState) {
                         continue;
                     }
                 };
+                let response = {
+                    let _op = dev.begin_operation();
+                    dev.raw_command(&payload)
+                };
 
-                match dev.raw_command(&payload) {
+                match response {
                     Ok(resp) => {
                         // TCP response: [len][payload] — no checksum (server responses per protocol)
                         let resp_frame = minidsp_protocol::packet::encode_tcp_response(&resp);

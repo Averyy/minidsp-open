@@ -13,7 +13,15 @@ Permanent technical detail belongs in:
 ## Current Status
 
 - Desktop `/devices/{id}/config` is fixed and verified on the physical 2x4 HD.
+- Desktop `GET /devices/{id}` was re-verified on 2026-04-10 on the physical 2x4 HD:
+  - malformed DSP100 meter reads are now treated as best-effort and clamp to `-140 dB` silence instead of stalling the compatibility status surface
+  - live daemon `GET /devices/0` returned `200` with the expected master state and stable `-140.0` input/output levels on the attached 2x4 HD
 - ESP32 `/devices/{id}/config` parity is fixed and verified on the physical 2x4 HD.
+- Fresh-daemon desktop `/devices/{id}/config` was tightened again on 2026-04-10:
+  - live HTTP verification on the physical 2x4 HD confirmed output-0 gain/delay/compressor ratio/attack/release plus input-0 gain and routing edits through `/devices/0/config`
+  - the scalar-shadow path still survives a full daemon restart for those non-authoritative DSP100 fields on preset `0`
+  - fresh low-address DSP100 reads can still return bogus raw words like `0x4A039901` at compressor/FIR slots, so `/config` now clamps those fields to verified shadow or conservative `0` instead of surfacing garbage values
+  - when local shadow is missing for a preset, the daemon can now import the official Device Console `setting*.xml` snapshot for that preset if its XML timestamp matches the live hardware modification token, which lets fresh daemon attaches recover sane routing/FIR/compressor state from the official app's own saved preset data instead of guessing
 - Desktop `/devices/{id}/play` is now implemented with the shared `PlaybackPlan` / `PlaybackGenerator` path used by ESP32.
 - Desktop playback backend is smoke-tested on local speakers: the default sweep plays audibly through the CPAL path and reports a real `startedAtUs` timestamp.
 - Desktop queue reconnect now re-acquires transports on disconnect and replays idempotent pending PEQ batch writes after reconnect.
@@ -21,6 +29,15 @@ Permanent technical detail belongs in:
 - ESP32 WiFi monitor now records disconnect reason codes, distinguishes credential failures from transient AP loss, and exposes `lastWifiDisconnectReason` in `/debug/info`.
 - ESP32 `/sync` and `/devices/{id}/play` are live on real 2x4 HD hardware in release firmware: `/play` responds before playback completes, streams the full sweep, and restores the previous source after auto-switching to USB.
 - ESP32 `/play` timing is now characterized on real hardware: the original `~13.6s` completion bug was fixed by half-ring chunking, and the remaining `~12.29-12.56s` enqueue-finish metric scales with byte volume at `TX_DONE=0`, which points to app-side enqueue/reporting semantics rather than a UAC2 driver clock defect.
+- Live audible `/play` testing on 2026-04-09 narrowed the remaining defect to our app-side signal/routing behavior, not the UAC2 transport:
+  - clean `/play` runs on physical output `2` complete with exact expected byte counts and `TX_DONE=0`, but the default signal still sounds like repeated `BRAP` bursts instead of a smooth subwoofer sweep
+  - a cleaner custom request (`16-bit`, no preamble/tone burst/gap/decay, `50-80 Hz`) sounds slightly better but is still wrong / too high-pitched
+  - that keeps the current suspicion on our generated signal shape and/or PCM formatting, not on a driver underrun or sample-clock bug
+- Shared `/play` defaults were then changed to a plain exact-band subwoofer baseline:
+  - default request is now `15-80 Hz`, `8 s`, `16-bit`, no preamble, no tone burst, no gap, no decay
+  - the generator now uses the exact requested sweep band instead of silently expanding to `f1/2 .. 2*f2`
+  - desktop direct-USB `/play` on the physical 2x4 HD now returns `sweepOffsetSamples=0`, `toneBurstOffsetSamples=0`, and `totalSamples=383918` with source/routing unchanged before and after playback
+  - audible confirmation on the real sub is still required before treating the new default as fully validated
 - ESP32 HID and UAC2 reconnect now recover on the physical 2x4 HD across the three important attach cases:
   - unplug/replug while the ESP32 stays up
   - MiniDSP appears later while the ESP32 is already running
@@ -43,39 +60,137 @@ Permanent technical detail belongs in:
   - modern routing write support was missing from both the desktop daemon and the ESP32 HTTP config path
   - the desktop CLI `input <n> routing <out> <gain_db>` path was writing the wrong gain encoding on float32 devices
   - shared typed `ReadFloats` parsing for modern raw-word slots was missing the 5-byte typed-response header variant, which could skew status/sample-count reads on SHARC/XMOS devices
-- DSP100 routing enable/disable is fully working and audio-verified (2026-04-08):
-  - both `0x13` (LoadDspParam) and `0x30` (linked-int) work for mixer status writes
-  - switched to `0x13` to match minidsp-rs (the known working open-source implementation)
-  - enable = value `0x02`, disable = value `0x01` (matches minidsp-rs `WriteInt::ENABLED/DISABLED`)
-  - audio-confirmed: enable, disable, single input, both inputs summing, all work correctly
 - Additional direct-USB reverse engineering on the physical 2x4 HD resolved a separate transport bug in our code:
   - real HID write acknowledgements can arrive as report-ID-prefixed unframed echoes beginning with `0x01`, not only as length-framed responses
   - the old decoder treated that leading `0x01` as a one-byte empty frame, which made successful direct USB writes look like `device error []`
   - after fixing `protocol/src/packet.rs`, direct USB writes now ACK cleanly and immediate read-back confirms the write actually landed
-- DSP100 routing investigation resolved:
-  - mixer status addresses `6..13`: enable=2, disable=1, via opcode `0x13` (matching minidsp-rs)
-  - readback via `0x14` is boolean-collapsed (any non-zero → 1) — this caused the two-day debugging loop (`status == 2` always returned false)
-  - fixed readback to `status != 0` in both desktop and ESP32 code
-  - route-gain cells at `32..39` are writable as float dB values
-  - the previous `0x30` approach also works but `0x13` is preferred for minidsp-rs compatibility
-- Live device testing also confirmed the modern mute polarity on DSP100:
+- A follow-up fix in the shared HID decoder resolved the remaining modern route-write failure on the real 2x4 HD:
+  - we were still accepting `0x01`-prefixed unframed echoes for read commands, not just write/ack commands
+  - that let a stale `ReadFlash` echo get misclassified as the next command response, which is why ESP32 route writes sometimes failed as `unexpected response FlashData([255, 169, 2])`
+  - restricting that special-case decoder path to write/ack-like commands fixed the poisoned-response path for both desktop HID and ESP32 USB host
+- DSP100 routing write compatibility is now proven on the real 2x4 HD:
+  - earlier direct USB checks established the scalar semantics we care about: mixer status addresses `6..13` use enable=`2`, disable=`1`, and route-gain cells `32..39` are writable as float dB values
+  - modern routing readback is still boolean-collapsed via `0x14` (any non-zero reads back as `1`), so `status == 2` was never a valid runtime check
+  - desktop hardware testing found `0x13` works for route-enable writes and `0x30` does not on the 2x4 HD, so we should not switch opcodes based on the old `0x30` note alone
+  - after the shared `0x01` echo-decoder fix, ESP32 `POST /devices/0/config` successfully forced `Input 1 -> Output 3 = enabled`, `Input 2 -> Output 3 = disabled`, and `/play` became audible on physical output `3`
+  - current runtime routing readback is still not authoritative enough to treat as solved state introspection, but the live route-enable write path itself is now working
+- Live device testing also confirmed and fixed the modern mute polarity on DSP100:
   - `1 = muted`
   - `2 = unmuted`
-  - our current float32 mute read/write logic is inverted and must be corrected in shared desktop + ESP32 code
+  - shared desktop + ESP32 code now uses that polarity
+- Live direct-USB verification on 2026-04-09 fixed the DSP100 / 2x4 HD delay write path:
+  - the shared client now writes delay slots with the device's sample-count integer encoding instead of the old raw big-endian `u32` path
+  - on the physical 2x4 HD, writing `0.5 ms` now lands as `48` samples and reads back as `0.5 ms`
+- Live direct-USB verification on 2026-04-09 also fixed desktop preset-switch semantics on the physical 2x4 HD:
+  - the real device returns an immediate raw `Ack` for `SetConfig`; the old shared queue behavior that waited for a second preset-only completion frame was wrong for this path
+  - the shared queue now returns the first valid `SetConfig` response immediately, and high-level `set_config()` verifies the change by polling master-status readback until the requested preset is active
+  - live desktop checks on the physical 2x4 HD now show `config 0`, `config 1`, raw `debug send 250000/250100`, and `POST /devices/0/preset/{preset}` all completing in about `20-30 ms` with matching before/after preset readback
+- Live direct-USB verification on 2026-04-09 also fixed long-running desktop flash/state commands on the physical 2x4 HD:
+  - the shared queue now gives `CopyPreset (0x27)` and `Reset (0x03)` a longer default deadline instead of the generic `10 s` command timeout
+  - `POST /devices/0/preset/copy` now returns `200` in `22.92 s`, matching the official Device Console session that took about `22.87 s` from `0x27` send to `Received OK`
+  - raw reset through the daemon path now returns `ResetComplete` in about `6.56 s`, and the daemon remained healthy enough to serve `GET /devices/0` immediately afterward
+  - the preset-copy route now persists refreshed daemon shadow/token state after the successful flash save instead of leaving the cache stale
+- Live direct-USB verification on 2026-04-09 also fixed desktop source-switch semantics on the physical 2x4 HD:
+  - the device emits a stale `ReadFlash`-shaped `0xFFA9` notification after source changes, and also reuses the short-form `ReadFloats` meter reply shape
+  - the shared queue now skips stale mismatched responses instead of treating them as the current command reply, and request-specific `ReadFlash` / `ReadFloats` parsing now rejects wrong-address payloads without rejecting the real short-form meter replies
+  - high-level `set_source()` now verifies completion by polling master-status readback until the requested source is active
+  - live desktop checks on the physical 2x4 HD now show both `POST /devices/0` with `{"source":"Analog"}` / `{"source":"Usb"}` and the dedicated `POST /devices/0/source/{source}` route completing cleanly with matching follow-up `GET /devices/0` responses
 - Modern-device readback issue resolved (2026-04-08):
-  - DSP100/2x4 HD mixer status readback via `0x14` is boolean-collapsed: any non-zero value reads as `1`, so `2` (enabled) and `1` (disabled) are indistinguishable
-  - fixed `client.rs` readback to use `status != 0` instead of `status == 2` (the old check always returned false since readback never returns 2)
-  - for authoritative routing state, the API should eventually read from saved preset flash data rather than runtime DSP parameter readback
+  - DSP100/2x4 HD selector-style status readback via `0x14` is not authoritative: routing enable and compressor/FIR bypass words can collapse to `1` on live hardware even when the last written value was different
+  - the shared desktop client now keeps selector shadow state for successful writes so long-lived `/config` readback can reflect what we actually drove on DSP100
+  - live desktop daemon verification on 2026-04-09 proved that same-client `/devices/0/config` route readback now tracks what we drove: `Input 1 -> Output 3` can be flipped without changing `Input 2 -> Output 3`, and `Input 1 -> Output 2 = false` reads back as `false` while `Input 2 -> Output 2` remains `true`
+  - for truly authoritative routing state, the API should eventually read from saved preset flash data or another source stronger than runtime DSP parameter readback
+- The shared client now validates write responses more strictly:
+  - PEQ batch phases, single biquad writes, and bypass writes now check for real `Ack` / completion responses instead of silently accepting parsed device errors
 - The current live CLI verification findings are consolidated in `docs/NOTES-cli-verification.md` and should drive the next debugging pass.
+- The physical 2x4 HD is now the project’s golden device for shared control-path debugging.
+  - imported official-app coverage still defines the intended support matrix
+  - live 2x4 HD behavior overrides inferred multi-device assumptions when the two disagree
+  - `minidsp-rs` and official-app behavior are reference points, but only live 2x4 HD reads, writes, and audible results decide whether a shared fix is actually correct
 - The strongest remaining likely compatibility drifts from known-working minidsp-rs behavior are:
-  - output delay writes on DSP100 / 2x4 HD
-  - compressor parameter writes beyond threshold on DSP100 / 2x4 HD
-- The current delay path is especially suspect because:
-  - the CLI converts milliseconds to sample counts
-  - the shared client writes float32-device delay slots via the generic raw `write_dsp_u32()` path
-  - those raw `u32` writes are encoded big-endian today
-  - live readback on the 2x4 HD was wrong by a large factor (`0.5 ms` came back around `79.833336 ms`)
-- That means the top open question is no longer "does delay work at all?" but "why does our DSP100 delay write path drift from the known-working minidsp-rs behavior?"
+  - compressor scalar writes beyond threshold / gain on DSP100 / 2x4 HD
+  - direct desktop verification on 2026-04-09 tightened this further:
+    - upstream minidsp-rs and the extracted official-app compressor path both still point to plain `0x13` scalar writes, so this drift is not explained by a `0x30` vs `0x13` command mismatch
+    - raw distinctive writes to `COMP_5_0_ratio`, `COMP_5_0_atime`, and `COMP_5_0_rtime` on the physical 2x4 HD did not appear anywhere in the exposed `0..34959` DSP/config space, even after `ReloadDspParam`
+    - the same pass proved `COMP_5_0_threshold` still writes correctly, so this is not a general `0x13` write failure
+    - desktop compressor scalar writes now use read-before / read-after verification so a no-op field fails loudly instead of being treated as success
+    - a direct 2026-04-09 control check with upstream `minidsp-rs` on the same physical 2x4 HD also only moved `threshold`; immediate typed-word readback still left `ratio / knee / attack / release = 0`
+    - forcing compressor bypass `off` first did not change that result on the tested hardware
+    - that means the remaining gap is no longer specific to this repo's desktop control path
+- Desktop raw typed-read compatibility was tightened on 2026-04-09:
+  - the physical 2x4 HD returns short `ReadFloats` replies in the low selector/status address range that the float parser classifies as `Unknown`, even though the raw payload is valid for typed-word callers
+  - the shared queue now lets raw/typed callers receive those same-opcode frames instead of timing out, which fixed live reads like `debug dump-word 22 2` and `debug dump-word 24 2` on the physical 2x4 HD
+- Desktop DSP100 polarity handling was corrected again on 2026-04-09:
+  - the false failure was in verification, not transport: the physical 2x4 HD polarity slot should be checked as a logical boolean instead of exact raw-word equality
+  - the shared desktop client now uses the upstream `minidsp-rs` modern integer `0x13` polarity write path (`0` / `1`) again and verifies success through logical before/after invert readback
+  - live desktop `/devices/0/config` toggles for outputs `2` and `3` now return `200`, read back correctly, and log the upstream-style `HID OUT payload: [13, 80, 00, 52|53, ...]`
+- Live desktop verification on 2026-04-09 also tightened the expected gain-readback model on the physical 2x4 HD:
+  - per-channel gain reads are quantized on this device; a requested `-1.5 dB` currently reads back around `-1.638082 dB`
+  - shared gain verification and the repeatable acceptance checks now use tolerance-based comparison instead of exact-float equality for those slots
+- A broader desktop HTTP verification pass on 2026-04-09 now live-proves the physical 2x4 HD for:
+  - `POST /devices/0` with the compatibility bare `MasterStatus` body (`{"volume":...}`, `{"mute":...}`), not a wrapper object
+  - source and preset switching through both the bare route and dedicated convenience routes
+  - input `0` and `1` gain/mute
+  - output `2` and `3` gain/mute/invert/delay
+  - all eight routing edges (`2 inputs x 4 outputs`) toggled and restored through `/devices/0/config`
+- Live desktop WebSocket verification on 2026-04-09 now also proves the physical 2x4 HD for:
+  - `/devices/0?poll=true` sending an immediate status frame on connect
+  - `/devices/0?levels=true&poll=true` continuing to stream state/levels while source writes stay fast and preset writes still return `200`
+  - clean live reruns on 2026-04-09 showed `POST /devices/0/source/Usb` / `/source/Analog` still completing in about `11 ms` / `6 ms` with the polling socket attached
+  - the same live reruns showed `POST /devices/0/preset/0` / `/preset/1` taking about `2.83 s` with the polling socket attached instead of the `20-30 ms` seen without it
+  - the official raw Device Console capture shows the same preset-change shape on this hardware: `0x25` acknowledged immediately at `2026-04-09T19:30:52.875Z`, but the first follow-up `0x14` status reply did not arrive until `2026-04-09T19:30:56.185Z`
+  - the websocket meter cadence now matches the official app's `500 ms` polling rhythm and no longer injects an extra immediate post-connect tick
+  - `/devices/0/ws` ignoring text frames and still returning the correct framed binary reply to a `ReadHardwareId` request
+- Live direct-USB verification on 2026-04-09 also fixed the desktop DSP100 / 2x4 HD FIR load path:
+  - the shared DSP100 output profile now includes FIR definitions for all four outputs, so output FIR is no longer treated as unsupported on the 2x4 HD
+  - the real device returns `FirLoadStart` size bytes as big-endian; on the tested 2x4 HD, `[0x39, 0x08, 0x00]` means `0x0800 = 2048` coefficients, not `8`
+  - the real device returns the `FirLoadEnd (0x3B)` `Ack` seconds later, not within the queue's 500 ms polling slice
+  - the shared queue now keeps polling until the overall command deadline instead of treating each 500 ms receive timeout as a hard command failure
+  - desktop direct-USB replay with upstream `minidsp-rs` on the same 2x4 HD reproduced the delayed bare `[0x01]` `FirLoadEnd` ack; upstream times out there, while this repo now accepts that delayed ack on the shared queue path
+  - with those fixes, desktop `POST /devices/0/config` FIR writes now return `200`, raw coefficient readback confirms the new taps landed, and same-client `GET /devices/0/config` reports `active_taps` correctly from shadow fallback
+  - a follow-up fresh-client fix corrected FIR/compressor bypass decoding on DSP100: live direct-USB verification on the physical 2x4 HD showed raw selector `1` = bypassed and `2` = enabled for these slots, so fresh-client `/devices/{id}/config` now decodes output FIR/compressor bypass correctly after daemon restart
+  - a follow-up persisted-shadow fix now restores fresh-daemon `active_taps` readback on desktop by serial number even though the live DSP100 tap-count slot still reads back as `0`
+- Desktop raw bridge shadowing was tightened on 2026-04-09:
+  - successful raw WS/TCP bridge writes now mirror their selector/PEQ side effects into the same daemon shadow state used by `/devices/{id}/config`
+  - that keeps desktop `/config` readback coherent after raw bridge activity instead of only after HTTP/CLI writes
+  - the daemon now persists that selector/PEQ shadow by device serial under `~/.config/minidsp-open/shadow-cache.json`, so fresh desktop daemon restarts restore verified routing and FIR tap-count state for the attached 2x4 HD
+- Official-app raw HID capture is now in place on 2026-04-09:
+  - canonical saved log: `app/minidsp-console-app-log.jsonl`
+  - companion high-level session log: `app/minidsp-snapshots/20260409-151113-device-console-session/device-console-main-session.log`
+  - this is a full raw `open / tx / tx-result / rx / close` capture from the patched local Device Console talking to the physical `2x4 HD`
+  - the capture confirms official-app use of `0x31`, `0x05`, `0x14`, `0x42`, `0x34`, `0x25`, `0x13`, `0x19`, and `0x30` on this hardware
+  - the same capture plus `app/app-extracted/build/src/dspMessage.js` now identify `0x06` / `0x07` as the preset-save flash-block pipeline and `0x40` as the DSP-version query
+  - that rules `0x06` / `0x07` out as the missing authoritative DSP100 compressor/runtime readback path on the tested 2x4 HD
+  - the companion session log also shows Device Console comparing the active preset's device token against its XML token and then explicitly writing a fresh modification token after audio-proc updates
+- Desktop DSP100 selector-write verification was tightened again on 2026-04-09:
+  - modern output mute and FIR/compressor bypass writes now use raw before/after selector-word checks on the physical 2x4 HD instead of trusting the write ACK alone
+  - those desktop HTTP/shared-client paths now fail loudly if the selector word does not land on the device
+- A stronger direct-USB routing-state pass on 2026-04-09 ruled out two likely false leads for fresh-client DSP100 routing recovery:
+  - a full readable `0..34959` DSP/config diff around a single route toggle found no authoritative routing mirror outside the collapsed `6..13` status words; the only unrelated changes were output meter values
+  - EEPROM modification tokens at `0xFFC8` stayed unchanged across raw live routing and bypass writes on the tested 2x4 HD path, so the firmware does not auto-advance them for those runtime writes
+- Desktop CLI compatibility was tightened again on 2026-04-09:
+  - `--log` / `MINIDSP_LOG` now match `minidsp-rs` semantics as a log-file path instead of a tracing-filter string
+  - TCP and WebSocket transports now emit the same frame-level send/receive logs as HID, so the transport log file is useful across all desktop paths
+  - `--usb` / `MINIDSP_USB` now accept upstream-style `vid[:pid]` selectors like `2752:0011`, not just raw HID paths
+- A broader desktop CLI acceptance pass on 2026-04-09 now live-verifies the real 2x4 HD for:
+  - device listing and status summary endpoints
+  - input/output mute and gain
+  - input/output PEQ set + bypass
+  - routing CLI off/on
+  - crossover bypass
+  - FIR load via CLI with matching `/config` readback
+- Desktop daemon `/config` compressor persistence was live-verified again on 2026-04-09:
+  - `POST /devices/0/config` changed output-0 compressor `bypass`, `threshold`, `ratio`, `attack`, `release`, and `gain` on the physical 2x4 HD
+  - same-daemon `GET /devices/0/config` reflected those values immediately
+  - a fresh daemon restart still returned the same compressor values for that preset, proving the token-gated scalar shadow restore now covers the non-authoritative DSP100 compressor fields
+- Desktop daemon preset-mutation token handling was aligned to the official app on 2026-04-09:
+  - `/devices/0/config` and measurement-mode preset-content writes now save a fresh active-preset modification token before persisting shadow state
+  - live daemon logging on the physical 2x4 HD showed `WriteFlash` traffic to `0xffcc` for active preset `1`, matching the official `0xffc8 + preset*4` token-save rule
+  - a no-op compressor `/config` write advanced the active preset token while the visible compressor state stayed stable, which is the intended controller-side freshness marker for later shadow restore
+- Fresh-daemon preset shadow recovery was extended again on 2026-04-10:
+  - the official Device Console `setting*.xml` `<timestamp>` field matches the per-preset hardware modification token on the physical 2x4 HD
+  - the desktop daemon now uses that match to import missing preset shadow from `~/Documents/miniDSP/MiniDSP Device Console/.../setting*.xml` when the official app has a current saved preset and live DSP100 readback is still non-authoritative
+  - this does not make low-address `0x14` authoritative; it gives the daemon a stronger controller-side source of truth than stale local cache when the official XML and device token agree
 - All 13 exact modern Device Console `HW`/`DSP` pairs are implemented and test-gated.
 - All 7 cached legacy `config.xml` families are implemented as source-backed runtime tables and test-gated.
 - The repeatable official-app importer/report pipeline is in place:
@@ -87,20 +202,32 @@ Permanent technical detail belongs in:
 ## Active Work
 
 - [ ] Treat `docs/NOTES-cli-verification.md` as the top-priority investigation checklist until the remaining CLI compatibility drifts are explained or fixed.
-- [ ] Investigate DSP100 / 2x4 HD output delay drift from minidsp-rs:
-  - confirm the exact known-working minidsp-rs delay write path and on-wire encoding
-  - compare it directly to our current `set_channel_delay_samples()` -> `write_dsp_u32()` path
-  - determine whether the bug is unit conversion, address selection, endianness, opcode/control byte, or save/runtime semantics
 - [ ] Investigate DSP100 / 2x4 HD compressor parameter drift from minidsp-rs:
-  - threshold appears to write
-  - ratio / attack / release did not show the expected live readback changes during CLI verification
+  - threshold and gain appear to write
+  - ratio / knee / attack / release still do not show the expected live effect
+  - the 2026-04-09 full-space direct-USB scan found no landing address anywhere in the exposed `0..34959` param space for distinctive ratio / attack / release writes, even after `ReloadDspParam`
+  - direct 2026-04-09 replay with upstream `minidsp-rs` on the same physical 2x4 HD matched this repo's result even with compressor bypass disabled first
+  - the official app session log also repeatedly reports `setItemVal(COMP_3_0_*) has no change in value` around those edits while polling only the compressor meter path, so the remaining gap still looks like effect/readback semantics on the hardware path rather than a missing write opcode family
+  - fresh-daemon 2026-04-10 checks still show low-address DSP100 reads are not authoritative enough to close this: `debug dump-word 43 1` returned `1` and FIR tap-count `debug dump-word 84 1` returned `0x4A039901` on the same physical 2x4 HD
 - [ ] Capture or otherwise verify the physical output duration of ESP32 `/play` on the real 2x4 HD now that software timing and repeated-play stability are characterized.
+- [ ] Validate the new shared `/play` default signal on the real sub and keep iterating until it sounds like a normal smooth low-frequency sweep:
+  - the previous measurement-bundle default (`5-500 Hz`, `24-bit`, `2 s` preamble, `80 Hz` tone burst, `0.2 s` gap, `2 s` decay, hidden guard-band expansion) was retired after it produced repeated `BRAP` bursts on hardware
+  - the current shared default is now an exact-band `15-80 Hz`, `8 s`, `16-bit` sweep with no extra marker sections
+  - if the new default is still wrong, the next suspect is PCM/sample-format behavior rather than routing or HID transport
 - [ ] Verify remaining `/play` compatibility edges on hardware where possible:
   - malformed request handling
   - sample-rate switch between plays
   - HID-only-device clear error path
-- [ ] Prove on hardware that the new shared linked-int `0x30` route-enable write path restores audible USB playback on DSP100 / 2x4 HD without relying on the official app
-- [ ] Finish DSP100 / 2x4 HD routing-state reverse engineering so `/devices/{id}/config` read-back matches the official app for mute/routing state, not just audible behavior
+- [x] Prove on hardware that the current shared `0x13` route-enable write path restores audible USB playback on DSP100 / 2x4 HD without relying on the official app
+  - confirmed live on 2026-04-09: after the shared HID echo-decoder fix, ESP32 route writes made `/play` audible on physical output `3`
+- [x] Make DSP100 / 2x4 HD routing-state read-back survive fresh desktop daemon reconnects via persisted verified shadow keyed by device serial
+- [x] Make DSP100 / 2x4 HD FIR `active_taps` read-back survive fresh desktop daemon reconnects via persisted verified shadow keyed by device serial
+- [ ] Continue DSP100 / 2x4 HD authoritative-state reverse engineering so fresh-client `/devices/{id}/config` can eventually prefer real hardware readback over persisted shadow for routing and FIR tap count
+  - current 2026-04-10 boundary on the physical 2x4 HD: the daemon/app surfaces are usable and return sane values, and they can now fall back to token-matched official Device Console preset XML when available, but untouched low-address DSP100 runtime state is still not defensible as direct hardware readback without verified shadow or another stronger source than raw `0x14`
+- [ ] Implement the first pass of learnings from `app/minidsp-console-app-log.jsonl`
+  - turn the canonical raw capture into labeled fixtures for the command families we already support (`0x04`, `0x05`, `0x06`, `0x07`, `0x13`, `0x19`, `0x25`, `0x30`, `0x34`, `0x40`, `0x42`)
+  - diff those request/response pairs against the shared client and queue behavior and close any remaining opcode or response-shape drift
+  - keep using the decoded official preset-save pipeline plus the companion session log's explicit token-save behavior as evidence that the remaining DSP100 compressor/runtime-state gap is not hidden behind `0x06` / `0x07`
 - [ ] Resolve exact runtime identity for the remaining official USB-only labels if stronger official evidence is found:
   - `HA-DSP`
   - `DDRC-22`

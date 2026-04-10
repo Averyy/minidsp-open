@@ -6,7 +6,16 @@ use minidsp::transport::ws::WsTransport;
 use minidsp_daemon::http::json::DeviceJson;
 use minidsp_protocol::source::Source;
 use serde::Deserialize;
+use std::fs::File;
+use std::io;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing_subscriber::Layer;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, fmt};
 
 mod cli;
 mod output;
@@ -46,7 +55,7 @@ struct Cli {
     #[arg(long = "daemon-url", value_name = "URL")]
     daemon_url: Option<String>,
 
-    /// Connect to specific USB device
+    /// Connect to a specific USB path or vid[:pid] selector
     #[arg(long, value_name = "PATH")]
     usb: Option<String>,
 
@@ -54,9 +63,9 @@ struct Cli {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Set log filter (e.g. "minidsp=debug")
-    #[arg(long = "log", value_name = "FILTER", hide = true)]
-    log_filter: Option<String>,
+    /// Log commands and responses to a file
+    #[arg(long = "log", value_name = "FILE")]
+    log_path: Option<PathBuf>,
 
     /// Use all locally-connected devices (daemon mode)
     #[arg(long = "all-local-devices", hide = true)]
@@ -190,6 +199,15 @@ enum DebugCommand {
         /// DSP address (decimal)
         addr: u16,
         /// Number of words to read (max 14)
+        #[arg(default_value = "1")]
+        count: u8,
+    },
+    /// Dump raw bytes from the full flash-address space
+    DumpFlash {
+        /// Flash address (decimal or 0x-prefixed hex)
+        #[arg(value_parser = parse_u32_auto)]
+        addr: u32,
+        /// Number of bytes to read (max 58)
         #[arg(default_value = "1")]
         count: u8,
     },
@@ -338,23 +356,86 @@ fn parse_on_off(s: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_u32_auto(s: &str) -> Result<u32, String> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).map_err(|_| format!("invalid hex u32 '{s}'"))
+    } else {
+        s.parse::<u32>()
+            .map_err(|_| format!("invalid decimal u32 '{s}'"))
+    }
+}
+
+#[derive(Clone)]
+struct SharedLogWriter(Arc<StdMutex<File>>);
+
+impl io::Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("log file lock poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("log file lock poisoned"))?
+            .flush()
+    }
+}
+
+fn make_log_writer(path: &PathBuf) -> Result<BoxMakeWriter, Box<dyn std::error::Error>> {
+    let file = Arc::new(StdMutex::new(File::create(path)?));
+    let writer = file.clone();
+    Ok(BoxMakeWriter::new(move || SharedLogWriter(writer.clone())))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let log_path = cli
+        .log_path
+        .clone()
+        .or_else(|| std::env::var("MINIDSP_LOG").ok().map(PathBuf::from));
 
-    // Configure logging based on -v flags or --log filter
-    let default_level = match cli.verbose {
-        0 => tracing::Level::WARN,
-        1 => tracing::Level::INFO,
-        2 => tracing::Level::DEBUG,
-        _ => tracing::Level::TRACE,
+    // Match minidsp-rs logging semantics:
+    // - -v/-vv/-vvv controls console verbosity
+    // - --log / MINIDSP_LOG writes transport logs to a file
+    let default_filter = match cli.verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
     };
-    let filter = if let Some(ref f) = cli.log_filter {
-        tracing_subscriber::EnvFilter::new(f)
+    let console_filter = if std::env::var_os("RUST_LOG").is_some() {
+        EnvFilter::from_default_env()
     } else {
-        tracing_subscriber::EnvFilter::from_default_env().add_directive(default_level.into())
+        EnvFilter::new(default_filter)
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let console_layer = fmt::layer().with_filter(console_filter);
+
+    if let Some(path) = &log_path {
+        match make_log_writer(path) {
+            Ok(writer) => {
+                let file_layer = fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .with_filter(EnvFilter::new(
+                        "minidsp=trace,minidsp_protocol=trace,minidsp_daemon=trace",
+                    ));
+                tracing_subscriber::registry()
+                    .with(console_layer)
+                    .with(file_layer)
+                    .init();
+            }
+            Err(e) => {
+                eprintln!("Error: failed to open log file {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    } else {
+        tracing_subscriber::registry().with(console_layer).init();
+    }
 
     if let Err(e) = run(cli).await {
         eprintln!("Error: {e}");
@@ -494,15 +575,11 @@ async fn execute_command(
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let resp = client
-                    .raw_command(bytes, minidsp::queue::Priority::Normal)
+                    .queue()
+                    .execute_raw(bytes, minidsp::queue::Priority::Normal)
                     .await?;
-                match resp {
-                    minidsp_protocol::commands::Response::Raw(data) => {
-                        let hex_str: String = data.iter().map(|b| format!("{b:02x}")).collect();
-                        println!("{hex_str}");
-                    }
-                    other => println!("{other:?}"),
-                }
+                let hex_str: String = resp.iter().map(|b| format!("{b:02x}")).collect();
+                println!("{hex_str}");
             }
             DebugCommand::Id => {
                 let hw = client.hw_id();
@@ -527,6 +604,19 @@ async fn execute_command(
                 let values = client.read_param_words(addr, count).await?;
                 for (i, v) in values.iter().enumerate() {
                     println!("  [{:04X}+{}] = {} (0x{:08X})", addr, i, v, v);
+                }
+            }
+            DebugCommand::DumpFlash { addr, count } => {
+                let count = count.min(minidsp_protocol::commands::FLASH_FULL_ADDR_CHUNK_MAX);
+                let data = client.read_flash_full_addr(addr, count).await?;
+                for (i, chunk) in data.chunks(16).enumerate() {
+                    let line_addr = addr + (i as u32 * 16);
+                    let bytes = chunk
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!("{line_addr:06x}: {bytes}");
                 }
             }
         },
@@ -563,15 +653,6 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
     let env_index: Option<usize> = std::env::var("MINIDSP_INDEX")
         .ok()
         .and_then(|s| s.parse().ok());
-    // MINIDSP_LOG sets the log filter (overrides -v/--log)
-    if let Ok(log_env) = std::env::var("MINIDSP_LOG") {
-        if cli.log_filter.is_none() {
-            // Can't override the already-initialized subscriber, but we set the env
-            // for tracing_subscriber::EnvFilter::from_default_env() to pick up
-            // SAFETY: called before any threads are spawned (single-threaded at this point)
-            unsafe { std::env::set_var("RUST_LOG", &log_env) };
-        }
-    }
 
     // Connection order per ref-compatibility.md:
     // 1. --daemon-sock  2. --tcp  3. --url  4. --daemon-url  5. --usb
@@ -657,7 +738,7 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
 
     // 5. Explicit USB (or MINIDSP_USB env var)
     if let Some(path) = cli.usb.as_deref().or(env_usb.as_deref()) {
-        let transport = HidTransport::open(path)?;
+        let transport = open_usb_selector(path, device_idx)?;
         return Ok(MiniDspClient::connect(Box::new(transport)).await?);
     }
 
@@ -700,6 +781,42 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
 fn parse_usb_url_path(url: &str) -> Result<String, Box<dyn std::error::Error>> {
     let path = url.split('?').next().unwrap_or(url);
     Ok(urlencoding::decode(path)?.into_owned())
+}
+
+fn parse_usb_vid_pid(selector: &str) -> Option<(u16, Option<u16>)> {
+    let parts: Vec<_> = selector.split(':').collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
+    let vid = u16::from_str_radix(parts[0], 16).ok()?;
+    let pid = if parts.len() == 2 {
+        Some(u16::from_str_radix(parts[1], 16).ok()?)
+    } else {
+        None
+    };
+    Some((vid, pid))
+}
+
+fn open_usb_selector(
+    selector: &str,
+    device_idx: usize,
+) -> Result<HidTransport, Box<dyn std::error::Error>> {
+    if let Some((vid, pid)) = parse_usb_vid_pid(selector) {
+        let matching: Vec<_> = minidsp::transport::hid::enumerate()?
+            .into_iter()
+            .filter(|dev| dev.vendor_id == vid && pid.is_none_or(|p| dev.product_id == p))
+            .collect();
+        let dev = matching.get(device_idx).ok_or_else(|| {
+            format!(
+                "device index {device_idx} out of range for usb selector {selector} (found {} device{})",
+                matching.len(),
+                if matching.len() == 1 { "" } else { "s" }
+            )
+        })?;
+        return Ok(HidTransport::open(&dev.path)?);
+    }
+
+    Ok(HidTransport::open(selector)?)
 }
 
 fn is_direct_ws_endpoint(url: &str) -> bool {
@@ -857,5 +974,20 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].product_name, "2x4HD");
         assert_eq!(devices[0].version.hw_id, 10);
+    }
+
+    #[test]
+    fn parse_usb_vid_pid_selectors() {
+        assert_eq!(parse_usb_vid_pid("2752"), Some((0x2752, None)));
+        assert_eq!(parse_usb_vid_pid("2752:0011"), Some((0x2752, Some(0x0011))));
+        assert_eq!(parse_usb_vid_pid("DevSrvsID%3A1234567890"), None);
+        assert_eq!(parse_usb_vid_pid("/dev/hidraw3"), None);
+    }
+
+    #[test]
+    fn parse_u32_auto_supports_decimal_and_hex() {
+        assert_eq!(parse_u32_auto("1234"), Ok(1234));
+        assert_eq!(parse_u32_auto("0xffc8"), Ok(0xffc8));
+        assert!(parse_u32_auto("0xzz").is_err());
     }
 }

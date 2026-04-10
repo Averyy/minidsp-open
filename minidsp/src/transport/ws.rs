@@ -139,6 +139,8 @@ impl Transport for WsTransport {
     ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
         let sink = self.sink.clone();
         let frame = packet::encode_frame(payload);
+        tracing::debug!("WS OUT payload: {:02x?}", payload);
+        tracing::trace!("WS OUT frame: {:02x?}", frame);
         Box::pin(async move {
             let mut sink = sink.lock().await;
             sink.send(Message::Binary(frame.into()))
@@ -164,8 +166,10 @@ impl Transport for WsTransport {
 
                 match result {
                     Ok(Some(Ok(Message::Binary(data)))) => {
+                        tracing::trace!("WS IN frame: {:02x?}", data);
                         // Daemon sends encode_frame (with checksum) over WS
                         if let Some(payload) = packet::decode_frame(&data) {
+                            tracing::debug!("WS IN payload: {:02x?}", payload);
                             return Ok(payload);
                         }
                         // Decode failure — corrupted frame, skip and try next

@@ -39,6 +39,24 @@ pub struct PeqBandConfig {
     pub bypass: bool,
 }
 
+/// Indexed biquad coefficients used for grouped crossover readback.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct IndexedBiquadConfig {
+    pub index: u8,
+    pub coeff: BiquadCoeffs,
+}
+
+/// Crossover group state: 4 biquads plus one group-level bypass flag.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct CrossoverGroupConfig {
+    pub index: u8,
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Vec::is_empty", default))]
+    pub filters: Vec<IndexedBiquadConfig>,
+    pub bypass: bool,
+}
+
 /// Compressor settings for an output channel.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
@@ -50,6 +68,14 @@ pub struct CompressorConfig {
     pub knee: f32,
     pub attack: f32,
     pub release: f32,
+}
+
+/// FIR state for a channel.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct FirConfig {
+    pub bypass: bool,
+    pub active_taps: u16,
 }
 
 /// Input channel config.
@@ -73,6 +99,10 @@ pub struct OutputChannelConfig {
     pub mute: bool,
     pub delay: f32,
     pub peq: Vec<PeqBandConfig>,
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Vec::is_empty", default))]
+    pub crossover: Vec<CrossoverGroupConfig>,
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
+    pub fir: Option<FirConfig>,
     #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
     pub compressor: Option<CompressorConfig>,
 }

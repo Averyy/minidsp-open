@@ -4,23 +4,36 @@
 //! Coefficients: [b0, b1, b2, a1, a2]
 //!
 //! Stability: a filter is stable when all poles are inside the unit circle.
-//! We check that the transfer function denominator `1 + a1*z^-1 + a2*z^-2` has
-//! roots with magnitude < 1.
+//! We support two feedback-sign conventions in the ecosystem:
+//! - direct-form coefficients where the denominator is `1 + a1*z^-1 + a2*z^-2`
+//! - stored/round-tripped DSP coefficients where the feedback terms are already
+//!   negated and the denominator is `1 - a1*z^-1 - a2*z^-2`
 
 /// Standard bypass (passthrough) biquad: b0=1, all others 0.
 pub const BYPASS: [f32; 5] = [1.0, 0.0, 0.0, 0.0, 0.0];
 
-/// Check if biquad coefficients represent a stable filter.
+fn jury_stable(a1: f64, a2: f64) -> bool {
+    a2.abs() < 1.0 && (1.0 + a1 + a2) > 0.0 && (1.0 - a1 + a2) > 0.0
+}
+
+/// Check if biquad coefficients are stable using the standard coefficient convention.
 ///
-/// Returns `true` if the filter is stable (all poles inside unit circle).
-/// A filter with coefficients [b0, b1, b2, a1, a2] has denominator
-/// `1 + a1*z^-1 + a2*z^-2`. Stability requires:
-/// - |a2| < 1
-/// - |a1| < 1 + a2
+/// A filter with coefficients `[b0, b1, b2, a1, a2]` has denominator
+/// `1 + a1*z^-1 + a2*z^-2`.
 pub fn is_stable(coeffs: &[f32; 5]) -> bool {
     let a1 = coeffs[3] as f64;
     let a2 = coeffs[4] as f64;
-    a2.abs() < 1.0 && a1.abs() < 1.0 + a2
+    jury_stable(a1, a2)
+}
+
+/// Check if the coefficients are stable under either common feedback-sign convention.
+///
+/// This is useful for non-fatal warnings when we may be round-tripping raw
+/// device coefficients back into the CLI/API.
+pub fn is_stable_any_convention(coeffs: &[f32; 5]) -> bool {
+    let a1 = coeffs[3] as f64;
+    let a2 = coeffs[4] as f64;
+    jury_stable(a1, a2) || jury_stable(-a1, -a2)
 }
 
 /// Check if coefficients represent a bypass (passthrough) filter.
@@ -54,6 +67,20 @@ mod tests {
         // Typical PEQ from ezBEQ
         let coeffs = [1.0003468, -1.9990215, 0.9986773, -1.9990215, 0.9990241];
         assert!(is_stable(&coeffs));
+        assert!(is_stable_any_convention(&coeffs));
+    }
+
+    #[test]
+    fn round_tripped_device_biquad_is_stable_in_alternate_convention() {
+        let coeffs = [
+            0.0000106448014776106,
+            0.0000212896029552212,
+            0.0000106448014776106,
+            1.9879366159439087,
+            -0.9879792332649231,
+        ];
+        assert!(!is_stable(&coeffs));
+        assert!(is_stable_any_convention(&coeffs));
     }
 
     #[test]

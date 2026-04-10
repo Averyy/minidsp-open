@@ -68,6 +68,12 @@ pub struct OutputConfigJson {
     pub delay: Option<std::time::Duration>,
     /// Polarity inversion: true = inverted, false = normal.
     pub invert: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crossover: Option<Vec<CrossoverConfigJson>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fir: Option<FirConfigJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compressor: Option<CompressorConfigJson>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,4 +97,38 @@ pub struct RoutingConfigJson {
     pub output: u8,
     pub enabled: bool,
     pub gain_db: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompressorConfigJson {
+    pub bypass: Option<bool>,
+    pub threshold: Option<f32>,
+    pub gain: Option<f32>,
+    pub ratio: Option<f32>,
+    pub knee: Option<f32>,
+    pub attack: Option<f32>,
+    pub release: Option<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IndexedBiquadJson {
+    pub index: u8,
+    pub coeff: Option<BiquadCoeffJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CrossoverConfigJson {
+    pub index: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<Vec<IndexedBiquadJson>>,
+    pub bypass: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FirConfigJson {
+    pub bypass: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coefficients: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_taps: Option<u16>,
 }

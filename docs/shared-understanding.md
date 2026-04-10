@@ -6,7 +6,7 @@ Three separate repos, one calibration workflow. The end goal is a single app whe
 
 ### 1. minidsp-open (this repo)
 **What:** Clean-room MiniDSP hardware controller. Rust. HTTP API + CLI.
-**Role:** The device control layer. Talks USB HID / TCP to MiniDSP hardware. Reads and writes every DSP parameter — PEQ biquads, gain, delay, polarity, crossover, volume, source, presets, config read-back.
+**Role:** The device control layer. Talks USB HID / TCP to MiniDSP hardware. The normal control surface is exposed through the daemon/app HTTP and WebSocket APIs, while the CLI remains primarily probe/debug/raw-transport tooling. Config inspection is implemented, with some DSP100 state still reconstructed from verified shadow data because the physical 2x4 HD does not expose authoritative runtime readback for every field; the desktop daemon now also mirrors the official app's explicit modification-token writes after preset-content mutations and can import token-matched official Device Console preset XML, so reconstructed state survives reconnects with a real freshness marker and a stronger controller-side fallback than stale local cache.
 **Replaces:** minidsp-rs (an upstream protocol reference) + MiniDSP Plugin (closed-source GUI) + $75 WI-DG WiFi bridge (ESP32 target).
 **Repo:** `~/code/minidsp-open`
 

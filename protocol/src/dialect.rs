@@ -118,8 +118,8 @@ pub fn fixed_point_to_float(raw: u32) -> f32 {
 pub fn encode_mute(muted: bool, dialect: &Dialect) -> Vec<u8> {
     match dialect.value_format {
         ValueFormat::Float32 => {
-            // New dialect: 2 bytes, 1=unmute, 2=mute
-            let val: u16 = if muted { 2 } else { 1 };
+            // New dialect on the live DSP100 / 2x4 HD uses 1=muted, 2=unmuted.
+            let val: u16 = if muted { 1 } else { 2 };
             val.to_le_bytes().to_vec()
         }
         ValueFormat::FixedPoint => {
@@ -141,7 +141,7 @@ pub fn decode_mute(data: &[u8], dialect: &Dialect) -> Option<bool> {
                 return None;
             }
             let val = u16::from_le_bytes([data[0], data[1]]);
-            Some(val == 2)
+            Some(val == 1)
         }
         ValueFormat::FixedPoint => {
             if data.len() < 4 {
@@ -225,9 +225,9 @@ mod tests {
     fn mute_encoding() {
         // New dialect
         let muted = encode_mute(true, &Dialect::NEW);
-        assert_eq!(muted, vec![0x02, 0x00]);
+        assert_eq!(muted, vec![0x01, 0x00]);
         let unmuted = encode_mute(false, &Dialect::NEW);
-        assert_eq!(unmuted, vec![0x01, 0x00]);
+        assert_eq!(unmuted, vec![0x02, 0x00]);
 
         // Old dialect
         let muted = encode_mute(true, &Dialect::OLD);

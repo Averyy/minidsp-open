@@ -4,14 +4,14 @@ Research findings for minidsp-open command queue architecture.
 
 ## Concurrency Rules
 
-All paths to the device go through a single-executor command queue. No code touches USB/TCP writes directly.
+All daemon-managed paths to the device go through a single-executor command queue. Standalone CLI runs can still talk to USB/TCP directly when no daemon is in the path.
 
 | Interface | Connection limit | Priority | Arbitration |
 |-----------|-----------------|----------|-------------|
 | **TCP bridge (port 5333)** | 1 connection (WI-DG compat) | NORMAL | Second connection rejected. Commands decoded and queued. |
 | **HTTP API (port 5380)** | Unlimited | HIGH for writes, NORMAL for reads | Queue depth limit (64) → 503 if full. |
 | **WebSocket levels** | Unlimited (subscribe to broadcast) | LOW | One shared poll task, droppable. Paused during batch ops. |
-| **CLI** | N/A (talks to HTTP API) | Same as HTTP | CLI never touches USB directly. |
+| **CLI via daemon** | N/A (talks to HTTP API) | Same as HTTP | Uses the daemon queue when pointed at the daemon. |
 | **Device Console** | Via TCP bridge (counts as the 1 TCP client) | NORMAL | Coexists with HTTP clients through the queue. |
 
 ## 1. USB HID Round-Trip Time
@@ -90,7 +90,31 @@ From minidsp-rs issues and community reports:
 
 2. **Issue #699 (simultaneous connections corrupt state):** When multiple clients (Device Console + minidsp-rs CLI) issue commands through the same TCP server, the interleaved commands cause Device Console JavaScript assertion errors. The Device Console expects a specific response to each command it sends, but receives responses to commands injected by other clients.
 
-3. **Issue #383 (Flex input switching delay):** After sending SetConfig (preset change), the device immediately sends the ACK (0xAB) but takes 4-5 seconds to actually apply the change. Commands sent during this window may target the wrong preset.
+3. **Issue #383 (Flex input switching delay):** After sending SetConfig (preset change), the device immediately sends a config-change acknowledgement and may still take 4-5 seconds to actually apply the change. Commands sent during this window may target the wrong preset.
+
+Live 2x4 HD note from this repo: on the physical DSP100 / 2x4 HD path tested on 2026-04-09, raw `SetConfig` returns an immediate `Ack` and the preset readback flips almost immediately. The shared queue should therefore return the first valid preset response right away, while the high-level client verifies completion by polling master status instead of waiting for a second transport-level preset-only frame.
+
+The official raw Device Console HID capture from 2026-04-09 also tightened two queue/parser rules for this device family:
+- successful writes can come back as report-ID-prefixed same-opcode echoes, not just bare `0x01` acknowledgements
+- `SetSource` can be followed by a stale `0x05 ff a9 {source}` flash notification that must not be consumed as the response to the next unrelated read
+- the official preset-save path is a longer flash workflow, not an interactive runtime-state read:
+  - `0x06` / `0x07` are `WriteFlashBlock` / `FinishFlashBlock` chunks for preset persistence
+  - the 2x4 HD save flow then verifies with `0x05 ff a3 01`, writes the modification token at `0xffc8`, and ends with `0x25 slot 0x01`
+- the companion official session log shows the same controller-side state model even for normal audio-proc edits:
+  - Device Console compares the device token against its XML token and then explicitly saves a fresh active-preset token after successful preset-content updates
+  - raw DSP writes on the physical 2x4 HD do not auto-advance `0xFFC8`, so controllers have to write the freshness marker themselves
+  - the desktop daemon now mirrors that behavior for `/config` and measurement-mode preset mutations before persisting shadow state
+- `CopyPreset (0x27)` is a genuinely long-running flash operation on this device family, not a fast-ack write:
+  - official Device Console on the same physical 2x4 HD sent `0x27 0x00` at `2026-04-08 15:14:04.417` and only logged `Received OK` at `2026-04-08 15:14:27.284`
+  - this repo now gives `0x27` a longer shared queue deadline, which was live-verified on 2026-04-09 by `POST /devices/0/preset/copy` completing in `22.92 s`
+- `Reset (0x03)` is also slow enough on the physical 2x4 HD to need a longer shared deadline:
+  - live desktop verification on 2026-04-09 showed `HID OUT payload: [03]` at `22:29:42.994` and `HID IN payload: [aa]` at `22:29:49.557`, i.e. about `6.56 s`
+  - this repo now gives `0x03` the same longer shared queue deadline so raw reset through the daemon bridge can complete instead of timing out at `10 s`
+- Live 2x4 HD websocket note from this repo: with `/devices/0?levels=true&poll=true` active on 2026-04-09, `POST /devices/0/preset/0` and `/preset/1` still succeeded, but each took about `2.83 s` instead of the `20-30 ms` seen without a live polling socket.
+  - clean reruns on the same daemon/build showed `POST /devices/0/source/Usb` / `/source/Analog` still completing in about `11 ms` / `6 ms` with the polling socket attached, so the slow path is specifically preset switching rather than all writes
+  - the official raw Device Console capture shows the same preset-change pattern on the physical 2x4 HD: `0x25` was acknowledged immediately at `2026-04-09T19:30:52.875Z`, but the first follow-up `0x14` status reply did not arrive until `2026-04-09T19:30:56.185Z`
+  - this repo now matches the official websocket meter cadence (`500 ms`) and avoids the extra immediate post-connect poll, so the remaining preset latency on the tested path is device/apply-time behavior, not the old silent-failure queue bug
+- Live 2x4 HD status note from this repo on 2026-04-10: low-priority DSP100 meter reads can still fail or return malformed data on the attached 2x4 HD, so the daemon now treats them as best-effort and clamps failed reads to `-140 dB` silence instead of letting `GET /devices/{id}` stall or fail.
 
 4. **Issue #765 (unreachable after standby):** After the device enters standby, the USB connection drops. minidsp-rs has no reconnection logic, so the daemon becomes permanently stuck.
 
@@ -381,6 +405,7 @@ async fn level_poll_task(queue: Arc<CommandQueue>, interval: Duration) {
 - **No mandatory inter-command delay** for normal operation (the device handles back-to-back commands fine as long as each waits for its response)
 - **Post-preset-switch delay:** Poll master status every 500ms until the new preset is confirmed (already done by minidsp-rs v0.1.7+). During this period, the queue is in `DeviceBusy` state
 - **Post-FIR-load delay:** The device auto-mutes during FIR coefficient loading. Wait for FIR load end ACK, then restore mute state (minidsp-rs already does this)
+  - Live 2x4 HD note from this repo on 2026-04-09: the `FirLoadEnd (0x3B)` `Ack` can arrive a few seconds after the packet is sent. The queue must keep polling until the overall command deadline; treating each 500 ms receive poll timeout as a fatal command timeout breaks real FIR loads.
 - **No artificial delays between PEQ writes** -- the protocol handles it as long as we wait for each ACK
 
 ### Handling "Busy"

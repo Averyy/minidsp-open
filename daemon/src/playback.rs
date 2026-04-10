@@ -79,7 +79,10 @@ pub fn run_playback(
             return Err(err);
         }
     };
-    if let Err(err) = stream.play().map_err(|e| PlaybackError::StartStream(e.to_string())) {
+    if let Err(err) = stream
+        .play()
+        .map_err(|e| PlaybackError::StartStream(e.to_string()))
+    {
         let _ = started_tx.send(Err(err.to_string()));
         return Err(err);
     }
@@ -338,8 +341,13 @@ fn decode_sample(bytes: &[u8], frame: usize, channel: usize, bit_depth: BitDepth
         }
         BitDepth::Pcm24 => {
             let offset = frame * 6 + channel * 3;
-            let sign = if bytes[offset + 2] & 0x80 != 0 { 0xff } else { 0x00 };
-            let sample = i32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], sign]);
+            let sign = if bytes[offset + 2] & 0x80 != 0 {
+                0xff
+            } else {
+                0x00
+            };
+            let sample =
+                i32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], sign]);
             sample as f32 / 8_388_607.0
         }
     }
