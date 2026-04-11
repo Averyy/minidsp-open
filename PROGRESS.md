@@ -227,6 +227,75 @@ Permanent technical detail belongs in:
 
 ## Active Work
 
+### Wi-DG parity (compat / discovery / fingerprint)
+
+Parallel workstream to the DSP control-surface items below. Makes
+minidsp-open a drop-in replacement for MiniDSP's Wi-DG networking
+appliance so the stock MiniDSP Device Console auto-discovers us on any
+LAN with zero config (UDP 3999 beacon + TCP 5333 bridge), and so the
+desktop daemon becomes an N-device rack-mounted Wi-DG replacement. Does
+not fix any DSP control-surface gap — see items below — but provides a
+feature-coverage safety net because Device Console can drive the full DSP
+feature set through our bridge for anything our own API hasn't covered.
+
+Plan + spec:
+- `docs/plan-widg-parity.md` — phased implementation plan
+- `docs/ref-widg-reimplementation.md` — master behavioral spec, every
+  byte of the external Wi-DG contract
+
+**P0 — Device Console auto-discovery (~7 h):**
+
+- [ ] P0-1 — UDP beacon byte-level rewrite to the 72-byte Wi-DG layout and
+      5-second interval (`protocol/src/discovery.rs`, `daemon/src/discovery/mod.rs`,
+      `app-esp32/src/main.rs`)
+- [ ] P0-2 — ESP32 SoftAP SSID template `miniDSP-Wi-DG_XXYYZZ` (last 3 MAC
+      bytes uppercase hex) (`app-esp32/src/wifi.rs`)
+- [ ] P0-3 — ESP32 hostname `miniDSP-Wi-DG`, LAN IP `192.168.100.1/24`,
+      DHCP pool `.100–.249`, 12 h lease, dual-mode AP+STA
+      (`app-esp32/src/main.rs`, `app-esp32/src/wifi.rs`)
+- [ ] P0-4 — TCP 5333 socket options (`SO_REUSEADDR`, `TCP_NODELAY`,
+      `SO_KEEPALIVE`) + multi-client fan-out + write-serialization mutex
+      (`daemon/src/tcp/mod.rs`, `app-esp32/src/main.rs`)
+- [ ] P0-5 — Desktop daemon defaults UDP beacon + TCP 5333 to ON so zero
+      config is needed for Device Console discovery (`daemon/src/lib.rs`,
+      `config.example.toml`)
+
+**P1 — Byte-for-byte fingerprint match (~5 h, after P0):**
+
+- [ ] P1-1 — mDNS hostname `miniDSP-Wi-DG.local`, service type
+      `_http._tcp:80` with TXT `path=/` (`app-esp32/src/main.rs:start_mdns`;
+      desktop via `mdns-sd` crate if not already present)
+- [ ] P1-2 — HTTP→HTTPS redirect on port 80, HTTPS on 443 with ECDSA-P256
+      self-signed cert (`CN=miniDSP-Wi-DG`), `Server: miniDSP-Wi-DG` header
+      (`app-esp32/src/http_server.rs`)
+- [ ] P1-3 — Desktop mDNS advertisement (same as P1-1)
+- [ ] P1-4 — ESP32 STA DHCP client advertises hostname `miniDSP-Wi-DG` via
+      DHCP option 12 (`app-esp32/src/wifi.rs`)
+- [ ] P1-5 — Appliance-mode beacon fill `0xFF` for identity bytes when no
+      DSP attached (replaces current `hw_id=0, dsp_id=0` fallback in
+      `app-esp32/src/main.rs:579-589`)
+
+**P3 — Security improvements (~2 h, independent of P0/P1):**
+
+- [ ] P3-1 — SoftAP default WPA2-PSK with a printed-on-label password;
+      leave open-AP as an opt-in flag for strict Wi-DG parity during
+      provisioning
+- [ ] P3-2 — Optional HTTP BasicAuth gate on the management UI (behind a
+      flag; off by default)
+- [ ] P3-3 — TLS cert ECDSA-P256, 3650-day validity, clean subject (folds
+      into P1-2)
+- [ ] P3-4 — Remove `/www/log-minidsp.txt` equivalent from the
+      unauthenticated space (authenticated only, or don't serve)
+
+Live verification gates (against a physical Wi-DG on the same LAN): see
+`app/widg-re/live-verification-plan.md` — TEST-01 (beacon byte capture),
+TEST-02 (TCP framing), TEST-06 (USB HID opcode capture) after P0; TEST-03
+and TEST-04 after P1.
+
+---
+
+### DSP control-surface (our own HTTP 5380 / CLI / ezBEQ API)
+
 - [ ] Treat `docs/NOTES-cli-verification.md` as the top-priority investigation checklist until the remaining CLI compatibility drifts are explained or fixed.
 - [ ] Investigate DSP100 / 2x4 HD compressor parameter drift from minidsp-rs:
   - threshold and gain appear to write
