@@ -593,7 +593,9 @@ async fn execute_line(
                     let delay_addr = ch_def
                         .delay
                         .ok_or("output channel does not have delay control")?;
-                    client.set_channel_delay_samples(delay_addr, samples).await?;
+                    client
+                        .set_channel_delay_samples(delay_addr, samples)
+                        .await?;
                 }
                 "invert" => {
                     if is_input {
@@ -731,9 +733,7 @@ pub async fn bm_command(
     cmd: BmCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !client.supports_bass_management() {
-        return Err(
-            "device does not support bass management (HT 113/115 firmware only)".into(),
-        );
+        return Err("device does not support bass management (HT 113/115 firmware only)".into());
     }
     match cmd {
         BmCommand::Status => {
@@ -850,7 +850,9 @@ pub async fn channel_command(
                 .delay
                 .ok_or("output channel does not have delay control")?;
             let samples = client.profile().delay_ms_to_samples(ms);
-            client.set_channel_delay_samples(delay_addr, samples).await?;
+            client
+                .set_channel_delay_samples(delay_addr, samples)
+                .await?;
         }
         ChannelCommand::Invert { state } => {
             let table = client

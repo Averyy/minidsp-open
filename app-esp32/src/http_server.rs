@@ -694,9 +694,7 @@ pub fn start(
                             if let Some(delay_addr) = output_ch.delay {
                                 let delay_ms = secs as f32 * 1000.0;
                                 let samples = dev.profile().delay_ms_to_samples(delay_ms);
-                                if let Err(e) =
-                                    dev.set_channel_delay_samples(delay_addr, samples)
-                                {
+                                if let Err(e) = dev.set_channel_delay_samples(delay_addr, samples) {
                                     return send_error(req, 500, &format!("set_delay: {e}"));
                                 }
                             }
@@ -1723,11 +1721,7 @@ fn switch_to_usb_source(
     dev.set_source(usb_index)
         .map_err(|err| (500, format!("set_source: {err}")))?;
 
-    Ok((
-        true,
-        Some(current_source.to_string()),
-        Some(current_source),
-    ))
+    Ok((true, Some(current_source.to_string()), Some(current_source)))
 }
 
 /// RAII guard that disables WiFi power save on creation and restores it on drop.
@@ -1814,13 +1808,12 @@ fn run_playback_thread(
     );
 
     // Start the USB audio stream and write the pre-generated data
-    let start_result = start_playback_pregenerated(&audio_device, &plan, pcm_data).map(
-        |mut start| {
+    let start_result =
+        start_playback_pregenerated(&audio_device, &plan, pcm_data).map(|mut start| {
             start.response.source_changed = source_changed;
             start.response.previous_source = previous_source.clone();
             start
-        },
-    );
+        });
 
     match start_result {
         Ok(start) => {

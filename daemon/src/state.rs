@@ -639,8 +639,8 @@ mod tests {
     #[test]
     fn parse_filter_hex_coeffs_decodes_five_floats() {
         // identity biquad: b0 = 1.0, others zero
-        let got = parse_filter_hex_coeffs("3f800000,00000000,00000000,00000000,00000000")
-            .expect("parse");
+        let got =
+            parse_filter_hex_coeffs("3f800000,00000000,00000000,00000000,00000000").expect("parse");
         assert_eq!(got, [1.0, 0.0, 0.0, 0.0, 0.0]);
 
         // mixed signs and values

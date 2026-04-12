@@ -1645,7 +1645,12 @@ mod tests {
             //    contains the float32 little-endian bytes. Round-tripping the
             //    LE bytes back into a u32 LE should yield the same word the
             //    XML stored.
-            let frame = write_dsp(/*addr*/ 42, *expected_value, /*save*/ true, &Dialect::NEW);
+            let frame = write_dsp(
+                /*addr*/ 42,
+                *expected_value,
+                /*save*/ true,
+                &Dialect::NEW,
+            );
             assert!(frame.len() >= 8, "{name}: write_dsp frame too short");
             // Frame layout: [CMD_WRITE_DSP, ctrl, addr_hi, addr_lo, val_le_b0..3]
             let val_bytes: [u8; 4] = frame[4..8].try_into().unwrap();

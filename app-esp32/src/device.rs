@@ -138,7 +138,9 @@ impl DeviceState {
     }
 
     fn expect_write_ok_slow(&self, payload: &[u8], context: &str) -> Result<(), UsbHidError> {
-        let resp = self.bus.command_with_timeout(payload, SLOW_COMMAND_TIMEOUT)?;
+        let resp = self
+            .bus
+            .command_with_timeout(payload, SLOW_COMMAND_TIMEOUT)?;
         match commands::parse_response_for_request(payload, &resp, self.dialect()) {
             Response::Ack | Response::PresetComplete | Response::ResetComplete => Ok(()),
             Response::Error(data) => Err(UsbHidError::Protocol(format!(
@@ -770,8 +772,9 @@ impl DeviceState {
 
         // Snapshot before mutating so a failure mid-loop still has the state
         // captured for an eventual restore.
-        *self.saved_peq.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(SavedPeqState { bands: bands.clone() });
+        *self.saved_peq.lock().unwrap_or_else(|e| e.into_inner()) = Some(SavedPeqState {
+            bands: bands.clone(),
+        });
 
         for &(addr, _, _) in &bands {
             self.bypass_filter(addr, true)?;
@@ -804,10 +807,7 @@ impl DeviceState {
     /// first (so mid-stream coefficient writes don't cause audible
     /// discontinuities), then write coefficients, then restore the saved
     /// per-band bypass bits.
-    pub fn restore_measurement_mode_with(
-        &self,
-        saved: &SavedPeqState,
-    ) -> Result<(), UsbHidError> {
+    pub fn restore_measurement_mode_with(&self, saved: &SavedPeqState) -> Result<(), UsbHidError> {
         for &(addr, _, _) in &saved.bands {
             self.bypass_filter(addr, true)?;
         }
@@ -818,10 +818,7 @@ impl DeviceState {
             self.bypass_filter(addr, bypass)?;
         }
 
-        info!(
-            "measurement mode: restored {} PEQ bands",
-            saved.bands.len()
-        );
+        info!("measurement mode: restored {} PEQ bands", saved.bands.len());
         Ok(())
     }
 
@@ -867,10 +864,7 @@ impl DeviceState {
         match ns.get_blob(&key, &mut buf) {
             Ok(Some(blob)) => match decode_peq_shadow(blob) {
                 Some(decoded) => {
-                    let mut shadow = self
-                        .peq_shadow
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut shadow = self.peq_shadow.lock().unwrap_or_else(|e| e.into_inner());
                     let mut merged = 0usize;
                     for (addr, entry) in decoded {
                         if let Some(slot) = shadow.get_mut(&addr) {
@@ -910,10 +904,7 @@ impl DeviceState {
             }
         };
         let key = peq_nvs_key(self.serial);
-        let shadow = self
-            .peq_shadow
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let shadow = self.peq_shadow.lock().unwrap_or_else(|e| e.into_inner());
         let blob = encode_peq_shadow(&shadow);
         drop(shadow);
         if blob.len() > PEQ_SHADOW_MAX_BYTES {
@@ -924,7 +915,10 @@ impl DeviceState {
             return;
         }
         match ns.set_blob(&key, &blob) {
-            Ok(()) => debug!("peq shadow: persisted {} bytes to NVS key {key}", blob.len()),
+            Ok(()) => debug!(
+                "peq shadow: persisted {} bytes to NVS key {key}",
+                blob.len()
+            ),
             Err(e) => warn!("peq shadow NVS write failed: {e}"),
         }
     }
@@ -938,11 +932,7 @@ impl DeviceState {
     /// hardware that sometimes drops `RESP_PRESET_COMPLETE` after the
     /// switch. The command send is allowed to time out — we then confirm
     /// the switch actually happened by polling master status.
-    pub fn set_config_with_verify(
-        &self,
-        preset: u8,
-        reset_mode: u8,
-    ) -> Result<(), UsbHidError> {
+    pub fn set_config_with_verify(&self, preset: u8, reset_mode: u8) -> Result<(), UsbHidError> {
         const SEND_TIMEOUT: Duration = Duration::from_millis(1500);
         const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
         const VERIFY_POLL_DELAY: Duration = Duration::from_millis(100);

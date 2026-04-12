@@ -142,8 +142,7 @@ fn is_token_flash_full_addr_write(payload: &[u8]) -> bool {
     }
     let addr = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
     let token_full = u32::from_be_bytes([eeprom::TOKENS_ADDR.0, eeprom::TOKENS_ADDR.1, 0, 0]) >> 16;
-    let token_lo_start: u32 =
-        ((eeprom::TOKENS_ADDR.0 as u32) << 8) | eeprom::TOKENS_ADDR.1 as u32;
+    let token_lo_start: u32 = ((eeprom::TOKENS_ADDR.0 as u32) << 8) | eeprom::TOKENS_ADDR.1 as u32;
     let token_lo_end = token_lo_start + 4 * eeprom::TOKEN_SIZE_BYTES as u32;
     let _ = token_full;
     (token_lo_start..token_lo_end).contains(&addr)

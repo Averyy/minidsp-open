@@ -229,8 +229,10 @@ fn start_softap(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str) -> Result
     wifi.start()
         .map_err(|e| WifiError::Provision(format!("start: {e}")))?;
 
-    info!("SoftAP started: SSID='{ssid}' at {}.{}.{}.{}",
-        SOFTAP_LAN_IP.0, SOFTAP_LAN_IP.1, SOFTAP_LAN_IP.2, SOFTAP_LAN_IP.3);
+    info!(
+        "SoftAP started: SSID='{ssid}' at {}.{}.{}.{}",
+        SOFTAP_LAN_IP.0, SOFTAP_LAN_IP.1, SOFTAP_LAN_IP.2, SOFTAP_LAN_IP.3
+    );
     Ok(())
 }
 
@@ -268,9 +270,7 @@ pub fn read_any_wifi_mac() -> Option<[u8; 6]> {
 /// stack creates them on first use, at which point ESP-IDF will reuse the
 /// hostname we stashed on the config we'll reapply here).
 fn set_netif_hostname(if_key: &[u8], hostname: &str) {
-    use esp_idf_svc::sys::{
-        esp_netif_get_handle_from_ifkey, esp_netif_set_hostname, ESP_OK,
-    };
+    use esp_idf_svc::sys::{esp_netif_get_handle_from_ifkey, esp_netif_set_hostname, ESP_OK};
     let cstr = match std::ffi::CString::new(hostname) {
         Ok(s) => s,
         Err(_) => return,
@@ -284,8 +284,10 @@ fn set_netif_hostname(if_key: &[u8], hostname: &str) {
         if ret != ESP_OK {
             warn!("esp_netif_set_hostname({hostname}) failed: {ret}");
         } else {
-            info!("netif hostname set to '{hostname}' on if_key={}",
-                std::str::from_utf8(&if_key[..if_key.len().saturating_sub(1)]).unwrap_or("?"));
+            info!(
+                "netif hostname set to '{hostname}' on if_key={}",
+                std::str::from_utf8(&if_key[..if_key.len().saturating_sub(1)]).unwrap_or("?")
+            );
         }
     }
 }
@@ -295,8 +297,8 @@ fn set_netif_hostname(if_key: &[u8], hostname: &str) {
 /// the new range on first bind.
 fn apply_softap_ip_config() {
     use esp_idf_svc::sys::{
-        esp_netif_dhcps_start, esp_netif_dhcps_stop, esp_netif_get_handle_from_ifkey,
-        esp_netif_ip_info_t, esp_netif_set_ip_info, esp_ip4_addr_t, ESP_OK,
+        esp_ip4_addr_t, esp_netif_dhcps_start, esp_netif_dhcps_stop,
+        esp_netif_get_handle_from_ifkey, esp_netif_ip_info_t, esp_netif_set_ip_info, ESP_OK,
     };
     unsafe {
         let netif = esp_netif_get_handle_from_ifkey(b"WIFI_AP_DEF\0".as_ptr() as *const _);

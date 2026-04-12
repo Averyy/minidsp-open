@@ -973,9 +973,7 @@ impl MiniDspClient {
                 mixer.rows, mixer.cols
             ))
         })?;
-        let gain_addr = mixer
-            .gain_addr(row, col)
-            .expect("validated by status_addr");
+        let gain_addr = mixer.gain_addr(row, col).expect("validated by status_addr");
         let polarity_addr = mixer
             .polarity_addr(row, col)
             .expect("validated by status_addr");
@@ -1007,9 +1005,7 @@ impl MiniDspClient {
                 mixer.rows, mixer.cols
             ))
         })?;
-        let gain_addr = mixer
-            .gain_addr(row, col)
-            .expect("validated by status_addr");
+        let gain_addr = mixer.gain_addr(row, col).expect("validated by status_addr");
         let polarity_addr = mixer
             .polarity_addr(row, col)
             .expect("validated by status_addr");
@@ -1043,11 +1039,7 @@ impl MiniDspClient {
     }
 
     /// Apply a patch to one bass-management gain channel.
-    pub async fn set_bm_channel(
-        &self,
-        ch: u8,
-        patch: BmChannelPatch,
-    ) -> Result<(), ClientError> {
+    pub async fn set_bm_channel(&self, ch: u8, patch: BmChannelPatch) -> Result<(), ClientError> {
         if let Some(gain_db) = patch.gain_db {
             self.set_bm_channel_gain(ch, gain_db).await?;
         }
@@ -1744,10 +1736,7 @@ impl MiniDspClient {
     /// separately via [`Self::default_peq_frequencies`] for clients that want
     /// to render an authentic "default" UI after a reset.
     pub async fn reset_all_peq_to_defaults(&self) -> Result<usize, ClientError> {
-        let table = self
-            .profile
-            .dsp_table
-            .ok_or(ClientError::Unsupported)?;
+        let table = self.profile.dsp_table.ok_or(ClientError::Unsupported)?;
 
         let mut touched = 0usize;
         for input in table.inputs {

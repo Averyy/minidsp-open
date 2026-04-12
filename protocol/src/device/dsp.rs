@@ -2258,8 +2258,7 @@ const fn peq_bands_5(base: u16) -> [PeqBand; 5] {
 /// should seed every band at these frequencies with Q=0.7, boost=0, type=PK,
 /// matching what `app/Audio Firmware/{family}/DSP_default_parameters.xml`
 /// encodes in every `<filter name="PEQ_*_*">` default block.
-pub const DEFAULT_PEQ_FREQS_HZ: [u32; 10] =
-    [20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
+pub const DEFAULT_PEQ_FREQS_HZ: [u32; 10] = [20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
 
 #[cfg(test)]
 mod tests {

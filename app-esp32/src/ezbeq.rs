@@ -129,8 +129,7 @@ pub fn read_entry_biquads_by_digest(
     if &header[0..4] != BIN_MAGIC {
         return Err("bad catalogue.bin magic (expected BEQ\\x02)".into());
     }
-    let entry_count =
-        u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    let entry_count = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if entry_count == 0 {
         return Err("catalogue is empty".into());
     }

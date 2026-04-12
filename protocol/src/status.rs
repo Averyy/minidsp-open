@@ -117,7 +117,10 @@ pub struct RoutingConfig {
     /// Per-cell polarity inversion. `None` for families whose routing matrix
     /// has no `polarity_base` (legacy DSP_100/DSP_101/DSP_105/DSP_111/DSP_28).
     /// `Some(true)` = inverted, `Some(false)` = normal.
-    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none", default))]
+    #[cfg_attr(
+        feature = "std",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
     pub polarity_inverted: Option<bool>,
 }
 
@@ -165,9 +168,15 @@ pub struct BmStateConfig {
 #[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
 pub struct BmChannelPatch {
-    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none", default))]
+    #[cfg_attr(
+        feature = "std",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
     pub muted: Option<bool>,
-    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none", default))]
+    #[cfg_attr(
+        feature = "std",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
     pub gain_db: Option<f32>,
 }
 
@@ -176,11 +185,20 @@ pub struct BmChannelPatch {
 #[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
 pub struct BmMixerCellPatch {
-    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none", default))]
+    #[cfg_attr(
+        feature = "std",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
     pub enabled: Option<bool>,
-    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none", default))]
+    #[cfg_attr(
+        feature = "std",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
     pub gain_db: Option<f32>,
-    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none", default))]
+    #[cfg_attr(
+        feature = "std",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
     pub polarity_inverted: Option<bool>,
 }
 
