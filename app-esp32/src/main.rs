@@ -562,35 +562,38 @@ fn discovery_packet_for_state(
     state: &http_server::SharedDeviceState,
 ) -> Option<minidsp_protocol::discovery::DiscoveryPacket> {
     let ip = get_sta_ip()?;
+    let mac = get_sta_mac().unwrap_or([0; 6]);
 
     if let Some(dev) = http_server::get_device(state) {
         let hw = dev.hw_id();
         return Some(minidsp_protocol::discovery::DiscoveryPacket::from_device(
+            mac,
             ip,
             hw.hw_id,
             hw.fw_major,
             hw.fw_minor,
             dev.dsp_version(),
-            dev.serial(),
+            dev.serial() as u16,
             format!("minidsp-{:08x}", dev.serial()),
         ));
     }
 
     let serial = fallback_discovery_serial();
     Some(minidsp_protocol::discovery::DiscoveryPacket::from_device(
+        mac,
         ip,
         0,
         0,
         1,
         0,
         serial,
-        format!("minidsp-bridge-{serial}"),
+        format!("minidsp-bridge-{serial:04x}"),
     ))
 }
 
-fn fallback_discovery_serial() -> u32 {
+fn fallback_discovery_serial() -> u16 {
     let mac = get_sta_mac().unwrap_or([0, 0, 0, 0, 0, 0]);
-    900_000 + ((mac[3] as u32) << 16) + ((mac[4] as u32) << 8) + mac[5] as u32
+    u16::from_be_bytes([mac[4], mac[5]])
 }
 
 /// Get the ESP32's STA IP address.
