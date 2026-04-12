@@ -137,7 +137,7 @@ From the ESP-IDF docs: "Upon receiving WIFI_EVENT_STA_DISCONNECTED, the default 
 POWER ON
     │
     ▼
-[1] Initialize NVS, hardware, USB HID host
+[1] Initialize early runtime state (logger, RGB LED controller, NVS, storage)
     │
     ▼
 [2] Check NVS for WiFi credentials
@@ -190,6 +190,16 @@ Background policy in the current implementation:
 - Manual `POST /debug/updater/check` uses the same updater path
 - Only one update run is allowed at a time; overlapping manual/scheduled checks return `busy`
 ```
+
+User-visible LED behavior during that sequence now follows `docs/ref-rgb-led.md`:
+
+- boot startup: solid amber
+- SoftAP provisioning: blue breathe
+- STA reconnect / connect-in-progress: blue flash
+- WiFi up but no usable MiniDSP path yet: amber breathe between `AMBER_MIN` and `AMBER`
+- MiniDSP path ready: dim solid green
+- real catalogue download/write activity: green breathe
+- fatal startup failure: solid red, latched until reboot
 
 ### What should be blocking vs non-blocking
 

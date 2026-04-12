@@ -131,6 +131,7 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
         "update available: {} -> {new_version}",
         installed.as_deref().unwrap_or("(none)"),
     );
+    let _led = crate::led::begin_background_update();
 
     // Clear installed version FIRST — if anything fails, next boot retries everything.
     // Bail out on failure: if we can't clear NVS and then delete the on-flash

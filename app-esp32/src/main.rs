@@ -22,6 +22,7 @@ mod device;
 mod diagnostics;
 mod ezbeq;
 mod http_server;
+mod led;
 mod storage;
 mod updater;
 mod usb_audio;
@@ -40,6 +41,14 @@ fn main() {
     // Step 0: Initialize ring buffer logger (before EspLogger so we capture everything)
     diagnostics::init_logger();
 
+    match led::start_global_controller() {
+        Ok(controller) => {
+            controller.set_mode(led::LedMode::Booting);
+            controller.set_device_ready(false);
+        }
+        Err(e) => warn!("LED init failed: {e}"),
+    }
+
     info!("minidsp-open v{} starting", env!("CARGO_PKG_VERSION"));
 
     // Initialize NVS (required for WiFi credentials)
@@ -57,17 +66,21 @@ fn main() {
 
     // Step 1: WiFi connection (or provisioning)
     info!("step 1: WiFi setup");
+    led::set_mode(led::LedMode::WifiConnecting);
     let wifi_handle = match wifi::connect_or_provision(nvs.clone()) {
         Ok(handle) => {
             if handle.is_sta {
                 info!("WiFi connected (STA mode)");
+                led::set_mode(led::LedMode::Operational);
             } else {
                 info!("WiFi in SoftAP provisioning mode");
+                led::set_mode(led::LedMode::ProvisioningAp);
             }
             Some(handle)
         }
         Err(e) => {
             error!("WiFi failed: {e} — continuing without network");
+            led::set_mode(led::LedMode::Fatal);
             None
         }
     };
@@ -112,6 +125,7 @@ fn main() {
         Ok(bus) => Some(Arc::new(bus)),
         Err(e) => {
             error!("USB HID init failed: {e} — USB will not be available");
+            led::set_mode(led::LedMode::Fatal);
             None
         }
     };
@@ -129,10 +143,12 @@ fn main() {
             Ok(state) => {
                 usb_state = UsbState::ProtocolReady;
                 on_device_activated(state, &device_state, &beq_state, &nvs);
+                led::set_device_ready(true);
             }
             Err(e) => {
                 usb_state = UsbState::Absent;
                 warn!("No MiniDSP device found: {e} — will retry in background");
+                led::set_device_ready(false);
             }
         }
     }
@@ -234,6 +250,7 @@ fn main() {
                 warn!("USB device lost — clearing device state");
                 *device_state.lock().unwrap() = None;
                 usb_state = UsbState::Absent;
+                led::set_device_ready(false);
             }
 
             // Scan if we don't have a working device (regardless of is_connected,
@@ -246,9 +263,11 @@ fn main() {
                         usb_backoff = Duration::from_secs(5);
                         usb_state = UsbState::ProtocolReady;
                         on_device_activated(state, &device_state, &beq_state, &nvs);
+                        led::set_device_ready(true);
                     }
                     Err(_) => {
                         // No device found within timeout — back off
+                        led::set_device_ready(false);
                         usb_backoff = (usb_backoff * 2).min(Duration::from_secs(60));
                     }
                 }

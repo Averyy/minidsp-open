@@ -872,6 +872,7 @@ unsafe extern "C" fn client_event_callback(
         warn!("USB device disconnected");
         cb.device_present.store(false, Ordering::SeqCst);
         cb.last_attach_ms.store(0, Ordering::SeqCst);
+        crate::led::set_device_ready(false);
     } else {
         debug!("USB client event: {}", event.event);
     }

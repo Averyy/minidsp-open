@@ -343,6 +343,7 @@ fn register_disconnect_reason_handler(
                 let reason = disconnected.reason() as u32;
                 LAST_DISCONNECT_REASON.store(reason, Ordering::Relaxed);
                 WIFI_CONNECTED.store(false, Ordering::Relaxed);
+                crate::led::set_mode(crate::led::LedMode::WifiConnecting);
                 warn!(
                     "WiFi disconnect reason {} ({})",
                     reason,
@@ -401,6 +402,7 @@ fn monitor_loop(
                 };
                 info!("WiFi reconnected: {ip}");
                 WIFI_CONNECTED.store(true, Ordering::Relaxed);
+                crate::led::set_mode(crate::led::LedMode::Operational);
                 backoff = Duration::from_secs(1);
                 credential_retries = 0;
             }
@@ -411,6 +413,7 @@ fn monitor_loop(
         if WIFI_CONNECTED.load(Ordering::Relaxed) {
             warn!("WiFi disconnected — starting reconnect loop");
             WIFI_CONNECTED.store(false, Ordering::Relaxed);
+            crate::led::set_mode(crate::led::LedMode::WifiConnecting);
         }
 
         let reason = LAST_DISCONNECT_REASON.load(Ordering::Relaxed);
@@ -427,6 +430,7 @@ fn monitor_loop(
                 if let Err(e) = clear_credentials(&nvs) {
                     warn!("WiFi: failed to clear credentials before provisioning fallback: {e}");
                 }
+                crate::led::set_mode(crate::led::LedMode::ProvisioningAp);
                 std::thread::sleep(Duration::from_secs(1));
                 unsafe { esp_idf_svc::sys::esp_restart() };
             }
@@ -465,6 +469,7 @@ fn monitor_loop(
                         .unwrap_or_else(|_| "unknown".into());
                     info!("WiFi reconnected: {ip}");
                     WIFI_CONNECTED.store(true, Ordering::Relaxed);
+                    crate::led::set_mode(crate::led::LedMode::Operational);
                     backoff = Duration::from_secs(1);
                     continue;
                 }

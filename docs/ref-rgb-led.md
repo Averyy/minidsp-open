@@ -65,6 +65,12 @@ The next tuning pass changed the unavailable-state amber behavior:
 - it now breathes between a low amber floor and full amber so the low end still reads as amber
 - the current checked-in `led-demo` entrypoint isolates that amber-only breathe loop for visual tuning
 
+Production integration landed later on 2026-04-12:
+
+- the real firmware now owns the LED through a dedicated controller thread in normal task context
+- `app-esp32/src/main.rs`, `app-esp32/src/wifi.rs`, and `app-esp32/src/updater.rs` now feed coarse state changes into that controller
+- live post-flash board checks on the same `led-test-board` dev board confirmed the production blue and amber states were driving correctly
+
 If a later board revision proves otherwise, update this note with the exact board photo, silk labels, and working pin/order.
 
 ## Important Caveats About Clones And Revisions
@@ -107,19 +113,21 @@ Current `app-esp32` state:
 - the raw color verification loop is still available in the shared driver for pin/order bring-up
 - the product-state demo is still available in the shared driver
 - the current checked-in `led-demo` entrypoint loops the amber-only breathe test while `MiniDspUnavailable` is being tuned
-- there is still no production LED status state machine wired into `app-esp32/src/main.rs`
+- the production firmware now has a real LED status controller wired into `app-esp32/src/main.rs`
+- that production path also consumes WiFi reconnect/provisioning signals from `app-esp32/src/wifi.rs`
+- real ezBEQ download/write activity now drives the update state from `app-esp32/src/updater.rs`
 
-So the LED hardware, GPIO selection, `GRB` ordering, the state-demo timing/brightness choices, and the current amber-floor workaround are all verified through a dedicated demo path, but not yet integrated into the main firmware state machine.
+So the LED hardware, GPIO selection, `GRB` ordering, the state-demo timing/brightness choices, the amber-floor workaround, and the production coarse-state plumbing are now all in place. The demo binary remains the tuning/bring-up tool; the real firmware now uses the same shared driver logic for normal runtime status.
 
 ## Recommended Driver Strategy
 
-Use Espressif's `led_strip` component via ESP-IDF, not Arduino helpers and not ad hoc bit-banging.
+Use the current direct `esp-idf-hal` RMT implementation in `app-esp32/src/led.rs`, not Arduino helpers and not ad hoc bit-banging.
 
 Why:
 
-- This project already uses ESP-IDF components through `esp-idf-sys` extra components.
-- `led_strip` is Espressif's intended driver for addressable LEDs like `WS2812`.
-- It supports an RMT backend, which is the normal way to generate WS2812 timing on ESP32 chips.
+- The current one-pixel board LED does not need an extra strip component layer.
+- The checked-in code already drives the board successfully with `esp-idf-hal` RMT primitives.
+- The production integration now uses that same path, so keeping one driver avoids a second abstraction split.
 - This repo is Rust + ESP-IDF, so Arduino-specific hidden helpers such as `RGB_BUILTIN` are the wrong abstraction.
 
 ## Recommended Backend
@@ -145,14 +153,13 @@ Espressif explicitly documents that `rmt_transmit()` must be called from task co
 
 ## Recommended Implementation Shape In This Repo
 
-When this gets implemented, the clean shape is:
+The production implementation now follows this shape:
 
-1. Add the `espressif/led_strip` extra component in `app-esp32/Cargo.toml`.
-2. Add a dedicated `app-esp32/src/led.rs`.
-3. Create a small `LedState` enum that models the user-visible device state.
-4. Give one module exclusive ownership of the LED handle.
-5. Drive animations from a normal Rust thread or a periodic tick from the main loop.
-6. Only send state changes or pattern requests into that module; do not let random code paths write the LED directly.
+1. Keep the dedicated `app-esp32/src/led.rs` module as the production driver base.
+2. Use the small `LedState` / `LedMode` model for user-visible coarse states.
+3. Give one controller thread exclusive ownership of the LED handle.
+4. Drive animations from that normal Rust thread.
+5. Only send state changes or pattern requests into that module; do not let random code paths write the LED directly.
 
 This keeps the LED from becoming another cross-cutting side effect.
 
@@ -185,8 +192,8 @@ Final recommended color/pattern mapping:
 Current tuned demo behavior on the tested board:
 
 - solid/flash states use slightly brighter peak values than the first bring-up pass, but remain intentionally low overall for rack use
-- breathing states fade all the way to black
-- breathing states include a very short dwell at both fully off and fully on so the motion reads more like `__--__` than a pure triangle
+- blue and green breathing states fade all the way to black
+- breathing states include a very short dwell at both fully off and fully on, while amber unavailable breathing uses the `AMBER_MIN` floor instead of full black
 - amber's low-end fade keeps its hue instead of falling through red on the last visible step
 
 Current unavailable-state amber tuning:
@@ -268,33 +275,27 @@ Verification rule:
 
 ## Integration Points In The Current Firmware
 
-The existing firmware already has natural state transition points where LED updates belong.
+The existing firmware now drives LED updates from these coarse transition points:
 
 Good hook points:
 
 - `app-esp32/src/main.rs`
-  - startup banner / boot
-  - SoftAP provisioning vs STA connected
-  - HTTP server ready
+  - boot startup
+  - initial STA vs SoftAP outcome
   - USB absent vs protocol-ready
+  - fatal startup failures
 - `app-esp32/src/wifi.rs`
-  - provisioning active
-  - STA connect success/failure
-  - reconnect attempts
+  - reconnect loop active
+  - STA reconnect success
+  - provisioning fallback after repeated credential failure
 - `app-esp32/src/updater.rs`
-  - update start
-  - update success
-  - update failure
-- `app-esp32/src/usb_hid.rs` or device-probe flow
-  - device detected
-  - device lost
-  - protocol probe failure
+  - real catalogue update/download work
 
 The LED should mirror coarse state transitions, not every low-level event.
 
-## Next Session Plan
+## Production Integration Status
 
-When integrating this into the real firmware state machine, the intended behavior is:
+The real firmware now uses the following behavior:
 
 - keep the existing direct `esp-idf-hal` RMT implementation in `app-esp32/src/led.rs`
 - keep `GPIO48`, one pixel, `GRB`
@@ -317,13 +318,14 @@ When integrating this into the real firmware state machine, the intended behavio
 Production-integration notes:
 
 - the current `DEMO_HOLD` and `TRANSITION_GAP` values are for demo loops only and should not drive the real state machine
-- the real firmware should update LED state on actual system transitions, not on fixed timers
-- one module should own the LED handle and consume coarse state updates from the rest of the firmware
+- the real firmware now updates LED state on actual system transitions, not on fixed timers
+- one controller thread owns the LED handle and consumes coarse state updates from the rest of the firmware
+- `Fatal` is latched in the controller so later WiFi-mode updates do not clear a hard failure indication
 - if the production path needs smoother or cheaper updates, optimize around the existing `led.rs` code rather than replacing it with a simpler GPIO blink path
 
-## Minimal Plumbing Needed When Implementing
+## Current Production Plumbing
 
-The current demo implementation does not require an extra ESP-IDF `led_strip` component. It uses `esp-idf-hal`'s RMT support directly for the one-pixel onboard LED.
+The current production implementation does not require an extra ESP-IDF `led_strip` component. It uses `esp-idf-hal`'s RMT support directly for the one-pixel onboard LED.
 
 If a future implementation needs more complex strip support or wants to standardize on Espressif's `led_strip` component, re-evaluate that decision then.
 
@@ -367,11 +369,13 @@ Before relying on the LED in production firmware:
 1. `GPIO48` is verified on the tested board with the color loop.
 2. `GRB` ordering is verified on the tested board with the color loop.
 3. The current state-demo timing and brightness have been visually tuned on the tested board.
-4. Verify the LED remains stable while WiFi is enabled.
-5. Verify the chosen pattern set is readable from across the room.
-6. Verify the "healthy idle" state is not visually obnoxious in a dark room.
-7. Verify boot, provisioning, device attach, device loss, and update paths all produce the intended state.
-8. If any board fails the test, capture the exact board revision and add it to this document before adding board-specific code paths.
+4. The production controller is wired to real firmware transitions in `main.rs`, `wifi.rs`, and `updater.rs`.
+5. Blue and amber production states were visually spot-checked on the tested board after flashing the integrated firmware on 2026-04-12.
+6. Verify the LED remains stable while WiFi is enabled.
+7. Verify the chosen pattern set is readable from across the room.
+8. Verify the "healthy idle" state is not visually obnoxious in a dark room.
+9. Verify boot, provisioning, device attach, device loss, and update paths all produce the intended state.
+10. If any board fails the test, capture the exact board revision and add it to this document before adding board-specific code paths.
 
 ## Bottom Line
 
@@ -382,8 +386,9 @@ For the boards currently used by `minidsp-open`, the onboard RGB LED should be t
 - one addressable `WS2812`-class pixel
 - driven from `GPIO48`
 - known-good with `GRB` ordering on the tested board
-- currently driven successfully by the repo's direct RMT implementation
+- currently driven successfully by the repo's direct RMT implementation in both demo and production firmware
 - current state-demo tuning on the tested board is `10 s` per state with `4.5 s` breathing and a tiny endpoint dwell
+- production LED state control now lives in the real firmware rather than only in the demo binary
 - still a candidate for future `led_strip` integration if a higher-level driver becomes useful
 
 That is the right assumption until a specific board revision proves otherwise.
