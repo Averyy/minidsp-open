@@ -128,7 +128,7 @@ fn main() {
         match discover_and_activate_device(bus, Duration::from_secs(30)) {
             Ok(state) => {
                 usb_state = UsbState::ProtocolReady;
-                on_device_activated(state, &device_state, &beq_state);
+                on_device_activated(state, &device_state, &beq_state, &nvs);
             }
             Err(e) => {
                 usb_state = UsbState::Absent;
@@ -245,7 +245,7 @@ fn main() {
                     Ok(state) => {
                         usb_backoff = Duration::from_secs(5);
                         usb_state = UsbState::ProtocolReady;
-                        on_device_activated(state, &device_state, &beq_state);
+                        on_device_activated(state, &device_state, &beq_state, &nvs);
                     }
                     Err(_) => {
                         // No device found within timeout — back off
@@ -355,6 +355,7 @@ fn on_device_activated(
     state: device::DeviceState,
     device_state: &http_server::SharedDeviceState,
     beq_state: &ezbeq::SharedEzBeqState,
+    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
 ) {
     info!(
         "device: {} (hw_id={}, dsp={})",
@@ -368,6 +369,12 @@ fn on_device_activated(
         let outputs = table.outputs.len() as u8;
         *beq_state.lock().unwrap() = ezbeq::EzBeqState::new(inputs, outputs);
     }
+
+    // Restore any persisted PEQ shadow from NVS before publishing the device
+    // into shared state, so the first /devices/0/config read after a reboot
+    // reflects the last committed biquads (saved at /config POST and
+    // measurement-mode commit boundaries).
+    state.load_peq_shadow_from_nvs(nvs);
 
     *device_state.lock().unwrap() = Some(Arc::new(state));
 }

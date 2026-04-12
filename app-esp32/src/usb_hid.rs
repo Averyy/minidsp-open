@@ -549,35 +549,6 @@ impl UsbHidBus {
         self.command_with_timeout(payload, XFER_TIMEOUT)
     }
 
-    /// Send a command payload without waiting for a reply packet.
-    pub fn command_no_reply(&self, payload: &[u8]) -> Result<(), UsbHidError> {
-        let _lock = self.lock.lock().unwrap();
-        debug!("USB send-only command start: {:02x?}", payload);
-
-        if !self.is_connected() {
-            warn!(
-                "USB send-only rejected while disconnected: {:02x?}",
-                payload
-            );
-            return Err(UsbHidError::Disconnected);
-        }
-
-        let dev_hdl = *self.dev_hdl.lock().unwrap();
-        let out_xfer = *self.out_xfer.lock().unwrap();
-        if dev_hdl.is_null() || out_xfer.is_null() {
-            return Err(UsbHidError::Disconnected);
-        }
-
-        let frame = minidsp_protocol::packet::encode_frame(payload);
-        let mut out_buf = [0xFF_u8; USB_REPORT_SIZE];
-        let copy_len = frame.len().min(USB_REPORT_SIZE);
-        out_buf[..copy_len].copy_from_slice(&frame[..copy_len]);
-
-        self.submit_out_transfer(out_xfer, &out_buf, payload, XFER_TIMEOUT)?;
-        debug!("USB send-only command completed: {:02x?}", payload);
-        Ok(())
-    }
-
     /// Best-effort cleanup of the current device (release interface, close).
     fn cleanup_device(&self) {
         let dev_hdl = *self.dev_hdl.lock().unwrap();

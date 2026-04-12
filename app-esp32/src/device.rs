@@ -987,38 +987,6 @@ impl DeviceState {
         }
     }
 
-    /// Send a reset command and verify the device comes back responsive.
-    ///
-    /// Matches the desktop's `reset_with_verification`: reset is expected
-    /// to tear the USB response down mid-flight, so we tolerate a timeout
-    /// on the send and just wait for the device to start answering
-    /// master-status reads again.
-    pub fn reset_with_verify(&self) -> Result<(), UsbHidError> {
-        const SEND_TIMEOUT: Duration = Duration::from_millis(1500);
-        const RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-        const RECOVERY_POLL_DELAY: Duration = Duration::from_millis(200);
-
-        let payload = commands::reset();
-        match self.bus.command_with_timeout(&payload, SEND_TIMEOUT) {
-            Ok(_) => {}
-            Err(UsbHidError::Timeout) => {
-                debug!("reset send timed out — waiting for recovery");
-            }
-            Err(err) => return Err(err),
-        }
-
-        let deadline = Instant::now() + RECOVERY_TIMEOUT;
-        loop {
-            std::thread::sleep(RECOVERY_POLL_DELAY);
-            if self.read_master_status_once().is_ok() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(UsbHidError::Protocol("reset recovery timeout".into()));
-            }
-        }
-    }
-
     #[allow(dead_code)]
     pub fn write_dsp(&self, addr: u16, value: f32, save: bool) -> Result<(), UsbHidError> {
         self.expect_write_ok(
