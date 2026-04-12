@@ -4,6 +4,7 @@
 //! All methods are blocking and thread-safe (via Arc<UsbHidBus>).
 
 use crate::usb_hid::{UsbHidBus, UsbHidError};
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use log::{debug, info, warn};
 use minidsp_protocol::commands::{self, HardwareId, Response};
 use minidsp_protocol::device::probe;
@@ -16,12 +17,24 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 struct PeqShadow {
     coeffs: [f32; 5],
     bypass: bool,
+}
+
+/// Snapshot of all PEQ bands captured when entering measurement mode.
+///
+/// The entries are `(addr, coefficients, bypass)` tuples for every PEQ band
+/// on inputs and outputs — the same shape as the desktop daemon's
+/// `minidsp::client::SavedPeqState` so ezBEQ / Home Assistant clients get
+/// identical JSON from either target. See
+/// `minidsp/src/client.rs::SavedPeqState` for the upstream definition.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SavedPeqState {
+    pub bands: Vec<(u16, [f32; 5], bool)>,
 }
 
 /// Device state — holds the USB bus, device profile, and identification info.
@@ -33,6 +46,9 @@ pub struct DeviceState {
     serial: u32,
     operation_lock: Mutex<()>,
     peq_shadow: Mutex<HashMap<u16, PeqShadow>>,
+    /// Measurement-mode snapshot — `Some` while PEQ bypass is in effect,
+    /// `None` once the client has explicitly restored state.
+    saved_peq: Mutex<Option<SavedPeqState>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +220,7 @@ impl DeviceState {
             serial,
             operation_lock: Mutex::new(()),
             peq_shadow: Mutex::new(peq_shadow),
+            saved_peq: Mutex::new(None),
         })
     }
 
@@ -653,7 +670,33 @@ impl DeviceState {
     }
 
     pub fn copy_preset(&self) -> Result<(), UsbHidError> {
-        self.expect_write_ok_slow(&commands::copy_preset(true), "copy preset")
+        self.expect_write_ok_slow(&commands::copy_preset(true), "copy preset")?;
+        // Mirror Device Console's verifyProgram check: read 0xFFA3 and bail if
+        // the device reports a failed flash persist (status > 0x0D).
+        let status = self.read_verify_program_status()?;
+        if !eeprom::is_verify_program_ok(status) {
+            return Err(UsbHidError::Protocol(format!(
+                "verifyProgram failed after CopyPreset: status=0x{:02X} > 0x{:02X}",
+                status,
+                eeprom::VERIFY_PROGRAM_OK_MAX
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_verify_program_status(&self) -> Result<u8, UsbHidError> {
+        let (hi, lo) = eeprom::VERIFY_PROGRAM_ADDR;
+        let req = commands::read_flash(hi, lo, 1);
+        let resp = self.bus.command_with_timeout(&req, SLOW_COMMAND_TIMEOUT)?;
+        match commands::parse_response_for_request(&req, &resp, self.dialect()) {
+            Response::FlashData(data) if !data.is_empty() => Ok(data[0]),
+            Response::FlashData(_) => Err(UsbHidError::Protocol(
+                "verify-program read returned empty payload".into(),
+            )),
+            other => Err(UsbHidError::Protocol(format!(
+                "verify-program ReadFlash unexpected response: {other:?}"
+            ))),
+        }
     }
 
     // -- DSP writes --
@@ -692,6 +735,285 @@ impl DeviceState {
             entry.bypass = bypass;
         }
         Ok(())
+    }
+
+    // -- Measurement mode --
+
+    /// Snapshot every PEQ band on the device and then bypass all of them so
+    /// a REW sweep sees an unfiltered signal path. The snapshot is stashed
+    /// in `saved_peq` so a later [`restore_measurement_mode`] can roll back.
+    pub fn enter_measurement_mode(&self) -> Result<(), UsbHidError> {
+        let table = self
+            .profile
+            .dsp_table
+            .ok_or_else(|| UsbHidError::Protocol("measurement mode unsupported".into()))?;
+
+        let mut bands: Vec<(u16, [f32; 5], bool)> = Vec::new();
+
+        for input in table.inputs {
+            for band in input.peq {
+                let coeffs = self.read_peq_coeffs(band.addr)?;
+                let bypass = self.read_peq_bypass(band.addr).unwrap_or(false);
+                bands.push((band.addr, coeffs, bypass));
+            }
+        }
+        for output in table.outputs {
+            for band in output.peq {
+                let coeffs = self.read_peq_coeffs(band.addr)?;
+                let bypass = self.read_peq_bypass(band.addr).unwrap_or(false);
+                bands.push((band.addr, coeffs, bypass));
+            }
+        }
+
+        // Snapshot before mutating so a failure mid-loop still has the state
+        // captured for an eventual restore.
+        *self.saved_peq.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(SavedPeqState { bands: bands.clone() });
+
+        for &(addr, _, _) in &bands {
+            self.bypass_filter(addr, true)?;
+        }
+
+        info!(
+            "measurement mode: saved and bypassed {} PEQ bands",
+            bands.len()
+        );
+        Ok(())
+    }
+
+    /// Restore PEQ state captured by [`enter_measurement_mode`]. Errors if
+    /// no snapshot is currently stored.
+    pub fn restore_measurement_mode(&self) -> Result<(), UsbHidError> {
+        let saved = self
+            .saved_peq
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| UsbHidError::Protocol("no saved measurement mode state".into()))?;
+        self.restore_measurement_mode_with(&saved)?;
+        *self.saved_peq.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
+    }
+
+    /// Restore PEQ state from an externally-provided snapshot. Uses a safe
+    /// three-phase write ordering that mirrors the desktop daemon's
+    /// `build_measurement_restore_batches`: bypass every affected band
+    /// first (so mid-stream coefficient writes don't cause audible
+    /// discontinuities), then write coefficients, then restore the saved
+    /// per-band bypass bits.
+    pub fn restore_measurement_mode_with(
+        &self,
+        saved: &SavedPeqState,
+    ) -> Result<(), UsbHidError> {
+        for &(addr, _, _) in &saved.bands {
+            self.bypass_filter(addr, true)?;
+        }
+        for &(addr, coeffs, _) in &saved.bands {
+            self.write_biquad(addr, &coeffs)?;
+        }
+        for &(addr, _, bypass) in &saved.bands {
+            self.bypass_filter(addr, bypass)?;
+        }
+
+        info!(
+            "measurement mode: restored {} PEQ bands",
+            saved.bands.len()
+        );
+        Ok(())
+    }
+
+    /// Read the currently-saved measurement-mode snapshot, if any.
+    #[allow(dead_code)]
+    pub fn saved_measurement_state(&self) -> Option<SavedPeqState> {
+        self.saved_peq
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Overwrite the saved measurement-mode snapshot. `None` clears it.
+    #[allow(dead_code)]
+    pub fn set_saved_measurement_state(&self, state: Option<SavedPeqState>) {
+        *self.saved_peq.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    }
+
+    // -- PEQ shadow NVS persistence --
+    //
+    // The in-memory `peq_shadow` is re-read from the device on every boot,
+    // which is fine for selector-reliable hardware. On the 2x4 HD / DSP100
+    // class of devices the live readback is unreliable (see
+    // `has_unreliable_selector_readback`), so losing the shadow on reboot
+    // effectively loses the user's last ezBEQ load. Persisting the shadow
+    // to NVS closes that gap without adding any always-on flash wear — we
+    // only write on explicit commit boundaries (full-config POST,
+    // measurement-mode transitions).
+
+    /// Load the PEQ shadow from NVS, merging entries onto whatever
+    /// `build_peq_shadow` seeded. Missing keys or decode failures are
+    /// non-fatal — we just log and keep the in-memory default.
+    pub fn load_peq_shadow_from_nvs(&self, nvs: &EspDefaultNvsPartition) {
+        let ns = match EspNvs::<NvsDefault>::new(nvs.clone(), PEQ_NVS_NAMESPACE, false) {
+            Ok(ns) => ns,
+            Err(e) => {
+                warn!("peq shadow NVS open (ro) failed: {e}");
+                return;
+            }
+        };
+        let key = peq_nvs_key(self.serial);
+        let mut buf = vec![0u8; PEQ_SHADOW_MAX_BYTES];
+        match ns.get_blob(&key, &mut buf) {
+            Ok(Some(blob)) => match decode_peq_shadow(blob) {
+                Some(decoded) => {
+                    let mut shadow = self
+                        .peq_shadow
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let mut merged = 0usize;
+                    for (addr, entry) in decoded {
+                        if let Some(slot) = shadow.get_mut(&addr) {
+                            *slot = entry;
+                            merged += 1;
+                        } else {
+                            // Unknown address — insert anyway so subsequent
+                            // reads see the persisted value.
+                            shadow.insert(addr, entry);
+                            merged += 1;
+                        }
+                    }
+                    info!("peq shadow: restored {merged} bands from NVS (key {key})");
+                }
+                None => {
+                    warn!("peq shadow NVS blob under key {key} failed to decode — ignoring");
+                }
+            },
+            Ok(None) => {
+                debug!("peq shadow: no NVS blob under {key}");
+            }
+            Err(e) => {
+                warn!("peq shadow NVS read failed: {e}");
+            }
+        }
+    }
+
+    /// Save the current PEQ shadow to NVS. Intended to be called at commit
+    /// boundaries — on every `/config` POST tail, after measurement-mode
+    /// enter/restore, etc. — not on every individual biquad write.
+    pub fn save_peq_shadow_to_nvs(&self, nvs: &EspDefaultNvsPartition) {
+        let ns = match EspNvs::<NvsDefault>::new(nvs.clone(), PEQ_NVS_NAMESPACE, true) {
+            Ok(ns) => ns,
+            Err(e) => {
+                warn!("peq shadow NVS open (rw) failed: {e}");
+                return;
+            }
+        };
+        let key = peq_nvs_key(self.serial);
+        let shadow = self
+            .peq_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let blob = encode_peq_shadow(&shadow);
+        drop(shadow);
+        if blob.len() > PEQ_SHADOW_MAX_BYTES {
+            warn!(
+                "peq shadow NVS encode too large ({} > {PEQ_SHADOW_MAX_BYTES}) — skipping persist",
+                blob.len()
+            );
+            return;
+        }
+        match ns.set_blob(&key, &blob) {
+            Ok(()) => debug!("peq shadow: persisted {} bytes to NVS key {key}", blob.len()),
+            Err(e) => warn!("peq shadow NVS write failed: {e}"),
+        }
+    }
+
+    // -- Bridge command verification (SetConfig / Reset) --
+
+    /// Switch presets with master-status verification.
+    ///
+    /// Mirrors the desktop daemon's `set_config_with_mode` so the TCP
+    /// bridge path returns a successful completion frame even on 2x4 HD
+    /// hardware that sometimes drops `RESP_PRESET_COMPLETE` after the
+    /// switch. The command send is allowed to time out — we then confirm
+    /// the switch actually happened by polling master status.
+    pub fn set_config_with_verify(
+        &self,
+        preset: u8,
+        reset_mode: u8,
+    ) -> Result<(), UsbHidError> {
+        const SEND_TIMEOUT: Duration = Duration::from_millis(1500);
+        const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
+        const VERIFY_POLL_DELAY: Duration = Duration::from_millis(100);
+
+        if preset >= self.profile.presets {
+            return Err(UsbHidError::Protocol(format!(
+                "preset {} out of range (max {})",
+                preset,
+                self.profile.presets - 1
+            )));
+        }
+
+        // Fast path: already on the requested preset. Matches desktop behavior.
+        if let Ok(before) = self.read_master_status_once() {
+            if before.preset == preset {
+                return Ok(());
+            }
+        }
+
+        let payload = commands::set_config(preset, reset_mode);
+        match self.bus.command_with_timeout(&payload, SEND_TIMEOUT) {
+            Ok(_) => {}
+            Err(UsbHidError::Timeout) => {
+                debug!("set_config send timed out — verifying via master status");
+            }
+            Err(err) => return Err(err),
+        }
+
+        let deadline = Instant::now() + VERIFY_TIMEOUT;
+        loop {
+            std::thread::sleep(VERIFY_POLL_DELAY);
+            if let Ok(status) = self.read_master_status_once() {
+                if status.preset == preset {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(UsbHidError::Protocol(format!(
+                    "set_config did not persist (expected preset {preset})"
+                )));
+            }
+        }
+    }
+
+    /// Send a reset command and verify the device comes back responsive.
+    ///
+    /// Matches the desktop's `reset_with_verification`: reset is expected
+    /// to tear the USB response down mid-flight, so we tolerate a timeout
+    /// on the send and just wait for the device to start answering
+    /// master-status reads again.
+    pub fn reset_with_verify(&self) -> Result<(), UsbHidError> {
+        const SEND_TIMEOUT: Duration = Duration::from_millis(1500);
+        const RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+        const RECOVERY_POLL_DELAY: Duration = Duration::from_millis(200);
+
+        let payload = commands::reset();
+        match self.bus.command_with_timeout(&payload, SEND_TIMEOUT) {
+            Ok(_) => {}
+            Err(UsbHidError::Timeout) => {
+                debug!("reset send timed out — waiting for recovery");
+            }
+            Err(err) => return Err(err),
+        }
+
+        let deadline = Instant::now() + RECOVERY_TIMEOUT;
+        loop {
+            std::thread::sleep(RECOVERY_POLL_DELAY);
+            if self.read_master_status_once().is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(UsbHidError::Protocol("reset recovery timeout".into()));
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -944,5 +1266,139 @@ impl DeviceState {
             },
             product_name: self.product_name().to_string(),
         }
+    }
+}
+
+// -- PEQ shadow NVS encoding helpers --
+
+/// NVS namespace used for PEQ shadow blobs. Max 15 chars.
+const PEQ_NVS_NAMESPACE: &str = "peqshad";
+
+/// Soft cap on the encoded PEQ shadow blob. NVS auto-chunks blobs bigger
+/// than one page (~4000 bytes) so we can comfortably go above the
+/// single-chunk boundary; 8 KiB fits the biggest supported device
+/// (Flex HT with every PEQ band populated = ~160 bands × 23 bytes + 3
+/// header ≈ 3.7 KiB) with healthy headroom. Increase if we add devices
+/// with more bands.
+const PEQ_SHADOW_MAX_BYTES: usize = 8192;
+
+/// Wire format version — future-proofs the blob for field additions.
+const PEQ_SHADOW_FORMAT_V1: u8 = 0x01;
+
+fn peq_nvs_key(serial: u32) -> String {
+    format!("s{serial:08x}")
+}
+
+/// Binary-encode the PEQ shadow for NVS persistence. Layout:
+///
+/// ```text
+/// [0]       : format version (0x01)
+/// [1..3]    : little-endian u16 band count
+/// [3..]     : band count × 23 bytes
+///   [0..2]    : LE u16 address
+///   [2..22]   : 5 × LE f32 biquad coefficients
+///   [22]      : bypass flag (0 = off, 1 = on)
+/// ```
+///
+/// Entries are sorted by address so two back-to-back encodes of the same
+/// logical state produce the same blob — avoids unnecessary NVS writes.
+fn encode_peq_shadow(shadow: &HashMap<u16, PeqShadow>) -> Vec<u8> {
+    let mut sorted: Vec<_> = shadow.iter().collect();
+    sorted.sort_by_key(|(addr, _)| **addr);
+
+    let mut buf = Vec::with_capacity(3 + sorted.len() * 23);
+    buf.push(PEQ_SHADOW_FORMAT_V1);
+    buf.extend_from_slice(&(sorted.len() as u16).to_le_bytes());
+    for (&addr, entry) in sorted {
+        buf.extend_from_slice(&addr.to_le_bytes());
+        for coeff in entry.coeffs {
+            buf.extend_from_slice(&coeff.to_le_bytes());
+        }
+        buf.push(if entry.bypass { 1 } else { 0 });
+    }
+    buf
+}
+
+/// Decode a PEQ shadow blob produced by [`encode_peq_shadow`]. Returns
+/// `None` on any structural error — the caller should log and fall back to
+/// the default shadow.
+fn decode_peq_shadow(data: &[u8]) -> Option<HashMap<u16, PeqShadow>> {
+    if data.len() < 3 || data[0] != PEQ_SHADOW_FORMAT_V1 {
+        return None;
+    }
+    let count = u16::from_le_bytes([data[1], data[2]]) as usize;
+    let expected_len = 3 + count * 23;
+    if data.len() < expected_len {
+        return None;
+    }
+
+    let mut shadow = HashMap::with_capacity(count);
+    let mut offset = 3;
+    for _ in 0..count {
+        let addr = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        offset += 2;
+
+        let mut coeffs = [0.0f32; 5];
+        for coeff in &mut coeffs {
+            let bytes = [
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ];
+            *coeff = f32::from_le_bytes(bytes);
+            offset += 4;
+        }
+
+        let bypass = data[offset] != 0;
+        offset += 1;
+
+        shadow.insert(addr, PeqShadow { coeffs, bypass });
+    }
+    Some(shadow)
+}
+
+#[cfg(test)]
+mod peq_shadow_tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_is_lossless() {
+        let mut original = HashMap::new();
+        original.insert(
+            0x1000,
+            PeqShadow {
+                coeffs: [1.0, 0.5, -0.25, 0.125, -0.0625],
+                bypass: false,
+            },
+        );
+        original.insert(
+            0x1001,
+            PeqShadow {
+                coeffs: [0.0; 5],
+                bypass: true,
+            },
+        );
+
+        let blob = encode_peq_shadow(&original);
+        let decoded = decode_peq_shadow(&blob).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        let entry = decoded[&0x1000];
+        assert_eq!(entry.coeffs, [1.0, 0.5, -0.25, 0.125, -0.0625]);
+        assert!(!entry.bypass);
+        let bypassed = decoded[&0x1001];
+        assert!(bypassed.bypass);
+    }
+
+    #[test]
+    fn decode_rejects_wrong_version() {
+        let blob = vec![0xFF, 0, 0];
+        assert!(decode_peq_shadow(&blob).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_truncated() {
+        let blob = vec![PEQ_SHADOW_FORMAT_V1, 2, 0];
+        assert!(decode_peq_shadow(&blob).is_none());
     }
 }

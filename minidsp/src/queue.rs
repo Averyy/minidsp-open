@@ -873,8 +873,20 @@ mod tests {
 
         let first = rx1.await.expect("first response channel");
         let second = rx2.await.expect("second response channel");
-        assert!(matches!(first.expect("first response"), QueueResponse { parsed: Response::Ack, .. }));
-        assert!(matches!(second.expect("second response"), QueueResponse { parsed: Response::Ack, .. }));
+        assert!(matches!(
+            first.expect("first response"),
+            QueueResponse {
+                parsed: Response::Ack,
+                ..
+            }
+        ));
+        assert!(matches!(
+            second.expect("second response"),
+            QueueResponse {
+                parsed: Response::Ack,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -918,9 +930,7 @@ mod tests {
         oversized_response.extend(std::iter::repeat(0xed).take(55));
         assert_eq!(oversized_response.len(), 63);
 
-        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(
-            oversized_response,
-        )])));
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(oversized_response)])));
 
         let resp = queue
             .execute_raw(request.clone(), Priority::High)
@@ -936,7 +946,11 @@ mod tests {
             resp.len(),
             resp
         );
-        assert_eq!(&resp[..], &request[..], "trimmed response should equal the echoed command");
+        assert_eq!(
+            &resp[..],
+            &request[..],
+            "trimmed response should equal the echoed command"
+        );
     }
 
     /// Confirm read commands (0x14 ReadFloats) are NOT trimmed even if the
@@ -946,7 +960,17 @@ mod tests {
         let request = commands::read_floats(0x0016, 2, &minidsp_protocol::dialect::Dialect::NEW);
         // A real ReadFloats response: opcode + addr (2) + count (1) + values (8) = 12 bytes
         let response = vec![
-            commands::CMD_READ_FLOATS, 0x00, 0x16, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            commands::CMD_READ_FLOATS,
+            0x00,
+            0x16,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
         ];
         let expected_len = response.len();
         let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(response)])));

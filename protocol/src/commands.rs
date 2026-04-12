@@ -22,25 +22,75 @@ pub const CMD_SET_DRE: u8 = 0x1E;
 pub const CMD_SET_CONFIG: u8 = 0x25;
 pub const CMD_COPY_PRESET: u8 = 0x27;
 pub const CMD_WRITE_BIQUAD: u8 = 0x30;
+pub const CMD_LOAD_DSP_PROGRAM: u8 = 0x11;
+pub const CMD_BLUETOOTH_AT_CMD: u8 = 0x21;
+pub const CMD_RELOAD_E2PROM_HEADER: u8 = 0x24;
 pub const CMD_READ_HARDWARE_ID: u8 = 0x31;
 pub const CMD_SET_SOURCE: u8 = 0x34;
-pub const CMD_FIR_LOAD_START: u8 = 0x39;
+/// Read the number of available FIR taps for a channel (live readback).
+///
+/// Wire shape: `[0x39][chan_u8]` → `[0x39][chan][count_u16_be]`.
+/// Device Console uses this as a true runtime query: `getNumAvailTaps(ch)` in
+/// `streamDevice.js`. Named `FIR_LOAD_START` historically because the same
+/// opcode also gates the FIR upload pipeline; the GET_NUM alias makes the
+/// live-read use case grep-findable.
+pub const CMD_GET_NUM_FIR_TAPS: u8 = 0x39;
+pub const CMD_FIR_LOAD_START: u8 = CMD_GET_NUM_FIR_TAPS;
 pub const CMD_FIR_LOAD_DATA: u8 = 0x3A;
 pub const CMD_RELOAD_DSP_PARAM: u8 = 0x3B;
 pub const CMD_WRITE_FLASH_FULL_ADDR: u8 = 0x3C;
 pub const CMD_READ_FLASH_FULL_ADDR: u8 = 0x3D;
+pub const CMD_ENTER_BOOTLOADER: u8 = 0x3E;
 pub const CMD_DIRAC_BYPASS: u8 = 0x3F;
 pub const CMD_READ_DSP_VERSION: u8 = 0x40;
 pub const CMD_SET_VOLUME: u8 = 0x42;
 pub const CMD_DIRAC_DELAY_GAIN: u8 = 0x45;
-pub const CMD_SET_HDMI_SOURCE: u8 = 0x49;
+pub const CMD_READ_DFLASH_ID: u8 = 0x46;
+/// Write a 32-byte page into the secondary "D flash" (paged external flash).
+///
+/// **IMPORTANT** — previously known in this codebase as `CMD_SET_HDMI_SOURCE`
+/// from a speculative minidsp-rs label that was never verified. The official
+/// Device Console `DspCmdCode` enum (`app/app-extracted/build/src/dspMessage.js`)
+/// defines this opcode as `WriteDFlashId`: `[0x49][page_no_u8][32 data bytes]`.
+/// It is used by the HDMI/eARC flash pipeline and the preset-program data path,
+/// not by audio-source switching. Audio-source switching is `CMD_SET_SOURCE`
+/// (`0x34`) for SHARC devices and a sub-command of `CMD_EARC` (`0x53`) for
+/// HDA/HTx. If a nanoAVR needs a different source-switch opcode, it's still
+/// unknown and `CMD_SET_HDMI_SOURCE` is retained as a deprecated alias so any
+/// pre-rename call sites fail over to the (incorrect but historical) 0x49
+/// instead of compiling against air.
+pub const CMD_WRITE_DFLASH_ID: u8 = 0x49;
+#[deprecated(
+    since = "0.2.0",
+    note = "0x49 is WriteDFlashId per Device Console — NOT an HDMI source switch. \
+            Use CMD_WRITE_DFLASH_ID or CMD_EARC as appropriate."
+)]
+pub const CMD_SET_HDMI_SOURCE: u8 = CMD_WRITE_DFLASH_ID;
+pub const CMD_ERASE_FLASH: u8 = 0x50;
+pub const CMD_COM_FW_UPGRADE: u8 = 0x52;
+pub const CMD_EARC: u8 = 0x53;
 pub const CMD_LOG_CONTROL: u8 = 0x54;
+pub const CMD_WISA: u8 = 0xF0;
 
-/// Official Device Console uses mode `0x02` for normal interactive preset
-/// changes on the 2x4 HD. A separate mode `0x00` is used by its converter flow
-/// when it explicitly changes presets "without reset".
-pub const PRESET_CHANGE_NORMAL: u8 = 0x02;
+/// Official Device Console uses three distinct reset-mode bytes on
+/// `ChangePreset (0x25)`:
+///
+/// - `0x00` (`PRESET_CHANGE_WITHOUT_RESET`): converter-flow change used only
+///   during preset import to avoid double-resetting when the DSP is already
+///   mid-import.
+/// - `0x01` (`PRESET_CHANGE_RELOAD_SAME_SLOT`): re-select the currently active
+///   slot — reload its state from flash into live RAM without the full DSP
+///   reset cycle. Used after an XML import when the user re-clicks the already
+///   active slot to force a re-load from the new cached file.
+/// - `0x02` (`PRESET_CHANGE_NORMAL`): normal interactive change — full DSP
+///   reset and post-preset verify cycle.
+///
+/// The official `index.js` chooses between `0x01` and `0x02` at runtime via
+/// `activePresetIdx === slot ? 0x01 : 0x02`. `0x00` is only used by the
+/// converter/importer path.
 pub const PRESET_CHANGE_WITHOUT_RESET: u8 = 0x00;
+pub const PRESET_CHANGE_RELOAD_SAME_SLOT: u8 = 0x01;
+pub const PRESET_CHANGE_NORMAL: u8 = 0x02;
 pub const FLASH_FULL_ADDR_CHUNK_MAX: u8 = 0x3A;
 
 // -- Response types --
@@ -55,7 +105,11 @@ pub const RESP_OVERFLOW: u8 = 0xFF;
 /// Returns true if the byte is a known MiniDSP command or response opcode.
 ///
 /// Used by the HID decoder to recognize `0xFF`-prefixed unframed packets
-/// without maintaining a separate hand-coded allowlist.
+/// without maintaining a separate hand-coded allowlist. This set must be the
+/// union of every opcode we RECOGNIZE (not necessarily every one we actively
+/// implement) so the TCP bridge can forward advanced Device Console commands
+/// (bootloader entry, firmware-update blocks, eARC sub-commands, WiSA
+/// sub-commands, etc.) without stripping them as "unknown".
 pub const fn is_known_opcode(byte: u8) -> bool {
     matches!(
         byte,
@@ -64,6 +118,7 @@ pub const fn is_known_opcode(byte: u8) -> bool {
             | CMD_READ_FLASH
             | CMD_WRITE_FLASH_BLOCK
             | CMD_FINISH_FLASH_BLOCK
+            | CMD_LOAD_DSP_PROGRAM
             | CMD_WRITE_DSP
             | CMD_READ_FLOATS
             | CMD_SET_MUTE
@@ -71,22 +126,30 @@ pub const fn is_known_opcode(byte: u8) -> bool {
             | CMD_SET_DISPLAY_BRIGHTNESS
             | CMD_SET_DISPLAY_IDLE_TIME
             | CMD_SET_DRE
+            | CMD_BLUETOOTH_AT_CMD
+            | CMD_RELOAD_E2PROM_HEADER
             | CMD_SET_CONFIG
             | CMD_COPY_PRESET
             | CMD_WRITE_BIQUAD
             | CMD_READ_HARDWARE_ID
             | CMD_SET_SOURCE
-            | CMD_FIR_LOAD_START
+            | CMD_GET_NUM_FIR_TAPS
             | CMD_FIR_LOAD_DATA
             | CMD_RELOAD_DSP_PARAM
             | CMD_WRITE_FLASH_FULL_ADDR
             | CMD_READ_FLASH_FULL_ADDR
+            | CMD_ENTER_BOOTLOADER
             | CMD_DIRAC_BYPASS
             | CMD_READ_DSP_VERSION
             | CMD_SET_VOLUME
             | CMD_DIRAC_DELAY_GAIN
-            | CMD_SET_HDMI_SOURCE
+            | CMD_READ_DFLASH_ID
+            | CMD_WRITE_DFLASH_ID
+            | CMD_ERASE_FLASH
+            | CMD_COM_FW_UPGRADE
+            | CMD_EARC
             | CMD_LOG_CONTROL
+            | CMD_WISA
             | RESP_OK
             | RESP_EVENT
             | RESP_RESET_COMPLETE
@@ -120,7 +183,7 @@ pub const fn is_write_command(opcode: u8) -> bool {
             | CMD_FIR_LOAD_DATA
             | CMD_RELOAD_DSP_PARAM
             | CMD_LOG_CONTROL
-            | CMD_SET_HDMI_SOURCE
+            | CMD_WRITE_DFLASH_ID
     )
 }
 
@@ -488,9 +551,46 @@ pub fn log_control(enable: bool) -> Vec<u8> {
     vec![CMD_LOG_CONTROL, if enable { 0x01 } else { 0x00 }]
 }
 
-/// Build a SetHdmiSource command (nanoAVR only).
-pub fn set_hdmi_source(source: u8) -> Vec<u8> {
-    vec![CMD_SET_HDMI_SOURCE, source]
+/// Build a `GetNumFirTaps (0x39)` request for one channel.
+///
+/// Device Console uses this as a LIVE readback for the currently available
+/// FIR tap count on a given output (or input, depending on family FIR
+/// topology). The response format is `[0x39][chan][count_u16_be]`; use
+/// [`parse_fir_tap_count_response`] to decode it.
+pub fn get_num_fir_taps(channel: u8) -> Vec<u8> {
+    vec![CMD_GET_NUM_FIR_TAPS, channel]
+}
+
+/// Parse the response to `get_num_fir_taps`. Returns `Some((chan, count))`
+/// when the frame matches `[0x39][chan][count_u16_be]` and `None` otherwise.
+pub fn parse_fir_tap_count_response(payload: &[u8]) -> Option<(u8, u16)> {
+    if payload.len() >= 4 && payload[0] == CMD_GET_NUM_FIR_TAPS {
+        let chan = payload[1];
+        let count = u16::from_be_bytes([payload[2], payload[3]]);
+        Some((chan, count))
+    } else {
+        None
+    }
+}
+
+/// Build a write-to-D-flash command (`0x49`).
+///
+/// **This is not** an HDMI source-switch command. See [`CMD_WRITE_DFLASH_ID`]
+/// for the reversal-of-fortune note. Wire shape is `[0x49][page_u8][32 data bytes]`
+/// per Device Console `dspMessage.js:WriteDFlashIdDspCmd`. Callers must
+/// supply exactly 32 bytes of data or the device will pad with garbage.
+pub fn write_dflash_id(page: u8, data: [u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(34);
+    out.push(CMD_WRITE_DFLASH_ID);
+    out.push(page);
+    out.extend_from_slice(&data);
+    out
+}
+
+/// Build a read-from-D-flash request (`0x46`). Reads 32 bytes of page `page`.
+/// Response format: `[0x46][page][32 data bytes]`.
+pub fn read_dflash_id(page: u8) -> Vec<u8> {
+    vec![CMD_READ_DFLASH_ID, page]
 }
 
 // -- Response parsing --
@@ -558,7 +658,7 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
         | CMD_FIR_LOAD_DATA
         | CMD_RELOAD_DSP_PARAM
         | CMD_LOG_CONTROL
-        | CMD_SET_HDMI_SOURCE
+        | CMD_WRITE_DFLASH_ID
         | RESP_OK => Response::Ack,
 
         _ => Response::Unknown(data.to_vec()),
@@ -1503,6 +1603,73 @@ mod tests {
         match resp {
             Response::Error(data) => assert!(data.is_empty()),
             _ => panic!("expected Error"),
+        }
+    }
+
+    /// Cross-check the SHARC compressor encoding contract against the
+    /// authoritative Device Console XML defaults. The XML stores each field
+    /// as a hex string in big-endian byte order; on the wire we transmit
+    /// float32 little-endian. The two MUST round-trip to the same `f32` value
+    /// — if this test fails, the on-wire encoding has drifted from the
+    /// official format and live writes against real hardware will be wrong.
+    ///
+    /// XML defaults from `app/Audio Firmware/100/DSP_default_parameters.xml`:
+    ///   threshold C1F00000 = -30.0
+    ///   gain      00000000 =  0.0
+    ///   ratio     40800000 =  4.0
+    ///   knee      41A00000 = 20.0
+    ///   atime     42200000 = 40.0 ms
+    ///   rtime     42C80000 = 100.0 ms
+    #[test]
+    fn compressor_xml_defaults_round_trip_through_wire_encoding() {
+        let cases: &[(&str, u32, f32)] = &[
+            ("threshold", 0xC1F00000, -30.0),
+            ("gain", 0x00000000, 0.0),
+            ("ratio", 0x40800000, 4.0),
+            ("knee", 0x41A00000, 20.0),
+            ("atime", 0x42200000, 40.0),
+            ("rtime", 0x42C80000, 100.0),
+        ];
+
+        for (name, xml_word_be, expected_value) in cases {
+            // 1. The XML hex string is the big-endian byte representation of
+            //    the IEEE 754 float32 value. The DSP memory word value is the
+            //    same u32, irrespective of byte order.
+            let from_xml = f32::from_bits(*xml_word_be);
+            assert_eq!(
+                from_xml, *expected_value,
+                "{name}: XML hex 0x{xml_word_be:08X} should decode to {expected_value}"
+            );
+
+            // 2. write_dsp(... value, ...) must produce a frame whose payload
+            //    contains the float32 little-endian bytes. Round-tripping the
+            //    LE bytes back into a u32 LE should yield the same word the
+            //    XML stored.
+            let frame = write_dsp(/*addr*/ 42, *expected_value, /*save*/ true, &Dialect::NEW);
+            assert!(frame.len() >= 8, "{name}: write_dsp frame too short");
+            // Frame layout: [CMD_WRITE_DSP, ctrl, addr_hi, addr_lo, val_le_b0..3]
+            let val_bytes: [u8; 4] = frame[4..8].try_into().unwrap();
+            let wire_word = u32::from_le_bytes(val_bytes);
+            assert_eq!(
+                wire_word, *xml_word_be,
+                "{name}: wire LE word 0x{wire_word:08X} should match XML BE hex 0x{xml_word_be:08X}"
+            );
+
+            // 3. The reverse: ReadFloats decoded as words via decode_word_chunks
+            //    (which is what client.read_param_word uses for compressor reads)
+            //    must produce the same u32, and reinterpreting it as f32 must
+            //    give the original value back.
+            let decoded_words = decode_word_chunks(&val_bytes, 1);
+            assert_eq!(
+                decoded_words,
+                vec![*xml_word_be],
+                "{name}: decode_word_chunks should round-trip"
+            );
+            assert_eq!(
+                f32::from_bits(decoded_words[0]),
+                *expected_value,
+                "{name}: f32::from_bits should reproduce the original value"
+            );
         }
     }
 }

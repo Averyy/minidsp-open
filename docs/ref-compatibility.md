@@ -537,11 +537,16 @@ ignore_advertisements = false
 These are allowed, but they are not part of the compatibility contract unless later promoted here:
 
 - `GET /devices/{id}/config` full config read-back
-- extended `/devices/{id}/config` fields beyond the compatibility request body documented above
+- extended `/devices/{id}/config` fields beyond the compatibility request body documented above (including the optional `polarity_inverted` per routing entry on families whose `RoutingMatrix.polarity_base` is populated — DSP_110 Flex Eight, DSP_113 / DSP_115 Flex HT/HTx, legacy DDRC-88BM)
 - measurement-mode endpoints
 - display endpoints
 - DRE endpoints
 - modification-token endpoints
+- `POST /devices/{id}/preset/copy` (CopyPreset + verifyProgram round-trip — bails before bumping tokens if `0xFFA3` indicates a corrupt save)
+- bass management endpoints for the HT/HTx 113 + 115 firmware variants (returns `501 Not Implemented` on every other family):
+  - `GET /devices/{id}/bm` — full BM snapshot (8 gain channels + 9 × 8 mixer cells, LFE virtual row at index 8)
+  - `POST /devices/{id}/bm/channel/{ch}` — partial patch `{gain_db?, muted?}`
+  - `POST /devices/{id}/bm/mixer/{row}/{col}` — partial patch `{enabled?, gain_db?, polarity_inverted?}`
 - `/debug/*`
 - `/llms.txt`
 - OpenAPI
@@ -557,7 +562,7 @@ Current verification note:
 - Desktop `GET /devices/{id}` is live-verified on the physical 2x4 HD after the 2026-04-10 meter fallback fix: malformed DSP100 meter replies now degrade to `-140 dB` silence instead of stalling compatibility status.
 - Desktop config read-back is implemented, but on DSP100 / 2x4 HD some fields still rely on verified shadow state rather than authoritative live hardware readback. Fresh-daemon `/devices/{id}/config` now clamps bogus low-address DSP100 scalar/tap reads to verified shadow or conservative zero instead of surfacing garbage values.
 - Desktop daemon preset-content writes now also mirror the official app's explicit modification-token save model on the physical 2x4 HD, so `/devices/{id}/config` shadow restore is keyed by a real active-preset freshness marker rather than by raw runtime writes that never touched `0xFFC8`.
-- Desktop daemon can also import missing preset shadow from the official Device Console `setting*.xml` cache when the XML timestamp matches the live device token for that slot. That is part of the controller-side recovery model for DSP100, not a claim of stronger live hardware readback.
+- Desktop daemon can also import missing preset shadow from the official Device Console `setting*.xml` cache when the XML timestamp matches the live device token for that slot and the XML `dspversion` matches the connected DSP family. That is part of the controller-side recovery model for DSP100, not a claim of stronger live hardware readback.
 - Desktop WebSocket compatibility surfaces are live-verified on the physical 2x4 HD: `/devices/{id}?poll=true` sends an immediate status frame, `/devices/{id}?levels=true&poll=true` keeps source writes fast and still allows preset writes to complete, and `/devices/{id}/ws` ignores text frames without breaking framed binary commands.
 - ESP32 `/devices/0/config` is now verified on the physical 2x4 HD for typed scalar read/write behavior and PEQ write/readback through the same PEQ shadow/default model used on desktop when live PEQ `0x14` reads return the all-zero placeholder.
 

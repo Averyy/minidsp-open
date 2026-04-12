@@ -229,9 +229,9 @@ impl PlaybackPlan {
                 let linear_weight = linear_span / LINEAR_LOG_CROSSOVER_HZ;
                 let total_weight = linear_weight + log_octaves;
                 let linear_fraction = linear_weight / total_weight;
-                let linear_samples = (request.sweep.duration * linear_fraction
-                    * request.sample_rate as f32)
-                    .round() as usize;
+                let linear_samples =
+                    (request.sweep.duration * linear_fraction * request.sample_rate as f32).round()
+                        as usize;
                 (linear_samples, LINEAR_LOG_CROSSOVER_HZ)
             } else {
                 (0, sweep_f1)
@@ -718,10 +718,7 @@ fn tone_burst_sample(index: usize, sample_rate: u32, tone: ToneBurstParams) -> f
 /// When `linear_section_samples > 0`, samples `0..linear_section_samples` use
 /// a linear frequency ramp from `sweep_f1` to `log_start_hz`, then the rest
 /// uses a logarithmic sweep from `log_start_hz` to `sweep_f2`.
-fn hybrid_sweep_sample(
-    index: usize,
-    plan: &PlaybackPlan,
-) -> f32 {
+fn hybrid_sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
     let sr = plan.request.sample_rate as f32;
 
     if index < plan.linear_section_samples {
@@ -737,7 +734,9 @@ fn hybrid_sweep_sample(
 
     // Logarithmic sweep section
     let log_index = index - plan.linear_section_samples;
-    let log_samples = plan.raw_sweep_samples.saturating_sub(plan.linear_section_samples);
+    let log_samples = plan
+        .raw_sweep_samples
+        .saturating_sub(plan.linear_section_samples);
     if log_samples == 0 {
         return 0.0;
     }

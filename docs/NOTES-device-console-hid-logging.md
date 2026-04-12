@@ -107,24 +107,108 @@ tools/restore_device_console_app.sh
   - `0x30` biquad/filter writes
 - The captured output-0 compressor edit sequence is now identified:
   - `0x13 0x0016 <- 2/3` for the compressor/FIR-style bypass selector slot
-  - `0x13 0x0028 <- threshold`
-  - `0x13 0x002a <- ratio`
-  - `0x13 0x002c <- attack`
-  - `0x13 0x002d <- release`
+  - `0x13 0x0028 <- threshold (float32-LE, dBFS value e.g. -35.0)`
+  - `0x13 0x002a <- ratio (float32-LE, direct ratio value e.g. 9.9 for 9.9:1)`
+  - `0x13 0x002c <- attack (float32-LE, direct milliseconds e.g. 30.0)`
+  - `0x13 0x002d <- release (float32-LE, direct milliseconds e.g. 220.0)`
+  - all writes use ctrl byte `0x80` (reloadFlag=true) in the 3-byte address prefix
   - those addresses match the repo's DSP100 table, so the remaining compressor gap is not a wrong opcode/address-family choice
+  - knee (0x002b) is present in the device XML with default float32 `20.0` but Device Console never writes it interactively in any captured session — it may be a hardware-only parameter
+  - Device Console **never** reads back compressor param addresses via `0x14` after writing them
 - The interleaved `0x14 0x0046 0x01` polls in that same session are compressor-meter reads (`DSP_100.meters.compressor[0]`), not authoritative parameter readback.
 - The remaining "unknown" command families from that session are now identified:
   - `0x40` is the DSP-version query (`GetDspVersionCmd`)
   - `0x06` is `WriteFlashBlock` and `0x07` is `FinishFlashBlock`
   - on the physical 2x4 HD they appear in the preset-save pipeline as:
-    - `0x06 0x01` / `0x06 0x81` chunks for the `presetVals` block
-    - `0x07 0x01` to finish that block
-    - `0x06 0x02` / `0x06 0x82` chunks for the `presetBypass` block
-    - `0x07 0x02` to finish that block
+    - `0x06 0x01` / `0x06 0x81` chunks for the `presetVals` block (~34,967-byte image)
+    - `0x07 0x01` to finish that block (response: `rx 02 01 01 ...`)
+    - `0x06 0x02` / `0x06 0x82` chunks for the `presetBypass` block (3-byte records: type+flags byte + 16-bit BE address; type 0x01=PEQ, 0x04=BPF/crossover, 0x80 bit set when bypass≠0)
+    - `0x07 0x02` to finish that block (response: `rx 02 02 02 ...`)
     - then `0x05 ff a3 01`, `0x04 ff c8 ....`, and `0x25 slot 0x01`
+  - the `presetVals` block written by "Initialize to default Settings" contains **default** values — it does NOT reflect live-edited values at the time of capture; live `0x13` edits and flash saves are independent operations
 - That means `0x06` / `0x07` are flash-persistence traffic, not the missing authoritative runtime readback path for DSP100 compressor or routing state.
 - The companion `device-console-main-session.log` tightens the same conclusion:
   - it logs `device token is the same as XML token` before update/save decisions
   - after audio-proc updates it logs `MMM: Saving modification-token to device` and then `MMM: Saving modification-token to file`
   - so modification tokens are not passive runtime-state mirrors on this path; the controller explicitly rewrites them as part of its local-state/save model
 - The desktop daemon now mirrors that controller behavior for `/config` and measurement-mode preset-content writes by saving a fresh active-preset token before persisting shadow state.
+
+## FIR Tap Count Model (2026-04-10 RE)
+
+Device Console does NOT read FIR tap count from hardware address `0x0054` (or any other
+parameter-space address). The hardware low-address tap-count slot reads back garbage on DSP100.
+
+Actual model used by Device Console:
+- **Configured taps**: read from local XML `_Taps` values in the saved preset/settings file
+- **Available tap capacity**: queried via opcode `0x39` (`GetNumFirTaps`) — a dedicated command
+  sent before FIR coefficient upload (during `deviceFlash.writeFirTapsToFlash`)
+  - Wire format: `[len=0x03, cmd=0x39, channel_byte, checksum]`
+  - Response: 4-byte DSP message; tap count = `response.readUInt16BE(0x02)`
+  - Example: `[0x04, 0x39, 0x08, 0x00]` → available taps = `0x0800 = 2048`
+  - NOT called during startup/attach; only when FIR data is about to be written
+
+Note: the `[0x39, 0x08, 0x00]` bytes described in `docs/NOTES-cli-verification.md` section 6
+under "FirLoadStart" are the response bytes for this `GetNumFirTaps (0x39)` command. The old
+label "FirLoadStart" was the pre-identification name for what is now confirmed as `0x39`.
+
+## Preset Change Notification (0xAB)
+
+After a `0x25` preset-change command with a non-zero flag byte, the device sends an async
+notification:
+
+- Opcode `0xAB` = `PresetChangeCompleted`
+- Logical payload: just 2 bytes `[0x02, 0xAB]` (the `size=0x02` tells the parser this is the full message)
+- Trailing bytes in the 64-byte HID report buffer are stale/irrelevant and are not decoded
+- `streamDevice.changePresetSlot(preset, flag)`: flag=0 → wait for sync `result-ok`; flag≠0 → wait for async `0xAB`
+- Wire format of `0x25`: `[len=0x04, cmd=0x25, preset_byte, flag_byte, checksum]`
+
+Also: opcode `0xAA` = `ResetCompleted` (async notification after device reset via `0x03`)
+
+## Full Opcode Table (2026-04-10 RE — all confirmed or identified)
+
+Commands confirmed on the physical 2x4 HD in live captures are marked with ★.
+
+| Opcode | Name | Direction | Notes |
+|--------|------|-----------|-------|
+| `0x03` | Reset | TX | Zero payload; `0xAA` async response |
+| `0x04` | WriteFlash | TX | `[addrHB, addrLB, ...data]`; used for token writes ★ |
+| `0x05` | ReadFlash | TX/RX | `[addrHB, addrLB, len]`; returns flash data ★ |
+| `0x06` | WriteFlashBlock | TX | Preset-save pipeline chunk ★ |
+| `0x07` | FinishFlashBlock | TX | Finalizes a flash block (`0x01` or `0x02`) ★ |
+| `0x11` | LoadDspProgram | TX | Raw DSP program chunk (DSP firmware upload only) |
+| `0x13` | LoadDspParam | TX | `[ctrl, addrHB, addrLB, ...4n bytes]`; ctrl=`0x80` reloads ★ |
+| `0x14` | ReadDspParam | TX/RX | `[addrHB, addrLB, wordCount]`; returns DSP words ★ |
+| `0x17` | SetMute (legacy) | TX | Old APK only: `[value]` quick-control |
+| `0x19` | BypassDspFilter | TX | `[enable? 0x80:0x00, addrHB, addrLB, ...]` ★ |
+| `0x1A` | DreStatus | TX/RX | DRE feature; device-specific |
+| `0x1B` | OledIdleTime | TX | `[secs]`; display idle timeout |
+| `0x1E` | SetDreStatus | TX | DRE enable/disable |
+| `0x21` | BluetoothAtCmd | TX/RX | Raw AT command bytes (e.g. `ATI0\r`); Bluetooth devices only |
+| `0x24` | ReloadE2promHdr | TX | Zero payload |
+| `0x25` | ChangePresetSlot | TX | `[preset, flag]`; flag=0 sync, flag≠0 async (0xAB response) ★ |
+| `0x27` | CopyPreset | TX | `[src, dst]`; ~23 s on physical 2x4 HD ★ |
+| `0x30` | SetDspFilterBiquads | TX | `[0x80, addrHB, addrLB, auxHB, auxLB, 5×float32-LE]` ★ |
+| `0x31` | GetHardwareId | TX/RX | Probe read ★ |
+| `0x34` | SetDigitalSource | TX | `[source_id]` ★ |
+| `0x39` | GetNumFirTaps | TX/RX | `[channel]`; response tap count at bytes [2..3] uint16BE |
+| `0x3C` | WriteFlashFullAddr | TX | `[addrB2, addrB1, addrB0, ...≤32 bytes]`; 24-bit address |
+| `0x3D` | ReadFlashFullAddr | TX/RX | `[addrB2, addrB1, addrB0, len≤0x3A]`; 24-bit address |
+| `0x3E` | EnterBootloader | TX | Zero payload; disconnects after send |
+| `0x3F` | BypassFIR (legacy) | TX | Old APK: master FIR bypass `[value]` |
+| `0x40` | GetDspVersion | TX/RX | DSP version query ★ |
+| `0x42` | SetMasterVolume | TX | `[volume_byte]` ★ |
+| `0x45` | DiracDelayGain | TX/RX | Subcommand `0xA1`; reads delay+gain tuples per channel |
+| `0x46` | ReadDFlashId | TX/RX | OTP read; `[selector]` → 32 bytes |
+| `0x49` | WriteDFlashId | TX | OTP write; `[selector, ...32 bytes]` |
+| `0x50` | EraseFlash | TX | Zero payload; standalone flash erase |
+| `0x52` | ComFwUpgrade | TX | XMOS firmware chunks `[phase, 32 bytes]` |
+| `0xAA` | ResetCompleted | RX | Async notification: `[0x02, 0xAA]` |
+| `0xAB` | PresetChangeCompleted | RX | Async notification: `[0x02, 0xAB]` |
+
+## DSP100 Routing Defaults
+
+Confirmed from "Initialize to default Settings" flash-save capture (2026-04-10):
+- Diagonal pattern only: `Input 0 → Output 0` and `Input 1 → Output 1` are active; cross-routes are inactive
+- Selector word encoding: `2 = active`, `1 = inactive`
+- Default values at addresses 6..13: `6=2, 7=1, 8=1, 9=1, 10=1, 11=2, 12=1, 13=1`
+- Routing gain at addresses 32..39: all `0.00000000` (float32 `0x00000000`, i.e. 0 dB)

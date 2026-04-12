@@ -244,7 +244,7 @@ Offset  Len  Field
 | 0x3B | ReloadDspParam | (none) — reload DSP params from flash |
 | 0x3F | DiracBypass | value:u8 (0=enabled, 1=bypassed) |
 | 0x42 | SetVolume | value:u8 (gain = -0.5 × value) |
-| 0x49 | SetHdmiSource | source:u8 | nanoAVR (hw_id 7/8) HDMI input switching — separate from SetSource (0x34) |
+| 0x49 | WriteDFlashId | page:u8, 32 data bytes | Paged write to the secondary "D flash". NOT an HDMI source switch — that was a mislabel inherited from minidsp-rs. Confirmed via Device Console `dspMessage.js:WriteDFlashIdDspCmd` (2026-04-11 RE session). Pair: 0x46 ReadDFlashId. |
 
 **New commands (NOT in minidsp-rs):**
 | Byte | Command | Payload | Notes |
@@ -377,8 +377,11 @@ Match minidsp-rs endpoints + additions:
 | **POST** | **`/devices/:id/display`** | **Set display brightness/idle (NEW)** |
 | **GET** | **`/devices/:id/dre`** | **Read DRE status (NEW)** |
 | **POST** | **`/devices/:id/dre`** | **Set DRE on/off (NEW)** |
-| **POST** | **`/devices/:id/preset/copy`** | **Copy current preset to another slot (NEW)** |
+| **POST** | **`/devices/:id/preset/copy`** | **Copy current preset to another slot, with verifyProgram round-trip (NEW)** |
 | **GET** | **`/devices/:id/tokens`** | **Read modification tokens for all presets (NEW)** |
+| **GET** | **`/devices/:id/bm`** | **Bass-management snapshot (HT 113/115 only) — 8 channels + 9×8 mixer with LFE virtual row (NEW)** |
+| **POST** | **`/devices/:id/bm/channel/:ch`** | **Patch BM gain channel `{gain_db?, muted?}` (HT 113/115 only) (NEW)** |
+| **POST** | **`/devices/:id/bm/mixer/:row/:col`** | **Patch BM mixer cell `{enabled?, gain_db?, polarity_inverted?}` (HT 113/115 only) (NEW)** |
 | **GET** | **`/debug/log`** | **Ring buffer log snapshot — ESP32 (NEW)** |
 | **GET** | **`/debug/info`** | **JSON system diagnostics: heap, WiFi, USB state, uptime (NEW)** |
 | **POST** | **`/debug/level`** | **Change runtime log level (NEW)** |

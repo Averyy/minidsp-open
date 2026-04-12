@@ -112,6 +112,17 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         )
         .route("/devices/{id}/tokens", get(get_tokens))
         .route("/devices/{id}/preset/copy", post(copy_preset))
+        .route("/devices/{id}/bm", get(get_bm_state))
+        .route("/devices/{id}/bm/channel/{ch}", post(set_bm_channel_route))
+        .route(
+            "/devices/{id}/bm/mixer/{row}/{col}",
+            post(set_bm_mixer_cell_route),
+        )
+        .route("/devices/{id}/peq/reset", post(reset_peq_to_defaults))
+        .route(
+            "/devices/{id}/peq/default-frequencies",
+            get(get_default_peq_frequencies),
+        )
         .route("/devices/{id}/ws", get(ws_raw_bridge))
         .route("/openapi.json", get(openapi))
         .route("/llms.txt", get(llms_txt))
@@ -696,6 +707,12 @@ async fn write_config(
                             .set_routing(input.index, route.output, route.enabled, route.gain_db)
                             .await
                             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        if let Some(inverted) = route.polarity_inverted {
+                            client
+                                .set_routing_polarity(input.index, route.output, inverted)
+                                .await
+                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        }
                     }
                 }
             }
@@ -742,15 +759,15 @@ async fn write_config(
                         .await
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
-                // Delay (Duration format: secs + nanos → sample count)
+                // Delay (Duration format: secs + nanos → sample count).
+                // Per-family range clamping lives on the profile so invalid
+                // inputs cannot propagate to the DSP.
                 if let Some(delay) = output.delay {
                     if let Some(delay_addr) = output_ch.delay {
-                        let sample_rate = client.profile().sample_rate as f32;
-                        let samples = (delay.as_secs_f32() * sample_rate)
-                            .round()
-                            .clamp(0.0, 48000.0);
+                        let delay_ms = delay.as_secs_f32() * 1000.0;
+                        let samples = client.profile().delay_ms_to_samples(delay_ms);
                         client
-                            .set_channel_delay_samples(delay_addr, samples as u32)
+                            .set_channel_delay_samples(delay_addr, samples)
                             .await
                             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                     }
@@ -941,6 +958,7 @@ async fn read_config(
                         output: route.output,
                         enabled: route.enabled,
                         gain_db: route.gain_db,
+                        polarity_inverted: route.polarity_inverted,
                     })
                     .collect(),
             ),
@@ -1169,19 +1187,146 @@ async fn get_tokens(
     }
 }
 
+/// `POST /devices/{id}/peq/reset` — write the identity passthrough biquad
+/// to every PEQ band on every input and output channel, mirroring the
+/// official Device Console "Initialize to default Settings" action. Bumps
+/// the active preset's modification token afterwards so any cached client
+/// re-syncs on its next read.
+async fn reset_peq_to_defaults(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let touched = client
+        .reset_all_peq_to_defaults()
+        .await
+        .map_err(client_error_to_status)?;
+    state
+        .persist_device_shadow_after_preset_mutation(&client)
+        .await;
+    Ok(Json(serde_json::json!({
+        "status": "peq_reset",
+        "bands_reset": touched,
+        "default_frequencies_hz": client.default_peq_frequencies(),
+    })))
+}
+
+/// `GET /devices/{id}/peq/default-frequencies` — return the official
+/// Device Console default PEQ band frequency schedule (20, 40, 80, 160,
+/// 320, 640, 1280, 2560, 5120, 10240 Hz). Useful for UI clients that want
+/// to render the same default labels as the official app after a reset.
+async fn get_default_peq_frequencies(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({
+        "frequencies_hz": client.default_peq_frequencies(),
+    })))
+}
+
+async fn get_bm_state(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> ApiResult<Json<minidsp_protocol::status::BmStateConfig>> {
+    let client = get_device_or_404(&state, id).await?;
+    if !client.supports_bass_management() {
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "device does not support bass management",
+        ));
+    }
+    let bm = client
+        .read_bass_management_state()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(bm))
+}
+
+async fn set_bm_channel_route(
+    State(state): State<Arc<DaemonState>>,
+    Path((id, ch)): Path<(usize, u8)>,
+    Json(patch): Json<minidsp_protocol::status::BmChannelPatch>,
+) -> ApiResult<Json<minidsp_protocol::status::BmChannelConfig>> {
+    let client = get_device_or_404(&state, id).await?;
+    if !client.supports_bass_management() {
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "device does not support bass management",
+        ));
+    }
+    client
+        .set_bm_channel(ch, patch)
+        .await
+        .map_err(|e| match e {
+            minidsp::client::ClientError::Unsupported => {
+                ApiError::new(StatusCode::NOT_IMPLEMENTED, e.to_string())
+            }
+            _ => ApiError::internal(e.to_string()),
+        })?;
+    let updated = client
+        .read_bm_channel(ch)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    state
+        .persist_device_shadow_after_preset_mutation(&client)
+        .await;
+    Ok(Json(updated))
+}
+
+async fn set_bm_mixer_cell_route(
+    State(state): State<Arc<DaemonState>>,
+    Path((id, row, col)): Path<(usize, u8, u8)>,
+    Json(patch): Json<minidsp_protocol::status::BmMixerCellPatch>,
+) -> ApiResult<Json<minidsp_protocol::status::BmMixerCellConfig>> {
+    let client = get_device_or_404(&state, id).await?;
+    if !client.supports_bass_management() {
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "device does not support bass management",
+        ));
+    }
+    client
+        .set_bm_mixer_cell(row, col, patch)
+        .await
+        .map_err(|e| match e {
+            minidsp::client::ClientError::Unsupported => {
+                ApiError::new(StatusCode::NOT_IMPLEMENTED, e.to_string())
+            }
+            _ => ApiError::internal(e.to_string()),
+        })?;
+    let updated = client
+        .read_bm_mixer_cell(row, col)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    state
+        .persist_device_shadow_after_preset_mutation(&client)
+        .await;
+    Ok(Json(updated))
+}
+
 async fn copy_preset(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    // CopyPreset is followed by a verifyProgram read at 0xFFA3 to confirm the
+    // device persisted the destination preset cleanly. A status byte > 0x0D
+    // means the flash write failed and the cached preset is corrupt — bail
+    // before bumping the modification token so we don't lie to clients about
+    // a successful save.
     client
-        .raw_command(
-            minidsp_protocol::commands::copy_preset(true),
-            minidsp::queue::Priority::Critical,
-        )
+        .copy_preset_verified()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    state.persist_device_shadow(&client).await;
+        .map_err(client_error_to_status)?;
+    // CopyPreset overwrites the destination preset's contents — that's a real
+    // preset mutation, not a transient master-status change. Bump the active
+    // preset's modification token so any client (Device Console, ezBEQ) that
+    // had a cached `<timestamp>` for it correctly detects the drift on next
+    // read instead of trusting stale state.
+    state
+        .persist_device_shadow_after_preset_mutation(&client)
+        .await;
     Ok(StatusCode::OK)
 }
 

@@ -160,7 +160,7 @@ This is now implemented in `minidsp-open`, and the generated coverage artifacts 
 
 ### For nanoAVR / nanoAVR HDA:
 
-No config.xml exists anywhere. These devices use HDMI source switching (command 0x49, not 0x34). Without a config.xml or a packet capture from a device owner, only basic support (volume/mute/source/preset) is possible. This matches minidsp-rs's current state.
+No config.xml exists anywhere. minidsp-rs historically claimed that HDMI source switching on these devices used opcode `0x49`, but that label was speculative and never verified on hardware. Device Console reverse engineering on 2026-04-11 (`app/app-extracted/build/src/dspMessage.js`) confirms `0x49` is actually `WriteDFlashId` — a paged write to the secondary D-flash — and the real HDMI / eARC source switching path is the `CMD_EARC` (0x53) sub-command family. Without a real packet capture from a nanoAVR owner, only basic support (volume/mute/source/preset) is possible, and any sightings of `0x49` in the wild for this family should be treated as D-flash writes, not source switches.
 
 ## Probe Mapping (hw_id, dsp_version -> Device)
 

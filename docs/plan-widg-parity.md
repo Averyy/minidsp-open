@@ -19,12 +19,13 @@ over USB HID.
 What it **does** do — and this is the reason to ship it:
 
 1. **Device Console auto-discovers minidsp-open on any LAN with zero config.**
-2. **Device Console can drive the full DSP feature set through our bridge.**
-   The Wi-DG is a transparent 64-byte pipe with zero DSP logic — our bridge
-   is the same. So whatever features Device Console supports on a real
-   Wi-DG, it supports through our bridge. This gives users a supported
-   fallback for any feature our own API doesn't cover yet — effectively a
-   feature-coverage safety net.
+2. **Target end state: Device Console drives the full DSP feature set through our bridge.**
+   The Wi-DG is a transparent 64-byte pipe with zero DSP logic, and our
+   bridge is intended to be the same. Once the remaining bridge-parity and
+   end-to-end Device Console verification work closes, whatever features
+   Device Console supports on a real Wi-DG should support through us. That
+   is the intended feature-coverage safety net; it is not a claim that
+   today's bridge parity is already fully verified.
 3. **Turns the desktop daemon into a rack-mounted Wi-DG replacement.** Any
    Linux/macOS/Windows box with one or more USB MiniDSPs attached becomes
    an N-device Wi-DG substitute with zero configuration.
@@ -154,17 +155,21 @@ doesn't see the device or fails to identify it.
 
 **Current state:** `app-esp32/src/wifi.rs:27` — `SOFTAP_SSID = "minidsp-setup"`.
 
-**Target state:** `miniDSP-Wi-DG_XXYYZZ` where `XXYYZZ` is the last 3 MAC
-bytes in uppercase hex. See `docs/ref-widg-reimplementation.md` §3.1,
-derived from Wi-DG's `/etc/uci-defaults/51_linkit_config` behavior at first
-boot reading `/dev/mtd2` offset 0x07 and formatting uppercase-hex.
+**Target state:** `miniDSP-open_XXYYZZ` where `XXYYZZ` is the last 3 MAC
+bytes in uppercase hex. This deliberately self-identifies as minidsp-open
+rather than masquerading as a real Wi-DG — Device Console discovery is
+driven by the UDP 3999 beacon, not the SoftAP SSID, so self-identifying
+here costs nothing in compatibility and is more honest to users. The
+MAC-suffix format matches Wi-DG's `/etc/uci-defaults/51_linkit_config`
+derivation (last 3 bytes of WiFi MAC at factory MTD2 offset 0x07,
+uppercase hex).
 
 **Specific changes:**
 
 1. **`app-esp32/src/wifi.rs`** — remove `SOFTAP_SSID` constant.
 2. **`app-esp32/src/wifi.rs`** — add `softap_ssid()` helper that reads the
    current WiFi MAC (ESP-IDF `esp_wifi_get_mac` or `esp_read_mac`), takes
-   the last 3 bytes, formats as `format!("miniDSP-Wi-DG_{:02X}{:02X}{:02X}", b[3], b[4], b[5])`.
+   the last 3 bytes, formats as `format!("miniDSP-open_{:02X}{:02X}{:02X}", b[3], b[4], b[5])`.
 3. Callers get the SSID dynamically at provisioning-mode entry instead of
    at constant-init time.
 
@@ -177,14 +182,20 @@ boot reading `/dev/mtd2` offset 0x07 and formatting uppercase-hex.
 - SoftAP LAN IP: ESP-IDF default `192.168.4.1`
 - DHCP pool: ESP-IDF default
 
-**Target state:** Wi-DG spec §3.1 — hostname `miniDSP-Wi-DG`, LAN IP
-`192.168.100.1/24`, DHCP `192.168.100.100–192.168.100.249`, 12 h lease.
+**Target state:** netif hostname `miniDSP-open` (advertised via DHCP
+option 12 on STA, seen in router client lists); LAN IP `192.168.100.1/24`,
+DHCP `192.168.100.100–192.168.100.249`, 12 h lease (matches Wi-DG spec
+§3.1 for the network plumbing). The mDNS hostname is deliberately
+different (`minidsp`, resolves as `minidsp.local`) and is set in P1-1 —
+see rationale there.
 
 **Specific changes:**
 
-1. **`app-esp32/src/main.rs`** — replace hostname formatting with fixed
-   constant `"miniDSP-Wi-DG"`. Applies to both `esp_netif_set_hostname`
-   and mDNS hostname.
+1. **`app-esp32/src/main.rs`** — replace the `minidsp-{serial}` hostname
+   formatting with fixed constant `"miniDSP-open"` and call
+   `esp_netif_set_hostname` with it. This is the DHCP-option-12 identity.
+   Do NOT reuse this constant for mDNS — P1-1 sets mDNS hostname
+   independently.
 2. **`app-esp32/src/wifi.rs`** — in SoftAP init, explicitly set:
    - `ip_info.ip = 192.168.100.1`
    - `ip_info.netmask = 255.255.255.0`
@@ -293,40 +304,52 @@ the same LAN, confirm the daemon shows up in the device list.
 - [ ] Hexdump of a single emitted beacon exactly matches the 72-byte table
       in `beacon.md` §1 (magic bytes, field offsets, 0xFF padding, MAC, IP,
       hw_id, dsp_no, SN, device name).
-- [ ] ESP32 SoftAP SSID matches the regex `^miniDSP-Wi-DG_[0-9A-F]{6}$`.
+- [ ] ESP32 SoftAP SSID matches the regex `^miniDSP-open_[0-9A-F]{6}$`.
 - [ ] ESP32 SoftAP clients get an IP in `192.168.100.100–.249`.
 
 ---
 
-## P1 — Wi-DG fingerprint match (~5 h)
+## P1 — Wi-DG structural parity, minidsp-open branding (~5 h)
 
-These items are not required for Device Console control, but they make a
-real Wi-DG and our firmware indistinguishable to everything on the LAN
-short of deep code inspection.
+These items are not required for Device Console control. They mirror
+Wi-DG's **structural** LAN behavior (mDNS service advertisement, HTTPS
+redirect, DHCP hostname, appliance-mode beacon semantics) so that every
+LAN-level protocol feature a real Wi-DG exposes is also exposed by our
+firmware, while our identity strings deliberately self-identify as
+minidsp-open rather than masquerading as a real Wi-DG.
 
 ### P1-1 — mDNS hostname + service type  ~1 h
 
 **Current state:** `app-esp32/src/main.rs:382-438` — `start_mdns()`
 advertises hostname `minidsp-{serial}` with service type `_minidsp._tcp:5380`.
 
-**Target state:** hostname `miniDSP-Wi-DG`, service type `_http._tcp:80`
-with TXT record `path=/`. Service instance name can be anything — we
-deliberately skip the `LinkIt Smart7688 WebUI on miniDSP-Wi-DG` fingerprint
-because the `LinkIt Smart7688` prefix is a MiniDSP oversight we're not
-obligated to reproduce.
+**Target state:** mDNS hostname `minidsp` (resolves as `minidsp.local`),
+service type `_http._tcp:80` with TXT record `path=/`. Service instance
+name can be anything — we deliberately skip the
+`LinkIt Smart7688 WebUI on miniDSP-Wi-DG` fingerprint because the
+`LinkIt Smart7688` prefix is a MiniDSP oversight we're not obligated to
+reproduce.
+
+Note: the mDNS hostname (`minidsp`) is intentionally distinct from the
+ESP32 netif hostname set in P0-3 (`miniDSP-open`). mDNS hostname drives
+`<name>.local` resolution; netif hostname drives DHCP option 12 /
+router client-list display. `minidsp.local` is the user-facing URL;
+`miniDSP-open` is the router-side identity.
 
 **Specific changes:**
 
-1. **`app-esp32/src/main.rs`** — hostname from `minidsp-{serial}` →
-   `"miniDSP-Wi-DG"` (shared with P0-3 — make it a single constant).
+1. **`app-esp32/src/main.rs:start_mdns()`** — set mDNS hostname to
+   `"minidsp"` via `mdns.set_hostname()`. Do NOT reuse the P0-3
+   netif-hostname constant — these are independent.
 2. **`app-esp32/src/main.rs:start_mdns()`** — change service type from
    `_minidsp._tcp:5380` → `_http._tcp:80`. Add TXT record `path=/`.
-3. **Desktop:** if we have mDNS support there (needs verification), mirror
-   the same service advertisement. If we don't, add it via the `mdns-sd`
-   crate. Desktop mDNS is optional but nice-to-have.
+
+Multi-instance collisions on `minidsp.local` are handled at runtime by
+mDNS RFC 6762 §9 conflict resolution (second host auto-bumps to
+`minidsp-2.local`, etc.).
 
 **Validation:** `dns-sd -B _http._tcp` on macOS should show our device.
-`dns-sd -G v4 miniDSP-Wi-DG.local` should resolve. `curl http://miniDSP-Wi-DG.local/`
+`dns-sd -G v4 minidsp.local` should resolve. `curl http://minidsp.local/`
 should hit our HTTP server.
 
 ### P1-2 — HTTP→HTTPS redirect on port 80  ~1 h
@@ -343,28 +366,66 @@ Wi-DG behavior. HTTPS on 443 with self-signed ECDSA cert.
    whose sole handler returns `302` with the `Location` header.
 2. **`app-esp32/src/http_server.rs`** — second EspHttpServer on :443 with
    TLS using an ESP-IDF generated or bundled ECDSA-P256 cert
-   (`CN=miniDSP-Wi-DG`, validity 3650 d). Cert key pair generated at
+   (`CN=miniDSP-open`, validity 3650 d). Cert key pair generated at
    first boot and persisted in NVS; regenerated if missing.
-3. **`app-esp32/src/http_server.rs`** — add `Server: miniDSP-Wi-DG` header
-   to all responses (intentional branding).
+3. **`app-esp32/src/http_server.rs`** — add `Server: miniDSP-open` header
+   to all responses (explicit self-identification).
 
 **Note:** We deliberately do NOT replicate Wi-DG's RSA-1024 `L=Uknown`
 typo subject. We use ECDSA-P256 with a clean subject line.
 See `app/widg-re/server-fingerprint.md` §2.
 
-### P1-3 — Desktop mDNS  ~1 h
+### P1-3 — Desktop mDNS service type + hostname rename  ~30 min
 
-Same as ESP32 via `mdns-sd` crate. Only if not already implemented.
+**Current state:** `daemon/src/mdns.rs` already advertises via the
+`mdns-sd` crate, but with our own identity:
+- `SERVICE_TYPE = "_minidsp._tcp.local."`
+- hostname `minidsp-{serial}.local.`
+- instance name `{product_name} ({serial})`
+- port = HTTP API port (5380)
+- TXT records: `hw_id`, `dsp_version`, `serial`, `product`
+
+**Target state:** mirror the ESP32 P1-1 deltas so that ESP32 and desktop
+daemon both appear under `_http._tcp` with hostname `minidsp.local.` +
+TXT `path=/`. This aligns the two targets on the same URL regardless of
+which one answers first.
+
+**Specific changes:**
+
+1. **`daemon/src/mdns.rs`** — change `SERVICE_TYPE` from
+   `_minidsp._tcp.local.` to `_http._tcp.local.`.
+2. **`daemon/src/mdns.rs`** — hostname → `"minidsp"` (shared constant
+   with ESP32 P1-1; distinct from the desktop daemon's internal
+   `miniDSP-open` identity because mDNS drives `.local` resolution).
+3. **`daemon/src/mdns.rs`** — TXT record set reduced to `path=/` only.
+
+**Port decision:** the desktop daemon serves its HTTP API on 5380, not
+80. Advertise port 5380 under `_http._tcp` — this diverges from the
+stock Wi-DG's port-80 advertisement, but keeps our working API as the
+single entry point (no new port-80 listener to add). Document the
+divergence in the TXT record if useful (e.g., `path=/`, no port
+override). If a future item needs strict byte-for-byte parity, it can
+add a separate port-80 redirect listener then.
+
+**Multi-instance note:** running two desktop daemons — or a desktop
+daemon plus an ESP32 — on the same LAN will trigger mDNS RFC 6762 §9
+conflict resolution (second instance auto-bumps to `minidsp-2.local.`
+at runtime). This is acceptable default behavior; a `--mdns-hostname`
+config flag can be added later if power users need deterministic names.
+
+**Validation:** `dns-sd -B _http._tcp` on macOS shows the daemon;
+`dns-sd -G v4 minidsp.local` resolves to the daemon host's IP;
+`curl http://minidsp.local:5380/` hits the HTTP API.
 
 ### P1-4 — DHCP client hostname option 12  ~30 min
 
 **Current state:** ESP32 doesn't advertise its hostname via DHCP when it
 joins a user's STA network. Wi-DG doesn't either — but we should.
 
-**Target state:** Send DHCP option 12 = `miniDSP-Wi-DG` whenever the
+**Target state:** Send DHCP option 12 = `miniDSP-open` whenever the
 ESP32's STA interface requests an address from an upstream router. This
 makes the device visible in the router's client list with a meaningful
-name.
+self-identified name.
 
 **Specific changes:**
 
@@ -389,13 +450,15 @@ match.
 ### P1 completion criteria
 
 - [ ] `curl -I http://<device>/` returns `302 Location: https://<device>/`
-      with `Server: miniDSP-Wi-DG`.
-- [ ] `curl -Ik https://<device>/` returns `200` with `Server: miniDSP-Wi-DG`.
-- [ ] TLS cert subject is `CN=miniDSP-Wi-DG`, ECDSA-P256 signature.
-- [ ] `dns-sd -B _http._tcp` shows the device; `dns-sd -G miniDSP-Wi-DG.local`
+      with `Server: miniDSP-open`.
+- [ ] `curl -Ik https://<device>/` returns `200` with `Server: miniDSP-open`.
+- [ ] TLS cert subject is `CN=miniDSP-open`, ECDSA-P256 signature.
+- [ ] `dns-sd -B _http._tcp` shows the device; `dns-sd -G v4 minidsp.local`
       resolves.
+- [ ] `curl http://minidsp.local/` hits the ESP32 HTTP server
+      (and `curl http://minidsp.local:5380/` hits the desktop daemon).
 - [ ] Upstream router DHCP log shows the STA interface requesting with
-      hostname `miniDSP-Wi-DG`.
+      hostname `miniDSP-open`.
 - [ ] Hexdump of an appliance-mode beacon has `0xFF` at offsets 0x12–0x17
       and 0x23–0x47.
 

@@ -19,10 +19,12 @@ control-surface workstream" section there.
 The concrete value of this spec is:
 
 1. **Device Console auto-discovers minidsp-open on any LAN with zero config.**
-2. **Device Console drives the full DSP feature set through our bridge**
-   (because the bridge is transparent, so every feature Device Console
-   supports on a real Wi-DG works through us — effectively a
-   feature-coverage safety net for anything our own API hasn't implemented yet).
+2. **Target end state: Device Console drives the full DSP feature set through our bridge**
+   (because the bridge is intended to be transparent, so once the remaining
+   bridge-parity and end-to-end Device Console verification work closes,
+   every feature Device Console supports on a real Wi-DG should work
+   through us — effectively a feature-coverage safety net for anything our
+   own API hasn't implemented yet).
 3. **Desktop daemon becomes a rack-mounted Wi-DG replacement** for any
    host running Linux/macOS/Windows with one or more USB MiniDSPs attached.
 
@@ -213,9 +215,14 @@ on the wire.
 | STA mode               | Dual-mode `apcli0` AP-client on MediaTek proprietary wireless stack. After provisioning, the AP remains up and STA joins the user's network simultaneously. |
 | STA credential store   | UCI (`wireless.sta.ssid` / `wireless.sta.key`) persisted in the JFFS2 overlay |
 
-ESP32 implementation must replicate: SSID template (identical format and
-case), open AP by default, LAN IP `192.168.100.1`, DHCP range, fixed
-hostname `miniDSP-Wi-DG`, the dual-mode AP+STA concurrent operation.
+ESP32 implementation must replicate the **structural** behavior: same
+SSID template format with MAC suffix (but using `miniDSP-open_XXYYZZ`
+instead of `miniDSP-Wi-DG_XXYYZZ` for self-identification), open AP by
+default, LAN IP `192.168.100.1`, DHCP range, the dual-mode AP+STA
+concurrent operation. Our netif hostname is `miniDSP-open` (DHCP option
+12, router client list) and our mDNS hostname is `minidsp` (resolves as
+`minidsp.local`) — both diverge from Wi-DG's `miniDSP-Wi-DG` label
+deliberately.
 
 **Security note: the factory firmware ships with open WiFi AND empty root SSH
 password AND WAN input=ACCEPT.** Our reimplementation should fix all three
@@ -399,8 +406,9 @@ The Wi-DG advertises **three stock services** — `_http._tcp:80`,
 discovery is UDP 3999 broadcast only; mDNS plays no role in it.
 
 **ESP32 requirement.** Publish `_http._tcp:80` (or :443) with TXT record
-`path=/` at hostname `miniDSP-Wi-DG.local`. Skip `_ssh._tcp` and `_smb._tcp`.
-This is sufficient for the web UI to be reachable via `.local` names.
+`path=/` at mDNS hostname `minidsp` (resolves as `minidsp.local`). Skip
+`_ssh._tcp` and `_smb._tcp`. This is sufficient for the web UI to be
+reachable via `.local` names.
 
 **mDNS service-name fingerprint.** The Wi-DG's Avahi service files name the
 instances as literal strings containing `"LinkIt Smart7688"`:
@@ -412,12 +420,12 @@ instances as literal strings containing `"LinkIt Smart7688"`:
 
 A client that fingerprints mDNS by instance name can distinguish a real Wi-DG
 from most alternatives by looking for the `LinkIt Smart7688` prefix. **ESP32
-decision:** we will NOT copy this fingerprint (using `miniDSP-Wi-DG` as the
-instance name instead) because (a) it's a LinkIt brand reference MiniDSP
-never cleaned up, and (b) Device Console does not parse mDNS at all
-(discovery is UDP 3999 only). A future scanner built specifically to detect
-"is this a real Wi-DG" would fail on our firmware — this is acceptable and
-arguably desirable for branding clarity.
+decision:** we will NOT copy this fingerprint (using `miniDSP-open` as the
+mDNS instance name instead) because (a) the `LinkIt Smart7688` prefix is a
+brand reference MiniDSP never cleaned up, and (b) Device Console does not
+parse mDNS at all (discovery is UDP 3999 only). A future scanner built
+specifically to detect "is this a real Wi-DG" would fail on our firmware —
+this is acceptable and arguably desirable for branding clarity.
 
 ### 3.7 Server fingerprint details (uhttpd / dropbear / TLS)
 
@@ -481,12 +489,14 @@ does NOT advertise DHCP option 12 (hostname) unless explicitly configured,
 and the Wi-DG's UCI config does not configure it. Upstream routers that log
 DHCP client hostnames will see no name for the Wi-DG.
 
-**ESP32 deviations (intentional, for security):**
-- Mint a fresh ECDSA-P256 TLS cert with subject `CN=miniDSP-Wi-DG`. Do NOT
+**ESP32 deviations (intentional, for security and self-identification):**
+- Mint a fresh ECDSA-P256 TLS cert with subject `CN=miniDSP-open`. Do NOT
   replicate the `L=Uknown` typo or the 1024-bit RSA key.
 - Skip SSH entirely (no Dropbear on ESP32).
-- DHCP client should advertise hostname `miniDSP-Wi-DG` via option 12.
-- Send `Server: miniDSP-Wi-DG` HTTP header for explicit identification.
+- DHCP client should advertise hostname `miniDSP-open` via option 12.
+- Send `Server: miniDSP-open` HTTP header for explicit identification.
+- mDNS hostname is `minidsp` (resolves as `minidsp.local`) — distinct
+  from the netif/DHCP/TLS identity so the user-facing URL stays short.
 
 ### 3.8 USB HID boot-time queries (required to fill beacon)
 
@@ -818,12 +828,13 @@ minidsp-open.
 
 ### Core (required for Device Console parity)
 
-- [ ] WiFi SoftAP with `miniDSP-Wi-DG_XXYYZZ` SSID template (open AP — factory
+- [ ] WiFi SoftAP with `miniDSP-open_XXYYZZ` SSID template (open AP — factory
       default — with an ESP32-side opt-in to upgrade to WPA2-PSK).
 - [ ] WiFi STA provisioning via the management web UI with UCI-equivalent
       persistence (NVS).
 - [ ] LAN IP `192.168.100.1/24`, DHCP server `.100–.249`, 12 h lease.
-- [ ] Hostname `miniDSP-Wi-DG`.
+- [ ] Netif hostname `miniDSP-open` (DHCP option 12 / router client list).
+- [ ] mDNS hostname `minidsp` (resolves as `minidsp.local`).
 - [ ] mDNS advertise `_http._tcp:80` with TXT `path=/`.
 - [done] USB host with MiniDSP VID/PID filter (12-entry table from §4.3).
 - [done] USB HID interrupt transfer OUT/IN at 64 bytes.
@@ -876,13 +887,13 @@ raw pipe, will not.
 | SoftAP encryption                 | **None (open)**                                       | **WPA2-PSK** with printed-on-label password                  |
 | Root SSH                          | **Enabled, empty password, 0.0.0.0:22**               | **Disabled entirely**                                         |
 | WAN firewall input                | `input=ACCEPT` (all ports open on STA uplink)         | Match LAN policy; explicit rules for 5333, 80, 443           |
-| TLS cert                          | Self-signed **RSA-1024**, `L=Uknown` typo             | Self-signed **ECDSA-P256**, `CN=miniDSP-Wi-DG`                |
+| TLS cert                          | Self-signed **RSA-1024**, `L=Uknown` typo             | Self-signed **ECDSA-P256**, `CN=miniDSP-open`                 |
 | TLS cert validity                 | 730 days                                              | 3650 days (avoids nuisance re-gen)                            |
 | `/www/log-minidsp.txt`            | Unauthenticated, public HTTP                          | Authenticated only (or removed)                               |
 | `/alexa/status.json`              | Public HTTP — leaks auth token                        | N/A (Alexa skipped Phase 1)                                   |
 | Port 8080 re-link trigger         | `0.0.0.0:8080`, no auth                               | N/A (Alexa skipped Phase 1)                                   |
-| `Server:` HTTP header             | Omitted (no identification)                           | `Server: miniDSP-Wi-DG` (explicit branding)                   |
-| DHCP client hostname              | Not advertised (empty option 12)                      | Advertises `miniDSP-Wi-DG`                                    |
+| `Server:` HTTP header             | Omitted (no identification)                           | `Server: miniDSP-open` (explicit self-identification)         |
+| DHCP client hostname              | Not advertised (empty option 12)                      | Advertises `miniDSP-open`                                     |
 | USB fd synchronization            | No locking (race between TCP and USB threads)        | Proper mutex or single-consumer model                         |
 | USB timeout retry                 | Tight loop, no yield, no bound                        | Yield + bounded retry                                         |
 | Process supervision               | None — crash = dead until reboot                      | ESP task watchdog + restart                                   |

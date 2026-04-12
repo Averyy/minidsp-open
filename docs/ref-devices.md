@@ -42,7 +42,7 @@ Current reality:
 - the physical 2x4 HD is the golden device for shared protocol/control debugging right now
 - official-app imports and `minidsp-rs` references define the intended matrix, but they do not overrule live 2x4 HD read/write behavior when the shared implementation disagrees
 - broader support claims must stay tied to extracted official-app evidence until more hardware exists
-- the daemon now also uses token-matched official Device Console `setting*.xml` files as a state-recovery source for DSP100-style fresh-attach gaps, but that is still controller-side reconstruction, not a blanket claim that every device has authoritative live readback
+- the daemon now also uses token-matched, DSP-family-matched official Device Console `setting*.xml` files as a state-recovery source for DSP100-style fresh-attach gaps, but that is still controller-side reconstruction, not a blanket claim that every device has authoritative live readback
 - all 13 exact modern Device Console HW/DSP pairs are currently represented in `probe.rs`
 - the importer-backed protocol tests already caught and corrected DSP 100 and DSP 101/105 table mistakes, so the generated artifacts are now an active guardrail rather than passive notes
 - the generated legacy metadata now captures source-backed FIR/compressor/meter/PEQ coverage plus inferred old-dialect topology from cached `config.xml` files
@@ -94,8 +94,8 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | 4 | miniSHARC 4x8 / 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | APK groups hw_id 4 with 1 and 5 for sources; minidsp-rs maps `(4, _) -> MSharc4x8`. Likely shared hw_id. |
 | 5 | 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | |
 | 6 | DDRC-88BM | TOSLINK, SPDIF | dsp_version=95, new dialect (SHARC). Not in APK or Device Console. minidsp-rs maps `(6, 95) -> DDRC88BM`. |
-| 7 | nanoAVR (variant) | Has HDMI source switching (cmd 0x49) | |
-| 8 | nanoAVR HDA | Has HDMI source switching (cmd 0x49) | minidsp-rs #569, partially broken |
+| 7 | nanoAVR (variant) | HDMI input switching path unknown | Previously documented as "cmd 0x49" per minidsp-rs, but that opcode was re-identified as `WriteDFlashId` via Device Console RE on 2026-04-11. Real HDMI switching is likely via `CMD_EARC` (0x53) sub-commands; not yet verified. |
+| 8 | nanoAVR HDA | HDMI input switching path unknown | minidsp-rs #569 sent cmd 0x49, which we now know writes a D-flash page instead of switching source. Not recommended until we have a verified hardware capture. |
 | 18 | SHD Studio (variant) | TOSLINK, SPDIF, AES-EBU, USB, LAN | APK groups with hw_id 17. Not in Device Console. Likely older or regional SHD Studio SKU. |
 | 11 | C-DSP 8x12 v2 | TOSLINK, SPDIF | dsp_version=97, new dialect (SHARC despite legacy hw_id). minidsp-rs maps `(11, 97) -> C8x12v2`. APK groups with hw_id 2 for sources. |
 

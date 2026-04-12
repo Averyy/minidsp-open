@@ -220,10 +220,7 @@ impl Transport for HidTransport {
                         return Ok(payload.clone());
                     }
 
-                    tracing::warn!(
-                        "HID: undecodable input packet ({} bytes), skipping",
-                        n
-                    );
+                    tracing::warn!("HID: undecodable input packet ({} bytes), skipping", n);
                 }
             })
             .await

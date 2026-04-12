@@ -97,6 +97,11 @@ pub struct RoutingConfigJson {
     pub output: u8,
     pub enabled: bool,
     pub gain_db: f32,
+    /// Per-cell polarity inversion. Only honored on families whose
+    /// `RoutingMatrix.polarity_base` is populated (Flex Eight, Flex HT/HTx,
+    /// DDRC-88BM). `None` leaves the cell's polarity untouched.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub polarity_inverted: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

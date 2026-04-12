@@ -394,6 +394,7 @@ pub fn start(
     // POST /devices/0/config — full config write (PEQ, gain, mute, delay, polarity, master)
     {
         let st = state.clone();
+        let nvs_clone = nvs.clone();
         server.fn_handler("/devices/0/config", Method::Post, move |mut req| {
             let dev = match get_device(&st) {
                 Some(d) => d,
@@ -686,11 +687,10 @@ pub fn start(
                             };
                             debug!("config write output[{idx}] delay_secs -> {secs}");
                             if let Some(delay_addr) = output_ch.delay {
-                                let sample_rate = dev.profile().sample_rate as f32;
-                                let samples =
-                                    (secs as f32 * sample_rate).round().clamp(0.0, 48000.0);
+                                let delay_ms = secs as f32 * 1000.0;
+                                let samples = dev.profile().delay_ms_to_samples(delay_ms);
                                 if let Err(e) =
-                                    dev.set_channel_delay_samples(delay_addr, samples as u32)
+                                    dev.set_channel_delay_samples(delay_addr, samples)
                                 {
                                     return send_error(req, 500, &format!("set_delay: {e}"));
                                 }
@@ -709,13 +709,18 @@ pub fn start(
                 }
             }
 
+            // Bulk-commit boundary: once a full ezBEQ profile has landed, snapshot
+            // the in-memory PEQ shadow to NVS so a reboot doesn't discard it on
+            // selector-unreliable hardware. Errors are logged inside the helper.
+            dev.save_peq_shadow_to_nvs(&nvs_clone);
+
             info!("POST /devices/0/config completed");
             send_empty_200(req)
         })?;
     }
 
-    // Display, DRE, tokens, preset copy
-    register_device_feature_routes(&mut server, state.clone())?;
+    // Display, DRE, tokens, preset copy, measurement-mode
+    register_device_feature_routes(&mut server, state.clone(), nvs.clone())?;
 
     // Debug / diagnostics endpoints
     register_debug_routes(&mut server, state.clone(), nvs.clone())?;
@@ -810,7 +815,7 @@ pub fn start(
                     <h2 style=\"color:#53c28b\">WiFi credentials saved!</h2>\
                     <p>Device will restart and connect to your network.</p>\
                     </body></html>";
-        let headers = [("Content-Type", "text/html")];
+        let headers = [("Server", "miniDSP-open"), ("Content-Type", "text/html")];
         let mut resp = req.into_response(200, None, &headers)?;
         resp.write_all(html.as_bytes())?;
         // Schedule restart after response is sent
@@ -1248,6 +1253,7 @@ fn register_preset_routes(
 fn register_device_feature_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    nvs: EspDefaultNvsPartition,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     // GET /devices/0/display
     {
@@ -1378,6 +1384,52 @@ fn register_device_feature_routes(
         })?;
     }
 
+    // POST /devices/0/measurement-mode — snapshot PEQ state and bypass every
+    // band so a REW sweep hits the device unfiltered.
+    {
+        let st = state.clone();
+        let nvs = nvs.clone();
+        server.fn_handler("/devices/0/measurement-mode", Method::Post, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            let _op = dev.begin_operation();
+            match dev.enter_measurement_mode() {
+                Ok(()) => {
+                    dev.save_peq_shadow_to_nvs(&nvs);
+                    send_json(req, 200, r#"{"status":"measurement_mode_active"}"#)
+                }
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
+    // POST /devices/0/measurement-mode/restore — roll back PEQ state to the
+    // snapshot taken by the last POST /measurement-mode.
+    {
+        let st = state.clone();
+        let nvs = nvs.clone();
+        server.fn_handler(
+            "/devices/0/measurement-mode/restore",
+            Method::Post,
+            move |req| {
+                let dev = match get_device(&st) {
+                    Some(d) => d,
+                    None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                };
+                let _op = dev.begin_operation();
+                match dev.restore_measurement_mode() {
+                    Ok(()) => {
+                        dev.save_peq_shadow_to_nvs(&nvs);
+                        send_json(req, 200, r#"{"status":"measurement_mode_restored"}"#)
+                    }
+                    Err(e) => send_error(req, 500, &e.to_string()),
+                }
+            },
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1394,6 +1446,7 @@ pub fn send_json<C: esp_idf_svc::http::server::Connection>(
     body: &str,
 ) -> Result<(), C::Error> {
     let headers = [
+        ("Server", "miniDSP-open"),
         ("Content-Type", "application/json"),
         ("Access-Control-Allow-Origin", "*"),
     ];
@@ -1407,6 +1460,7 @@ fn send_text<C: esp_idf_svc::http::server::Connection>(
     text: &str,
 ) -> Result<(), C::Error> {
     let headers = [
+        ("Server", "miniDSP-open"),
         ("Content-Type", "text/plain; charset=utf-8"),
         ("Access-Control-Allow-Origin", "*"),
     ];
@@ -1420,6 +1474,7 @@ fn send_html<C: esp_idf_svc::http::server::Connection>(
     html: &str,
 ) -> Result<(), C::Error> {
     let headers = [
+        ("Server", "miniDSP-open"),
         ("Content-Type", "text/html"),
         ("Access-Control-Allow-Origin", "*"),
     ];
@@ -1433,6 +1488,7 @@ fn send_redirect<C: esp_idf_svc::http::server::Connection>(
     location: &str,
 ) -> Result<(), C::Error> {
     let headers = [
+        ("Server", "miniDSP-open"),
         ("Location", location),
         ("Content-Type", "text/html"),
         ("Cache-Control", "no-store"),
@@ -1452,6 +1508,7 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
 ) -> Result<(), C::Error> {
     let headers = [
+        ("Server", "miniDSP-open"),
         ("Access-Control-Allow-Origin", "*"),
         (
             "Access-Control-Allow-Methods",
@@ -1468,7 +1525,10 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
 fn send_empty_200<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
 ) -> Result<(), C::Error> {
-    let headers = [("Access-Control-Allow-Origin", "*")];
+    let headers = [
+        ("Server", "miniDSP-open"),
+        ("Access-Control-Allow-Origin", "*"),
+    ];
     let mut resp = req.into_response(200, None, &headers)?;
     resp.write_all(b"")?;
     Ok(())
@@ -1545,7 +1605,7 @@ fn send_provision_error<C: esp_idf_svc::http::server::Connection>(
          <p><a href=\"/\">Back to setup</a></p>\
          </body></html>"
     );
-    let headers = [("Content-Type", "text/html")];
+    let headers = [("Server", "miniDSP-open"), ("Content-Type", "text/html")];
     let mut resp = req.into_response(400, None, &headers)?;
     resp.write_all(html.as_bytes())?;
     Ok(())
@@ -2665,6 +2725,7 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
         _ => "application/octet-stream",
     };
     let headers = [
+        ("Server", "miniDSP-open"),
         ("Content-Type", content_type),
         ("Access-Control-Allow-Origin", "*"),
         ("Cache-Control", "public, max-age=3600"),

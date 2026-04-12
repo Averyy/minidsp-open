@@ -80,14 +80,19 @@ Reason: the current DSP100 runtime readback is not authoritative for these paths
 - desktop daemon routing state is now restored cleanly across process restarts because verified selector shadow is persisted by device serial
 - desktop daemon FIR tap count is now restored cleanly across process restarts for the same reason, even though the live DSP100 tap-count slot still reads back as `0`
 
-## Not verified cleanly / likely bugs
+## Not verified cleanly / likely methodology issue
 
-- output compressor parameter writes
-  - the official Device Console capture confirms the real desktop app uses the same plain `0x13` DSP100 write family we use for compressor edits
-  - captured output-0 compressor writes map cleanly to `bypass=22`, `threshold=40`, `ratio=42`, `attack=44`, `release=45`
-  - the same capture only shows repeated `0x14 0x0046 0x01 -> 0.0` polls around those writes, i.e. compressor meter reads, not authoritative parameter readback
-  - the companion official app session log also repeatedly reports `setItemVal(COMP_3_0_*) has no change in value` around those edits, which matches the live suspicion that this is not an opcode-family mismatch
-  - threshold changed in the live readback used during testing, but ratio / attack / release still did not show the expected changes there
+- output compressor parameter writes (beyond threshold/gain)
+  - **Protocol encoding is confirmed correct** (2026-04-10 RE session, multiple capture angles):
+    - All compressor params use opcode `0x13`, ctrl=`0x80` (reloadFlag=true), 3-byte address prefix
+    - ratio writes as raw float32-LE ratio value (e.g., `9.9` → `66 66 1e 41`)
+    - attack writes as raw float32-LE milliseconds (e.g., `30.0` → `00 00 f0 41`)
+    - release writes as raw float32-LE milliseconds (e.g., `220.0` → `00 00 5c 43`)
+    - addresses match our `DSP100_OUTPUTS` table exactly
+    - Device Console never reads back these addresses via `0x14` after writing; only polls compressor meter at `0x0046`
+  - **"no change in value" explained**: Device Console's `userPreset.setItemVal()` compares against its in-memory `singleValues` cache, not live hardware. If the cached value matches what's being set, the hardware write is skipped. This is a DC-internal optimization, not a hardware limitation.
+  - **Most likely remaining cause**: the default compressor threshold is `-30 dBFS`, which is too quiet to trigger audible compression on typical test signals. The compressor will only have a measurable effect if the signal exceeds the threshold.
+  - **Next step**: audible retest on loud material with compressor enabled (status=2) and threshold set to trigger. This is a test methodology issue, not a protocol investigation item.
 - direct PEQ coefficient verification
   - raw direct reads at the PEQ addresses returned zeros during the test run, so the write could not be proven from that path alone
 
@@ -122,22 +127,17 @@ Reason: the current DSP100 runtime readback is not authoritative for these paths
 Priority target where current behavior still appears to drift from minidsp-rs without a clear reason:
 
 1. compressor parameter writes
-   - current CLI path writes threshold / ratio / attack / release as plain DSP floats
-   - upstream minidsp-rs and the extracted official-app compressor path both still use plain `0x13` scalar writes here, so the remaining drift is not explained by a switch back to `0x30`
-   - the captured official app session on the physical 2x4 HD explicitly wrote output-0 `threshold=40`, `ratio=42`, `attack=44`, `release=45`, and toggled bypass/status at `22`
-   - live readback only showed threshold changing in the test pass
-   - a full direct-USB scan of the exposed `0..34959` DSP/config space on 2026-04-09 tightened this further:
-     - distinctive raw writes to `COMP_5_0_ratio`, `COMP_5_0_atime`, and `COMP_5_0_rtime` did not appear anywhere in the exposed address space
-     - sending `ReloadDspParam` immediately after those writes still left the live compressor block unchanged
-     - the same pass still showed `COMP_5_0_threshold` landing correctly, so this is not a generic `0x13` failure
-   - direct 2026-04-09 replay with upstream `minidsp-rs` on the same physical 2x4 HD also only moved `threshold`; immediate typed-word readback still left `ratio / attack / release = 0`
-  - forcing compressor bypass `off` first did not change that result on the tested hardware
-  - desktop daemon `/config` now persists output compressor `bypass`, `threshold`, `ratio`, `attack`, `release`, and `gain` through a fresh daemon restart on the physical 2x4 HD via token-gated scalar shadow restore, so the app/daemon no longer depend on same-client CLI state for compressor visibility
-  - the desktop daemon now also mirrors the official app's explicit token-save behavior after preset-content `/config` mutations, so those persisted compressor values are tagged with a fresh active-preset modification token instead of relying on stale EEPROM token state
-  - the official app's nearby `0x14 0x0046 0x01` polls decode as compressor meter reads, not a parameter-readback path, so the remaining issue is now narrowed to effect/readback/state recovery rather than opcode selection
-  - likely causes to check:
-    - the physical 2x4 HD firmware ignores or virtualizes some of the exposed XML-defined slots even though threshold / gain still work
-    - authoritative compressor state is still not exposed through the simple `0x14` path, and the decoded official `0x06` / `0x07` preset-save flow does not fill that gap
+   - **Protocol is confirmed correct** (2026-04-10 RE — see `docs/NOTES-device-console-hid-logging.md`)
+   - All compressor params use opcode `0x13`, ctrl=`0x80`, raw float32-LE values:
+     - ratio: direct ratio value (e.g., 9.9 for 9.9:1)
+     - attack/release: direct milliseconds (e.g., 30.0 ms)
+     - threshold: direct dBFS (e.g., -35.0)
+   - Device Console never reads back these addresses after writing; only polls the compressor meter at `0x0046`
+   - The "no change in value" session log messages are Device Console's in-memory cache comparison, not hardware readback
+   - **Most likely cause of prior test failure**: default threshold `-30 dBFS` is too quiet to trigger compression on the test signal. Compressor effect is only audible when the signal exceeds the threshold.
+   - **Status**: protocol gap is closed. Remaining work is an audible retest on loud material — this is a test methodology item, not a protocol investigation item.
+   - desktop daemon `/config` now persists output compressor `bypass`, `threshold`, `ratio`, `attack`, `release`, and `gain` through a fresh daemon restart on the physical 2x4 HD via token-gated scalar shadow restore
+   - the desktop daemon now also mirrors the official app's explicit token-save behavior after preset-content `/config` mutations
 
 4. low-address typed reads
    - the physical 2x4 HD returns short `ReadFloats` replies in the selector/status range that are valid for typed-word callers but nonsensical as float payloads
@@ -163,11 +163,19 @@ Priority target where current behavior still appears to drift from minidsp-rs wi
 
 6. FIR load sequencing
    - output FIR definitions for DSP100 / 2x4 HD were missing initially; desktop output FIR was therefore incorrectly treated as unsupported until the shared table was fixed
-   - the physical 2x4 HD returns `FirLoadStart` size bytes as big-endian; `[0x39, 0x08, 0x00]` means `0x0800 = 2048`, not `8`
+   - the physical 2x4 HD returns `GetNumFirTaps (0x39)` response bytes as big-endian; `[0x04, 0x39, 0x08, 0x00]` means `readUInt16BE(2) = 0x0800 = 2048` available taps, not `8`
+     - opcode `0x39` is `GetNumFirTaps` — confirmed from `dspMessage.js` RE (2026-04-10)
+     - wire format: `[len=0x03, cmd=0x39, channel_byte, checksum]`; response: 4-byte DSP message, tap count at bytes [2..3] uint16BE
+     - called before FIR coefficient upload (in `deviceFlash.writeFirTapsToFlash`), NOT during startup
    - the physical 2x4 HD returns the `FirLoadEnd (0x3B)` `Ack` seconds after the packet is sent
    - before the 2026-04-09 queue fix, the shared queue treated each 500 ms receive poll timeout as a hard command failure, so FIR load end timed out even though the device later ACKed it
    - a direct 2026-04-09 replay with upstream `minidsp-rs` on the same physical 2x4 HD reproduced the delayed bare `[0x01]` `FirLoadEnd` ack and still timed out there
    - after the queue + parser fixes in this repo, desktop `POST /devices/0/config` FIR writes return `200`, raw coefficient readback shows the requested taps landing on the real device, and `/config` reports `active_taps` correctly both before and after a fresh daemon restart
+   - FIR tap count model (confirmed from Device Console RE, 2026-04-10):
+     - Device Console does NOT read hardware address `0x0054` for tap count (never appears in any capture)
+     - configured taps come from local XML `_Taps` values in the saved preset/settings file
+     - available tap capacity comes from opcode `0x39` (GetNumFirTaps), queried during FIR writes
+     - the hardware low-address tap-count slot at index 84 reads back garbage on DSP100 — this is a known hardware limitation
    - remaining drift:
      - authoritative live tap-count readback still falls back to `0` on the physical 2x4 HD
      - the desktop daemon now masks that hardware limitation with persisted verified shadow so `/config` stays useful across reconnects
@@ -243,7 +251,7 @@ Items that are different but currently have a defensible reason:
 
 Before doing another broad CLI validation pass:
 
-1. Fix compressor parameter write behavior, or prove the remaining discrepancy is readback-only.
+1. ~~Fix compressor parameter write behavior, or prove the remaining discrepancy is readback-only.~~ **CLOSED 2026-04-10**: Protocol encoding is confirmed correct by multi-angle RE. Remaining work is audible retest on loud material (threshold must be exceeded).
 2. Improve authoritative readback coverage for selector-style DSP100 state, or treat those paths as write-shadow/audio-verified only.
    - fresh-client FIR/compressor bypass is now fixed
    - fresh-client routing state and FIR `active_taps` now restore cleanly on the desktop daemon via persisted verified shadow
@@ -268,7 +276,7 @@ Before doing another broad CLI validation pass:
 
 - **Item stays open** but the address/polarity question is now settled. Direct capture of the Device Console editing Output 1 compressor on a clean-default preset (2026-04-10 session) confirmed our addresses match exactly: threshold=`0x800028`, ratio=`0x80002a`, attack=`0x80002c`, release=`0x80002d`, status=`0x800016` with `2=enabled`/`3=bypassed`. These match `DSP100_OUTPUTS` in `protocol/src/device/dsp.rs` exactly.
 - The bypass polarity for compressor status (`2=on`, `3=off`) is already correct in `minidsp/src/client.rs:1109-1110` with a matching comment.
-- Likely remaining cause: default threshold `-30 dB` is too quiet to trigger audible compression on the signal used in prior tests. Next step is an audible retest on loud material, not more protocol investigation.
+- Likely remaining cause: default threshold `-30 dB` is too quiet to trigger audible compression on the signal used in prior tests. Next step is an audible retest on loud material; if that still fails, reopen protocol/timing investigation rather than assuming the control path is finished.
 
 ## Pause State
 
@@ -276,6 +284,9 @@ Before doing another broad CLI validation pass:
 - `0x40` is the DSP-version query, not an unknown state opcode.
 - Device Console writes compressor edits through the same `0x13` DSP100 slots this repo already uses and still polls only the compressor meter path nearby.
 - Device Console also compares XML/device modification tokens and explicitly writes a fresh active-preset token after preset-content updates; the desktop daemon now mirrors that behavior for `/config` and measurement-mode mutations.
-- **DSP100 authoritative-state reverse engineering task is closed (2026-04-10).** The official app has the same workaround rule we do; there is no stronger readback path to find.
+- **DSP100 authoritative-state reverse engineering task is closed (2026-04-10).** In current captures, extracted desktop sources, and current RE, the official app shows the same workaround rule we do: token-matched XML cache or initialize defaults when no cache exists. No stronger readback path has been found so far.
 - **TCP bridge write-ack framing wire-format bug is fixed (2026-04-10).** Python TCP client confirms response sizes and first-byte opcodes are now valid. End-to-end verification against the official Device Console Electron app is still pending.
-- Remaining DSP100 gap: compressor parameter effect/readback parity beyond threshold/gain. Addresses and polarity are now confirmed correct; the remaining issue is most likely test methodology rather than protocol mismatch.
+- Remaining DSP100 gap: compressor parameter effect/readback parity beyond threshold/gain. Addresses, polarity, and encoding are now all confirmed correct by multi-angle RE (2026-04-10); the remaining issue is test methodology (signal too quiet to trigger the compressor), not protocol mismatch. Next step: audible retest on loud material with compressor enabled and threshold set to trigger.
+- **New opcode 0x39 = GetNumFirTaps** confirmed from Device Console source RE (2026-04-10). Queried during FIR coefficient upload (not startup). Wire format in NOTES-device-console-hid-logging.md.
+- **0xAB = PresetChangeCompleted** async notification after `0x25` with non-zero flag. Payload-less (2-byte logical frame). Handled in our queue already.
+- **Routing defaults confirmed**: diagonal pattern (in0→out0=active, in1→out1=active, cross-routes=inactive). Selector word 2=active, 1=inactive.

@@ -12,19 +12,38 @@ Permanent technical detail belongs in:
 
 ## Current Status
 
+- 2026-04-11 control-surface additions for the HT/HTx launch story plus a corrected EEPROM constant (live verified on the physical 2x4 HD):
+  - **0xFFA9 mislabel fixed**: `protocol/src/eeprom.rs` previously declared `SELECTABLE_AUDIO_SOURCES_ADDR = (0xFF, 0xA9)` with a 32-byte size. Live dump on the 2x4 HD plus the deobfuscated Device Console `dspMessage.js` (`AudioSrcChangedMsg`) confirmed `0xFFA9` is a 1-byte unsolicited notification address — not a source list. Constant renamed to `AUDIO_SRC_CHANGED_NOTIFICATION_ADDR`. The real selectable-source descriptor lives at `0xFFEA` (`AudioSrcSelectMsg`, max 32 source IDs, 1 byte each) and now has its own `AUDIO_SRC_SELECT_ADDR` / `AUDIO_SRC_SELECT_MAX_SOURCES` constants. Both addresses return uninitialized flash on the 2x4 HD because that family has fixed sources; the descriptor only matters on HT-class devices and the parser is intentionally deferred until an HT is on the bench.
+  - **verifyProgram post-save check** added to mirror Device Console's `userPreset.js verifyProgram()` flow: `protocol/src/eeprom.rs` exposes `is_verify_program_ok(byte)` (status `<= 0x0D`); `minidsp/src/client.rs` adds `read_verify_program_status()` and `copy_preset_verified()`; the desktop `POST /devices/{id}/preset/copy` route now bails with a typed error before bumping tokens if the device reports a corrupt save; `app-esp32/src/device.rs::copy_preset` does the same on the firmware side. Live verified: `POST /devices/0/preset/copy` returns `200 OK` and a direct `dump-flash 0xFFA3 1` reads back `0x00` (well under the failure threshold).
+  - **Bass management client API** wired for the HT 113/115 firmware variants. `minidsp/src/client.rs` now exposes `supports_bass_management`, `read_bass_management_state`, `read/set_bm_channel`, `set_bm_channel_gain`, `set_bm_channel_mute`, `read/set_bm_mixer_cell` against the existing `BassManagement` / `BmMatrixMixer` address tables (incl. the LFE virtual row at index 8). HTTP routes: `GET /devices/{id}/bm`, `POST /devices/{id}/bm/channel/{ch}`, `POST /devices/{id}/bm/mixer/{row}/{col}` — all return `501 Not Implemented` on non-HT families. CLI: new `minidsp bm status | channel <ch> [--gain DB] [--mute on|off] | mixer <row> <col> [--enable on|off] [--gain DB] [--invert on|off]`. Smoke tested on the 2x4 HD: refusal path returns `device does not support bass management (HT 113/115 firmware only)`. New protocol tests pin the 9×8 base addresses (status @ 56, gain @ 128, polarity @ 200) and confirm only DSP_113 / DSP_115 expose the block. Underlying `BassManagement` / `BmMatrixMixer` address tables were already validated against `app/Audio Firmware/113/DSP_default_parameters.xml` lines 159..271 in the previous RE session.
+  - **Per-cell routing polarity exposure** completes the routing contract gap on families whose `RoutingMatrix.polarity_base` is populated (DSP_110 Flex Eight, DSP_113 / DSP_115 Flex HT/HTx, legacy DDRC-88BM). `RoutingConfig` and `RoutingConfigJson` gained an `Option<bool> polarity_inverted` field; `MiniDspClient::set_routing_polarity` returns `Unsupported` on families without `polarity_base`; the bulk `/devices/{id}/config` write path applies polarity when set; `minidsp input <ch> routing <out> <gain> --invert on|off` exposes it on the CLI. Live verified: `--invert on` against the 2x4 HD (DSP_100, no polarity_base) correctly errors with `unsupported operation for this device`; plain routing without `--invert` still succeeds.
+  - Full test suite stays green after all four changes (`cargo test -p minidsp-protocol -p minidsp -p minidsp-daemon`: ~250 tests, 0 failed). New tests: `is_verify_program_ok_boundary`, `bm_matrix_addresses_are_contiguous_and_lfe_row_marked`, `only_ht_families_expose_bass_management`.
+  - Open follow-ups (deliberately deferred): typed parser for the `0xFFEA` selectable-source descriptor (needs an HT-class device on the bench to confirm byte layout); advanced Dirac control surface (mux_bypass / dirac_delay / mixer_fir / fir-ctrl / iir-ctrl) — still needs an RE session for the address table.
 - TCP bridge write-response framing is fixed and verified on the physical 2x4 HD (2026-04-10):
   - the official MiniDSP Device Console discovered the daemon via UDP broadcast and crashed immediately on every write command with `Error: Unexpected DSP command code 1`
   - root cause: `protocol/src/packet.rs::decode_hid_response` was returning all 63 trailing bytes of the HID buffer for the `0x01`-prefix unframed-echo case instead of trimming to the actual echo length
   - fix: `minidsp/src/queue.rs::execute_queued_command` now trims the response to `cmd.payload.len()` when the request opcode is a write command and the oversized response first byte matches the request first byte; same trim applied in `app-esp32/src/device.rs::raw_command`
   - Python TCP client verification on the physical 2x4 HD: `WriteDSP` response shrank from 64 bytes to 9 bytes, `SetVolume` from 64 to 3 bytes, `SetMute` from 64 to 3 bytes; `ReadHardwareId` and `ReadFloats` responses unchanged at 12 bytes each
 - 2026-04-10 first-attach experiment with the official Device Console against the physical 2x4 HD (see `app/minidsp-snapshots/20260410-firstattach-experiment/`) confirmed:
-  - there is no hidden authoritative readback path for DSP100 routing / compressor / FIR state; the official app when starting with no local cache offers only "Initialize to default Settings" or "Disconnect" — the same limitation as our shadow fallback model
+  - no stronger authoritative readback path has been found so far for DSP100 routing / compressor / FIR state; the official app when starting with no local cache offers only "Initialize to default Settings" or "Disconnect" — the same limitation as our shadow fallback model
   - "Initialize to default Settings" is app-driven: the app reads defaults from its bundled XML and writes them via the `0x06` flash-block pipeline (2204 `0x06` writes in the captured session); there is no device-side reset opcode
+  - extracted desktop sources and captured session logs are consistent with the same controller-side model: token-matched `setting*.xml` state keyed by modification token (`timestamp`) plus explicit modification-token save-to-device and save-to-file after preset-content writes
   - preset names are client-side XML only (`<customname>` in the app's local `setting*.xml`); zero device writes occur on a rename
   - compressor bypass polarity confirmed: `2 = enabled`, `3 = bypassed/off` (distinct from routing polarity which uses `1/2`); our code at `minidsp/src/client.rs:1109-1110` already has the correct polarity
-  - compressor param addresses for all four outputs confirmed to match our `DSP100_OUTPUTS` table in `protocol/src/device/dsp.rs` exactly: threshold=`0x800028`, ratio=`0x80002a`, attack=`0x80002c`, release=`0x80002d`, status enable=`0x800016`
+  - compressor param table for all four outputs matches our `DSP100_OUTPUTS` table in `protocol/src/device/dsp.rs`, including knee=`0x80002b`; the 2026-04-10 edit capture directly exercised threshold=`0x800028`, ratio=`0x80002a`, attack=`0x80002c`, release=`0x80002d`, status enable=`0x800016`, and the official XML/cache entries cover knee
   - our UDP discovery packets correctly advertise the daemon to the official Device Console; it treats the daemon as a legitimate network-attached MiniDSP
   - experiment artifacts archived at `app/minidsp-snapshots/20260410-firstattach-experiment/` (HID capture `device-console-firstattach.jsonl`, Device Console cache states before and after)
+- 2026-04-10 deep RE session (codex-dobby multi-angle): full Device Console JS source + APK + Wi-DG + all captures analyzed:
+  - **Compressor encoding confirmed end-to-end**: ratio, attack, release are raw float32-LE values via opcode `0x13` ctrl=`0x80`; no special conversion formula. Example live writes from capture: ratio `9.9` → `66 66 1e 41`, attack `30.0 ms` → `00 00 f0 41`, release `220.0 ms` → `00 00 5c 43`. These are direct UI values, not scaled integers.
+  - **"no change in value" explained**: Device Console's `userPreset.setItemVal()` compares against its in-memory `singleValues` cache; if cached value matches, hardware write is skipped. Not a hardware limitation. The prior test was likely trying to write default values back to a device already at defaults.
+  - **Compressor investigation CLOSED as test-methodology issue**: the remaining likely cause is that default threshold `-30 dBFS` is too quiet to trigger audible compression on the test signal. Audible retest on loud material is the next step, not further protocol RE.
+  - **FIR tap count model confirmed**: Device Console does NOT read hardware address `0x0054`. Configured taps come from local XML `_Taps`. Available capacity queried via opcode `0x39` (`GetNumFirTaps`): wire format `[len=0x03, cmd=0x39, channel, cksum]`; response tap count at bytes [2..3] uint16BE.
+  - **0x39 = GetNumFirTaps confirmed**: called during FIR write operations (not startup). Identical to what NOTES-cli-verification called "FirLoadStart" — now correctly identified.
+  - **0xAB = PresetChangeCompleted confirmed**: 2-byte async notification `[0x02, 0xAB]` sent after `0x25` with non-zero flag. Trailing HID bytes are stale buffer, not payload. `0x25` with flag=0 gets synchronous `result-ok` instead.
+  - **Routing defaults confirmed from "Initialize to defaults" 0x06 capture**: diagonal pattern only — `in0→out0` (addr 6=2) and `in1→out1` (addr 11=2) active; cross-routes (addr 7,8,9,10,12,13=1) inactive. All gain slots = float32 0.0.
+  - **Wi-DG confirmed as transparent 64-byte pass-through**: no DSP protocol logic, no extra framing. TCP 5333 = raw 64-byte HID pipe. UDP beacon = 72 bytes every 5 s, field-by-field breakdown in `docs/ref-widg-reimplementation.md`.
+  - **Preset-bypass block format confirmed**: `0x06 0x02` flash block contains 3-byte records: `[type+flags_byte, addrHB, addrLB]`; type `0x01`=PEQ, `0x04`=BPF/crossover/custom, `0x80` bit set when bypass value is nonzero.
+  - **Full opcode table compiled**: see `docs/NOTES-device-console-hid-logging.md` for the complete table including `0x03`, `0x11`, `0x17`, `0x24`, `0x39`, `0x3C`, `0x3D`, `0x3E`, `0x45`, `0x46`, `0x49`, `0x50`, `0x52`, `0xAA`, `0xAB`.
 - Desktop `/devices/{id}/config` is fixed and verified on the physical 2x4 HD.
 - Desktop `GET /devices/{id}` was re-verified on 2026-04-10 on the physical 2x4 HD:
   - malformed DSP100 meter reads are now treated as best-effort and clamp to `-140 dB` silence instead of stalling the compatibility status surface
@@ -34,7 +53,7 @@ Permanent technical detail belongs in:
   - live HTTP verification on the physical 2x4 HD confirmed output-0 gain/delay/compressor ratio/attack/release plus input-0 gain and routing edits through `/devices/0/config`
   - the scalar-shadow path still survives a full daemon restart for those non-authoritative DSP100 fields on preset `0`
   - fresh low-address DSP100 reads can still return bogus raw words like `0x4A039901` at compressor/FIR slots, so `/config` now clamps those fields to verified shadow or conservative `0` instead of surfacing garbage values
-  - when local shadow is missing for a preset, the daemon can now import the official Device Console `setting*.xml` snapshot for that preset if its XML timestamp matches the live hardware modification token, which lets fresh daemon attaches recover sane routing/FIR/compressor state from the official app's own saved preset data instead of guessing
+  - when local shadow is missing for a preset, the daemon can now import the official Device Console `setting*.xml` snapshot for that preset if its XML timestamp matches the live hardware modification token and its `dspversion` matches the connected DSP family, which lets fresh daemon attaches recover sane routing/FIR/compressor state from the official app's own saved preset data instead of guessing
 - Desktop `/devices/{id}/play` is now implemented with the shared `PlaybackPlan` / `PlaybackGenerator` path used by ESP32.
 - Desktop `/play` now uses the shared REW/MSO-style measurement sweep defaults (`5-400 Hz` hybrid sweep, `2 s` low-level dither pre-silence, `2 s` post-silence, `16-bit`) instead of the retired subwoofer-only baseline.
 - Desktop playback backend is smoke-tested on local speakers: the default sweep plays audibly through the CPAL path and reports a real `startedAtUs` timestamp.
@@ -234,9 +253,11 @@ minidsp-open a drop-in replacement for MiniDSP's Wi-DG networking
 appliance so the stock MiniDSP Device Console auto-discovers us on any
 LAN with zero config (UDP 3999 beacon + TCP 5333 bridge), and so the
 desktop daemon becomes an N-device rack-mounted Wi-DG replacement. Does
-not fix any DSP control-surface gap — see items below — but provides a
-feature-coverage safety net because Device Console can drive the full DSP
-feature set through our bridge for anything our own API hasn't covered.
+not fix any DSP control-surface gap — see items below — but should become
+a feature-coverage safety net once the remaining Device Console bridge
+verification closes, because Device Console ought to be able to drive the
+same DSP feature set through our bridge that it can drive through a real
+Wi-DG.
 
 Plan + spec:
 - `docs/plan-widg-parity.md` — phased implementation plan
@@ -297,14 +318,12 @@ and TEST-04 after P1.
 ### DSP control-surface (our own HTTP 5380 / CLI / ezBEQ API)
 
 - [ ] Treat `docs/NOTES-cli-verification.md` as the top-priority investigation checklist until the remaining CLI compatibility drifts are explained or fixed.
-- [ ] Investigate DSP100 / 2x4 HD compressor parameter drift from minidsp-rs:
-  - threshold and gain appear to write
-  - ratio / knee / attack / release still do not show the expected live effect
-  - the 2026-04-09 full-space direct-USB scan found no landing address anywhere in the exposed `0..34959` param space for distinctive ratio / attack / release writes, even after `ReloadDspParam`
-  - direct 2026-04-09 replay with upstream `minidsp-rs` on the same physical 2x4 HD matched this repo's result even with compressor bypass disabled first
-  - the official app session log also repeatedly reports `setItemVal(COMP_3_0_*) has no change in value` around those edits while polling only the compressor meter path, so the remaining gap still looks like effect/readback semantics on the hardware path rather than a missing write opcode family
-  - fresh-daemon 2026-04-10 checks still show low-address DSP100 reads are not authoritative enough to close this: `debug dump-word 43 1` returned `1` and FIR tap-count `debug dump-word 84 1` returned `0x4A039901` on the same physical 2x4 HD
-  - 2026-04-10: direct capture of the official Device Console editing Output 1 compressor on a clean-default preset confirmed our addresses and bypass polarity exactly match the captured writes: threshold=`0x800028`, ratio=`0x80002a`, attack=`0x80002c`, release=`0x80002d`, status enable=`0x800016` with value `2=on`/`3=off`. These match our `DSP100_OUTPUTS` table in `protocol/src/device/dsp.rs` exactly. The remaining gap is most likely test methodology — default threshold `-30 dB` is too quiet to trigger audible compression on the signal used in prior tests. The next step is an audible retest on loud material, not more protocol investigation.
+- [x] ~~Investigate DSP100 / 2x4 HD compressor parameter drift from minidsp-rs~~ **CLOSED 2026-04-10 (protocol gap)**: Multi-angle RE session (Device Console JS source, APK, Wi-DG, all captures) confirmed:
+  - compressor ratio, attack, release write as raw float32-LE via opcode `0x13` ctrl=`0x80` — same as this repo already does
+  - "no change in value" session log messages = Device Console in-memory cache comparison, not hardware readback; the prior test was likely writing default values back to a device already at defaults
+  - Device Console never reads back compressor params after writing; only polls compressor meter at address `0x0046`
+  - **Most likely prior test failure cause**: default threshold `-30 dBFS` is too quiet to trigger audible compression on typical test signals
+  - **Remaining item (methodology, not protocol)**: audible retest on loud material with compressor enabled and threshold set to trigger. Open as audio-verification item below.
 - [ ] Capture or otherwise verify the physical output duration of ESP32 `/play` on the real 2x4 HD now that software timing and repeated-play stability are characterized.
 - [ ] Validate the new shared `/play` default signal on the real sub and keep iterating until it sounds like a normal smooth low-frequency sweep:
   - the previous measurement-bundle default (`5-500 Hz`, `24-bit`, `2 s` preamble, `80 Hz` tone burst, `0.2 s` gap, `2 s` decay, hidden guard-band expansion) was retired after it produced repeated `BRAP` bursts on hardware
@@ -322,7 +341,7 @@ and TEST-04 after P1.
 - [x] Make DSP100 / 2x4 HD routing-state read-back survive fresh desktop daemon reconnects via persisted verified shadow keyed by device serial
 - [x] Make DSP100 / 2x4 HD FIR `active_taps` read-back survive fresh desktop daemon reconnects via persisted verified shadow keyed by device serial
 - [x] ~~Continue DSP100 / 2x4 HD authoritative-state reverse engineering so fresh-client `/devices/{id}/config` can eventually prefer real hardware readback over persisted shadow for routing and FIR tap count~~
-  - **CLOSED 2026-04-10:** the first-attach experiment with the official Device Console against the physical 2x4 HD definitively proved no such authoritative readback path exists. When the official app has no local cache for a device, it offers only "Initialize to default Settings" or "Disconnect" — the same workaround rule we use: token-matched XML cache, fall back to "initialize defaults" if no cache. There is no hidden readback opcode to find.
+  - **CLOSED 2026-04-10:** no stronger authoritative readback path has been found in the first-attach experiment, the extracted desktop sources, the captured session logs, or the current Ghidra pass. When the official app has no local cache for a device, it offers only "Initialize to default Settings" or "Disconnect", and the extracted `userPreset` / `userPresetMgr` flow is consistent with the same token-matched `setting*.xml` cache plus explicit modification-token save model we now mirror. Treat this as strong current evidence, not a mathematical proof that no hidden opcode exists anywhere.
 - [ ] Decide whether the desktop daemon's UDP discovery should advertise when bridging a local USB device. The 2026-04-10 experiment showed the official Device Console discovers the daemon via UDP broadcast and (until the TCP bridge fix) crashed when using the network path. Even with the TCP bridge fix, there is still a question of whether broadcasting a local-USB-bridge daemon is desirable behavior or should be opt-in (e.g., a `--no-advertise-local` flag).
 - [ ] End-to-end verify the official MiniDSP Device Console Electron app against the TCP bridge fix (2026-04-10):
   - Python TCP client wire-level verification on the physical 2x4 HD already confirmed the response sizes are now correct and the `Unexpected DSP command code 1` crash signature can no longer be produced by our bridge
@@ -331,10 +350,12 @@ and TEST-04 after P1.
   - If anything still crashes, capture the HID log and compare it against the Python wire-level verification to identify any remaining Device-Console-specific framing quirks
   - This task closes `docs/todo-checker.md` Section 4.2 entries 2 and 3 (the UDP discovery entry is already closed)
 - Reference capture for 2026-04-10 Device Console first-attach findings: `app/minidsp-snapshots/20260410-firstattach-experiment/` (HID capture `device-console-firstattach.jsonl`, Device Console cache states before and after).
+- [ ] Audible retest of compressor on loud material: enable compressor (status=2), set threshold high enough to trigger (e.g. -20 dBFS), verify ratio/attack/release have audible effect. This is the last remaining compressor item — the protocol is fully confirmed correct.
 - [ ] Implement the first pass of learnings from `app/minidsp-console-app-log.jsonl`
   - turn the canonical raw capture into labeled fixtures for the command families we already support (`0x04`, `0x05`, `0x06`, `0x07`, `0x13`, `0x19`, `0x25`, `0x30`, `0x34`, `0x40`, `0x42`)
   - diff those request/response pairs against the shared client and queue behavior and close any remaining opcode or response-shape drift
   - keep using the decoded official preset-save pipeline plus the companion session log's explicit token-save behavior as evidence that the remaining DSP100 compressor/runtime-state gap is not hidden behind `0x06` / `0x07`
+  - the full opcode table is now compiled in `docs/NOTES-device-console-hid-logging.md`; cross-check any new captures against that table
 - [ ] Resolve exact runtime identity for the remaining official USB-only labels if stronger official evidence is found:
   - `HA-DSP`
   - `DDRC-22`

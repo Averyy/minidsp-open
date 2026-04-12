@@ -725,15 +725,31 @@ mod tests {
     fn all_profiles_are_internally_consistent() {
         let all_devices: &[(u8, u8)] = &[
             // Modern SHARC
-            (10, 100), (10, 101), (27, 100), (27, 101),
-            (14, 105), (17, 105), (18, 105), (21, 105),
-            (30, 110), (30, 111), (31, 113), (31, 115),
-            (32, 113), (32, 115),
+            (10, 100),
+            (10, 101),
+            (27, 100),
+            (27, 101),
+            (14, 105),
+            (17, 105),
+            (18, 105),
+            (21, 105),
+            (30, 110),
+            (30, 111),
+            (31, 113),
+            (31, 115),
+            (32, 113),
+            (32, 115),
             // Legacy
-            (1, 0), (1, 51), (2, 54), (2, 22),
-            (4, 0), (6, 95), (11, 97),
+            (1, 0),
+            (1, 51),
+            (2, 54),
+            (2, 22),
+            (4, 0),
+            (6, 95),
+            (11, 97),
             // Basic
-            (7, 0), (8, 0),
+            (7, 0),
+            (8, 0),
             // Unknown
             (99, 99),
         ];
@@ -756,12 +772,17 @@ mod tests {
                 assert!(
                     table.inputs.len() <= p.inputs as usize,
                     "({hw},{dsp}) {} has more DSP table inputs ({}) than profile channels ({})",
-                    p.name, table.inputs.len(), p.inputs
+                    p.name,
+                    table.inputs.len(),
+                    p.inputs
                 );
                 assert_eq!(
-                    table.outputs.len(), p.outputs as usize,
+                    table.outputs.len(),
+                    p.outputs as usize,
                     "({hw},{dsp}) {} output count mismatch: profile={} table={}",
-                    p.name, p.outputs, table.outputs.len()
+                    p.name,
+                    p.outputs,
+                    table.outputs.len()
                 );
             }
             // Must have at least 1 preset
@@ -786,7 +807,8 @@ mod tests {
             // USB audio devices should use new dialect
             if p.has_usb_audio {
                 assert_eq!(
-                    p.dialect, Dialect::NEW,
+                    p.dialect,
+                    Dialect::NEW,
                     "({hw},{dsp}) {} has USB audio but old dialect",
                     p.name
                 );
@@ -801,13 +823,21 @@ mod tests {
         for (hw, dsp) in legacy_adau {
             let p = identify(hw, dsp);
             assert_eq!(
-                p.dialect, Dialect::OLD,
+                p.dialect,
+                Dialect::OLD,
                 "({hw},{dsp}) {} should use old dialect",
                 p.name
             );
-            assert!(!p.has_usb_audio, "({hw},{dsp}) {} should not have USB audio", p.name);
-            assert!(!p.has_unreliable_selector_readback,
-                "({hw},{dsp}) {} should not have unreliable selector readback", p.name);
+            assert!(
+                !p.has_usb_audio,
+                "({hw},{dsp}) {} should not have USB audio",
+                p.name
+            );
+            assert!(
+                !p.has_unreliable_selector_readback,
+                "({hw},{dsp}) {} should not have unreliable selector readback",
+                p.name
+            );
         }
     }
 
@@ -818,7 +848,8 @@ mod tests {
         for (hw, dsp) in sharc_legacy {
             let p = identify(hw, dsp);
             assert_eq!(
-                p.dialect, Dialect::NEW,
+                p.dialect,
+                Dialect::NEW,
                 "({hw},{dsp}) {} should use new dialect",
                 p.name
             );

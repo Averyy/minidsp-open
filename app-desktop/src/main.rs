@@ -170,10 +170,48 @@ enum Command {
         #[command(subcommand)]
         cmd: ChannelCommand,
     },
+    /// Bass management (Flex HT / HTx 113+115 firmware only)
+    Bm {
+        #[command(subcommand)]
+        cmd: BmCommand,
+    },
     /// Send raw hex commands to the device (for debugging)
     Debug {
         #[command(subcommand)]
         cmd: DebugCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum BmCommand {
+    /// Print the full bass-management state (channels + mixer)
+    Status,
+    /// Set per-channel gain or mute on the BM gain block
+    Channel {
+        /// 0-based channel index (0..8)
+        channel: u8,
+        /// Set the channel gain in dB
+        #[arg(long, allow_hyphen_values = true)]
+        gain: Option<f32>,
+        /// Set the channel mute state
+        #[arg(long, value_parser = parse_on_off)]
+        mute: Option<bool>,
+    },
+    /// Modify one cell of the 9 × 8 BM matrix mixer
+    Mixer {
+        /// 0-based row index (0..9; row 8 is the LFE virtual channel)
+        row: u8,
+        /// 0-based output column (0..8)
+        col: u8,
+        /// Enable / disable this cell
+        #[arg(long, value_parser = parse_on_off)]
+        enable: Option<bool>,
+        /// Set the cell gain in dB
+        #[arg(long, allow_hyphen_values = true)]
+        gain: Option<f32>,
+        /// Invert the cell polarity
+        #[arg(long, value_parser = parse_on_off)]
+        invert: Option<bool>,
     },
 }
 
@@ -264,6 +302,9 @@ enum ChannelCommand {
         /// Disable this route instead of enabling it
         #[arg(long)]
         off: bool,
+        /// Invert per-cell polarity (Flex Eight / Flex HT/HTx + DDRC-88BM only)
+        #[arg(long, value_parser = parse_on_off)]
+        invert: Option<bool>,
     },
 }
 
@@ -560,6 +601,9 @@ async fn execute_command(
         }
         Some(Command::Output { channel, cmd }) => {
             cli::channel_command(client, false, *channel, cmd.clone()).await?;
+        }
+        Some(Command::Bm { cmd }) => {
+            cli::bm_command(client, cmd.clone()).await?;
         }
         Some(Command::Debug { cmd }) => match cmd.clone() {
             DebugCommand::Send { hex } => {
@@ -921,17 +965,17 @@ pub(crate) fn discover_network_devices(
                     if debug {
                         eprintln!(
                             "discovery decode: host={} ip={} hw_id={} dsp={} serial={}",
-                            pkt.hostname, ip, pkt.hw_id, pkt.dsp_id, serial
+                            pkt.hostname, ip, pkt.hw_id, pkt.dsp_no, serial
                         );
                     }
                     let dev = NetworkProbeDevice {
                         hostname: pkt.hostname.clone(),
                         ip: ip.clone(),
                         hw_id: pkt.hw_id,
-                        dsp_version: pkt.dsp_id,
+                        dsp_version: pkt.dsp_no,
                         serial,
                     };
-                    seen.insert((ip, pkt.hw_id, pkt.dsp_id, serial), dev);
+                    seen.insert((ip, pkt.hw_id, pkt.dsp_no, serial), dev);
                 } else if debug {
                     eprintln!("discovery decode: dropped invalid packet");
                 }

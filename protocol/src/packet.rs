@@ -138,7 +138,7 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
                     | Some(crate::commands::CMD_FIR_LOAD_DATA)
                     | Some(crate::commands::CMD_RELOAD_DSP_PARAM)
                     | Some(crate::commands::CMD_LOG_CONTROL)
-                    | Some(crate::commands::CMD_SET_HDMI_SOURCE)
+                    | Some(crate::commands::CMD_WRITE_DFLASH_ID)
                     | Some(crate::commands::RESP_EVENT)
             ) {
                 return Some(data[1..].to_vec());
@@ -172,7 +172,7 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
                     | Some(crate::commands::CMD_FIR_LOAD_DATA)
                     | Some(crate::commands::CMD_RELOAD_DSP_PARAM)
                     | Some(crate::commands::CMD_LOG_CONTROL)
-                    | Some(crate::commands::CMD_SET_HDMI_SOURCE)
+                    | Some(crate::commands::CMD_WRITE_DFLASH_ID)
             ) {
                 return Some(data[1..].to_vec());
             }

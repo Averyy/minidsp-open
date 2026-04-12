@@ -102,9 +102,134 @@ pub struct DiracBlock {
 pub struct BassManagement {
     pub global_lpf_addr: u16,
     pub global_hpf_addr: u16,
+    /// Base address of the per-channel `BM_DGain_*_status` words (8 entries).
     pub gain_status_base: u16,
+    /// Base address of the per-channel `BM_DGain_*` gain values (8 entries).
     pub gain_base: u16,
     pub per_channel_bpf: &'static [(u16, u16)], // (lpf, hpf) per channel
+    /// 9 × 8 bass-management routing matrix. The 9th row is the LFE virtual
+    /// channel from the `LFE_CHN STANDALONE_DSP_MODULE`. Each cell has its own
+    /// status, gain, and polarity address. See `app/Audio Firmware/113/
+    /// DSP_default_parameters.xml` lines 159..271 for the canonical layout.
+    pub bm_routing: BmMatrixMixer,
+}
+
+/// 9 × 8 bass-management matrix mixer (`BM_MATRIX_MIXER`) shared by HT/HTx
+/// firmware (DSP 113 and 115). The 9th input row is the LFE virtual channel
+/// declared as a `STANDALONE_DSP_MODULE type="LFE_CHN" CHN_NUM="9"` in the
+/// official structure layout.
+///
+/// Each cell occupies one parameter index in three contiguous regions
+/// (status / gain / polarity), strided row-major. Row indices are 1-based in
+/// the XML name (`BM_Mixer_R_C_*`); the address math here is 0-based.
+#[derive(Debug, Clone, Copy)]
+pub struct BmMatrixMixer {
+    /// Total rows including the LFE virtual row at index 8 (= row 9 in XML).
+    pub rows: u8,
+    /// Output column count.
+    pub cols: u8,
+    /// Base address of `BM_Mixer_R_C_status` words (`rows * cols` entries,
+    /// row-major). Status semantics match the regular routing matrix:
+    /// `2 = enabled`, `1 = disabled`, `3 = ?` (rare in defaults).
+    pub status_base: u16,
+    /// Base address of `BM_Mixer_R_C` gain values (`rows * cols` entries),
+    /// stored as float32 dB.
+    pub gain_base: u16,
+    /// Base address of `BM_Mixer_R_C_pol` polarity words (`rows * cols`
+    /// entries), stored as 1-byte-per-cell integers (0 = normal, 1 = inverted).
+    pub polarity_base: u16,
+}
+
+impl BmMatrixMixer {
+    /// Number of cells in the matrix.
+    pub const fn cell_count(&self) -> u16 {
+        self.rows as u16 * self.cols as u16
+    }
+
+    /// Compute the cell offset (`row * cols + col`) for 0-based row, col.
+    /// Returns `None` if the indices are out of range.
+    pub const fn cell_offset(&self, row: u8, col: u8) -> Option<u16> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        Some((row as u16) * (self.cols as u16) + (col as u16))
+    }
+
+    /// Address of the status word for cell (row, col).
+    pub const fn status_addr(&self, row: u8, col: u8) -> Option<u16> {
+        match self.cell_offset(row, col) {
+            Some(off) => Some(self.status_base + off),
+            None => None,
+        }
+    }
+
+    /// Address of the gain word for cell (row, col).
+    pub const fn gain_addr(&self, row: u8, col: u8) -> Option<u16> {
+        match self.cell_offset(row, col) {
+            Some(off) => Some(self.gain_base + off),
+            None => None,
+        }
+    }
+
+    /// Address of the polarity word for cell (row, col).
+    pub const fn polarity_addr(&self, row: u8, col: u8) -> Option<u16> {
+        match self.cell_offset(row, col) {
+            Some(off) => Some(self.polarity_base + off),
+            None => None,
+        }
+    }
+
+    /// True if `row` is the LFE virtual row (index `rows - 1` for HT
+    /// families). Useful for clients that want to render an LFE-aware UI.
+    pub const fn is_lfe_row(&self, row: u8) -> bool {
+        row + 1 == self.rows
+    }
+}
+
+/// Per-family delay range in milliseconds. Derived from the official
+/// `DSP_default_parameters.xml` delay `<range>`/`<step>` metadata per family.
+/// Used to clamp HTTP/CLI delay writes so invalid out-of-range floats never
+/// reach DSP memory. See `docs/ref-address-tables.md` for per-family values
+/// and `app/Audio Firmware/{family}/DSP_default_parameters.xml` for source.
+#[derive(Debug, Clone, Copy)]
+pub struct DelayRange {
+    /// Minimum delay in milliseconds (always 0 for shipped families).
+    pub min_ms: f32,
+    /// Maximum delay in milliseconds, inclusive.
+    pub max_ms: f32,
+    /// Quantization step in milliseconds (hardware snaps to integer multiples).
+    pub step_ms: f32,
+}
+
+impl DelayRange {
+    /// Conservative fallback used for tables without explicit XML-derived
+    /// values. 30 ms / step 0.02 is the tightest of the seven modern families
+    /// and matches the official 48 kHz Dirac family ranges.
+    pub const fn fallback() -> Self {
+        Self {
+            min_ms: 0.0,
+            max_ms: 30.0,
+            step_ms: 0.02,
+        }
+    }
+
+    /// Clamp `value_ms` into `[min_ms, max_ms]`.
+    ///
+    /// NaN is treated as the minimum (refuse to propagate garbage). `+∞` and
+    /// `-∞` saturate to max and min respectively — this matches the C-level
+    /// clamp semantics of `f32::clamp`, which would also saturate, but we
+    /// handle it explicitly so NaN can't slip through as a payload.
+    pub fn clamp(&self, value_ms: f32) -> f32 {
+        if value_ms.is_nan() {
+            return self.min_ms;
+        }
+        value_ms.clamp(self.min_ms, self.max_ms)
+    }
+
+    /// Return true if `value_ms` is finite and inside `[min_ms, max_ms]`.
+    pub fn contains(&self, value_ms: f32) -> bool {
+        value_ms.is_finite() && value_ms >= self.min_ms && value_ms <= self.max_ms
+    }
 }
 
 /// Complete DSP address table for a device structure.
@@ -116,6 +241,28 @@ pub struct DspTable {
     pub meters: &'static Meters,
     pub dirac: Option<DiracBlock>,
     pub bass_management: Option<&'static BassManagement>,
+    /// Per-family delay range in milliseconds. Used to clamp delay writes.
+    pub delay_range: DelayRange,
+    /// Total param-memory budget in 32-bit words, sourced from the
+    /// `<params addr="0" size="N">` element in each family's
+    /// `DSP_default_parameters.xml`. For Dirac-capable families the Dirac
+    /// block starts immediately after this range. Used to bounds-check
+    /// address reads/writes and to size full-config reads against the
+    /// authoritative DSP memory layout rather than relying on the max address
+    /// observed in the PEQ / routing tables. 0 = not populated / unknown.
+    pub param_memory_size: u32,
+    /// Protocol command-set version declared by `<CMD_VERSION>` in the
+    /// official root `info.xml` DSP entry. All seven modern SHARC families
+    /// currently use version 3. Recorded here so a future firmware bump to
+    /// CMD 4 on one family (without the others) would flip a gate instead
+    /// of silently misdecoding responses.
+    pub cmd_version: u8,
+    /// Intermediate DSP id reported while a firmware convert is in progress.
+    /// Pulled from per-family `info.xml` `<DSP_FW_CONVERT intermediateDspId="...">`.
+    /// `Some(n)` means "if a device in this family reports dsp_id = n, it's
+    /// mid-convert to the sibling Dirac/non-Dirac firmware and will re-enumerate
+    /// shortly" — see RE-NOTES §"100 <-> 101" for the exact pairings.
+    pub intermediate_dsp_id: Option<u16>,
 }
 
 // ========================================================================
@@ -282,6 +429,18 @@ pub static DSP_100: DspTable = DspTable {
     meters: &DSP100_METERS,
     dirac: None,
     bass_management: None,
+    // 2x4 HD / Flex @ 96 kHz: 0 .. 80 ms step 0.01 (official DSP_default_parameters.xml).
+    delay_range: DelayRange {
+        min_ms: 0.0,
+        max_ms: 80.0,
+        step_ms: 0.01,
+    },
+    // `<params addr="0" size="34960">` — largest modern family (2x4HD has
+    // FIR output taps at 85/2134/4183/6232 and full PEQ + crossover beyond).
+    param_memory_size: 34960,
+    cmd_version: 3,
+    // 2x4 HD ↔ DDRC-24 conversion path per `100/info.xml` DSP_FW_CONVERT.
+    intermediate_dsp_id: Some(201),
 };
 
 // ========================================================================
@@ -400,13 +559,26 @@ pub static DSP_101: DspTable = DspTable {
         cols: 4,
     },
     meters: &DSP101_METERS,
+    // Dirac block starts immediately after the main param region. Values
+    // match `app/Audio Firmware/101/DSP_default_parameters.xml` `<dirac>`.
     dirac: Some(DiracBlock {
-        base_addr: 496,
-        size: 3332,
+        base_addr: 1792,
+        size: 5124,
         channels: 2,
         fir_taps: 1088,
     }),
     bass_management: None,
+    // DDRC-24 / Flex DL @ 48 kHz: 0 .. 30 ms step 0.02.
+    delay_range: DelayRange {
+        min_ms: 0.0,
+        max_ms: 30.0,
+        step_ms: 0.02,
+    },
+    // `<params addr="0" size="1792">`. Dirac block follows at idx 1792.
+    param_memory_size: 1792,
+    cmd_version: 3,
+    // DDRC-24 ↔ 2x4 HD conversion path per `101/info.xml` DSP_FW_CONVERT.
+    intermediate_dsp_id: Some(200),
 };
 
 // ========================================================================
@@ -425,13 +597,28 @@ pub static DSP_105: DspTable = DspTable {
         cols: 4,
     },
     meters: &DSP101_METERS,
+    // Dirac block per `app/Audio Firmware/105/DSP_default_parameters.xml`.
+    // SHD reuses the 2/4 output layout of DSP 101 but its Dirac block is
+    // larger (more FIR taps for the longer 96 kHz impulse response).
     dirac: Some(DiracBlock {
-        base_addr: 496,
-        size: 5636,
+        base_addr: 1792,
+        size: 9476,
         channels: 2,
         fir_taps: 2176,
     }),
     bass_management: None,
+    // SHD / SHD Studio / SHD Power @ 96 kHz: 0 .. 30 ms step 0.01.
+    delay_range: DelayRange {
+        min_ms: 0.0,
+        max_ms: 30.0,
+        step_ms: 0.01,
+    },
+    // `<params addr="0" size="1792">`. Dirac block follows at idx 1792 with a
+    // larger 9476-word footprint than 101's 5124 (SHD convolves 2176 taps).
+    param_memory_size: 1792,
+    cmd_version: 3,
+    // SHD family has no documented convert path in `105/info.xml`.
+    intermediate_dsp_id: None,
 };
 
 // ========================================================================
@@ -540,6 +727,18 @@ pub static DSP_110: DspTable = DspTable {
     meters: &DSP110_METERS,
     dirac: None,
     bass_management: None,
+    // Flex Eight @ 96 kHz: 0 .. 60 ms step 0.01.
+    delay_range: DelayRange {
+        min_ms: 0.0,
+        max_ms: 60.0,
+        step_ms: 0.01,
+    },
+    // `<params addr="0" size="20392">`. Large footprint due to input-side FIR
+    // blocks (2 × 2048 taps) plus 8-output PEQ/crossover chains.
+    param_memory_size: 20392,
+    cmd_version: 3,
+    // Flex Eight ↔ Flex Eight DL conversion path per `110/info.xml`.
+    intermediate_dsp_id: Some(211),
 };
 
 // ========================================================================
@@ -621,6 +820,17 @@ pub static DSP_111: DspTable = DspTable {
         fir_taps: 1088,
     }),
     bass_management: None,
+    // Flex Eight DL @ 48 kHz: 0 .. 30 ms step 0.02.
+    delay_range: DelayRange {
+        min_ms: 0.0,
+        max_ms: 30.0,
+        step_ms: 0.02,
+    },
+    // `<params addr="0" size="3568">`. Dirac block follows at idx 3568.
+    param_memory_size: 3568,
+    cmd_version: 3,
+    // Flex Eight DL ↔ Flex Eight conversion path per `111/info.xml`.
+    intermediate_dsp_id: Some(210),
 };
 
 // ========================================================================
@@ -693,6 +903,18 @@ static DSP113_BASS_MGMT: BassManagement = BassManagement {
     gain_status_base: 40,
     gain_base: 48,
     per_channel_bpf: &DSP113_BM_BPF,
+    // 9 × 8 BM matrix mixer with the LFE virtual row at row 9 (0-based 8).
+    // Status idx 56..127 (= 9*8 = 72 cells), gain idx 128..199, polarity
+    // idx 200..271 — verified against `app/Audio Firmware/113/
+    // DSP_default_parameters.xml` lines 159..271. DSP 115 reuses the
+    // identical layout (verified at lines 809..1024 of 115's defaults).
+    bm_routing: BmMatrixMixer {
+        rows: 9,
+        cols: 8,
+        status_base: 56,
+        gain_base: 128,
+        polarity_base: 200,
+    },
 };
 
 static DSP113_METERS: Meters = Meters {
@@ -721,6 +943,17 @@ pub static DSP_113: DspTable = DspTable {
         fir_taps: 640,
     }),
     bass_management: Some(&DSP113_BASS_MGMT),
+    // Flex HT / HTx old FW @ 48 kHz: 0 .. 30 ms step 0.02.
+    delay_range: DelayRange {
+        min_ms: 0.0,
+        max_ms: 30.0,
+        step_ms: 0.02,
+    },
+    // `<params addr="0" size="6624">`. Dirac block follows at idx 6624.
+    param_memory_size: 6624,
+    cmd_version: 3,
+    // HT family has no documented convert path in `113/info.xml`.
+    intermediate_dsp_id: None,
 };
 
 // ========================================================================
@@ -811,6 +1044,18 @@ pub static DSP_115: DspTable = DspTable {
     meters: &DSP113_METERS,
     dirac: None, // DSP 115 replaced Dirac with input PEQ
     bass_management: Some(&DSP113_BASS_MGMT),
+    // Flex HT / HTx new FW @ 48 kHz: 0 .. 30 ms step 0.02.
+    delay_range: DelayRange {
+        min_ms: 0.0,
+        max_ms: 30.0,
+        step_ms: 0.02,
+    },
+    // `<params addr="0" size="8224">` — larger than 113 because 115 adds a
+    // standalone input-PEQ block before Dirac. Dirac block follows at 8224.
+    param_memory_size: 8224,
+    cmd_version: 3,
+    // HT family has no documented convert path in `115/info.xml`.
+    intermediate_dsp_id: None,
 };
 
 // ========================================================================
@@ -1082,6 +1327,16 @@ pub static LEGACY_MSHARC_4X8: DspTable = DspTable {
     meters: &LEGACY_MSHARC_METERS,
     dirac: None,
     bass_management: None,
+    delay_range: DelayRange::fallback(),
+    // Legacy SigmaDSP families don't come from the modern Device Console XML
+    // corpus; we don't have an authoritative param_memory_size for them yet.
+    // 0 means "unknown — do not use for bounds checking".
+    param_memory_size: 0,
+    // Legacy families predate the modern `<CMD_VERSION>` tagging in
+    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    cmd_version: 0,
+    // No documented firmware convert paths for legacy families.
+    intermediate_dsp_id: None,
 };
 
 static LEGACY_DDRC88BM_INPUTS: [InputChannel; 8] = [
@@ -1208,6 +1463,17 @@ static LEGACY_DDRC88BM_BASS_MGMT: BassManagement = BassManagement {
     gain_status_base: 0,
     gain_base: 8,
     per_channel_bpf: &LEGACY_DDRC88BM_BM_BPF,
+    // Legacy DDRC-88BM doesn't expose a published BM_Mixer matrix in the
+    // SigmaDSP `config.xml`; populate with zeros so the field exists but
+    // dimension queries return an empty matrix and clients won't try to
+    // address cells. Future legacy XML reconciliation can fill this in.
+    bm_routing: BmMatrixMixer {
+        rows: 0,
+        cols: 0,
+        status_base: 0,
+        gain_base: 0,
+        polarity_base: 0,
+    },
 };
 
 static LEGACY_DDRC88BM_METERS: Meters = Meters {
@@ -1231,6 +1497,16 @@ pub static LEGACY_DDRC_88BM: DspTable = DspTable {
     meters: &LEGACY_DDRC88BM_METERS,
     dirac: None,
     bass_management: Some(&LEGACY_DDRC88BM_BASS_MGMT),
+    delay_range: DelayRange::fallback(),
+    // Legacy SigmaDSP families don't come from the modern Device Console XML
+    // corpus; we don't have an authoritative param_memory_size for them yet.
+    // 0 means "unknown — do not use for bounds checking".
+    param_memory_size: 0,
+    // Legacy families predate the modern `<CMD_VERSION>` tagging in
+    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    cmd_version: 0,
+    // No documented firmware convert paths for legacy families.
+    intermediate_dsp_id: None,
 };
 
 static LEGACY_CDSP_8X12_INPUT_PEQ: [[PeqBand; 10]; 8] = [
@@ -1380,6 +1656,16 @@ pub static LEGACY_CDSP_8X12_V2: DspTable = DspTable {
     meters: &LEGACY_CDSP_8X12_METERS,
     dirac: None,
     bass_management: None,
+    delay_range: DelayRange::fallback(),
+    // Legacy SigmaDSP families don't come from the modern Device Console XML
+    // corpus; we don't have an authoritative param_memory_size for them yet.
+    // 0 means "unknown — do not use for bounds checking".
+    param_memory_size: 0,
+    // Legacy families predate the modern `<CMD_VERSION>` tagging in
+    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    cmd_version: 0,
+    // No documented firmware convert paths for legacy families.
+    intermediate_dsp_id: None,
 };
 
 // ========================================================================
@@ -1537,6 +1823,16 @@ pub static LEGACY_10X10HD: DspTable = DspTable {
     meters: &LEGACY_10X10HD_METERS,
     dirac: None,
     bass_management: None,
+    delay_range: DelayRange::fallback(),
+    // Legacy SigmaDSP families don't come from the modern Device Console XML
+    // corpus; we don't have an authoritative param_memory_size for them yet.
+    // 0 means "unknown — do not use for bounds checking".
+    param_memory_size: 0,
+    // Legacy families predate the modern `<CMD_VERSION>` tagging in
+    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    cmd_version: 0,
+    // No documented firmware convert paths for legacy families.
+    intermediate_dsp_id: None,
 };
 
 static LEGACY_4X10HD_INPUT_PEQ: [[PeqBand; 5]; 4] = [
@@ -1642,6 +1938,16 @@ pub static LEGACY_4X10HD: DspTable = DspTable {
     meters: &LEGACY_4X10HD_METERS,
     dirac: None,
     bass_management: None,
+    delay_range: DelayRange::fallback(),
+    // Legacy SigmaDSP families don't come from the modern Device Console XML
+    // corpus; we don't have an authoritative param_memory_size for them yet.
+    // 0 means "unknown — do not use for bounds checking".
+    param_memory_size: 0,
+    // Legacy families predate the modern `<CMD_VERSION>` tagging in
+    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    cmd_version: 0,
+    // No documented firmware convert paths for legacy families.
+    intermediate_dsp_id: None,
 };
 
 static LEGACY_M2X4_INPUT_PEQ: [[PeqBand; 6]; 2] = [peq_bands_6(12), peq_bands_6(42)];
@@ -1716,6 +2022,16 @@ pub static LEGACY_M2X4: DspTable = DspTable {
     meters: &LEGACY_M2X4_METERS,
     dirac: None,
     bass_management: None,
+    delay_range: DelayRange::fallback(),
+    // Legacy SigmaDSP families don't come from the modern Device Console XML
+    // corpus; we don't have an authoritative param_memory_size for them yet.
+    // 0 means "unknown — do not use for bounds checking".
+    param_memory_size: 0,
+    // Legacy families predate the modern `<CMD_VERSION>` tagging in
+    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    cmd_version: 0,
+    // No documented firmware convert paths for legacy families.
+    intermediate_dsp_id: None,
 };
 
 static LEGACY_NANODIGI_INPUT_PEQ: [[PeqBand; 5]; 4] = [
@@ -1885,6 +2201,16 @@ pub static LEGACY_NANODIGI_2X8: DspTable = DspTable {
     meters: &LEGACY_NANODIGI_METERS,
     dirac: None,
     bass_management: None,
+    delay_range: DelayRange::fallback(),
+    // Legacy SigmaDSP families don't come from the modern Device Console XML
+    // corpus; we don't have an authoritative param_memory_size for them yet.
+    // 0 means "unknown — do not use for bounds checking".
+    param_memory_size: 0,
+    // Legacy families predate the modern `<CMD_VERSION>` tagging in
+    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    cmd_version: 0,
+    // No documented firmware convert paths for legacy families.
+    intermediate_dsp_id: None,
 };
 
 // ========================================================================
@@ -1925,4 +2251,268 @@ const fn peq_bands_5(base: u16) -> [PeqBand; 5] {
         PeqBand::new(base + 15),
         PeqBand::new(base + 20),
     ]
+}
+
+/// Default PEQ band frequencies in Hz used by the official app for a fresh
+/// 10-band PEQ chain. Doubling schedule from 20 Hz. A client reset-to-defaults
+/// should seed every band at these frequencies with Q=0.7, boost=0, type=PK,
+/// matching what `app/Audio Firmware/{family}/DSP_default_parameters.xml`
+/// encodes in every `<filter name="PEQ_*_*">` default block.
+pub const DEFAULT_PEQ_FREQS_HZ: [u32; 10] =
+    [20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delay_range_clamp_handles_out_of_range_and_nan() {
+        let range = DelayRange {
+            min_ms: 0.0,
+            max_ms: 80.0,
+            step_ms: 0.01,
+        };
+        assert_eq!(range.clamp(-5.0), 0.0);
+        assert_eq!(range.clamp(0.0), 0.0);
+        assert_eq!(range.clamp(40.0), 40.0);
+        assert_eq!(range.clamp(80.0), 80.0);
+        assert_eq!(range.clamp(120.0), 80.0);
+        assert_eq!(range.clamp(f32::NAN), 0.0);
+        assert_eq!(range.clamp(f32::INFINITY), 80.0);
+        assert_eq!(range.clamp(f32::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn delay_range_contains_is_strict() {
+        let range = DelayRange {
+            min_ms: 0.0,
+            max_ms: 30.0,
+            step_ms: 0.02,
+        };
+        assert!(range.contains(0.0));
+        assert!(range.contains(15.0));
+        assert!(range.contains(30.0));
+        assert!(!range.contains(-0.1));
+        assert!(!range.contains(30.01));
+        assert!(!range.contains(f32::NAN));
+        assert!(!range.contains(f32::INFINITY));
+    }
+
+    #[test]
+    fn modern_families_match_xml_derived_delay_ranges() {
+        // DSP100 2x4 HD / Flex @ 96 kHz: 0..80 ms step 0.01 per
+        // app/Audio Firmware/100/DSP_default_parameters.xml <range> attrs.
+        assert_eq!(DSP_100.delay_range.max_ms, 80.0);
+        assert_eq!(DSP_100.delay_range.step_ms, 0.01);
+        // DSP101 DDRC-24 / Flex DL @ 48 kHz: 0..30 ms step 0.02.
+        assert_eq!(DSP_101.delay_range.max_ms, 30.0);
+        assert_eq!(DSP_101.delay_range.step_ms, 0.02);
+        // DSP105 SHD @ 96 kHz: 0..30 ms step 0.01.
+        assert_eq!(DSP_105.delay_range.max_ms, 30.0);
+        assert_eq!(DSP_105.delay_range.step_ms, 0.01);
+        // DSP110 Flex Eight @ 96 kHz: 0..60 ms step 0.01.
+        assert_eq!(DSP_110.delay_range.max_ms, 60.0);
+        assert_eq!(DSP_110.delay_range.step_ms, 0.01);
+        // DSP111 Flex Eight DL @ 48 kHz: 0..30 ms step 0.02.
+        assert_eq!(DSP_111.delay_range.max_ms, 30.0);
+        assert_eq!(DSP_111.delay_range.step_ms, 0.02);
+        // DSP113/115 Flex HT/HTx @ 48 kHz: 0..30 ms step 0.02.
+        assert_eq!(DSP_113.delay_range.max_ms, 30.0);
+        assert_eq!(DSP_113.delay_range.step_ms, 0.02);
+        assert_eq!(DSP_115.delay_range.max_ms, 30.0);
+        assert_eq!(DSP_115.delay_range.step_ms, 0.02);
+
+        // All modern families have a zero minimum.
+        for table in [
+            &DSP_100, &DSP_101, &DSP_105, &DSP_110, &DSP_111, &DSP_113, &DSP_115,
+        ] {
+            assert_eq!(table.delay_range.min_ms, 0.0);
+        }
+    }
+
+    #[test]
+    fn modern_families_have_xml_derived_param_memory_size() {
+        // `<params addr="0" size="N">` from each family's default params XML.
+        assert_eq!(DSP_100.param_memory_size, 34960);
+        assert_eq!(DSP_101.param_memory_size, 1792);
+        assert_eq!(DSP_105.param_memory_size, 1792);
+        assert_eq!(DSP_110.param_memory_size, 20392);
+        assert_eq!(DSP_111.param_memory_size, 3568);
+        assert_eq!(DSP_113.param_memory_size, 6624);
+        assert_eq!(DSP_115.param_memory_size, 8224);
+
+        // For families whose Rust table carries a `DiracBlock`, the block
+        // must start immediately at `param_memory_size` — the XML always
+        // encodes it as `<dirac addr="{param_size}">`. DSP_115 intentionally
+        // sets `dirac: None` (runtime Dirac licensing can't be inferred from
+        // XML for the new HT firmware, see RE-NOTES §"Important 115 Caution")
+        // so it's excluded. If we ever repopulate DiracBlock from a fresher
+        // corpus, this test catches address drift.
+        for table in [&DSP_101, &DSP_105, &DSP_111, &DSP_113] {
+            let dirac = table
+                .dirac
+                .expect("Dirac-capable family must carry a DiracBlock");
+            assert_eq!(
+                u32::from(dirac.base_addr),
+                table.param_memory_size,
+                "Dirac block should start at params end for family"
+            );
+        }
+    }
+
+    #[test]
+    fn modern_families_declare_cmd_version_3() {
+        for table in [
+            &DSP_100, &DSP_101, &DSP_105, &DSP_110, &DSP_111, &DSP_113, &DSP_115,
+        ] {
+            assert_eq!(
+                table.cmd_version, 3,
+                "all modern SHARC families should be CMD_VERSION 3"
+            );
+        }
+    }
+
+    #[test]
+    fn convert_path_families_carry_intermediate_dsp_id() {
+        // 2x4 HD <-> DDRC-24 path.
+        assert_eq!(DSP_100.intermediate_dsp_id, Some(201));
+        assert_eq!(DSP_101.intermediate_dsp_id, Some(200));
+        // Flex Eight <-> Flex Eight DL path.
+        assert_eq!(DSP_110.intermediate_dsp_id, Some(211));
+        assert_eq!(DSP_111.intermediate_dsp_id, Some(210));
+        // SHD / HT families have no published convert path.
+        assert_eq!(DSP_105.intermediate_dsp_id, None);
+        assert_eq!(DSP_113.intermediate_dsp_id, None);
+        assert_eq!(DSP_115.intermediate_dsp_id, None);
+    }
+
+    #[test]
+    fn default_peq_freqs_schedule_doubles_from_20hz() {
+        assert_eq!(DEFAULT_PEQ_FREQS_HZ.len(), 10);
+        assert_eq!(DEFAULT_PEQ_FREQS_HZ[0], 20);
+        assert_eq!(DEFAULT_PEQ_FREQS_HZ[9], 10240);
+        // Every band is 2x the previous.
+        for window in DEFAULT_PEQ_FREQS_HZ.windows(2) {
+            assert_eq!(window[1], window[0] * 2);
+        }
+    }
+
+    #[test]
+    fn ht_bm_routing_matches_xml_addresses() {
+        // Verified against `app/Audio Firmware/113/DSP_default_parameters.xml`
+        // and `115/DSP_default_parameters.xml`. Both share the identical
+        // BM_Mixer layout (113 lines 159..271, 115 lines 809..1024).
+        let bm = DSP_113
+            .bass_management
+            .expect("DSP 113 has bass management")
+            .bm_routing;
+        assert_eq!(bm.rows, 9, "9 rows including LFE virtual row");
+        assert_eq!(bm.cols, 8, "8 output columns");
+        assert_eq!(bm.cell_count(), 72);
+
+        // Row 0 (XML: BM_Mixer_1_*) status starts at idx 56.
+        assert_eq!(bm.status_addr(0, 0), Some(56));
+        assert_eq!(bm.status_addr(0, 7), Some(63));
+        // Row 8 (XML: BM_Mixer_9_*, the LFE row) status starts at idx 120.
+        assert_eq!(bm.status_addr(8, 0), Some(120));
+        assert_eq!(bm.status_addr(8, 7), Some(127));
+
+        // Gain region starts immediately after status — idx 128.
+        assert_eq!(bm.gain_addr(0, 0), Some(128));
+        assert_eq!(bm.gain_addr(8, 7), Some(199));
+
+        // Polarity region starts after gain — idx 200.
+        assert_eq!(bm.polarity_addr(0, 0), Some(200));
+        assert_eq!(bm.polarity_addr(8, 7), Some(271));
+
+        // Out-of-range queries return None instead of computing junk addrs.
+        assert_eq!(bm.status_addr(9, 0), None);
+        assert_eq!(bm.status_addr(0, 8), None);
+        assert_eq!(bm.gain_addr(15, 0), None);
+
+        // The LFE virtual row is the last one.
+        assert!(bm.is_lfe_row(8));
+        assert!(!bm.is_lfe_row(0));
+        assert!(!bm.is_lfe_row(7));
+
+        // 115 must use the same matrix layout as 113 (verified empirically;
+        // assert here so a future address-table edit catches the divergence).
+        let bm115 = DSP_115
+            .bass_management
+            .expect("DSP 115 has bass management")
+            .bm_routing;
+        assert_eq!(bm115.rows, bm.rows);
+        assert_eq!(bm115.cols, bm.cols);
+        assert_eq!(bm115.status_base, bm.status_base);
+        assert_eq!(bm115.gain_base, bm.gain_base);
+        assert_eq!(bm115.polarity_base, bm.polarity_base);
+    }
+
+    #[test]
+    fn bm_matrix_addresses_are_contiguous_and_lfe_row_marked() {
+        let bm = DSP_113
+            .bass_management
+            .expect("DSP 113 has bass management")
+            .bm_routing;
+        // 9 × 8 layout including the LFE virtual row at index 8.
+        assert_eq!(bm.rows, 9);
+        assert_eq!(bm.cols, 8);
+        assert_eq!(bm.cell_count(), 72);
+        assert!(bm.is_lfe_row(8));
+        assert!(!bm.is_lfe_row(0));
+        // First cell of each region matches the documented base addresses
+        // (status @ 56, gain @ 128, polarity @ 200).
+        assert_eq!(bm.status_addr(0, 0), Some(56));
+        assert_eq!(bm.gain_addr(0, 0), Some(128));
+        assert_eq!(bm.polarity_addr(0, 0), Some(200));
+        // Last LFE cell sits at the end of each region.
+        assert_eq!(bm.status_addr(8, 7), Some(56 + 71));
+        assert_eq!(bm.gain_addr(8, 7), Some(128 + 71));
+        assert_eq!(bm.polarity_addr(8, 7), Some(200 + 71));
+        // Out-of-range row / col returns None.
+        assert_eq!(bm.status_addr(9, 0), None);
+        assert_eq!(bm.gain_addr(0, 8), None);
+        assert_eq!(bm.polarity_addr(9, 8), None);
+    }
+
+    #[test]
+    fn only_ht_families_expose_bass_management() {
+        // HT firmware variants are the only modern families that populate
+        // the bass-management block. Everything else returns None.
+        assert!(DSP_113.bass_management.is_some());
+        assert!(DSP_115.bass_management.is_some());
+        for (name, table) in [
+            ("DSP_100", &DSP_100),
+            ("DSP_101", &DSP_101),
+            ("DSP_105", &DSP_105),
+            ("DSP_110", &DSP_110),
+            ("DSP_111", &DSP_111),
+        ] {
+            assert!(
+                table.bass_management.is_none(),
+                "{name} should not expose bass management"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_families_use_conservative_fallback_range() {
+        // Legacy SigmaDSP-derived tables don't have XML-derived ranges; they
+        // fall back to the tight 0..30 ms step 0.02 envelope which is the
+        // tightest modern family profile.
+        let fb = DelayRange::fallback();
+        for table in [
+            &LEGACY_MSHARC_4X8,
+            &LEGACY_DDRC_88BM,
+            &LEGACY_CDSP_8X12_V2,
+            &LEGACY_10X10HD,
+            &LEGACY_4X10HD,
+            &LEGACY_M2X4,
+            &LEGACY_NANODIGI_2X8,
+        ] {
+            assert_eq!(table.delay_range.min_ms, fb.min_ms);
+            assert_eq!(table.delay_range.max_ms, fb.max_ms);
+            assert_eq!(table.delay_range.step_ms, fb.step_ms);
+        }
+    }
 }

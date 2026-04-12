@@ -4,7 +4,7 @@
 use crate::discover_daemon_unix;
 use crate::output;
 use crate::{
-    ChannelCommand, Cli, CompressorCommand, CrossoverCommand, FirCommand, PeqCommand,
+    BmCommand, ChannelCommand, Cli, CompressorCommand, CrossoverCommand, FirCommand, PeqCommand,
     apply_force_kind, connect, connect_all_local, discover_daemon_tcp, discover_network_devices,
 };
 use minidsp::client::MiniDspClient;
@@ -345,53 +345,29 @@ pub async fn server(
         }
     });
 
-    // Start UDP discovery (if we have a device)
-    if let Some(client) = state.get_device(0).await {
-        let hw_id = client.hw_id().hw_id;
-        let fw_major = client.hw_id().fw_major;
-        let fw_minor = client.hw_id().fw_minor;
-        let serial = client.serial();
-        let dsp = client.dsp_version();
-        let disc_hostname = hostname.to_string();
-        // CLI --ip overrides config file ip
-        let disc_ip = cli_ip
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                config
-                    .advertise
-                    .as_ref()
-                    .and_then(|a| a.ip.as_deref())
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or_else(|| {
-                // Auto-detect local IP by connecting to a remote address
-                std::net::UdpSocket::bind("0.0.0.0:0")
-                    .and_then(|s| {
-                        s.connect("8.8.8.8:53")?;
-                        s.local_addr()
-                    })
-                    .map(|a| match a.ip() {
-                        std::net::IpAddr::V4(v4) => v4,
-                        _ => std::net::Ipv4Addr::UNSPECIFIED,
-                    })
-                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)
-            });
-        tokio::spawn(async move {
-            if let Err(e) = minidsp_daemon::discovery::broadcast_loop(
-                disc_ip,
-                hw_id,
-                fw_major,
-                fw_minor,
-                dsp,
-                serial,
-                disc_hostname,
-            )
-            .await
-            {
-                tracing::error!("UDP discovery error: {e}");
-            }
+    // Start UDP discovery — runs unconditionally so Device Console can find
+    // the daemon even before a USB DSP is attached. The broadcast loop polls
+    // DaemonState on every tick and switches between full-device and
+    // appliance-mode beacons as devices come and go.
+    // CLI --ip overrides config file ip; advertise_hostname is passed through
+    // so operators can still force a specific instance name via CLI flag.
+    let _ = hostname; // hostname flag retained for backwards compat; beacon name is now derived per-device
+    let disc_override_ip: Option<std::net::Ipv4Addr> =
+        cli_ip.and_then(|s| s.parse().ok()).or_else(|| {
+            config
+                .advertise
+                .as_ref()
+                .and_then(|a| a.ip.as_deref())
+                .and_then(|s| s.parse().ok())
         });
-    }
+    let disc_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            minidsp_daemon::discovery::broadcast_loop(disc_state, disc_override_ip).await
+        {
+            tracing::error!("UDP discovery error: {e}");
+        }
+    });
 
     // Start Unix socket listener at /tmp/minidsp.sock
     #[cfg(unix)]
@@ -419,38 +395,33 @@ pub async fn server(
         });
     }
 
-    // Start mDNS advertisement
-    let _mdns_handle = if let Some(client) = state.get_device(0).await {
-        let port: u16 = http_bind
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(5380);
-        let product = probe::product_name(client.hw_id().hw_id, client.dsp_version());
-        match minidsp_daemon::mdns::advertise(
-            port,
-            client.serial(),
-            product,
-            client.hw_id().hw_id,
-            client.dsp_version(),
-        ) {
-            Ok(mdns) => {
-                tracing::info!("mDNS: advertising as minidsp-{}.local", client.serial());
-                Some(mdns)
-            }
-            Err(e) => {
-                tracing::warn!("mDNS advertisement failed: {e}");
-                None
-            }
+    // Start mDNS advertisement unconditionally — `minidsp.local` should
+    // resolve whether or not a DSP is attached so `http://minidsp.local/`
+    // hits the daemon immediately after boot.
+    let mdns_port: u16 = http_bind
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5380);
+    let mdns_suffix = state
+        .get_device(0)
+        .await
+        .map(|client| client.serial().to_string());
+    let _mdns_handle = match minidsp_daemon::mdns::advertise(mdns_port, mdns_suffix) {
+        Ok(mdns) => {
+            tracing::info!("mDNS: advertising minidsp.local on port {mdns_port}");
+            Some(mdns)
         }
-    } else {
-        None
+        Err(e) => {
+            tracing::warn!("mDNS advertisement failed: {e}");
+            None
+        }
     };
 
     println!("minidsp-open daemon listening on {http_bind}");
     println!("  HTTP API: http://{http_bind}/devices");
     println!("  TCP bridge: {tcp_bind}");
-    println!("  mDNS: _minidsp._tcp.local.");
+    println!("  mDNS: _http._tcp.local. (minidsp.local:{mdns_port})");
     #[cfg(unix)]
     println!("  Unix socket: /tmp/minidsp.sock");
 
@@ -610,9 +581,7 @@ async fn execute_line(
                         return Err("input delay not supported via this command".into());
                     }
                     let ms: f32 = parts.get(3).ok_or("missing delay value")?.parse()?;
-                    let samples = (ms * client.profile().sample_rate as f32 / 1000.0)
-                        .round()
-                        .clamp(0.0, 48000.0);
+                    let samples = client.profile().delay_ms_to_samples(ms);
                     let table = client
                         .profile()
                         .dsp_table
@@ -624,9 +593,7 @@ async fn execute_line(
                     let delay_addr = ch_def
                         .delay
                         .ok_or("output channel does not have delay control")?;
-                    client
-                        .set_channel_delay_samples(delay_addr, samples as u32)
-                        .await?;
+                    client.set_channel_delay_samples(delay_addr, samples).await?;
                 }
                 "invert" => {
                     if is_input {
@@ -758,6 +725,98 @@ fn get_channel_mute_addr(
     }
 }
 
+/// Handle `minidsp bm` subcommands.
+pub async fn bm_command(
+    client: &MiniDspClient,
+    cmd: BmCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !client.supports_bass_management() {
+        return Err(
+            "device does not support bass management (HT 113/115 firmware only)".into(),
+        );
+    }
+    match cmd {
+        BmCommand::Status => {
+            let state = client.read_bass_management_state().await?;
+            println!("Bass management ({} × {} mixer):", state.rows, state.cols);
+            println!("  Channels (gain block):");
+            for ch in &state.channels {
+                println!(
+                    "    [{}] gain={:+.2} dB  mute={}",
+                    ch.index,
+                    ch.gain_db,
+                    if ch.muted { "on" } else { "off" }
+                );
+            }
+            println!("  Mixer cells:");
+            for cell in &state.mixer {
+                let lfe_marker = if cell.row + 1 == state.rows {
+                    " (LFE)"
+                } else {
+                    ""
+                };
+                println!(
+                    "    R{}{} -> C{}: enable={}  gain={:+.2} dB  invert={}",
+                    cell.row,
+                    lfe_marker,
+                    cell.col,
+                    if cell.enabled { "on" } else { "off" },
+                    cell.gain_db,
+                    if cell.polarity_inverted { "on" } else { "off" }
+                );
+            }
+        }
+        BmCommand::Channel {
+            channel,
+            gain,
+            mute,
+        } => {
+            if gain.is_none() && mute.is_none() {
+                let cfg = client.read_bm_channel(channel).await?;
+                println!(
+                    "BM channel {}: gain={:+.2} dB  mute={}",
+                    cfg.index,
+                    cfg.gain_db,
+                    if cfg.muted { "on" } else { "off" }
+                );
+                return Ok(());
+            }
+            let patch = minidsp_protocol::status::BmChannelPatch {
+                muted: mute,
+                gain_db: gain,
+            };
+            client.set_bm_channel(channel, patch).await?;
+        }
+        BmCommand::Mixer {
+            row,
+            col,
+            enable,
+            gain,
+            invert,
+        } => {
+            if enable.is_none() && gain.is_none() && invert.is_none() {
+                let cell = client.read_bm_mixer_cell(row, col).await?;
+                println!(
+                    "BM mixer R{} -> C{}: enable={}  gain={:+.2} dB  invert={}",
+                    cell.row,
+                    cell.col,
+                    if cell.enabled { "on" } else { "off" },
+                    cell.gain_db,
+                    if cell.polarity_inverted { "on" } else { "off" }
+                );
+                return Ok(());
+            }
+            let patch = minidsp_protocol::status::BmMixerCellPatch {
+                enabled: enable,
+                gain_db: gain,
+                polarity_inverted: invert,
+            };
+            client.set_bm_mixer_cell(row, col, patch).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Handle input/output channel subcommands from clap.
 pub async fn channel_command(
     client: &MiniDspClient,
@@ -790,11 +849,8 @@ pub async fn channel_command(
             let delay_addr = ch_def
                 .delay
                 .ok_or("output channel does not have delay control")?;
-            let sample_rate = client.profile().sample_rate as f32;
-            let samples = (ms * sample_rate / 1000.0).round().clamp(0.0, 48000.0);
-            client
-                .set_channel_delay_samples(delay_addr, samples as u32)
-                .await?;
+            let samples = client.profile().delay_ms_to_samples(ms);
+            client.set_channel_delay_samples(delay_addr, samples).await?;
         }
         ChannelCommand::Invert { state } => {
             let table = client
@@ -1020,11 +1076,17 @@ pub async fn channel_command(
             output,
             gain_db,
             off,
+            invert,
         } => {
             if !is_input {
                 return Err("routing only available on input channels".into());
             }
             client.set_routing(channel, output, !off, gain_db).await?;
+            if let Some(inverted) = invert {
+                client
+                    .set_routing_polarity(channel, output, inverted)
+                    .await?;
+            }
         }
     }
     Ok(())

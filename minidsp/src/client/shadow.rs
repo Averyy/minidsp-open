@@ -52,8 +52,12 @@ pub(super) fn build_measurement_restore_batches(
 
     for &(addr, coeffs, bypass) in saved {
         let current = current_shadow.get(&addr).copied();
-        let coeffs_changed = current.map(|shadow| shadow.coeffs != coeffs).unwrap_or(true);
-        let bypass_changed = current.map(|shadow| shadow.bypass != bypass).unwrap_or(true);
+        let coeffs_changed = current
+            .map(|shadow| shadow.coeffs != coeffs)
+            .unwrap_or(true);
+        let bypass_changed = current
+            .map(|shadow| shadow.bypass != bypass)
+            .unwrap_or(true);
 
         if coeffs_changed {
             if !current.map(|shadow| shadow.bypass).unwrap_or(false) {

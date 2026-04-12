@@ -5,12 +5,13 @@ use crate::transport::{Transport, TransportError};
 use getrandom::getrandom;
 use minidsp_protocol::commands::{self, HardwareId, Response};
 use minidsp_protocol::device::DeviceProfile;
-use minidsp_protocol::device::dsp::FirFilter;
+use minidsp_protocol::device::dsp::{BassManagement, FirFilter};
 use minidsp_protocol::device::probe;
 use minidsp_protocol::dialect::ValueFormat;
 use minidsp_protocol::eeprom;
 use minidsp_protocol::status::{
-    BiquadCoeffs, CompressorConfig, CrossoverGroupConfig, DeviceConfig, DeviceInfo, DeviceVersion,
+    BiquadCoeffs, BmChannelConfig, BmChannelPatch, BmMixerCellConfig, BmMixerCellPatch,
+    BmStateConfig, CompressorConfig, CrossoverGroupConfig, DeviceConfig, DeviceInfo, DeviceVersion,
     FirConfig, IndexedBiquadConfig, InputChannelConfig, MasterStatusView, OutputChannelConfig,
     PeqBandConfig, RoutingConfig, StatusSummary,
 };
@@ -872,6 +873,212 @@ impl MiniDspClient {
         Ok(())
     }
 
+    /// Set per-cell polarity inversion for the main routing matrix.
+    ///
+    /// Only families whose `RoutingMatrix.polarity_base` is populated support
+    /// this — currently DSP_110 (Flex Eight), DSP_113 / DSP_115 (Flex HT/HTx),
+    /// and the legacy DDRC-88BM. Returns [`ClientError::Unsupported`] for
+    /// other families.
+    pub async fn set_routing_polarity(
+        &self,
+        input: u8,
+        output: u8,
+        inverted: bool,
+    ) -> Result<(), ClientError> {
+        let table = self.profile.dsp_table.ok_or(ClientError::Unsupported)?;
+        let routing = table.routing;
+        if input >= routing.rows || output >= routing.cols {
+            return Err(ClientError::Protocol(format!(
+                "routing index ({input}, {output}) out of range (max {}x{})",
+                routing.rows, routing.cols
+            )));
+        }
+        let polarity_base = routing.polarity_base.ok_or(ClientError::Unsupported)?;
+        let flat_idx = input as u16 * routing.cols as u16 + output as u16;
+        let polarity_addr = polarity_base + flat_idx;
+        self.set_invert(polarity_addr, inverted).await
+    }
+
+    /// Bass-management address table for this device, or `None` if the
+    /// family doesn't expose the HT bass-management block. Currently only
+    /// DSP_113 / DSP_115 (Flex HT / HTx 113 + 115 firmware) populate this.
+    pub fn bass_management_table(&self) -> Option<&'static BassManagement> {
+        self.profile.dsp_table.and_then(|t| t.bass_management)
+    }
+
+    /// True if this device exposes the HT bass-management block.
+    pub fn supports_bass_management(&self) -> bool {
+        self.bass_management_table().is_some()
+    }
+
+    fn require_bm_table(&self) -> Result<&'static BassManagement, ClientError> {
+        self.bass_management_table().ok_or(ClientError::Unsupported)
+    }
+
+    /// Number of BM gain channels (always 8 on the supported HT families).
+    const BM_NUM_CHANNELS: u8 = 8;
+
+    fn check_bm_channel(ch: u8) -> Result<(), ClientError> {
+        if ch >= Self::BM_NUM_CHANNELS {
+            return Err(ClientError::Protocol(format!(
+                "bm channel {ch} out of range (0..{})",
+                Self::BM_NUM_CHANNELS
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read one bass-management channel (gain + mute state).
+    pub async fn read_bm_channel(&self, ch: u8) -> Result<BmChannelConfig, ClientError> {
+        let bm = self.require_bm_table()?;
+        Self::check_bm_channel(ch)?;
+        let status_addr = bm.gain_status_base + ch as u16;
+        let gain_addr = bm.gain_base + ch as u16;
+        let muted = self.read_param_word(status_addr).await? as u16 == 1;
+        let gain_db = self.read_config_gain_db(gain_addr).await?;
+        Ok(BmChannelConfig {
+            index: ch,
+            muted,
+            gain_db,
+        })
+    }
+
+    /// Set the gain (dB) for one bass-management channel.
+    pub async fn set_bm_channel_gain(&self, ch: u8, gain_db: f32) -> Result<(), ClientError> {
+        let bm = self.require_bm_table()?;
+        Self::check_bm_channel(ch)?;
+        let addr = bm.gain_base + ch as u16;
+        self.set_channel_gain(addr, gain_db).await
+    }
+
+    /// Set the mute state for one bass-management channel.
+    pub async fn set_bm_channel_mute(&self, ch: u8, muted: bool) -> Result<(), ClientError> {
+        let bm = self.require_bm_table()?;
+        Self::check_bm_channel(ch)?;
+        let addr = bm.gain_status_base + ch as u16;
+        self.set_channel_mute(addr, muted).await
+    }
+
+    /// Read one cell of the BM matrix mixer (status / gain / polarity).
+    pub async fn read_bm_mixer_cell(
+        &self,
+        row: u8,
+        col: u8,
+    ) -> Result<BmMixerCellConfig, ClientError> {
+        let bm = self.require_bm_table()?;
+        let mixer = bm.bm_routing;
+        let status_addr = mixer.status_addr(row, col).ok_or_else(|| {
+            ClientError::Protocol(format!(
+                "bm mixer cell ({row},{col}) out of range ({}x{})",
+                mixer.rows, mixer.cols
+            ))
+        })?;
+        let gain_addr = mixer
+            .gain_addr(row, col)
+            .expect("validated by status_addr");
+        let polarity_addr = mixer
+            .polarity_addr(row, col)
+            .expect("validated by status_addr");
+        let enabled = self.read_param_word(status_addr).await? as u16 == 2;
+        let gain_db = self.read_config_gain_db(gain_addr).await?;
+        let polarity_inverted = self.read_param_word(polarity_addr).await? as u16 != 0;
+        Ok(BmMixerCellConfig {
+            row,
+            col,
+            enabled,
+            gain_db,
+            polarity_inverted,
+        })
+    }
+
+    /// Apply a patch to one cell of the BM matrix mixer. Only the populated
+    /// fields of `patch` are written.
+    pub async fn set_bm_mixer_cell(
+        &self,
+        row: u8,
+        col: u8,
+        patch: BmMixerCellPatch,
+    ) -> Result<(), ClientError> {
+        let bm = self.require_bm_table()?;
+        let mixer = bm.bm_routing;
+        let status_addr = mixer.status_addr(row, col).ok_or_else(|| {
+            ClientError::Protocol(format!(
+                "bm mixer cell ({row},{col}) out of range ({}x{})",
+                mixer.rows, mixer.cols
+            ))
+        })?;
+        let gain_addr = mixer
+            .gain_addr(row, col)
+            .expect("validated by status_addr");
+        let polarity_addr = mixer
+            .polarity_addr(row, col)
+            .expect("validated by status_addr");
+        if let Some(gain_db) = patch.gain_db {
+            self.set_channel_gain(gain_addr, gain_db).await?;
+        }
+        if let Some(enabled) = patch.enabled {
+            // Mixer status: 2=enabled, 1=disabled — same convention as
+            // `set_routing` for the main routing matrix.
+            let before = self.read_param_word(status_addr).await? as u16;
+            let previous_shadow = self.selector_shadow_value(status_addr).await;
+            self.write_selector_int(
+                status_addr,
+                if enabled { 2 } else { 1 },
+                "set bm mixer status",
+            )
+            .await?;
+            let after = self.read_param_word(status_addr).await? as u16;
+            if after == 0 {
+                self.restore_selector_shadow(status_addr, previous_shadow)
+                    .await;
+                return Err(ClientError::Protocol(format!(
+                    "set bm mixer status at addr {status_addr} did not persist (before={before}, after={after})"
+                )));
+            }
+        }
+        if let Some(polarity_inverted) = patch.polarity_inverted {
+            self.set_invert(polarity_addr, polarity_inverted).await?;
+        }
+        Ok(())
+    }
+
+    /// Apply a patch to one bass-management gain channel.
+    pub async fn set_bm_channel(
+        &self,
+        ch: u8,
+        patch: BmChannelPatch,
+    ) -> Result<(), ClientError> {
+        if let Some(gain_db) = patch.gain_db {
+            self.set_bm_channel_gain(ch, gain_db).await?;
+        }
+        if let Some(muted) = patch.muted {
+            self.set_bm_channel_mute(ch, muted).await?;
+        }
+        Ok(())
+    }
+
+    /// Read the full bass-management state snapshot (8 channels + 9×8 mixer).
+    pub async fn read_bass_management_state(&self) -> Result<BmStateConfig, ClientError> {
+        let bm = self.require_bm_table()?;
+        let mixer = bm.bm_routing;
+        let mut channels = Vec::with_capacity(Self::BM_NUM_CHANNELS as usize);
+        for ch in 0..Self::BM_NUM_CHANNELS {
+            channels.push(self.read_bm_channel(ch).await?);
+        }
+        let mut mixer_cells = Vec::with_capacity(mixer.cell_count() as usize);
+        for row in 0..mixer.rows {
+            for col in 0..mixer.cols {
+                mixer_cells.push(self.read_bm_mixer_cell(row, col).await?);
+            }
+        }
+        Ok(BmStateConfig {
+            channels,
+            mixer: mixer_cells,
+            rows: mixer.rows,
+            cols: mixer.cols,
+        })
+    }
+
     /// Write biquad coefficients to a PEQ band.
     /// Warns (but does not reject) unstable filters for minidsp-rs compatibility.
     pub async fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), ClientError> {
@@ -1223,6 +1430,46 @@ impl MiniDspClient {
         })
     }
 
+    /// Read the verify-program status byte (0xFFA3) and return it.
+    ///
+    /// Mirrors Device Console's `verifyProgram()` flow: after a preset save
+    /// the device writes a status code into [`eeprom::VERIFY_PROGRAM_ADDR`];
+    /// values `<= 0x0D` mean the flash block was persisted cleanly.
+    pub async fn read_verify_program_status(&self) -> Result<u8, ClientError> {
+        let (hi, lo) = eeprom::VERIFY_PROGRAM_ADDR;
+        let resp = self
+            .queue
+            .execute(commands::read_flash(hi, lo, 1), Priority::Critical)
+            .await?;
+        match resp {
+            Response::FlashData(data) if !data.is_empty() => Ok(data[0]),
+            Response::FlashData(_) => Err(ClientError::Protocol(
+                "verify-program read returned empty payload".into(),
+            )),
+            _ => Err(ClientError::Protocol(
+                "unexpected response to verify-program ReadFlash".into(),
+            )),
+        }
+    }
+
+    /// Send `CopyPreset` and then verify the save by reading
+    /// [`eeprom::VERIFY_PROGRAM_ADDR`]. Returns an error if the device
+    /// reports a status byte above [`eeprom::VERIFY_PROGRAM_OK_MAX`], which
+    /// Device Console treats as a failed flash persist.
+    pub async fn copy_preset_verified(&self) -> Result<(), ClientError> {
+        self.queue
+            .execute(commands::copy_preset(true), Priority::Critical)
+            .await?;
+        let status = self.read_verify_program_status().await?;
+        if !eeprom::is_verify_program_ok(status) {
+            return Err(ClientError::Protocol(format!(
+                "verifyProgram failed after CopyPreset: status=0x{status:02X} > 0x{:02X}",
+                eeprom::VERIFY_PROGRAM_OK_MAX
+            )));
+        }
+        Ok(())
+    }
+
     /// Read raw bytes from the device's full flash-address space.
     pub async fn read_flash_full_addr(&self, addr: u32, count: u8) -> Result<Vec<u8>, ClientError> {
         let resp = self
@@ -1479,6 +1726,82 @@ impl MiniDspClient {
             .insert(fir.taps_count, coeffs.len() as u16);
         self.set_mute(master.is_muted()).await?;
         Ok(())
+    }
+
+    /// Reset every PEQ band on every input and output channel to the
+    /// passthrough identity biquad and clear all bypass flags. This matches
+    /// the official Device Console "Initialize to default Settings" action,
+    /// which writes the same identity biquad (`<dec>1,0,0,0,0</dec>`) to
+    /// every PEQ slot per `app/Audio Firmware/{family}/DSP_default_parameters.xml`
+    /// `<filter name="PEQ_*_*">` defaults.
+    ///
+    /// Returns the number of bands that were touched.
+    ///
+    /// The official app also seeds the *display* frequency for each band from
+    /// the [`minidsp_protocol::device::dsp::DEFAULT_PEQ_FREQS_HZ`] doubling
+    /// schedule (20, 40, 80, ..., 10240 Hz). The device itself doesn't store
+    /// frequency — only biquad coefficients — so we expose that schedule
+    /// separately via [`Self::default_peq_frequencies`] for clients that want
+    /// to render an authentic "default" UI after a reset.
+    pub async fn reset_all_peq_to_defaults(&self) -> Result<usize, ClientError> {
+        let table = self
+            .profile
+            .dsp_table
+            .ok_or(ClientError::Unsupported)?;
+
+        let mut touched = 0usize;
+        for input in table.inputs {
+            for band in input.peq {
+                self.write_biquad(band.addr, &minidsp_protocol::biquad::BYPASS)
+                    .await?;
+                self.bypass_filter(band.addr, false).await?;
+                touched += 1;
+            }
+        }
+        for output in table.outputs {
+            for band in output.peq {
+                self.write_biquad(band.addr, &minidsp_protocol::biquad::BYPASS)
+                    .await?;
+                self.bypass_filter(band.addr, false).await?;
+                touched += 1;
+            }
+        }
+        Ok(touched)
+    }
+
+    /// Returns the official 10-band default PEQ frequency schedule (20, 40,
+    /// 80, ..., 10240 Hz) for clients that want to render the same default
+    /// UI labels Device Console uses after a reset. The device itself does
+    /// not store frequency — see [`Self::reset_all_peq_to_defaults`] for the
+    /// hardware-side reset.
+    pub fn default_peq_frequencies(&self) -> &'static [u32; 10] {
+        &minidsp_protocol::device::dsp::DEFAULT_PEQ_FREQS_HZ
+    }
+
+    /// Live readback of the active FIR tap count for a given FIR index using
+    /// `CMD_GET_NUM_FIR_TAPS (0x39)` — the same opcode that's already issued
+    /// inside `load_fir`, but exposed standalone so `/devices/{id}/config` and
+    /// the CLI can ask the device "how many taps does this FIR slot currently
+    /// have loaded?" without kicking off an upload cycle.
+    ///
+    /// Device Console calls this `getNumAvailTaps(chanIdx)` and uses it as the
+    /// authoritative source for the "available taps" UI element, which
+    /// directly plugs the PROGRESS.md gap about DSP100 fresh-client FIR tap
+    /// count needing verified-shadow fallback — the count is *live-queryable*,
+    /// we just weren't exposing it.
+    pub async fn read_fir_tap_count(&self, fir_index: u8) -> Result<u16, ClientError> {
+        match self
+            .raw_command(commands::get_num_fir_taps(fir_index), Priority::Normal)
+            .await?
+        {
+            Response::FirLoadInfo { max_coeffs } => Ok(max_coeffs),
+            Response::Error(data) => Err(ClientError::Protocol(format!(
+                "get_num_fir_taps({fir_index}): device error {data:02x?}"
+            ))),
+            other => Err(ClientError::Protocol(format!(
+                "get_num_fir_taps({fir_index}): unexpected response {other:?}"
+            ))),
+        }
     }
 
     /// Send raw command payload. For advanced/raw access.
@@ -1793,10 +2116,21 @@ impl MiniDspClient {
                             }
                         };
                         let gain_db = self.read_config_gain_db(gain_addr).await.unwrap_or(0.0);
+                        let polarity_inverted = match routing.polarity_base {
+                            Some(base) => {
+                                let polarity_addr = base + flat_idx;
+                                self.read_param_scalar_u32(polarity_addr)
+                                    .await
+                                    .ok()
+                                    .map(|raw| raw != 0)
+                            }
+                            None => None,
+                        };
                         routing_entries.push(RoutingConfig {
                             output,
                             enabled,
                             gain_db,
+                            polarity_inverted,
                         });
                     }
                 }
@@ -1854,13 +2188,12 @@ impl MiniDspClient {
                 let fir = if let Some(fir) = output.fir {
                     let shadow_taps = self.selector_shadow_value(fir.taps_count).await;
                     let active_taps = match self.read_param_scalar_u32(fir.taps_count).await {
-                        Ok(value) if self.profile.has_unreliable_selector_readback => {
-                            shadow_taps.or_else(|| {
+                        Ok(value) if self.profile.has_unreliable_selector_readback => shadow_taps
+                            .or_else(|| {
                                 (1..=fir.max_taps as u32)
                                     .contains(&value)
                                     .then_some(value as u16)
-                            })
-                        }
+                            }),
                         Ok(value) if (1..=fir.max_taps as u32).contains(&value) => {
                             Some(value as u16)
                         }
@@ -2467,7 +2800,10 @@ mod tests {
 
         assert!(phase1.is_empty());
         assert!(phase2.is_empty());
-        assert_eq!(phase3, vec![commands::bypass_filter(0x2000, false, &Dialect::NEW)]);
+        assert_eq!(
+            phase3,
+            vec![commands::bypass_filter(0x2000, false, &Dialect::NEW)]
+        );
     }
 
     #[test]
@@ -2485,9 +2821,18 @@ mod tests {
         let (phase1, phase2, phase3) =
             build_measurement_restore_batches(&current_shadow, &saved, &Dialect::NEW);
 
-        assert_eq!(phase1, vec![commands::bypass_filter(0x2000, true, &Dialect::NEW)]);
-        assert_eq!(phase2, vec![commands::write_biquad(0x2000, &coeffs, &Dialect::NEW)]);
-        assert_eq!(phase3, vec![commands::bypass_filter(0x2000, false, &Dialect::NEW)]);
+        assert_eq!(
+            phase1,
+            vec![commands::bypass_filter(0x2000, true, &Dialect::NEW)]
+        );
+        assert_eq!(
+            phase2,
+            vec![commands::write_biquad(0x2000, &coeffs, &Dialect::NEW)]
+        );
+        assert_eq!(
+            phase3,
+            vec![commands::bypass_filter(0x2000, false, &Dialect::NEW)]
+        );
     }
 
     #[tokio::test]
@@ -2789,13 +3134,10 @@ mod tests {
             state_transition_lock: Mutex::new(()),
         };
 
-        let (first, second) = tokio::join!(
-            async { client.set_config(2).await },
-            async {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                client.set_config(3).await
-            }
-        );
+        let (first, second) = tokio::join!(async { client.set_config(2).await }, async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            client.set_config(3).await
+        });
 
         first.expect("first preset switch should succeed");
         second.expect("second preset switch should succeed");
@@ -2841,7 +3183,9 @@ mod tests {
     #[tokio::test]
     async fn wait_for_reset_recovery_rejects_single_status_blip() {
         let client = MiniDspClient {
-            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(1)))),
+            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(
+                1,
+            )))),
             transport_url: "mock://reset-single-blip".into(),
             profile: probe::identify(10, 100),
             hw_id: HardwareId {
@@ -2872,7 +3216,9 @@ mod tests {
     #[tokio::test]
     async fn reset_succeeds_when_transport_times_out_but_status_recovers() {
         let client = MiniDspClient {
-            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(2)))),
+            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(
+                2,
+            )))),
             transport_url: "mock://reset-timeout".into(),
             profile: probe::identify(10, 100),
             hw_id: HardwareId {

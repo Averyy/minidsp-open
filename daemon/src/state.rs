@@ -1,6 +1,8 @@
 //! Shared daemon state — device registry, broadcast channels.
 
-use minidsp::client::{DeviceShadowState, MiniDspClient, PresetShadowState, SavedPeqState};
+use minidsp::client::{
+    CachedPeqShadow, DeviceShadowState, MiniDspClient, PresetShadowState, SavedPeqState,
+};
 use minidsp_protocol::device::DeviceProfile;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -254,7 +256,7 @@ fn import_official_app_presets(
             continue;
         }
         let Some((timestamp, preset)) =
-            parse_official_setting_xml(&path, &selector_addrs, &scalar_addrs)
+            parse_official_setting_xml(&path, &selector_addrs, &scalar_addrs, profile.dsp_version)
         else {
             continue;
         };
@@ -412,25 +414,47 @@ fn parse_official_setting_xml(
     path: &Path,
     selector_addrs: &HashSet<u16>,
     scalar_addrs: &HashSet<u16>,
+    expected_dsp_version: u8,
 ) -> Option<(u32, PresetShadowState)> {
     let content = fs::read_to_string(path).ok()?;
 
+    // The setting*.xml schema has three first-class record types:
+    //   <item addr="N"> ... </item>      selector/scalar addresses
+    //   <filter addr="N"> ... </filter>  biquad PEQ (5 coefficient words + bypass)
+    //   <fir addr="N"> ... </fir>        raw FIR coefficients (2048+ f32 per block)
+    //
+    // We parse <item> into selector/scalar buckets per the profile's known
+    // address sets. We parse <filter> into the PEQ shadow, keyed by the same
+    // biquad base address our dsp.rs tables use. We deliberately DO NOT parse
+    // <fir> coefficient payloads — the FIR *tap count* lives in an ordinary
+    // <item> and is already captured via the selector bucket; the raw taps are
+    // not consumed by any runtime readback path today and would be ~8 KiB per
+    // block × 4 blocks × 4 presets if we stored them.
     enum Bucket {
         Selector,
         Scalar,
+        Filter,
         Ignore,
     }
 
     let mut timestamp = None;
-    let mut current_addr = None;
+    let mut dsp_version = None;
+    let mut current_addr: Option<u16> = None;
     let mut current_bucket = Bucket::Ignore;
+    let mut current_filter_bypass: Option<bool> = None;
+    let mut current_filter_coeffs: Option<[f32; 5]> = None;
     let mut selector = HashMap::new();
     let mut scalar = HashMap::new();
+    let mut peq: HashMap<u16, CachedPeqShadow> = HashMap::new();
 
     for line in content.lines() {
         let line = line.trim();
         if let Some(text) = extract_tag_text(line, "timestamp") {
             timestamp = text.parse::<u32>().ok();
+            continue;
+        }
+        if let Some(text) = extract_tag_text(line, "dspversion") {
+            dsp_version = text.parse::<u8>().ok();
             continue;
         }
         if line.starts_with("<item ") {
@@ -445,6 +469,47 @@ fn parse_official_setting_xml(
             };
             continue;
         }
+        if line.starts_with("<filter ") {
+            let addr = extract_item_addr(line)?;
+            current_addr = Some(addr);
+            current_bucket = Bucket::Filter;
+            current_filter_bypass = None;
+            current_filter_coeffs = None;
+            continue;
+        }
+        if line.starts_with("<fir ") {
+            // Swallow the block so embedded <hex>/<para>/<subpara> lines don't
+            // leak into whatever bucket preceded it. Intentionally no capture.
+            current_addr = None;
+            current_bucket = Bucket::Ignore;
+            continue;
+        }
+        if matches!(current_bucket, Bucket::Filter) {
+            if let Some(text) = extract_tag_text(line, "bypass") {
+                current_filter_bypass = text.parse::<u8>().ok().map(|v| v != 0);
+                continue;
+            }
+            if let Some(text) = extract_tag_text(line, "hex") {
+                current_filter_coeffs = parse_filter_hex_coeffs(text);
+                continue;
+            }
+            if line.starts_with("</filter>") {
+                if let (Some(addr), Some(coeffs)) = (current_addr, current_filter_coeffs) {
+                    peq.insert(
+                        addr,
+                        CachedPeqShadow {
+                            coeffs,
+                            bypass: current_filter_bypass.unwrap_or(false),
+                        },
+                    );
+                }
+                current_addr = None;
+                current_bucket = Bucket::Ignore;
+                current_filter_bypass = None;
+                current_filter_coeffs = None;
+            }
+            continue;
+        }
         if let Some(hex) = extract_tag_text(line, "hex") {
             let Some(addr) = current_addr else {
                 continue;
@@ -457,7 +522,7 @@ fn parse_official_setting_xml(
                 Bucket::Scalar => {
                     scalar.insert(addr, value);
                 }
-                Bucket::Ignore => {}
+                Bucket::Filter | Bucket::Ignore => {}
             }
             continue;
         }
@@ -467,14 +532,32 @@ fn parse_official_setting_xml(
         }
     }
 
+    if dsp_version? != expected_dsp_version {
+        return None;
+    }
+
     Some((
         timestamp?,
         PresetShadowState {
-            peq: HashMap::new(),
+            peq,
             selector,
             scalar,
         },
     ))
+}
+
+/// Parse a `<hex>` line from a `<filter>` block: five comma-separated 32-bit
+/// IEEE 754 floats in lowercase hex. Returns None on any short or malformed
+/// value so partial writes never poison the shadow.
+fn parse_filter_hex_coeffs(text: &str) -> Option<[f32; 5]> {
+    let mut coeffs = [0f32; 5];
+    let mut iter = text.split(',');
+    for slot in coeffs.iter_mut() {
+        let word = iter.next()?.trim();
+        let bits = u32::from_str_radix(word, 16).ok()?;
+        *slot = f32::from_bits(bits);
+    }
+    Some(coeffs)
 }
 
 fn extract_tag_text<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
@@ -524,7 +607,8 @@ mod tests {
             .join("../app/minidsp-snapshots/20260408-130500-preset1-after-reset-live/official-setting1.xml");
         let (selector_addrs, scalar_addrs) = official_xml_shadow_addrs(&probe::identify(10, 100));
         let (timestamp, preset) =
-            parse_official_setting_xml(&path, &selector_addrs, &scalar_addrs).expect("parse xml");
+            parse_official_setting_xml(&path, &selector_addrs, &scalar_addrs, 100)
+                .expect("parse xml");
 
         assert_eq!(timestamp, 0xfacc_93dd);
         assert_eq!(preset.selector.get(&6), Some(&2));
@@ -533,5 +617,69 @@ mod tests {
         assert_eq!(preset.scalar.get(&40), Some(&(-30.0f32).to_bits()));
         assert_eq!(preset.scalar.get(&42), Some(&(4.0f32).to_bits()));
         assert_eq!(preset.scalar.get(&44), Some(&(40.0f32).to_bits()));
+
+        // <filter> blocks are parsed into peq shadow. The fixture has 68
+        // identity-PEQ filters starting at addr 8280 (PEQ_1_1) stepping by 5.
+        // Every band should land in the shadow keyed by its base address.
+        assert!(
+            preset.peq.len() >= 60,
+            "expected ≥60 PEQ bands recovered from <filter> blocks, got {}",
+            preset.peq.len()
+        );
+        let identity = preset.peq.get(&8280).expect("PEQ_1_1 at 8280");
+        assert_eq!(identity.coeffs, [1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(!identity.bypass);
+        assert_eq!(
+            preset.peq.get(&8325).map(|p| p.coeffs),
+            Some([1.0, 0.0, 0.0, 0.0, 0.0]),
+            "PEQ_1_10 at 8325 should also be identity"
+        );
+    }
+
+    #[test]
+    fn parse_filter_hex_coeffs_decodes_five_floats() {
+        // identity biquad: b0 = 1.0, others zero
+        let got = parse_filter_hex_coeffs("3f800000,00000000,00000000,00000000,00000000")
+            .expect("parse");
+        assert_eq!(got, [1.0, 0.0, 0.0, 0.0, 0.0]);
+
+        // mixed signs and values
+        let got =
+            parse_filter_hex_coeffs("3f800000,bf800000,40000000,c0000000,3f000000").expect("parse");
+        assert_eq!(got, [1.0, -1.0, 2.0, -2.0, 0.5]);
+    }
+
+    #[test]
+    fn parse_filter_hex_coeffs_rejects_short_and_malformed() {
+        // only 4 words — should reject
+        assert!(parse_filter_hex_coeffs("3f800000,0,0,0").is_none());
+        // non-hex garbage
+        assert!(parse_filter_hex_coeffs("3f800000,not_hex,0,0,0").is_none());
+    }
+
+    #[test]
+    fn parse_official_setting_xml_rejects_mismatched_dsp_version() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../app/minidsp-snapshots/20260408-130500-preset1-after-reset-live/official-setting1.xml");
+        let temp = std::env::temp_dir().join(format!(
+            "minidsp-open-mismatched-setting-{}-{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let content = fs::read_to_string(&source).expect("read source xml");
+        let mismatched = content.replace(
+            "<dspversion>100</dspversion>",
+            "<dspversion>101</dspversion>",
+        );
+        fs::write(&temp, mismatched).expect("write temp xml");
+
+        let (selector_addrs, scalar_addrs) = official_xml_shadow_addrs(&probe::identify(10, 100));
+        let parsed = parse_official_setting_xml(&temp, &selector_addrs, &scalar_addrs, 100);
+
+        let _ = fs::remove_file(&temp);
+        assert!(parsed.is_none(), "mismatched dspversion should be rejected");
     }
 }

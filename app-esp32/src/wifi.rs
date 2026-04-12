@@ -25,7 +25,19 @@ use std::time::Duration;
 const NVS_NAMESPACE: &str = "wifi";
 const NVS_KEY_SSID: &str = "ssid";
 const NVS_KEY_PASS: &str = "pass";
-const SOFTAP_SSID: &str = "minidsp-setup";
+
+/// Network hostname used on every netif (DHCP option 12 + mDNS A-record)
+/// — matches the Wi-DG-style identity expected by Device Console.
+pub const NETIF_HOSTNAME: &str = "miniDSP-open";
+
+/// SoftAP LAN address when the device is provisioning or running dual-mode.
+/// Chosen to match the Wi-DG /24 default so users with Wi-DG recipes don't
+/// have to memorize a new address.
+pub const SOFTAP_LAN_IP: (u8, u8, u8, u8) = (192, 168, 100, 1);
+
+/// SoftAP SSID prefix; real SSID appends the last 3 bytes of the MAC so
+/// each device is uniquely identifiable on the 2.4 GHz band.
+const SOFTAP_SSID_PREFIX: &str = "miniDSP-open_";
 
 /// WiFi connection error.
 #[derive(Debug)]
@@ -92,6 +104,13 @@ pub fn connect_or_provision(nvs: EspDefaultNvsPartition) -> Result<WifiHandle, W
     .map_err(|e| WifiError::Init(format!("BlockingWifi: {e}")))?;
     let disconnect_subscription = register_disconnect_reason_handler(&sysloop)?;
 
+    // Set DHCP option 12 / mDNS-friendly hostname on both STA and AP netifs
+    // BEFORE wifi.connect() so the first DHCP DISCOVER already carries it.
+    // Router admin pages will then list the device as "miniDSP-open" rather
+    // than a synthetic espressif_<mac> hostname.
+    set_netif_hostname(b"WIFI_STA_DEF\0", NETIF_HOSTNAME);
+    set_netif_hostname(b"WIFI_AP_DEF\0", NETIF_HOSTNAME);
+
     // Try to read saved credentials from NVS
     if let Some((ssid, password)) = read_credentials(&nvs) {
         info!("WiFi: connecting to '{ssid}'");
@@ -121,8 +140,9 @@ pub fn connect_or_provision(nvs: EspDefaultNvsPartition) -> Result<WifiHandle, W
     }
 
     // Start SoftAP for provisioning
-    info!("WiFi: starting SoftAP '{SOFTAP_SSID}' for provisioning");
-    start_softap(&mut wifi)?;
+    let ssid = softap_ssid();
+    info!("WiFi: starting SoftAP '{ssid}' for provisioning");
+    start_softap(&mut wifi, &ssid)?;
 
     Ok(WifiHandle {
         wifi,
@@ -190,9 +210,14 @@ fn connect_sta(
 }
 
 /// Start SoftAP mode for WiFi provisioning.
-fn start_softap(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), WifiError> {
+fn start_softap(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str) -> Result<(), WifiError> {
+    // Configure the SoftAP netif to use SOFTAP_LAN_IP with a /24 before the
+    // radio is started — otherwise the ESP-IDF default 192.168.4.1 is
+    // already baked in and clients will pick up the wrong subnet.
+    apply_softap_ip_config();
+
     wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
-        ssid: SOFTAP_SSID
+        ssid: ssid
             .try_into()
             .map_err(|_| WifiError::Provision("SSID too long".into()))?,
         auth_method: AuthMethod::None,
@@ -204,8 +229,107 @@ fn start_softap(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), WifiErr
     wifi.start()
         .map_err(|e| WifiError::Provision(format!("start: {e}")))?;
 
-    info!("SoftAP started: SSID='{SOFTAP_SSID}'");
+    info!("SoftAP started: SSID='{ssid}' at {}.{}.{}.{}",
+        SOFTAP_LAN_IP.0, SOFTAP_LAN_IP.1, SOFTAP_LAN_IP.2, SOFTAP_LAN_IP.3);
     Ok(())
+}
+
+/// Compose a unique-per-device SoftAP SSID from the last 3 MAC bytes.
+/// Falls back to `miniDSP-open_000000` if the MAC can't be read yet.
+fn softap_ssid() -> String {
+    let mac = read_any_wifi_mac().unwrap_or([0u8; 6]);
+    format!(
+        "{SOFTAP_SSID_PREFIX}{:02X}{:02X}{:02X}",
+        mac[3], mac[4], mac[5]
+    )
+}
+
+/// Read the STA MAC if available, otherwise the SoftAP MAC. Returns None if
+/// the WiFi driver hasn't initialized yet (e.g. first-boot before NVS).
+pub fn read_any_wifi_mac() -> Option<[u8; 6]> {
+    use esp_idf_svc::sys::{
+        esp_wifi_get_mac, wifi_interface_t_WIFI_IF_AP, wifi_interface_t_WIFI_IF_STA, ESP_OK,
+    };
+    unsafe {
+        let mut mac = [0u8; 6];
+        if esp_wifi_get_mac(wifi_interface_t_WIFI_IF_STA, mac.as_mut_ptr()) == ESP_OK {
+            return Some(mac);
+        }
+        let mut mac = [0u8; 6];
+        if esp_wifi_get_mac(wifi_interface_t_WIFI_IF_AP, mac.as_mut_ptr()) == ESP_OK {
+            return Some(mac);
+        }
+    }
+    None
+}
+
+/// Set the esp-netif hostname on the given interface key. Silently no-ops
+/// if the interface hasn't been brought up yet (which is fine — the WiFi
+/// stack creates them on first use, at which point ESP-IDF will reuse the
+/// hostname we stashed on the config we'll reapply here).
+fn set_netif_hostname(if_key: &[u8], hostname: &str) {
+    use esp_idf_svc::sys::{
+        esp_netif_get_handle_from_ifkey, esp_netif_set_hostname, ESP_OK,
+    };
+    let cstr = match std::ffi::CString::new(hostname) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    unsafe {
+        let netif = esp_netif_get_handle_from_ifkey(if_key.as_ptr() as *const _);
+        if netif.is_null() {
+            return;
+        }
+        let ret = esp_netif_set_hostname(netif, cstr.as_ptr());
+        if ret != ESP_OK {
+            warn!("esp_netif_set_hostname({hostname}) failed: {ret}");
+        } else {
+            info!("netif hostname set to '{hostname}' on if_key={}",
+                std::str::from_utf8(&if_key[..if_key.len().saturating_sub(1)]).unwrap_or("?"));
+        }
+    }
+}
+
+/// Configure the SoftAP IP block (stop DHCPS, set ip_info, restart DHCPS).
+/// Must be called BEFORE wifi.start() for the radio's DHCP server to use
+/// the new range on first bind.
+fn apply_softap_ip_config() {
+    use esp_idf_svc::sys::{
+        esp_netif_dhcps_start, esp_netif_dhcps_stop, esp_netif_get_handle_from_ifkey,
+        esp_netif_ip_info_t, esp_netif_set_ip_info, esp_ip4_addr_t, ESP_OK,
+    };
+    unsafe {
+        let netif = esp_netif_get_handle_from_ifkey(b"WIFI_AP_DEF\0".as_ptr() as *const _);
+        if netif.is_null() {
+            warn!("SoftAP IP config: netif WIFI_AP_DEF not found");
+            return;
+        }
+        // It's OK if dhcps isn't running yet — the stop call is a no-op.
+        let _ = esp_netif_dhcps_stop(netif);
+
+        let ip_u32 = (SOFTAP_LAN_IP.0 as u32)
+            | ((SOFTAP_LAN_IP.1 as u32) << 8)
+            | ((SOFTAP_LAN_IP.2 as u32) << 16)
+            | ((SOFTAP_LAN_IP.3 as u32) << 24);
+        let gw_u32 = ip_u32; // gateway == the ESP's own address
+        let netmask_u32 = 0x00FFFFFFu32; // 255.255.255.0 in little-endian order
+
+        let ip_info = esp_netif_ip_info_t {
+            ip: esp_ip4_addr_t { addr: ip_u32 },
+            netmask: esp_ip4_addr_t { addr: netmask_u32 },
+            gw: esp_ip4_addr_t { addr: gw_u32 },
+        };
+
+        let ret = esp_netif_set_ip_info(netif, &ip_info);
+        if ret != ESP_OK {
+            warn!("esp_netif_set_ip_info failed: {ret}");
+        }
+
+        let ret = esp_netif_dhcps_start(netif);
+        if ret != ESP_OK {
+            warn!("esp_netif_dhcps_start failed: {ret}");
+        }
+    }
 }
 
 fn register_disconnect_reason_handler(
@@ -543,7 +667,7 @@ pub fn clear_credentials(nvs: &EspDefaultNvsPartition) -> Result<(), WifiError> 
 }
 
 /// Read the actual SoftAP IP from the ESP-IDF network interface.
-/// Falls back to 192.168.4.1 if the interface isn't available.
+/// Falls back to [`SOFTAP_LAN_IP`] if the interface isn't available.
 pub fn get_softap_ip() -> std::net::Ipv4Addr {
     unsafe {
         let netif =
@@ -565,7 +689,12 @@ pub fn get_softap_ip() -> std::net::Ipv4Addr {
             }
         }
     }
-    std::net::Ipv4Addr::new(192, 168, 4, 1)
+    std::net::Ipv4Addr::new(
+        SOFTAP_LAN_IP.0,
+        SOFTAP_LAN_IP.1,
+        SOFTAP_LAN_IP.2,
+        SOFTAP_LAN_IP.3,
+    )
 }
 
 /// Configure DHCP server for captive portal:

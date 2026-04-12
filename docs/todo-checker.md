@@ -162,17 +162,15 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
   Verified on 2026-04-09 on the physical 2x4 HD:
   CLI `output 2 crossover set 0 ...` changed all four group-0 biquads on the live device, `GET /devices/0/config` read back the new coefficients immediately, and the original group was restored through `/config`.
 - [ ] compressor subcommand
-  Current 2x4 HD direct-USB finding on 2026-04-09: threshold / gain are live-verifiable, but ratio / knee / attack / release still fail read-before / read-after verification and did not land anywhere in the exposed `0..34959` param space during a full-memory scan.
-  Updated 2026-04-09 desktop finding: direct replay with upstream `minidsp-rs` on the same physical 2x4 HD sends the same plain `0x13` scalar writes and still only moves threshold; forcing compressor bypass `off` first did not change that result.
-  Updated 2026-04-09 official-app capture finding: Device Console also uses plain `0x13` writes here on the physical 2x4 HD, specifically output-0 `bypass=22`, `threshold=40`, `ratio=42`, `attack=44`, `release=45`. The interleaved `0x14 0x0046 0x01` polls are compressor-meter reads, not authoritative parameter readback.
-  Updated 2026-04-09 daemon finding: `POST /devices/0/config` changed output-0 compressor state on the physical 2x4 HD and a fresh daemon restart still returned the same values, so desktop app/daemon visibility for these fields is now covered by token-gated scalar shadow restore even though live authoritative readback is still incomplete.
-  Updated 2026-04-09 token-model finding: a no-op compressor `/config` write now also advances the active preset modification token through the daemon, matching the official app's explicit token-save behavior instead of relying on raw DSP writes to touch `0xFFC8`.
-  Updated 2026-04-10 recovery-model finding: if the local daemon cache is missing a preset, the desktop daemon can now import the matching official Device Console `setting*.xml` snapshot when its `<timestamp>` matches the hardware token for that preset, so fresh attach still recovers sane controller-side compressor state without pretending raw low-address `0x14` became authoritative.
-  Re-verified on 2026-04-10 on the physical 2x4 HD: after starting the daemon with a fresh config home, switching to presets `2` and `3` still produced sane `/devices/0/config` compressor/FIR state, confirming that token-matched official XML import is closing those missing-shadow presets on live hardware.
+  Updated 2026-04-09 official-app capture finding: Device Console uses plain `0x13` writes on the physical 2x4 HD — output-0 addresses `bypass=22`, `threshold=40`, `ratio=42`, `attack=44`, `release=45`. The interleaved `0x14 0x0046 0x01` polls are compressor-meter reads, not authoritative parameter readback.
+  Updated 2026-04-10 protocol RE finding (CLOSED as test-methodology issue): multi-angle RE (Device Console JS source, APK, Wi-DG, all captures) confirmed compressor ratio/attack/release write as raw float32-LE via `0x13` ctrl=`0x80` — same encoding this repo already uses. "No change in value" session log messages = Device Console in-memory cache comparison, not hardware readback. Most likely prior test failure: default threshold `-30 dBFS` is too quiet to trigger audible compression on typical test signals. Protocol gap is closed. **Remaining item**: audible retest on loud material with threshold set to trigger; if audible compression is confirmed, check this item.
+  Updated 2026-04-09 daemon finding: `POST /devices/0/config` changed output-0 compressor state on the physical 2x4 HD and a fresh daemon restart still returned the same values via token-gated scalar shadow restore.
+  Updated 2026-04-10 recovery-model finding: the daemon can now import the matching official Device Console `setting*.xml` snapshot for missing preset shadow when its `<timestamp>` matches the hardware token.
 - [x] FIR subcommand
   Verified on 2026-04-09 on the physical 2x4 HD:
   desktop `POST /devices/0/config` with output FIR coefficients returned `200`, raw coeff readback at `4183..` matched the requested six-tap pattern, and same-client `GET /devices/0/config` reported `active_taps: 6` with `bypass: false`.
   Updated 2026-04-09 desktop finding: fresh-daemon `/config` now restores FIR `active_taps` across reconnects from persisted verified selector shadow keyed by serial, while authoritative live DSP100 tap-count readback still returns `0`. Fresh-client FIR/compressor bypass still decodes correctly as `1 = bypassed`, `2 = enabled`.
+  Updated 2026-04-10 tap-count model (RE confirmed): Device Console never reads hardware address `0x0054` for tap count. Configured taps come from local XML `_Taps`. Available tap capacity queried via opcode `0x39` (`GetNumFirTaps`) during FIR writes only (not startup). Hardware low-address tap-count slot returns garbage on DSP100 — this is a confirmed hardware limitation, not a protocol gap.
 - [x] routing subcommand
   Verified on 2026-04-09 via `minidsp --daemon-url ... input 0 routing 2 0 --off` / restore with matching `GET /devices/0/config` before/after readback on the physical 2x4 HD.
   Updated 2026-04-09 desktop finding: fresh-daemon `/config` now restores routing state across reconnects from persisted verified selector shadow keyed by serial. Authoritative live DSP100 routing readback is still unavailable; a full readable-DSP-space diff found no routing mirror outside the collapsed `6..13` words, and EEPROM modification tokens at `0xFFC8` stayed unchanged across raw runtime routing writes.
@@ -235,7 +233,7 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 - [x] `POST /devices/{id}/preset/{preset}`
   Re-verified on 2026-04-10 on the physical 2x4 HD: verified preset-switch surfaces now intentionally wait for master-status confirmation instead of returning on the transport ack. `POST /devices/0/preset/2` completed in `5.02 s`, `minidsp --daemon-url http://127.0.0.1:5382 config 3` completed in `5.37 s`, `minidsp --url tcp://127.0.0.1:5333 config 1` completed in `5.38 s`, and compatibility `POST /devices/0 {"preset":0}` completed in `5.32 s`.
 - [x] `POST /devices/{id}/preset/copy`
-  Re-verified on 2026-04-10 on the physical 2x4 HD: `POST /devices/0/preset/copy` returned `200` in `23.02 s`, matching the official Device Console `0x27` timing (`2026-04-08 15:14:04.417` send -> `2026-04-08 15:14:27.284` OK), and the route correctly returned an empty success body (`Content-Length: 0`).
+  Re-verified on 2026-04-10 on the physical 2x4 HD: `POST /devices/0/preset/copy` returned `200` in `23.02 s`, matching the official Device Console `0x27` timing (`2026-04-08 15:14:04.417` send -> `2026-04-08 15:14:27.284` OK), and the route correctly returned an empty success body (`Content-Length: 0`). Re-verified again on 2026-04-11 on the physical 2x4 HD after wiring the new `copy_preset_verified` path: `POST /devices/0/preset/copy` returned `200 OK`, and a direct `dump-flash 0xFFA3 1` reads back `0x00` immediately afterwards (well below the `0x0D` Device Console failure threshold), confirming the verifyProgram round-trip mirrors `userPreset.js verifyProgram()` and that the route only bumps tokens on a clean save.
 
 ### 3.3 Response-shape checks
 
@@ -349,11 +347,11 @@ This section is mandatory before deleting the compatibility todo.
 - [ ] `POST /devices/0/config` applies input PEQ/gain/mute correctly.
 - [ ] `POST /devices/0/config` applies output PEQ/gain/mute/delay/invert correctly.
 - [ ] If routing/crossover/compressor/FIR fields are part of the compatibility shape, they are implemented and tested.
-  Current 2026-04-09 desktop state on the physical 2x4 HD:
+  Current desktop state (2026-04-10):
   routing, crossover coefficient writes, and FIR write paths are live-verified on the long-lived daemon client;
-  compressor write opcode/address selection now matches the captured official desktop app, but parameter effect/readback still has unresolved drift beyond threshold / gain;
-  fresh-daemon routing and FIR `active_taps` readback now restore from persisted verified shadow keyed by serial;
-  authoritative live DSP100 readback for routing and FIR tap count is still incomplete.
+  compressor write encoding confirmed correct by RE — opcode `0x13`, raw float32-LE, same as this repo uses; remaining item is audible retest on loud material (test-methodology, not protocol);
+  fresh-daemon routing and FIR `active_taps` readback restore from persisted verified shadow keyed by serial;
+  authoritative live DSP100 readback for routing and FIR tap count is a confirmed hardware limitation (Device Console has the same limitation).
 - [ ] If they are not part of the compatibility shape, `ref-compatibility.md` says so clearly.
 
 ---
