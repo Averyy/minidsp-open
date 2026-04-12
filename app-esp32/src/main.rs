@@ -573,7 +573,7 @@ fn discovery_packet_for_state(
             hw.fw_major,
             hw.fw_minor,
             dev.dsp_version(),
-            dev.serial() as u16,
+            minidsp_protocol::discovery::serial_to_u16(dev.serial()),
             format!("minidsp-{:08x}", dev.serial()),
         ));
     }

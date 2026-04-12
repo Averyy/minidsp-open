@@ -129,7 +129,8 @@ pub fn read_entry_biquads_by_digest(
     if &header[0..4] != BIN_MAGIC {
         return Err("bad catalogue.bin magic (expected BEQ\\x02)".into());
     }
-    let entry_count = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let entry_count =
+        u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if entry_count == 0 {
         return Err("catalogue is empty".into());
     }
@@ -171,6 +172,9 @@ pub fn read_entry_biquads_by_digest(
 fn parse_biquad_record(
     record: &[u8],
 ) -> Result<(u8, f32, Vec<[f32; 5]>), Box<dyn std::error::Error>> {
+    if record.len() < 5 {
+        return Err(format!("record too short: {} bytes", record.len()).into());
+    }
     let filter_count = record[0];
     if filter_count as usize > MAX_FILTERS {
         return Err(format!(
@@ -179,11 +183,20 @@ fn parse_biquad_record(
         )
         .into());
     }
-    let mv_adjust = f32::from_le_bytes(record[1..5].try_into().unwrap());
+    let mv_adjust = f32::from_le_bytes([record[1], record[2], record[3], record[4]]);
     if !mv_adjust.is_finite() || mv_adjust.abs() > 40.0 {
         return Err(
             format!("mv_adjust {mv_adjust} out of range (must be finite, |mv| <= 40)").into(),
         );
+    }
+
+    let needed = 5 + filter_count as usize * COEFFS_PER_FILTER * 4;
+    if record.len() < needed {
+        return Err(format!(
+            "record too short for {filter_count} filters: have {}, need {needed}",
+            record.len()
+        )
+        .into());
     }
 
     let mut coeffs = Vec::with_capacity(filter_count as usize);
@@ -192,7 +205,12 @@ fn parse_biquad_record(
         let mut c = [0f32; 5];
         for j in 0..5 {
             let offset = base + j * 4;
-            c[j] = f32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
+            c[j] = f32::from_le_bytes([
+                record[offset],
+                record[offset + 1],
+                record[offset + 2],
+                record[offset + 3],
+            ]);
         }
         coeffs.push(c);
     }

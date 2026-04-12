@@ -12,7 +12,7 @@ use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::sys;
 use log::{error, info, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Base URL for catalogue data on GitHub Pages.
@@ -29,6 +29,18 @@ const NVS_BASE_URL_KEY: &str = "base_url";
 const DOWNLOAD_CHUNK: usize = 4096;
 const UPDATER_THREAD_STACK_BYTES: usize = 24 * 1024;
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Cooldown between user-triggered refreshes so repeated 404s on a missing
+/// GitHub Pages manifest don't burn TLS handshakes on every page load.
+const TRIGGER_COOLDOWN_SECS: u32 = 5 * 60;
+/// Monotonic seconds since boot of the most recent refresh attempt (0 = never).
+static LAST_TRIGGER_SECS: AtomicU32 = AtomicU32::new(0);
+
+fn uptime_secs() -> u32 {
+    // esp_timer_get_time returns i64 microseconds since boot; cap at u32 seconds.
+    let us = unsafe { sys::esp_timer_get_time() } as u64;
+    (us / 1_000_000).min(u32::MAX as u64) as u32
+}
 
 /// Result of an update check.
 #[derive(Debug)]
@@ -120,9 +132,13 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
         installed.as_deref().unwrap_or("(none)"),
     );
 
-    // Clear installed version FIRST — if anything fails, next boot retries everything
+    // Clear installed version FIRST — if anything fails, next boot retries everything.
+    // Bail out on failure: if we can't clear NVS and then delete the on-flash
+    // files, a later download failure would leave the old version string pointing
+    // at an empty data partition and the next boot would believe it was current.
     if let Err(e) = write_nvs_version(nvs, "") {
-        warn!("failed to clear NVS version: {e}");
+        error!("failed to clear NVS version before update: {e}");
+        return UpdateResult::Error(format!("clear NVS version: {e}"));
     }
 
     // Delete all existing data files before downloading new ones (all-or-nothing)
@@ -186,6 +202,14 @@ pub fn trigger_background_refresh(
     nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
     reason: &'static str,
 ) -> bool {
+    // Throttle user-triggered refreshes. Each attempt costs a TLS handshake
+    // and — when the manifest 404s — only learns that it still 404s.
+    let now = uptime_secs();
+    let last = LAST_TRIGGER_SECS.load(Ordering::Acquire);
+    if last != 0 && now.saturating_sub(last) < TRIGGER_COOLDOWN_SECS {
+        return false;
+    }
+
     let guard = match UpdateRunGuard::acquire() {
         Some(guard) => guard,
         None => return false,
@@ -199,7 +223,13 @@ pub fn trigger_background_refresh(
             let _guard = guard;
             log_update_result(check_and_update(&nvs));
         }) {
-        Ok(_) => true,
+        Ok(_) => {
+            // Only mark the cooldown consumed once the refresh thread actually
+            // started — otherwise spawn failures would block the next attempt
+            // for 5 minutes even though no refresh ran.
+            LAST_TRIGGER_SECS.store(now, Ordering::Release);
+            true
+        }
         Err(e) => {
             warn!("failed to spawn background catalogue refresh: {e}");
             false

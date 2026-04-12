@@ -644,7 +644,10 @@ impl DeviceState {
     }
 
     pub fn set_preset(&self, preset: u8) -> Result<(), UsbHidError> {
-        self.expect_write_ok_slow(&commands::set_config(preset, 0), "set preset")
+        // Route through the verify path so HTTP + CLI callers share the same
+        // dropped-PresetComplete fallback as the TCP bridge. 2x4 HD hardware
+        // occasionally skips the completion frame after a preset switch.
+        self.set_config_with_verify(preset, commands::PRESET_CHANGE_NORMAL)
     }
 
     pub fn set_dirac_bypass(&self, bypass: bool) -> Result<(), UsbHidError> {

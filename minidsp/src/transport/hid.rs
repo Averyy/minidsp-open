@@ -50,8 +50,10 @@ impl HidTransport {
     /// Open a HID device by path.
     pub fn open(path: &str) -> Result<Self, TransportError> {
         let api = hidapi::HidApi::new().map_err(|e| TransportError::Hid(e.to_string()))?;
+        let cpath = std::ffi::CString::new(path)
+            .map_err(|e| TransportError::Hid(format!("invalid HID path (NUL byte): {e}")))?;
         let device = api
-            .open_path(&std::ffi::CString::new(path).unwrap())
+            .open_path(&cpath)
             .map_err(|e| TransportError::Hid(e.to_string()))?;
         let info = device
             .get_device_info()

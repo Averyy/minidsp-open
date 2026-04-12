@@ -113,9 +113,11 @@ pub fn start(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let mut buf = [0u8; 1024];
-            let len = req.read(&mut buf).unwrap_or(0);
-            let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
+            let body = match read_request_body(&mut req, 1024) {
+                Ok(b) => b,
+                Err(msg) => return send_error(req, 413, msg),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
@@ -148,6 +150,9 @@ pub fn start(
                 }
             }
             if let Some(preset) = json.get("preset").and_then(|v| v.as_u64()) {
+                if preset > u8::MAX as u64 {
+                    return send_error(req, 400, "preset out of range");
+                }
                 if let Err(e) = dev.set_preset(preset as u8) {
                     return send_error(req, 500, &format!("set_preset: {e}"));
                 }
@@ -778,9 +783,11 @@ pub fn start(
     // POST /api/wifi/connect — WiFi provisioning form handler
     let nvs_wifi = nvs.clone();
     server.fn_handler("/api/wifi/connect", Method::Post, move |mut req| {
-        let mut buf = [0u8; 256];
-        let len = req.read(&mut buf).unwrap_or(0);
-        let body = std::str::from_utf8(&buf[..len]).unwrap_or("");
+        let body_bytes = match read_request_body(&mut req, 512) {
+            Ok(b) => b,
+            Err(msg) => return send_provision_error(req, msg),
+        };
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("");
 
         // Parse form-encoded body: ssid=...&password=...
         let mut ssid = String::new();
@@ -963,7 +970,7 @@ fn register_debug_routes(
             let query = uri.split_once('?').map(|(_, q)| q).unwrap_or("");
             let mut addr: Option<u16> = None;
             let mut count: u8 = 1;
-            let mut format = "floats";
+            let mut format: Option<&str> = None;
 
             for part in query.split('&') {
                 let Some((key, value)) = part.split_once('=') else {
@@ -986,7 +993,7 @@ fn register_debug_routes(
                         }
                     }
                     "format" if value == "words" || value == "floats" => {
-                        format = value;
+                        format = Some(value);
                     }
                     _ => {}
                 }
@@ -998,7 +1005,7 @@ fn register_debug_routes(
             let _op = dev.begin_operation();
 
             let body = match format {
-                "words" => match dev.read_dsp_words(addr, count) {
+                Some("words") => match dev.read_dsp_words(addr, count) {
                     Ok(values) => serde_json::to_string(&json!({
                         "addr": addr,
                         "count": count,
@@ -1008,7 +1015,7 @@ fn register_debug_routes(
                     .unwrap_or_default(),
                     Err(e) => return send_error(req, 500, &e.to_string()),
                 },
-                _ => match dev.read_dsp_floats(addr, count) {
+                Some("floats") => match dev.read_dsp_floats(addr, count) {
                     Ok(values) => serde_json::to_string(&json!({
                         "addr": addr,
                         "count": count,
@@ -1018,6 +1025,32 @@ fn register_debug_routes(
                     .unwrap_or_default(),
                     Err(e) => return send_error(req, 500, &e.to_string()),
                 },
+                None => {
+                    // Auto-pick: float decode is strict and rejects anything that
+                    // doesn't look like a plausible DSP parameter (EEPROM pages,
+                    // unused addresses, etc.). Try floats first, then fall back to
+                    // words so /debug/dsp can inspect any address.
+                    match dev.read_dsp_floats(addr, count) {
+                        Ok(values) => serde_json::to_string(&json!({
+                            "addr": addr,
+                            "count": count,
+                            "format": "floats",
+                            "values": values,
+                        }))
+                        .unwrap_or_default(),
+                        Err(_) => match dev.read_dsp_words(addr, count) {
+                            Ok(values) => serde_json::to_string(&json!({
+                                "addr": addr,
+                                "count": count,
+                                "format": "words",
+                                "values": values,
+                            }))
+                            .unwrap_or_default(),
+                            Err(e) => return send_error(req, 500, &e.to_string()),
+                        },
+                    }
+                }
+                _ => unreachable!(),
             };
 
             send_json(req, 200, &body)
@@ -1026,20 +1059,19 @@ fn register_debug_routes(
 
     // POST /debug/level — change runtime log level
     server.fn_handler("/debug/level", Method::Post, |mut req| {
-        let mut buf = [0u8; 128];
-        let len = req.read(&mut buf).unwrap_or(0);
+        let body = match read_request_body(&mut req, 256) {
+            Ok(b) => b,
+            Err(msg) => return send_error(req, 413, msg),
+        };
 
-        let level_str = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
+        let level_str = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
             json.get("level")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string()
         } else {
             // Try plain text body
-            std::str::from_utf8(&buf[..len])
-                .unwrap_or("")
-                .trim()
-                .to_string()
+            std::str::from_utf8(&body).unwrap_or("").trim().to_string()
         };
 
         match diagnostics::set_log_level(&level_str) {
@@ -1074,9 +1106,11 @@ fn register_debug_routes(
     {
         let nvs = nvs.clone();
         server.fn_handler("/debug/updater", Method::Post, move |mut req| {
-            let mut buf = [0u8; 512];
-            let len = req.read(&mut buf).unwrap_or(0);
-            let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
+            let body = match read_request_body(&mut req, 512) {
+                Ok(b) => b,
+                Err(msg) => return send_error(req, 413, msg),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
@@ -1288,15 +1322,29 @@ fn register_device_feature_routes(
                 }
                 Some(d) => d,
             };
-            let mut buf = [0u8; 256];
-            let len = req.read(&mut buf).unwrap_or(0);
+            let body = match read_request_body(&mut req, 512) {
+                Ok(b) => b,
+                Err(msg) => return send_error(req, 413, msg),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => return send_error(req, 400, "invalid JSON"),
+            };
             let _op = dev.begin_operation();
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
-                if let Some(b) = json.get("brightness").and_then(|v| v.as_u64()) {
-                    let _ = dev.set_display_brightness(b as u8);
+            if let Some(b) = json.get("brightness").and_then(|v| v.as_u64()) {
+                if b > u8::MAX as u64 {
+                    return send_error(req, 400, "brightness out of range (0-255)");
                 }
-                if let Some(t) = json.get("idle_time").and_then(|v| v.as_u64()) {
-                    let _ = dev.set_display_idle_time(t as u8);
+                if let Err(e) = dev.set_display_brightness(b as u8) {
+                    return send_error(req, 500, &format!("set_display_brightness: {e}"));
+                }
+            }
+            if let Some(t) = json.get("idle_time").and_then(|v| v.as_u64()) {
+                if t > u8::MAX as u64 {
+                    return send_error(req, 400, "idle_time out of range (0-255)");
+                }
+                if let Err(e) = dev.set_display_idle_time(t as u8) {
+                    return send_error(req, 500, &format!("set_display_idle_time: {e}"));
                 }
             }
             send_json(req, 200, r#"{"status":"ok"}"#)
@@ -1336,12 +1384,18 @@ fn register_device_feature_routes(
                 }
                 Some(d) => d,
             };
-            let mut buf = [0u8; 256];
-            let len = req.read(&mut buf).unwrap_or(0);
+            let body = match read_request_body(&mut req, 256) {
+                Ok(b) => b,
+                Err(msg) => return send_error(req, 413, msg),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => return send_error(req, 400, "invalid JSON"),
+            };
             let _op = dev.begin_operation();
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
-                if let Some(enabled) = json.get("enabled").and_then(|v| v.as_bool()) {
-                    let _ = dev.set_dre(enabled);
+            if let Some(enabled) = json.get("enabled").and_then(|v| v.as_bool()) {
+                if let Err(e) = dev.set_dre(enabled) {
+                    return send_error(req, 500, &format!("set_dre: {e}"));
                 }
             }
             send_json(req, 200, r#"{"status":"ok"}"#)

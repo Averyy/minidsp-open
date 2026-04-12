@@ -489,9 +489,9 @@ async fn play_device(
         .await
         .map_err(|_| ApiError::internal("playback thread ended unexpectedly"))?
         .map_err(ApiError::internal)?;
-    Ok(Json(
-        serde_json::to_value(response).expect("play response serializes"),
-    ))
+    let value = serde_json::to_value(response)
+        .map_err(|e| ApiError::internal(format!("serialize play response: {e}")))?;
+    Ok(Json(value))
 }
 
 async fn volume_direction(

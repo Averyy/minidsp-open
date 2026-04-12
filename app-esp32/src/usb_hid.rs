@@ -509,9 +509,25 @@ impl UsbHidBus {
             }
 
             // Try to decode the HID response frame
-            if let Some(payload) = minidsp_protocol::packet::decode_hid_response(&resp_buf) {
-                debug!("USB command decoded response: {:02x?}", payload);
-                return Ok(payload);
+            if let Some(decoded) = minidsp_protocol::packet::decode_hid_response(&resp_buf) {
+                debug!("USB command decoded response: {:02x?}", decoded);
+
+                // Skip stale frames whose opcode doesn't match the request. The
+                // 2x4 HD emits AudioSrcChanged / flash-notification frames that
+                // can arrive before the real ack for set_source / set_config.
+                // Mirrors the desktop queue's skip-stale loop in minidsp/src/queue.rs.
+                if let (Some(req_op), Some(resp_op)) =
+                    (payload.first().copied(), decoded.first().copied())
+                {
+                    if !minidsp_protocol::commands::matches_response(req_op, resp_op) {
+                        debug!(
+                            "USB HID: skipping stale response op=0x{resp_op:02x} for request op=0x{req_op:02x}, frame: {:02x?}",
+                            decoded
+                        );
+                        continue;
+                    }
+                }
+                return Ok(decoded);
             }
 
             // Undecodable packet — log and retry within the timeout window
