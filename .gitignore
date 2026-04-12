@@ -4,3 +4,4 @@ app/
 target/
 
 .codex-dobby/
+.claude/
