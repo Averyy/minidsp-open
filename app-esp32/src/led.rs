@@ -11,8 +11,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const RMT_RESOLUTION_HZ: Hertz = Hertz(10_000_000);
-const DEMO_HOLD: Duration = Duration::from_secs(10);
-const TRANSITION_GAP: Duration = Duration::from_millis(250);
 const BREATH_STEP: Duration = Duration::from_millis(100);
 const FLASH_ON_TIME: Duration = Duration::from_millis(150);
 const FLASH_OFF_TIME: Duration = Duration::from_millis(150);
@@ -47,22 +45,21 @@ pub enum LedState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Rgb {
+pub(crate) struct Rgb {
     red: u8,
     green: u8,
     blue: u8,
 }
 
 impl Rgb {
-    const BLACK: Self = Self::new(0, 0, 0);
-    const RED: Self = Self::new(28, 0, 0);
-    const GREEN: Self = Self::new(0, 24, 0);
-    const BLUE: Self = Self::new(0, 0, 28);
-    const AMBER: Self = Self::new(30, 13, 0);
-    const AMBER_MIN: Self = Self::new(4, 2, 0);
-    const WHITE: Self = Self::new(20, 20, 20);
+    pub(crate) const BLACK: Self = Self::new(0, 0, 0);
+    pub(crate) const RED: Self = Self::new(28, 0, 0);
+    pub(crate) const GREEN: Self = Self::new(0, 24, 0);
+    pub(crate) const BLUE: Self = Self::new(0, 0, 28);
+    pub(crate) const AMBER: Self = Self::new(30, 13, 0);
+    pub(crate) const AMBER_MIN: Self = Self::new(4, 2, 0);
 
-    const fn new(red: u8, green: u8, blue: u8) -> Self {
+    pub(crate) const fn new(red: u8, green: u8, blue: u8) -> Self {
         Self { red, green, blue }
     }
 
@@ -273,51 +270,14 @@ impl Led<'static> {
             last_color: None,
         })
     }
-
-    pub fn run_demo_loop(&mut self) -> Result<(), EspError> {
-        info!("LED demo enabled on GPIO48");
-        loop {
-            self.run_color_verification()?;
-            self.run_state_demo()?;
-        }
-    }
-
-    pub fn run_first_color_test_loop(&mut self) -> Result<(), EspError> {
-        info!("LED first-color test enabled on GPIO48");
-        loop {
-            self.show_color("raw red", Rgb::RED, DEMO_HOLD)?;
-        }
-    }
-
-    pub fn run_color_verification_loop(&mut self) -> Result<(), EspError> {
-        info!("LED color verification loop enabled on GPIO48");
-        loop {
-            self.run_color_verification()?;
-        }
-    }
-
-    pub fn run_state_demo_loop(&mut self) -> Result<(), EspError> {
-        info!("LED state demo loop enabled on GPIO48");
-        loop {
-            self.run_state_demo()?;
-        }
-    }
-
-    pub fn run_amber_breathe_demo_loop(&mut self) -> Result<(), EspError> {
-        info!("LED amber breathe demo loop enabled on GPIO48");
-        loop {
-            self.breathe_between(
-                Rgb::AMBER_MIN,
-                Rgb::AMBER,
-                STATE_BREATHE_PERIOD,
-                STATE_BREATHE_PERIOD,
-            )?;
-        }
-    }
 }
 
 impl<'d> Led<'d> {
-    fn render_state_frame(&mut self, state: LedState, elapsed: Duration) -> Result<(), EspError> {
+    pub(crate) fn render_state_frame(
+        &mut self,
+        state: LedState,
+        elapsed: Duration,
+    ) -> Result<(), EspError> {
         self.write(Self::color_for_state(state, elapsed))
     }
 
@@ -344,102 +304,11 @@ impl<'d> Led<'d> {
         }
     }
 
-    fn run_color_verification(&mut self) -> Result<(), EspError> {
-        self.show_color("raw red", Rgb::RED, DEMO_HOLD)?;
-        self.show_color("raw green", Rgb::GREEN, DEMO_HOLD)?;
-        self.show_color("raw blue", Rgb::BLUE, DEMO_HOLD)?;
-        self.show_color("raw amber", Rgb::AMBER, DEMO_HOLD)?;
-        self.show_color("raw white", Rgb::WHITE, DEMO_HOLD)?;
-        self.show_color("raw off", Rgb::BLACK, DEMO_HOLD)?;
-        Ok(())
-    }
-
-    fn run_state_demo(&mut self) -> Result<(), EspError> {
-        self.show_state_for(LedState::Booting, DEMO_HOLD)?;
-        self.show_state_for(LedState::ProvisioningAp, DEMO_HOLD)?;
-        self.show_state_for(LedState::WifiConnecting, DEMO_HOLD)?;
-        self.show_state_for(LedState::MiniDspUnavailable, DEMO_HOLD)?;
-        self.show_state_for(LedState::MiniDspReady, DEMO_HOLD)?;
-        self.show_state_for(LedState::BackgroundUpdate, DEMO_HOLD)?;
-        self.show_state_for(LedState::Fatal, DEMO_HOLD)?;
-        Ok(())
-    }
-
-    fn show_state_for(&mut self, state: LedState, duration: Duration) -> Result<(), EspError> {
-        info!("LED state demo: {state:?}");
-        self.run_animation(duration, |elapsed| Self::color_for_state(state, elapsed))?;
-        self.off()?;
-        thread::sleep(TRANSITION_GAP);
-        Ok(())
-    }
-
-    fn show_color(&mut self, label: &str, color: Rgb, duration: Duration) -> Result<(), EspError> {
-        info!("LED color demo: {label}");
-        self.write(color)?;
-        thread::sleep(duration);
-        self.off()?;
-        thread::sleep(TRANSITION_GAP);
-        Ok(())
-    }
-
-    fn hold(&mut self, color: Rgb, duration: Duration) -> Result<(), EspError> {
-        self.run_animation(duration, |_| color)
-    }
-
-    fn flash(
-        &mut self,
-        color: Rgb,
-        duration: Duration,
-        on_time: Duration,
-        off_time: Duration,
-    ) -> Result<(), EspError> {
-        self.run_animation(duration, |elapsed| Self::flash_color(color, elapsed, on_time, off_time))
-    }
-
-    fn breathe(
-        &mut self,
-        color: Rgb,
-        duration: Duration,
-        period: Duration,
-        min_factor: f32,
-        max_factor: f32,
-    ) -> Result<(), EspError> {
-        self.run_animation(duration, |elapsed| {
-            Self::breathe_color(color, elapsed, period, min_factor, max_factor)
-        })
-    }
-
-    fn breathe_between(
-        &mut self,
-        low: Rgb,
-        high: Rgb,
-        duration: Duration,
-        period: Duration,
-    ) -> Result<(), EspError> {
-        self.run_animation(duration, |elapsed| {
-            Self::breathe_between_color(low, high, elapsed, period)
-        })
-    }
-
-    fn run_animation<F>(&mut self, duration: Duration, mut frame: F) -> Result<(), EspError>
-    where
-        F: FnMut(Duration) -> Rgb,
-    {
-        let deadline = Instant::now() + duration;
-        while Instant::now() < deadline {
-            let elapsed = duration
-                .saturating_sub(deadline.saturating_duration_since(Instant::now()));
-            self.write(frame(elapsed))?;
-            thread::sleep(BREATH_STEP.min(deadline.saturating_duration_since(Instant::now())));
-        }
-        Ok(())
-    }
-
-    fn off(&mut self) -> Result<(), EspError> {
+    pub(crate) fn off(&mut self) -> Result<(), EspError> {
         self.write(Rgb::BLACK)
     }
 
-    fn write(&mut self, color: Rgb) -> Result<(), EspError> {
+    pub(crate) fn write(&mut self, color: Rgb) -> Result<(), EspError> {
         if self.last_color == Some(color) {
             return Ok(());
         }

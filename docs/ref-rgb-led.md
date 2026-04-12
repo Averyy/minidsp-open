@@ -53,6 +53,7 @@ Live verification on 2026-04-12 on the connected dev board (`USB Single Serial`,
 Later on the same board, the product-state demo was also tuned and visually checked:
 
 - state-demo entrypoint: `app-esp32/src/bin/led-demo.rs`
+- demo helper module: `app-esp32/src/led_demo.rs`
 - state hold in the current demo: `10 s`
 - breathing period in the current demo: `4.5 s`
 - breathing endpoint dwell in the current demo: about `180 ms` at both fully off and fully on
@@ -110,14 +111,15 @@ Current `app-esp32` state:
 
 - there is now a small RMT-based LED driver in `app-esp32/src/led.rs`
 - there is a standalone LED demo binary at `app-esp32/src/bin/led-demo.rs`
-- the raw color verification loop is still available in the shared driver for pin/order bring-up
-- the product-state demo is still available in the shared driver
+- demo-only tuning and bring-up loops now live in `app-esp32/src/led_demo.rs`
+- the raw color verification loop is still available there for pin/order bring-up
+- the product-state demo is still available there for reviewing all status colors/timing
 - the current checked-in `led-demo` entrypoint loops the amber-only breathe test while `MiniDspUnavailable` is being tuned
 - the production firmware now has a real LED status controller wired into `app-esp32/src/main.rs`
 - that production path also consumes WiFi reconnect/provisioning signals from `app-esp32/src/wifi.rs`
 - real ezBEQ download/write activity now drives the update state from `app-esp32/src/updater.rs`
 
-So the LED hardware, GPIO selection, `GRB` ordering, the state-demo timing/brightness choices, the amber-floor workaround, and the production coarse-state plumbing are now all in place. The demo binary remains the tuning/bring-up tool; the real firmware now uses the same shared driver logic for normal runtime status.
+So the LED hardware, GPIO selection, `GRB` ordering, the state-demo timing/brightness choices, the amber-floor workaround, and the production coarse-state plumbing are now all in place. The demo binary remains the tuning/bring-up tool; the real firmware now uses the same shared WS2812 write path and state-rendering behavior for normal runtime status.
 
 ## Recommended Driver Strategy
 
@@ -334,7 +336,8 @@ If a future implementation needs more complex strip support or wants to standard
 There is now a dedicated demo binary for bring-up and visual review:
 
 - source: `app-esp32/src/bin/led-demo.rs`
-- shared driver: `app-esp32/src/led.rs`
+- production driver: `app-esp32/src/led.rs`
+- demo helper module: `app-esp32/src/led_demo.rs`
 
 Build it with:
 
@@ -357,7 +360,7 @@ Current amber demo timing:
 - breathing endpoint dwell: about `180 ms`
 - low endpoint: low amber, not black
 
-Other shared-driver demo paths still exist:
+Other demo-helper paths still exist in `app-esp32/src/led_demo.rs`:
 
 - raw color verification loop for pin/order bring-up
 - full product-state demo for reviewing all status colors/timing
