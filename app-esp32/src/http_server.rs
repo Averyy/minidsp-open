@@ -822,7 +822,7 @@ pub fn start(
                     <h2 style=\"color:#53c28b\">WiFi credentials saved!</h2>\
                     <p>Device will restart and connect to your network.</p>\
                     </body></html>";
-        let headers = [("Server", "miniDSP-open"), ("Content-Type", "text/html")];
+        let headers = [("Server", "miniDSP-Open"), ("Content-Type", "text/html")];
         let mut resp = req.into_response(200, None, &headers)?;
         resp.write_all(html.as_bytes())?;
         // Schedule restart after response is sent
@@ -1500,7 +1500,7 @@ pub fn send_json<C: esp_idf_svc::http::server::Connection>(
     body: &str,
 ) -> Result<(), C::Error> {
     let headers = [
-        ("Server", "miniDSP-open"),
+        ("Server", "miniDSP-Open"),
         ("Content-Type", "application/json"),
         ("Access-Control-Allow-Origin", "*"),
     ];
@@ -1514,7 +1514,7 @@ fn send_text<C: esp_idf_svc::http::server::Connection>(
     text: &str,
 ) -> Result<(), C::Error> {
     let headers = [
-        ("Server", "miniDSP-open"),
+        ("Server", "miniDSP-Open"),
         ("Content-Type", "text/plain; charset=utf-8"),
         ("Access-Control-Allow-Origin", "*"),
     ];
@@ -1528,7 +1528,7 @@ fn send_html<C: esp_idf_svc::http::server::Connection>(
     html: &str,
 ) -> Result<(), C::Error> {
     let headers = [
-        ("Server", "miniDSP-open"),
+        ("Server", "miniDSP-Open"),
         ("Content-Type", "text/html"),
         ("Access-Control-Allow-Origin", "*"),
     ];
@@ -1542,7 +1542,7 @@ fn send_redirect<C: esp_idf_svc::http::server::Connection>(
     location: &str,
 ) -> Result<(), C::Error> {
     let headers = [
-        ("Server", "miniDSP-open"),
+        ("Server", "miniDSP-Open"),
         ("Location", location),
         ("Content-Type", "text/html"),
         ("Cache-Control", "no-store"),
@@ -1562,7 +1562,7 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
 ) -> Result<(), C::Error> {
     let headers = [
-        ("Server", "miniDSP-open"),
+        ("Server", "miniDSP-Open"),
         ("Access-Control-Allow-Origin", "*"),
         (
             "Access-Control-Allow-Methods",
@@ -1580,7 +1580,7 @@ fn send_empty_200<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
 ) -> Result<(), C::Error> {
     let headers = [
-        ("Server", "miniDSP-open"),
+        ("Server", "miniDSP-Open"),
         ("Access-Control-Allow-Origin", "*"),
     ];
     let mut resp = req.into_response(200, None, &headers)?;
@@ -1659,7 +1659,7 @@ fn send_provision_error<C: esp_idf_svc::http::server::Connection>(
          <p><a href=\"/\">Back to setup</a></p>\
          </body></html>"
     );
-    let headers = [("Server", "miniDSP-open"), ("Content-Type", "text/html")];
+    let headers = [("Server", "miniDSP-Open"), ("Content-Type", "text/html")];
     let mut resp = req.into_response(400, None, &headers)?;
     resp.write_all(html.as_bytes())?;
     Ok(())
@@ -2779,7 +2779,7 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
         _ => "application/octet-stream",
     };
     let headers = [
-        ("Server", "miniDSP-open"),
+        ("Server", "miniDSP-Open"),
         ("Content-Type", content_type),
         ("Access-Control-Allow-Origin", "*"),
         ("Cache-Control", "public, max-age=3600"),

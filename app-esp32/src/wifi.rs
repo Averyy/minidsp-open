@@ -28,7 +28,7 @@ const NVS_KEY_PASS: &str = "pass";
 
 /// Network hostname used on every netif (DHCP option 12 + mDNS A-record)
 /// — matches the Wi-DG-style identity expected by Device Console.
-pub const NETIF_HOSTNAME: &str = "miniDSP-open";
+pub const NETIF_HOSTNAME: &str = "miniDSP-Open";
 
 /// SoftAP LAN address when the device is provisioning or running dual-mode.
 /// Chosen to match the Wi-DG /24 default so users with Wi-DG recipes don't
@@ -37,7 +37,7 @@ pub const SOFTAP_LAN_IP: (u8, u8, u8, u8) = (192, 168, 100, 1);
 
 /// SoftAP SSID prefix; real SSID appends the last 3 bytes of the MAC so
 /// each device is uniquely identifiable on the 2.4 GHz band.
-const SOFTAP_SSID_PREFIX: &str = "miniDSP-open_";
+const SOFTAP_SSID_PREFIX: &str = "miniDSP-Open-";
 
 /// WiFi connection error.
 #[derive(Debug)]
@@ -106,7 +106,7 @@ pub fn connect_or_provision(nvs: EspDefaultNvsPartition) -> Result<WifiHandle, W
 
     // Set DHCP option 12 / mDNS-friendly hostname on both STA and AP netifs
     // BEFORE wifi.connect() so the first DHCP DISCOVER already carries it.
-    // Router admin pages will then list the device as "miniDSP-open" rather
+    // Router admin pages will then list the device as "miniDSP-Open" rather
     // than a synthetic espressif_<mac> hostname.
     set_netif_hostname(b"WIFI_STA_DEF\0", NETIF_HOSTNAME);
     set_netif_hostname(b"WIFI_AP_DEF\0", NETIF_HOSTNAME);
@@ -235,7 +235,7 @@ fn start_softap(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str) -> Result
 }
 
 /// Compose a unique-per-device SoftAP SSID from the last 3 MAC bytes.
-/// Falls back to `miniDSP-open_000000` if the MAC can't be read yet.
+/// Falls back to `miniDSP-Open-000000` if the MAC can't be read yet.
 fn softap_ssid() -> String {
     let mac = read_any_wifi_mac().unwrap_or([0u8; 6]);
     format!(
