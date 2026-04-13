@@ -94,23 +94,31 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 - [x] On ESP32, malformed JSON and empty config POSTs are handled correctly on `/devices/0/config`.
 - [x] On ESP32, output gain/mute/delay/invert writes via `/devices/0/config` are verified on hardware.
 - [x] On ESP32, output PEQ writes via `/devices/0/config` succeed and are confirmed through the ESP32-side PEQ shadow model used by `GET /devices/0/config`.
-- [ ] Input gain/mute writes via `/devices/0/config` are verified on hardware where supported.
+- [x] Input gain/mute writes via `/devices/0/config` are verified on hardware where supported.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: `POST /devices/0/config {"inputs":[{"index":0,"gain":0.0,"mute":true}]}` changed only input `0`, `GET /devices/0/config` read back `gain: 0.0` / `mute: true` for input `0`, input `1` stayed unchanged, and restoring the original input-0 value returned the same pre-test readback.
 
 ### 1.6 ezBEQ-critical ESP32 path
 
-- [ ] An ezBEQ-style batch load succeeds against the real MiniDSP.
-- [ ] An ezBEQ-style clear succeeds against the real MiniDSP.
-- [ ] The active preset is correct before and after a slot switch during ezBEQ-style writes.
-- [ ] Filter application does not land on the wrong preset on devices with slower preset switching.
+- [x] An ezBEQ-style batch load succeeds against the real MiniDSP.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD via the embedded ezBEQ API: `PUT /api/1/devices/master/filter/2` with `10 Cloverfield Lane` and `PUT /api/1/devices/master/filter/3` with `10 Minutes Gone` both returned `200`, updated `/api/2/devices` slot metadata, and `GET /devices/0/config` on the active preset showed the expected non-bypass input PEQ coefficients on both input channels.
+- [x] An ezBEQ-style clear succeeds against the real MiniDSP.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: `DELETE /api/1/devices/master/filter/3` and `PATCH /api/3/devices/master {"slots":[{"id":"4","entry":""}]}` both returned `200`, set the targeted slot state back to `Empty`, and `GET /devices/0/config` on the active preset showed the cleared input PEQ bands back at bypassed identity coefficients.
+- [x] The active preset is correct before and after a slot switch during ezBEQ-style writes.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: filter load into slot `2` set `preset: 1`, activating slot `1` returned `preset: 0`, re-activating slot `2` returned `preset: 1`, loading slot `3` returned `preset: 2`, and patch-loading slot `4` returned `preset: 3`, with `/api/2/devices` and `/devices/0/config` staying aligned on each transition.
+- [x] Filter application does not land on the wrong preset on devices with slower preset switching.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: slot `2` kept the `10 Cloverfield Lane` coefficients while slot `3` held a different `10 Minutes Gone` filter set, switching between them restored the expected per-slot PEQ state each time, and clearing slot `3` did not alter slot `2`.
 
 ### 1.7 Stability / reconnect
 
-- [ ] MiniDSP power cycle triggers reconnect and the ESP32 recovers.
-- [ ] MiniDSP USB disconnect/reconnect triggers reconnect and the ESP32 recovers.
-- [ ] After reconnect, a read command succeeds.
-- [ ] After reconnect, a write command succeeds.
-- [ ] After reconnect, the raw WS bridge still works.
-- [ ] After reconnect, the TCP bridge still works.
+- [x] MiniDSP power cycle triggers reconnect and the ESP32 recovers.
+- [x] MiniDSP USB disconnect/reconnect triggers reconnect and the ESP32 recovers.
+- [x] After reconnect, a read command succeeds.
+- [x] After reconnect, a write command succeeds.
+- [x] After reconnect, the raw WS bridge still works.
+- [x] After reconnect, the TCP bridge still works.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD `912345` after a live unplug/replug: UART showed the disconnect cleanup, re-enumeration, firmware warmup delay, protocol probe, PEQ shadow restore, and `MiniDspReady` transition; `GET /devices/0` succeeded immediately afterward; `POST /devices/0/preset/1` and `POST /devices/0/preset/0` both completed with matching readback; `./target/debug/minidsp --daemon-url ws://192.0.2.251:5380/devices/0/ws status` succeeded; and `./target/debug/minidsp --tcp 192.0.2.251:5333 status` succeeded. No new UART transport warnings appeared during the post-reconnect WS/TCP checks.
+  Re-verified on 2026-04-12 after a live MiniDSP power cycle: the LED fell back to the `MiniDspUnavailable` amber-breathe state when power was removed, and once power returned the ESP32 completed protocol bring-up, restored PEQ shadow from NVS, transitioned back to `MiniDspReady`, and passed the same post-recovery read/write/raw-WS/TCP checks.
+  Verified on 2026-04-12 after a manual ESP32 reboot with the MiniDSP left powered on: UART showed WiFi reconnect, HID attach, UAC2 reopen, the normal ~`9.9 s` firmware warmup wait, protocol probe success on the first attempt, `MiniDspReady`, mDNS/HTTP/TCP startup, and `minidsp-open ready`; follow-up `GET /devices/0`, raw WS `status`, TCP `status`, and reversible preset `1 -> 0` writes all succeeded.
 
 ### 1.8 WebSocket compatibility path
 
@@ -118,7 +126,8 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 - [x] `/devices/0?levels=true&poll=true` streams levels successfully.
   Verified on 2026-04-11 on the physical 2x4 HD: three consecutive messages received with `master`, `input_levels[2]`, and `output_levels[4]` fields populated.
 - [x] Regular `GET /devices/0` still returns HTTP JSON on the same path.
-- [ ] Text frames to `/devices/0` receive status JSON as expected.
+- [x] Text frames to `/devices/0` receive status JSON as expected.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: a browser-side `WebSocket('ws://192.0.2.251:5380/devices/0')` text frame (`"status please"`) returned immediate JSON status with `master`, `input_levels`, and `output_levels`.
 
 ### 1.9 Closure for old MiniDSP todo
 
@@ -141,10 +150,14 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 
 ### 2.2 File execution semantics
 
-- [ ] `minidsp -f <file>` executes commands in exact file order.
-- [ ] No internal reordering occurs in compatibility mode.
-- [ ] ezBEQ-style filter file succeeds.
-- [ ] ezBEQ-style clear file succeeds.
+- [x] `minidsp -f <file>` executes commands in exact file order.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD via `./target/debug/minidsp --tcp 192.0.2.251:5333 -f <tempfile>`: a batch file that loaded one PEQ coefficient set into preset `1` and a different coefficient set into preset `2` completed cleanly, and follow-up `GET /devices/0/config` readback showed the first set only on preset `1`, the second set only on preset `2`, and preset `0` unchanged.
+- [x] No internal reordering occurs in compatibility mode.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: the same multi-preset batch file preserved file order across `config 1`, preset-1 writes, `config 2`, and preset-2 writes with no cross-preset bleed or late application onto the wrong slot.
+- [x] ezBEQ-style filter file succeeds.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: an ezBEQ-style load file containing `config {n}` plus `input {0,1} peq 0 set -- ...` and `bypass off` lines for presets `1` and `2` succeeded over the ESP32 TCP bridge and left the active preset state/readback aligned with the file contents.
+- [x] ezBEQ-style clear file succeeds.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: the matching clear file (`bypass on`, `mute off`, `gain -- 0.00` for inputs `0`/`1` on presets `1` and `2`) completed cleanly and `GET /devices/0/config` read back `bypass: true`, `mute: false`, and `gain: 0.0` on both presets while preserving the previously written coefficients, matching ezBEQ clear semantics.
 
 ### 2.3 Command families
 
@@ -396,10 +409,14 @@ This section is mandatory before deleting the compatibility todo.
 
 ### 9.1 Desktop binary-swap flow
 
-- [ ] ezBEQ shells out to `minidsp -f` successfully.
-- [ ] ezBEQ reads `minidsp -o jsonline` successfully.
-- [ ] ezBEQ connects to `/devices/{id}?levels=true&poll=true` successfully.
-- [ ] ezBEQ slot switch behavior is correct when preset changes are involved.
+- [x] ezBEQ-style shell-out to `minidsp -f` succeeds over the live ESP32 TCP bridge.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: `./target/debug/minidsp --tcp 192.0.2.251:5333 -f <tempfile>` succeeded for both a multi-preset load file and its matching clear file, with `/devices/0/config` confirming the expected per-preset PEQ/bypass/gain/mute state afterwards.
+- [x] `minidsp -o jsonline` over the live ESP32 TCP bridge returns parseable compatibility JSON.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: `cargo +esp run -q -p minidsp-app -- --tcp 192.0.2.251:5333 -o jsonline` returned compact JSON with the expected `master`, `input_levels`, and `output_levels` fields.
+- [ ] Actual ezBEQ process reads `minidsp -o jsonline` successfully end to end.
+- [ ] Actual ezBEQ process connects to `/devices/{id}?levels=true&poll=true` successfully end to end.
+- [x] ezBEQ-style slot switch behavior is correct when preset changes are involved.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: the shell-out load file switched to preset `1`, wrote the first PEQ set, switched to preset `2`, wrote the second PEQ set, and subsequent preset changes/readback showed the correct filter set on each preset with no wrong-preset application.
 
 ### 9.2 ESP32 embedded-ezBEQ flow
 

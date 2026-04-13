@@ -1400,9 +1400,13 @@ impl DeviceState {
     /// switch. The command send is allowed to time out — we then confirm
     /// the switch actually happened by polling master status.
     pub fn set_config_with_verify(&self, preset: u8, reset_mode: u8) -> Result<(), UsbHidError> {
-        const SEND_TIMEOUT: Duration = Duration::from_millis(1500);
+        // The 2x4 HD can take several seconds to emit `RESP_PRESET_COMPLETE`.
+        // Timing out too early forces the USB timeout-recovery path on every
+        // normal preset switch, which is both noisy and unstable under stress.
+        const SEND_TIMEOUT: Duration = Duration::from_secs(5);
         const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
         const VERIFY_POLL_DELAY: Duration = Duration::from_millis(100);
+        const POST_SET_CONFIG_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
         if preset >= self.profile.presets {
             return Err(UsbHidError::Protocol(format!(
@@ -1433,6 +1437,7 @@ impl DeviceState {
             std::thread::sleep(VERIFY_POLL_DELAY);
             if let Ok(status) = self.read_master_status_once() {
                 if status.preset == preset {
+                    std::thread::sleep(POST_SET_CONFIG_SETTLE_DELAY);
                     return Ok(());
                 }
             }
@@ -1817,6 +1822,16 @@ impl DeviceState {
     /// the in-memory shadow state so `/config` reflects TCP bridge /
     /// WebSocket activity.
     pub fn raw_command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
+        if payload.first().copied() == Some(commands::CMD_SET_CONFIG) && payload.len() >= 2 {
+            let preset = payload[1];
+            let reset_mode = payload
+                .get(2)
+                .copied()
+                .unwrap_or(commands::PRESET_CHANGE_NORMAL);
+            self.set_config_with_verify(preset, reset_mode)?;
+            return Ok(vec![commands::RESP_PRESET_COMPLETE]);
+        }
+
         let mut resp = self.bus.command(payload)?;
         // Trim HID echo garbage: for write commands, real DSP100/2x4 HD hardware
         // returns an unframed 0x01-prefixed echo of the full 64-byte HID buffer.

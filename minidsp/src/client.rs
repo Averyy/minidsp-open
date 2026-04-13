@@ -86,8 +86,14 @@ pub struct DeviceShadowState {
 
 const MASTER_STATUS_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const MASTER_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// On the live 2x4 HD, master-status can report the new preset slightly before
+// follow-on PEQ writes reliably land on that preset. A short settle window keeps
+// `minidsp -f` batch writes from racing the hardware bank switch.
+const POST_SET_CONFIG_SETTLE_DELAY: Duration = Duration::from_secs(1);
 const MASTER_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-const SET_CONFIG_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+// Raw TCP/WS bridge implementations may verify the preset switch before they
+// reply, so `SetConfig` cannot assume an immediate transport ack.
+const SET_CONFIG_RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
 const RESET_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESET_VERIFY_TIMEOUT: Duration = Duration::from_secs(12);
 const RESET_STATUS_READ_TIMEOUT: Duration = Duration::from_millis(250);
@@ -664,6 +670,7 @@ impl MiniDspClient {
                 .await?;
 
             if after.preset == preset {
+                tokio::time::sleep(POST_SET_CONFIG_SETTLE_DELAY).await;
                 Ok(after)
             } else {
                 Err(ClientError::Protocol(format!(
