@@ -167,6 +167,8 @@ pub const fn is_write_command(opcode: u8) -> bool {
     matches!(
         opcode,
         CMD_WRITE_FLASH
+            | CMD_WRITE_FLASH_BLOCK
+            | CMD_FINISH_FLASH_BLOCK
             | CMD_WRITE_FLASH_FULL_ADDR
             | CMD_WRITE_DSP
             | CMD_WRITE_BIQUAD
@@ -642,6 +644,8 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
 
         // Ack-like responses for various commands
         CMD_WRITE_FLASH
+        | CMD_WRITE_FLASH_BLOCK
+        | CMD_FINISH_FLASH_BLOCK
         | CMD_WRITE_FLASH_FULL_ADDR
         | CMD_WRITE_DSP
         | CMD_WRITE_BIQUAD
@@ -1157,6 +1161,24 @@ mod tests {
     #[test]
     fn finish_flash_block_cmd() {
         assert_eq!(finish_flash_block(0x02), vec![CMD_FINISH_FLASH_BLOCK, 0x02]);
+    }
+
+    #[test]
+    fn flash_block_writes_are_treated_as_write_commands() {
+        assert!(is_write_command(CMD_WRITE_FLASH_BLOCK));
+        assert!(is_write_command(CMD_FINISH_FLASH_BLOCK));
+    }
+
+    #[test]
+    fn flash_block_echoes_parse_as_ack() {
+        assert_eq!(
+            parse_response(&[CMD_WRITE_FLASH_BLOCK, 0x01, 0x04, 0x88], &Dialect::NEW),
+            Response::Ack
+        );
+        assert_eq!(
+            parse_response(&[CMD_FINISH_FLASH_BLOCK, 0x01], &Dialect::NEW),
+            Response::Ack
+        );
     }
 
     #[test]

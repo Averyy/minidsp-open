@@ -122,6 +122,8 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
                     | Some(crate::commands::CMD_READ_FLOATS)
                     | Some(crate::commands::CMD_READ_FLASH)
                     | Some(crate::commands::CMD_READ_FLASH_FULL_ADDR)
+                    | Some(crate::commands::CMD_WRITE_FLASH_BLOCK)
+                    | Some(crate::commands::CMD_FINISH_FLASH_BLOCK)
                     | Some(crate::commands::CMD_WRITE_DSP)
                     | Some(crate::commands::CMD_WRITE_FLASH_FULL_ADDR)
                     | Some(crate::commands::CMD_WRITE_BIQUAD)
@@ -153,27 +155,11 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
             // successful writes. Restrict that special case to write/ack-like
             // commands so late read-command echoes cannot poison the next
             // request/response exchange.
-            if matches!(
-                data.get(1).copied(),
-                Some(crate::commands::CMD_WRITE_FLASH)
-                    | Some(crate::commands::CMD_WRITE_FLASH_FULL_ADDR)
-                    | Some(crate::commands::CMD_WRITE_DSP)
-                    | Some(crate::commands::CMD_WRITE_BIQUAD)
-                    | Some(crate::commands::CMD_SET_VOLUME)
-                    | Some(crate::commands::CMD_SET_MUTE)
-                    | Some(crate::commands::CMD_SET_SOURCE)
-                    | Some(crate::commands::CMD_SET_CONFIG)
-                    | Some(crate::commands::CMD_BYPASS_FILTER)
-                    | Some(crate::commands::CMD_DIRAC_BYPASS)
-                    | Some(crate::commands::CMD_SET_DISPLAY_BRIGHTNESS)
-                    | Some(crate::commands::CMD_SET_DISPLAY_IDLE_TIME)
-                    | Some(crate::commands::CMD_SET_DRE)
-                    | Some(crate::commands::CMD_COPY_PRESET)
-                    | Some(crate::commands::CMD_FIR_LOAD_DATA)
-                    | Some(crate::commands::CMD_RELOAD_DSP_PARAM)
-                    | Some(crate::commands::CMD_LOG_CONTROL)
-                    | Some(crate::commands::CMD_WRITE_DFLASH_ID)
-            ) {
+            if data
+                .get(1)
+                .copied()
+                .is_some_and(crate::commands::is_write_command)
+            {
                 return Some(data[1..].to_vec());
             }
 
@@ -359,6 +345,40 @@ mod tests {
         let report = [0x01, 0x04, 0xff, 0xc8, 0x5a, 0x4c, 0x1b, 0x2b];
         let decoded = decode_hid_response(&report).unwrap();
         assert_eq!(decoded, vec![0x04, 0xff, 0xc8, 0x5a, 0x4c, 0x1b, 0x2b]);
+    }
+
+    #[test]
+    fn hid_unframed_write_flash_block_echo_with_leading_zero_report_id() {
+        let report = [0x00, 0x06, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00];
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(
+            decoded,
+            vec![0x06, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn hid_unframed_write_flash_block_echo_with_leading_one_report_id() {
+        let report = [0x01, 0x06, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00];
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(
+            decoded,
+            vec![0x06, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn hid_unframed_finish_flash_block_echo_with_leading_zero_report_id() {
+        let report = [0x00, 0x07, 0x02, 0x00, 0x00];
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(decoded, vec![0x07, 0x02, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn hid_unframed_finish_flash_block_echo_with_leading_one_report_id() {
+        let report = [0x01, 0x07, 0x02, 0x00, 0x00];
+        let decoded = decode_hid_response(&report).unwrap();
+        assert_eq!(decoded, vec![0x07, 0x02, 0x00, 0x00]);
     }
 
     #[test]

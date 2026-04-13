@@ -958,6 +958,142 @@ mod tests {
         );
     }
 
+    /// Regression test: WriteFlashBlock (0x06) from the Device Console
+    /// preset-save pipeline also comes back as an oversized echoed HID buffer
+    /// on real hardware. The TCP bridge must trim that to the request length
+    /// instead of leaking the trailing junk into the Device Console parser.
+    #[tokio::test]
+    async fn write_flash_block_response_trimmed_to_request_length() {
+        let request = vec![0x06u8, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00];
+        let mut oversized_response = request.clone();
+        oversized_response.extend(std::iter::repeat(0xed).take(54));
+        assert_eq!(oversized_response.len(), 63);
+
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(oversized_response)])));
+
+        let resp = queue
+            .execute_raw(request.clone(), Priority::High)
+            .await
+            .expect("execute_raw should succeed with oversized write flash block echo");
+
+        assert_eq!(
+            resp.len(),
+            request.len(),
+            "raw flash-block response should be trimmed to request length ({}), got {} bytes: {:02x?}",
+            request.len(),
+            resp.len(),
+            resp
+        );
+        assert_eq!(
+            &resp[..],
+            &request[..],
+            "trimmed flash-block response should equal the echoed command"
+        );
+    }
+
+    /// Regression test: FinishFlashBlock (0x07) uses the same unframed HID
+    /// echo behavior as WriteFlashBlock (0x06), so the queue must trim the
+    /// fixed-size HID tail before returning the raw bytes to TCP clients.
+    #[tokio::test]
+    async fn finish_flash_block_response_trimmed_to_request_length() {
+        let request = vec![0x07u8, 0x02];
+        let mut oversized_response = request.clone();
+        oversized_response.extend(std::iter::repeat(0xed).take(61));
+        assert_eq!(oversized_response.len(), 63);
+
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(oversized_response)])));
+
+        let resp = queue
+            .execute_raw(request.clone(), Priority::High)
+            .await
+            .expect("execute_raw should succeed with oversized finish flash block echo");
+
+        assert_eq!(
+            resp.len(),
+            request.len(),
+            "raw finish-flash response should be trimmed to request length ({}), got {} bytes: {:02x?}",
+            request.len(),
+            resp.len(),
+            resp
+        );
+        assert_eq!(
+            &resp[..],
+            &request[..],
+            "trimmed finish-flash response should equal the echoed command"
+        );
+    }
+
+    /// Replay the Device Console preset-save / reload sequence from the
+    /// successful direct-USB app log:
+    ///
+    /// 1. `0x06` WriteFlashBlock echoed as an oversized HID buffer
+    /// 2. `0x07` FinishFlashBlock echoed as an oversized HID buffer
+    /// 3. `0x05` ReadFlash verify-program
+    /// 4. `0x04` WriteFlash modification token
+    /// 5. `0x25` ChangePreset / reload-current-slot completion
+    ///
+    /// This is the strongest non-hardware proof we can get for the shared TCP
+    /// bridge path: the exact command family that previously crashed the
+    /// official Device Console now decodes, trims, and advances through the
+    /// same sequence the direct-USB path already completes successfully.
+    #[tokio::test]
+    async fn device_console_preset_pipeline_replay_matches_expected_responses() {
+        let write_flash_block = vec![0x06u8, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00];
+        let mut write_flash_block_resp = write_flash_block.clone();
+        write_flash_block_resp.extend(std::iter::repeat(0xed).take(54));
+
+        let finish_flash_block = vec![0x07u8, 0x02];
+        let mut finish_flash_block_resp = finish_flash_block.clone();
+        finish_flash_block_resp.extend(std::iter::repeat(0xed).take(61));
+
+        let verify_program_req = commands::read_flash(0xff, 0xa3, 1);
+        let verify_program_resp = vec![commands::CMD_READ_FLASH, 0xff, 0xa3, 0x03];
+
+        let save_token_req = commands::write_flash(0xff, 0xc8, &[0xb5, 0x80, 0xeb, 0x8e]);
+        let save_token_resp = save_token_req.clone();
+
+        let reload_preset_req = commands::set_config(0, commands::PRESET_CHANGE_RELOAD_SAME_SLOT);
+        let reload_preset_resp = vec![commands::RESP_PRESET_COMPLETE];
+
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([
+            Ok(write_flash_block_resp),
+            Ok(finish_flash_block_resp),
+            Ok(verify_program_resp),
+            Ok(save_token_resp),
+            Ok(reload_preset_resp),
+        ])));
+
+        let raw_write_flash_block = queue
+            .execute_raw(write_flash_block.clone(), Priority::High)
+            .await
+            .expect("write flash block should trim to the echoed command");
+        assert_eq!(raw_write_flash_block, write_flash_block);
+
+        let raw_finish_flash_block = queue
+            .execute_raw(finish_flash_block.clone(), Priority::High)
+            .await
+            .expect("finish flash block should trim to the echoed command");
+        assert_eq!(raw_finish_flash_block, finish_flash_block);
+
+        let verify_program = queue
+            .execute(verify_program_req, Priority::Normal)
+            .await
+            .expect("verify-program read should parse after flash block writes");
+        assert_eq!(verify_program, Response::FlashData(vec![0x03]));
+
+        let save_token = queue
+            .execute(save_token_req, Priority::High)
+            .await
+            .expect("save modification token should accept opcode echo ack");
+        assert_eq!(save_token, Response::Ack);
+
+        let reload_preset = queue
+            .execute(reload_preset_req, Priority::Critical)
+            .await
+            .expect("reload-current-slot set_config should accept preset complete");
+        assert_eq!(reload_preset, Response::PresetComplete);
+    }
+
     /// Confirm read commands (0x14 ReadFloats) are NOT trimmed even if the
     /// response happens to start with the same opcode byte.
     #[tokio::test]
