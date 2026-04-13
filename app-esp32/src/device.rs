@@ -7,6 +7,7 @@ use crate::usb_hid::{UsbHidBus, UsbHidError};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use log::{debug, info, warn};
 use minidsp_protocol::commands::{self, HardwareId, Response};
+use minidsp_protocol::default_preset::{default_preset_image_for_dsp, DefaultPresetImage};
 use minidsp_protocol::device::probe;
 use minidsp_protocol::device::DeviceProfile;
 use minidsp_protocol::dialect::{Dialect, ValueFormat};
@@ -114,6 +115,217 @@ const SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
 /// FIR load end can legitimately take longer than normal flash-style commands.
 const FIR_LOAD_END_TIMEOUT: Duration = Duration::from_secs(60);
 const GAIN_VERIFY_TOLERANCE_DB: f32 = 0.2;
+const FLASH_BLOCK_PRESET_VALUES: u8 = 0x01;
+const FLASH_BLOCK_PRESET_BYPASS: u8 = 0x02;
+const RECOVERY_MODIFICATION_TOKEN: [u8; 4] = [0xFE, 0xEF, 0x8F, 0xCF];
+
+fn raw_bridge_timeout_for_payload(payload: &[u8]) -> Duration {
+    match payload.first().copied() {
+        Some(
+            commands::CMD_COPY_PRESET
+            | commands::CMD_RESET
+            | commands::CMD_ENTER_BOOTLOADER
+            | commands::CMD_WRITE_FLASH_BLOCK
+            | commands::CMD_FINISH_FLASH_BLOCK,
+        ) => SLOW_COMMAND_TIMEOUT,
+        _ => Duration::from_secs(5),
+    }
+}
+
+fn build_preset_values_block(params: &[u8]) -> Vec<u8> {
+    let total_len = params.len() + 7;
+    let size = (total_len as u32).to_be_bytes();
+    let mut block = vec![
+        (size[1] & 0xF0) | 0x04,
+        size[2],
+        size[3],
+        0x13,
+        0x0F,
+        0x00,
+        0x00,
+    ];
+    block.extend_from_slice(params);
+    block
+}
+
+fn build_preset_bypass_block(bypass: &[u8]) -> Vec<u8> {
+    let total_len = bypass.len() + 3;
+    let size = (total_len as u32).to_be_bytes();
+    let mut block = vec![0x05, size[2], size[3]];
+    block.extend_from_slice(bypass);
+    block
+}
+
+fn default_bypass_map(image: &DefaultPresetImage) -> HashMap<u16, bool> {
+    let mut map = HashMap::new();
+    for chunk in image.bypass.chunks_exact(3) {
+        map.insert(
+            u16::from_be_bytes([chunk[1], chunk[2]]),
+            chunk[0] & 0x80 != 0,
+        );
+    }
+    map
+}
+
+fn default_param_word(image: &DefaultPresetImage, addr: u16) -> Option<u32> {
+    let offset = addr as usize * 4;
+    let bytes: [u8; 4] = image.params.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn default_param_coeffs(image: &DefaultPresetImage, addr: u16) -> Option<[f32; 5]> {
+    let mut coeffs = [0.0; 5];
+    for (idx, coeff) in coeffs.iter_mut().enumerate() {
+        *coeff = f32::from_bits(default_param_word(image, addr + idx as u16)?);
+    }
+    Some(coeffs)
+}
+
+fn default_preset_shadow(profile: &DeviceProfile, image: &DefaultPresetImage) -> PresetShadowState {
+    let mut snapshot = PresetShadowState::default();
+    let bypass = default_bypass_map(image);
+    let Some(table) = profile.dsp_table else {
+        return snapshot;
+    };
+
+    for input in table.inputs {
+        if let Some(mute) = input.mute {
+            if let Some(value) = default_param_word(image, mute) {
+                snapshot.selector.insert(mute, value as u16);
+            }
+        }
+        if let Some(gain) = input.gain {
+            if let Some(value) = default_param_word(image, gain) {
+                snapshot.scalar.insert(gain, value);
+            }
+        }
+        if let Some(polarity) = input.polarity {
+            if let Some(value) = default_param_word(image, polarity) {
+                snapshot.selector.insert(polarity, value as u16);
+            }
+        }
+        for band in input.peq {
+            if let Some(coeffs) = default_param_coeffs(image, band.addr) {
+                snapshot.peq.insert(
+                    band.addr,
+                    CachedPeqShadow {
+                        coeffs,
+                        bypass: bypass.get(&band.addr).copied().unwrap_or(false),
+                    },
+                );
+            }
+        }
+        if let Some(fir) = input.fir {
+            if let Some(value) = default_param_word(image, fir.taps_count) {
+                snapshot.selector.insert(fir.taps_count, value as u16);
+            }
+        }
+    }
+
+    for output in table.outputs {
+        if let Some(value) = default_param_word(image, output.mute) {
+            snapshot.selector.insert(output.mute, value as u16);
+        }
+        if let Some(value) = default_param_word(image, output.gain) {
+            snapshot.scalar.insert(output.gain, value);
+        }
+        if let Some(delay) = output.delay {
+            if let Some(value) = default_param_word(image, delay) {
+                snapshot.scalar.insert(delay, value);
+            }
+        }
+        if let Some(polarity) = output.polarity {
+            if let Some(value) = default_param_word(image, polarity) {
+                snapshot.selector.insert(polarity, value as u16);
+            }
+        }
+        for band in output.peq {
+            if let Some(coeffs) = default_param_coeffs(image, band.addr) {
+                snapshot.peq.insert(
+                    band.addr,
+                    CachedPeqShadow {
+                        coeffs,
+                        bypass: bypass.get(&band.addr).copied().unwrap_or(false),
+                    },
+                );
+            }
+        }
+        if let Some(fir) = output.fir {
+            if let Some(value) = default_param_word(image, fir.bypass) {
+                snapshot.selector.insert(fir.bypass, value as u16);
+            }
+            if let Some(value) = default_param_word(image, fir.taps_count) {
+                snapshot.selector.insert(fir.taps_count, value as u16);
+            }
+        }
+        if let Some(crossover) = output.crossover {
+            for base in [crossover.lpf_addr, crossover.hpf_addr] {
+                for idx in 0..4u16 {
+                    let addr = base + idx * 5;
+                    if let Some(coeffs) = default_param_coeffs(image, addr) {
+                        snapshot.peq.insert(
+                            addr,
+                            CachedPeqShadow {
+                                coeffs,
+                                bypass: bypass.get(&addr).copied().unwrap_or(false),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(comp) = output.compressor {
+            if let Some(value) = default_param_word(image, comp.bypass) {
+                snapshot.selector.insert(comp.bypass, value as u16);
+            }
+            for addr in [
+                comp.threshold,
+                comp.gain,
+                comp.ratio,
+                comp.knee,
+                comp.attack,
+                comp.release,
+            ] {
+                if let Some(value) = default_param_word(image, addr) {
+                    snapshot.scalar.insert(addr, value);
+                }
+            }
+        }
+    }
+
+    let routing_span = table.routing.rows as u16 * table.routing.cols as u16;
+    for offset in 0..routing_span {
+        let status_addr = table.routing.status_base + offset;
+        if let Some(value) = default_param_word(image, status_addr) {
+            snapshot.selector.insert(status_addr, value as u16);
+        }
+        let gain_addr = table.routing.gain_base + offset;
+        if let Some(value) = default_param_word(image, gain_addr) {
+            snapshot.scalar.insert(gain_addr, value);
+        }
+        if let Some(polarity_base) = table.routing.polarity_base {
+            let polarity_addr = polarity_base + offset;
+            if let Some(value) = default_param_word(image, polarity_addr) {
+                snapshot.selector.insert(polarity_addr, value as u16);
+            }
+        }
+    }
+
+    snapshot
+}
+
+fn random_token_bytes() -> Result<[u8; 4], UsbHidError> {
+    let mut token = [0u8; 4];
+    unsafe {
+        esp_idf_sys::esp_fill_random(token.as_mut_ptr().cast(), token.len());
+    }
+    if token == [0u8; 4] {
+        return Err(UsbHidError::Protocol(
+            "failed to generate nonzero modification token".into(),
+        ));
+    }
+    Ok(token)
+}
 
 impl DeviceState {
     const BM_NUM_CHANNELS: u8 = 8;
@@ -153,8 +365,37 @@ impl DeviceState {
         self.expect_write_ok_with_timeout(payload, SLOW_COMMAND_TIMEOUT, context)
     }
 
+    fn send_reboot_command(&self, payload: &[u8], context: &str) -> Result<(), UsbHidError> {
+        const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+        match self.bus.command_with_timeout(payload, SEND_TIMEOUT) {
+            Ok(resp) => {
+                match commands::parse_response_for_request(payload, &resp, self.dialect()) {
+                    Response::Ack | Response::ResetComplete => Ok(()),
+                    Response::Error(data) => Err(UsbHidError::Protocol(format!(
+                        "{context}: device error {data:02x?}"
+                    ))),
+                    other => Err(UsbHidError::Protocol(format!(
+                        "{context}: unexpected response {other:?}"
+                    ))),
+                }
+            }
+            Err(UsbHidError::Timeout)
+            | Err(UsbHidError::Disconnected)
+            | Err(UsbHidError::Transfer(_)) => {
+                debug!(
+                    "{context}: device dropped transport during reboot, waiting for physical USB disconnect"
+                );
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn probe_with_timeout(bus: Arc<UsbHidBus>, timeout: Duration) -> Result<Self, UsbHidError> {
-        // ReadHardwareId
+        // Bare ReadHardwareId is the proven-good probe used by the last known
+        // stable ESP32 build. Sending extra probe bytes here can leave the HID
+        // endpoint in recovery before we ever identify the device.
         let resp = bus.command_with_timeout(&commands::read_hardware_id(), timeout)?;
         let parsed = commands::parse_response_for_request(
             &commands::read_hardware_id(),
@@ -370,6 +611,16 @@ impl DeviceState {
             .get(&preset)
             .cloned();
         self.apply_active_shadow_snapshot(snapshot);
+    }
+
+    fn store_preset_shadow_snapshot(&self, preset: u8, snapshot: PresetShadowState) {
+        self.preset_shadows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(preset, snapshot.clone());
+        if *self.active_preset.lock().unwrap_or_else(|e| e.into_inner()) == Some(preset) {
+            self.apply_active_shadow_snapshot(Some(snapshot));
+        }
     }
 
     fn prefers_scalar_shadow_for_addr(&self, addr: u16) -> bool {
@@ -1019,6 +1270,118 @@ impl DeviceState {
         Ok(())
     }
 
+    fn default_preset_image(&self) -> Result<&'static DefaultPresetImage, UsbHidError> {
+        default_preset_image_for_dsp(self.dsp_version)
+            .ok_or_else(|| UsbHidError::Protocol("default preset reset not supported".into()))
+    }
+
+    fn write_flash_image_block(
+        &self,
+        block_id: u8,
+        block: &[u8],
+        context: &str,
+    ) -> Result<(), UsbHidError> {
+        for (chunk_idx, chunk) in block.chunks(0x20).enumerate() {
+            self.expect_write_ok_slow(
+                &commands::write_flash_block(block_id, chunk, chunk_idx == 0),
+                context,
+            )?;
+        }
+        self.expect_write_ok_slow(&commands::finish_flash_block(block_id), context)?;
+        Ok(())
+    }
+
+    fn write_preset_defaults_locked(&self) -> Result<(), UsbHidError> {
+        let image = self.default_preset_image()?;
+        self.write_flash_image_block(
+            FLASH_BLOCK_PRESET_VALUES,
+            &build_preset_values_block(image.params),
+            "write default preset values",
+        )?;
+        self.write_flash_image_block(
+            FLASH_BLOCK_PRESET_BYPASS,
+            &build_preset_bypass_block(image.bypass),
+            "write default preset bypass",
+        )?;
+        let status = self.read_verify_program_status()?;
+        if !eeprom::is_verify_program_ok(status) {
+            return Err(UsbHidError::Protocol(format!(
+                "verifyProgram failed after default preset write: status=0x{:02X} > 0x{:02X}",
+                status,
+                eeprom::VERIFY_PROGRAM_OK_MAX
+            )));
+        }
+        Ok(())
+    }
+
+    fn save_preset_token_locked(&self, preset: u8, token: [u8; 4]) -> Result<(), UsbHidError> {
+        let (hi, lo) = eeprom::token_addr_for_slot(preset);
+        self.expect_write_ok(
+            &commands::write_flash(hi, lo, &token),
+            "save modification token",
+        )
+    }
+
+    pub fn supports_default_preset_reset(&self) -> bool {
+        self.default_preset_image().is_ok()
+    }
+
+    pub fn reset_active_preset_to_defaults(&self) -> Result<u8, UsbHidError> {
+        let _guard = self.begin_operation();
+        let preset = self.get_master_status()?.preset;
+        self.write_preset_defaults_locked()?;
+        let token = random_token_bytes()?;
+        self.save_preset_token_locked(preset, token)?;
+        self.set_config_with_verify(preset, commands::PRESET_CHANGE_RELOAD_SAME_SLOT)?;
+        let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
+        self.store_preset_shadow_snapshot(preset, snapshot);
+        Ok(preset)
+    }
+
+    pub fn reset_preset_to_defaults(&self, preset: u8) -> Result<(), UsbHidError> {
+        let _guard = self.begin_operation();
+        self.set_config_with_verify(preset, commands::PRESET_CHANGE_WITHOUT_RESET)?;
+        self.write_preset_defaults_locked()?;
+        let token = random_token_bytes()?;
+        self.save_preset_token_locked(preset, token)?;
+        self.set_config_with_verify(preset, commands::PRESET_CHANGE_RELOAD_SAME_SLOT)?;
+        let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
+        self.store_preset_shadow_snapshot(preset, snapshot);
+        Ok(())
+    }
+
+    pub fn initialize_all_presets_to_defaults(&self, reboot: bool) -> Result<(), UsbHidError> {
+        let _guard = self.begin_operation();
+        self.set_config_with_verify(0, commands::PRESET_CHANGE_WITHOUT_RESET)?;
+        self.write_preset_defaults_locked()?;
+        self.save_preset_token_locked(0, RECOVERY_MODIFICATION_TOKEN)?;
+        self.set_config_with_verify(0, commands::PRESET_CHANGE_RELOAD_SAME_SLOT)?;
+        self.copy_preset()?;
+
+        let mut all_tokens = Vec::with_capacity(self.profile.presets as usize * 4);
+        for _ in 0..self.profile.presets {
+            all_tokens.extend_from_slice(&RECOVERY_MODIFICATION_TOKEN);
+        }
+        self.expect_write_ok(
+            &commands::write_flash(eeprom::TOKENS_ADDR.0, eeprom::TOKENS_ADDR.1, &all_tokens),
+            "write recovery modification tokens",
+        )?;
+
+        let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
+        for preset in 0..self.profile.presets {
+            self.store_preset_shadow_snapshot(preset, snapshot.clone());
+        }
+
+        if reboot {
+            self.reboot_device()?;
+        }
+        Ok(())
+    }
+
+    pub fn reboot_device(&self) -> Result<(), UsbHidError> {
+        self.send_reboot_command(&commands::enter_bootloader(), "enter bootloader reboot")
+    }
+
     pub fn supports_bass_management(&self) -> bool {
         self.profile
             .dsp_table
@@ -1156,7 +1519,7 @@ impl DeviceState {
         })
     }
 
-    fn read_verify_program_status(&self) -> Result<u8, UsbHidError> {
+    pub fn read_verify_program_status(&self) -> Result<u8, UsbHidError> {
         let (hi, lo) = eeprom::VERIFY_PROGRAM_ADDR;
         let req = commands::read_flash(hi, lo, 1);
         let resp = self.bus.command_with_timeout(&req, SLOW_COMMAND_TIMEOUT)?;
@@ -1416,9 +1779,11 @@ impl DeviceState {
             )));
         }
 
-        // Fast path: already on the requested preset. Matches desktop behavior.
+        // Fast path: already on the requested preset. A same-slot reload still
+        // needs to be sent because the reset flow uses it to activate a
+        // freshly-written preset image.
         if let Ok(before) = self.read_master_status_once() {
-            if before.preset == preset {
+            if before.preset == preset && reset_mode != commands::PRESET_CHANGE_RELOAD_SAME_SLOT {
                 return Ok(());
             }
         }
@@ -1813,7 +2178,7 @@ impl DeviceState {
 
     pub fn read_tokens(&self) -> Result<Vec<u8>, UsbHidError> {
         let (hi, lo) = eeprom::TOKENS_ADDR;
-        self.read_flash_data(hi, lo, 8)
+        self.read_flash_data(hi, lo, 16)
     }
 
     // -- Raw command --
@@ -1829,10 +2194,23 @@ impl DeviceState {
                 .copied()
                 .unwrap_or(commands::PRESET_CHANGE_NORMAL);
             self.set_config_with_verify(preset, reset_mode)?;
-            return Ok(vec![commands::RESP_PRESET_COMPLETE]);
+            return Ok(vec![
+                if reset_mode == commands::PRESET_CHANGE_WITHOUT_RESET {
+                    commands::RESP_OK
+                } else {
+                    commands::RESP_PRESET_COMPLETE
+                },
+            ]);
         }
 
-        let mut resp = self.bus.command(payload)?;
+        if payload.first().copied() == Some(commands::CMD_ENTER_BOOTLOADER) {
+            self.reboot_device()?;
+            return Ok(vec![commands::RESP_RESET_COMPLETE]);
+        }
+
+        let mut resp = self
+            .bus
+            .command_with_timeout(payload, raw_bridge_timeout_for_payload(payload))?;
         // Trim HID echo garbage: for write commands, real DSP100/2x4 HD hardware
         // returns an unframed 0x01-prefixed echo of the full 64-byte HID buffer.
         // decode_hid_response strips the 0x01 prefix but returns all 63 trailing
@@ -1854,6 +2232,18 @@ impl DeviceState {
             self.mirror_raw_to_shadow(payload);
         }
         Ok(resp)
+    }
+
+    /// Execute a raw TCP-bridge command and encode the reply the way the
+    /// official Device Console network parser expects:
+    ///
+    /// - `0x01` for OK
+    /// - `0x00` for Error
+    /// - `0x02 <event>` for preset/reset completion
+    /// - `[len][cmd ...]` for read-style replies
+    pub fn tcp_bridge_command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
+        let resp = self.raw_command(payload)?;
+        Ok(encode_tcp_bridge_response(payload, &resp, self.dialect()))
     }
 
     /// Parse a raw write payload and update in-memory shadow state for
@@ -1914,6 +2304,117 @@ impl DeviceState {
             },
             product_name: self.product_name().to_string(),
         }
+    }
+}
+
+fn encode_tcp_bridge_response(request: &[u8], raw_resp: &[u8], dialect: &Dialect) -> Vec<u8> {
+    minidsp_protocol::packet::encode_device_console_tcp_response(request, raw_resp, dialect)
+}
+
+#[cfg(test)]
+mod tcp_bridge_tests {
+    use super::encode_tcp_bridge_response;
+    use minidsp_protocol::commands;
+    use minidsp_protocol::dialect::Dialect;
+
+    #[test]
+    fn tcp_bridge_write_flash_block_echo_becomes_ok_frame() {
+        let request = [0x06u8, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00];
+        let raw_resp = request;
+        assert_eq!(
+            encode_tcp_bridge_response(&request, &raw_resp, &Dialect::NEW),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn tcp_bridge_finish_flash_block_echo_becomes_block_event() {
+        let request = [0x07u8, 0x02];
+        let raw_resp = request;
+        assert_eq!(
+            encode_tcp_bridge_response(&request, &raw_resp, &Dialect::NEW),
+            vec![2, 0x02]
+        );
+    }
+
+    #[test]
+    fn tcp_bridge_finish_flash_block_event_stays_block_event() {
+        let request = [0x07u8, 0x02];
+        let raw_resp = [commands::RESP_EVENT, 0x02];
+        assert_eq!(
+            encode_tcp_bridge_response(&request, &raw_resp, &Dialect::NEW),
+            vec![2, 0x02]
+        );
+    }
+
+    #[test]
+    fn tcp_bridge_finish_flash_block_bare_event_uses_request_block_id() {
+        let request = [0x07u8, 0x02];
+        let raw_resp = [commands::RESP_EVENT];
+        assert_eq!(
+            encode_tcp_bridge_response(&request, &raw_resp, &Dialect::NEW),
+            vec![2, 0x02]
+        );
+    }
+
+    #[test]
+    fn tcp_bridge_preset_complete_stays_event_frame() {
+        let request = commands::set_config(0, commands::PRESET_CHANGE_RELOAD_SAME_SLOT);
+        let raw_resp = [commands::RESP_PRESET_COMPLETE];
+        assert_eq!(
+            encode_tcp_bridge_response(&request, &raw_resp, &Dialect::NEW),
+            vec![2, commands::RESP_PRESET_COMPLETE]
+        );
+    }
+
+    #[test]
+    fn tcp_bridge_read_flash_keeps_command_response_shape() {
+        let request = commands::read_flash(0xff, 0xa3, 1);
+        let raw_resp = [commands::CMD_READ_FLASH, 0xff, 0xa3, 0x03];
+        assert_eq!(
+            encode_tcp_bridge_response(&request, &raw_resp, &Dialect::NEW),
+            vec![5, commands::CMD_READ_FLASH, 0xff, 0xa3, 0x03]
+        );
+    }
+
+    #[test]
+    fn tcp_bridge_error_becomes_single_byte_error_frame() {
+        let request = commands::write_flash(0xff, 0xc8, &[0x12, 0x34, 0x56, 0x78]);
+        let raw_resp = [commands::RESP_ERROR, 0x71];
+        assert_eq!(
+            encode_tcp_bridge_response(&request, &raw_resp, &Dialect::NEW),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn tcp_bridge_set_config_without_reset_becomes_ok_frame() {
+        let request = commands::set_config(0, commands::PRESET_CHANGE_WITHOUT_RESET);
+        let raw_resp = [commands::RESP_OK];
+        assert_eq!(
+            encode_tcp_bridge_response(&request, &raw_resp, &Dialect::NEW),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn raw_bridge_flash_commands_use_slow_timeout() {
+        assert_eq!(
+            raw_bridge_timeout_for_payload(&commands::write_flash_block(0x01, &[0x04, 0x88], true)),
+            SLOW_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            raw_bridge_timeout_for_payload(&commands::finish_flash_block(0x02)),
+            SLOW_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            raw_bridge_timeout_for_payload(&commands::copy_preset(true)),
+            SLOW_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            raw_bridge_timeout_for_payload(&commands::enter_bootloader()),
+            SLOW_COMMAND_TIMEOUT
+        );
     }
 }
 

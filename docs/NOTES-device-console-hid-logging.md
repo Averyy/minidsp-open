@@ -186,7 +186,7 @@ Commands confirmed on the physical 2x4 HD in live captures are marked with ★.
 | `0x21` | BluetoothAtCmd | TX/RX | Raw AT command bytes (e.g. `ATI0\r`); Bluetooth devices only |
 | `0x24` | ReloadE2promHdr | TX | Zero payload |
 | `0x25` | ChangePresetSlot | TX | `[preset, flag]`; flag=0 sync, flag≠0 async (0xAB response) ★ |
-| `0x27` | CopyPreset | TX | `[src, dst]`; ~23 s on physical 2x4 HD ★ |
+| `0x27` | CopyPreset | TX | Sync form `0x27 0x00`; current best evidence is "copy the active preset to the remaining preset slots"; ~23 s on physical 2x4 HD ★ |
 | `0x30` | SetDspFilterBiquads | TX | `[0x80, addrHB, addrLB, auxHB, auxLB, 5×float32-LE]` ★ |
 | `0x31` | GetHardwareId | TX/RX | Probe read ★ |
 | `0x34` | SetDigitalSource | TX | `[source_id]` ★ |

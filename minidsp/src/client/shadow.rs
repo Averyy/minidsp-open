@@ -300,6 +300,24 @@ impl MiniDspClient {
         self.apply_active_shadow_snapshot(snapshot).await;
     }
 
+    pub(super) async fn store_preset_shadow_snapshot(
+        &self,
+        preset: u8,
+        snapshot: PresetShadowState,
+    ) {
+        self.preset_shadows
+            .lock()
+            .await
+            .insert(preset, snapshot.clone());
+        if *self.active_preset.lock().await == Some(preset) {
+            self.apply_active_shadow_snapshot(Some(snapshot)).await;
+        }
+    }
+
+    pub(super) async fn set_preset_token(&self, preset: u8, token: [u8; 4]) {
+        self.preset_tokens.lock().await.insert(preset, token);
+    }
+
     /// Mirror the side effects of a successful raw-bridge write into the
     /// client's shadow state so `/config` can reflect raw WS/TCP activity.
     pub async fn mirror_raw_command_if_success(&self, payload: &[u8], raw_response: &[u8]) {

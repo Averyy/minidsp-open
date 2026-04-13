@@ -2,6 +2,7 @@ app/
 .DS_Store
 .playwright-mcp/
 target/
+.scratch/
 
 .codex-dobby/
 .claude/

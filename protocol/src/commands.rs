@@ -263,6 +263,14 @@ pub fn reset() -> Vec<u8> {
     vec![CMD_RESET]
 }
 
+/// Build an EnterBootloader command.
+///
+/// On SHARC-family devices the official Device Console uses this as the final
+/// "reboot the unit" step after initialize-all / preset persistence flows.
+pub fn enter_bootloader() -> Vec<u8> {
+    vec![CMD_ENTER_BOOTLOADER]
+}
+
 /// Build a ReadFlash command.
 pub fn read_flash(addr_hi: u8, addr_lo: u8, count: u8) -> Vec<u8> {
     vec![CMD_READ_FLASH, addr_hi, addr_lo, count]
@@ -647,6 +655,7 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
         | CMD_WRITE_FLASH_BLOCK
         | CMD_FINISH_FLASH_BLOCK
         | CMD_WRITE_FLASH_FULL_ADDR
+        | CMD_ENTER_BOOTLOADER
         | CMD_WRITE_DSP
         | CMD_WRITE_BIQUAD
         | CMD_SET_VOLUME
@@ -683,6 +692,18 @@ pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect
         && data[2] == request[2]
     {
         return Response::PresetComplete;
+    }
+
+    if request.first() == Some(&CMD_FINISH_FLASH_BLOCK) && data.first() == Some(&RESP_EVENT) {
+        if data.len() == 1 {
+            return Response::Ack;
+        }
+
+        if request.len() >= 2 && data.get(1) == request.get(1) {
+            return Response::Ack;
+        }
+
+        return Response::Unknown(data.to_vec());
     }
 
     if request.first() == Some(&CMD_READ_FLASH_FULL_ADDR)
@@ -1032,6 +1053,16 @@ pub fn matches_response(cmd_opcode: u8, resp_opcode: u8) -> bool {
                 || resp_opcode == RESP_PRESET_COMPLETE
                 || resp_opcode == RESP_EVENT
         }
+        CMD_ENTER_BOOTLOADER => {
+            resp_opcode == CMD_ENTER_BOOTLOADER
+                || resp_opcode == RESP_OK
+                || resp_opcode == RESP_RESET_COMPLETE
+        }
+        CMD_FINISH_FLASH_BLOCK => {
+            resp_opcode == CMD_FINISH_FLASH_BLOCK
+                || resp_opcode == RESP_OK
+                || resp_opcode == RESP_EVENT
+        }
         CMD_RESET => resp_opcode == RESP_RESET_COMPLETE,
         CMD_FIR_LOAD_START => resp_opcode == CMD_FIR_LOAD_START,
         _ => {
@@ -1334,6 +1365,37 @@ mod tests {
     #[test]
     fn set_config_matches_event_response_opcode() {
         assert!(matches_response(CMD_SET_CONFIG, RESP_EVENT));
+    }
+
+    #[test]
+    fn enter_bootloader_cmd() {
+        assert_eq!(enter_bootloader(), vec![CMD_ENTER_BOOTLOADER]);
+    }
+
+    #[test]
+    fn enter_bootloader_matches_reset_complete() {
+        assert!(matches_response(CMD_ENTER_BOOTLOADER, RESP_RESET_COMPLETE));
+    }
+
+    #[test]
+    fn parse_finish_flash_block_event_for_request_as_ack() {
+        let req = finish_flash_block(0x02);
+        let data = [RESP_EVENT, 0x02];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert_eq!(resp, Response::Ack);
+    }
+
+    #[test]
+    fn finish_flash_block_matches_event_response_opcode() {
+        assert!(matches_response(CMD_FINISH_FLASH_BLOCK, RESP_EVENT));
+    }
+
+    #[test]
+    fn parse_finish_flash_block_bare_event_for_request_as_ack() {
+        let req = finish_flash_block(0x02);
+        let data = [RESP_EVENT];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert_eq!(resp, Response::Ack);
     }
 
     // -- Simulator-verified response tests --

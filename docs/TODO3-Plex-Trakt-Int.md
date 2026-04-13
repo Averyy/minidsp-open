@@ -4,8 +4,11 @@ Preserve the Plex/Trakt research here while implementation focus stays on the Ap
 
 ## Current Recommendation
 
-- Prioritize `pyatv` / Apple TV watching for **Infuse on Apple TV**.
-- Keep **Plex** as the best metadata-rich fallback/parallel path.
+- Prioritize the Apple TV Companion watcher as the primary now-playing path for the first matcher.
+- Use an exact normalized title match plus duration within `±15 min` as the approved first-pass policy.
+- Treat Companion-only results as movie suggestions only; do not auto-apply a final BEQ variant from that metadata alone.
+- Do not block the first product flow on identifying Infuse versus Plex through Companion; sparse third-party payloads are still acceptable for movie suggestion mode when title and duration are strong.
+- Keep **Plex** as metadata enrichment or fallback when richer identifiers are available, not as a blocker for the first implementation.
 - Treat **Trakt** as enrichment or secondary automation input unless its real-time behavior is explicitly validated in our environment.
 
 ## Why This Still Matters
@@ -143,10 +146,12 @@ Notes:
   - can observe Infuse itself
   - local
   - does not depend on Plex
+  - current live captures are already good enough to begin a first matcher for Infuse, Plex, Prime, and Apple TV app playback
 - Cons:
-  - likely mostly title/year/app-level matching
-  - weaker identifiers
-  - requires string search and confidence scoring
+  - Infuse and Plex still have weaker identifiers than Prime or Apple TV app playback
+  - Netflix is still effectively unsupported through the current Companion payloads
+  - requires normalization, duration tolerance, and confidence scoring instead of pure identifier joins
+  - does not reliably reveal the actual source audio mix, so it is not enough for safe BEQ auto-apply
 
 ### Plex
 
@@ -169,6 +174,8 @@ Notes:
 
 ## Implementation TODOs
 
+- [ ] Implement the first matcher on top of Companion metadata before revisiting Plex or Trakt enrichment.
+- [ ] Group Companion hits at the movie level and surface candidate BEQ variants instead of pretending one digest is automatically safe.
 - [ ] Validate current Plex real-time endpoints beyond `GET /status/sessions`, especially the exact WebSocket notifications path.
 - [ ] Capture one real Plex webhook payload from an Apple TV client and document the fields we actually receive for movies and episodes.
 - [ ] Verify whether Plex webhook payloads for Apple TV playback include enough identifier data to map directly to TMDB/IMDb/BEQ entries without fuzzy matching.

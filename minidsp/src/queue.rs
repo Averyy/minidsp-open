@@ -54,7 +54,12 @@ const DEFAULT_SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
 
 fn default_timeout_for_payload(payload: &[u8]) -> Duration {
     match payload.first().copied() {
-        Some(commands::CMD_COPY_PRESET | commands::CMD_RESET) => DEFAULT_SLOW_COMMAND_TIMEOUT,
+        Some(
+            commands::CMD_COPY_PRESET
+            | commands::CMD_RESET
+            | commands::CMD_WRITE_FLASH_BLOCK
+            | commands::CMD_FINISH_FLASH_BLOCK,
+        ) => DEFAULT_SLOW_COMMAND_TIMEOUT,
         _ => DEFAULT_COMMAND_TIMEOUT,
     }
 }
@@ -915,6 +920,22 @@ mod tests {
         assert_eq!(
             default_timeout_for_payload(&commands::set_source(2)),
             DEFAULT_COMMAND_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn write_flash_block_uses_extended_default_timeout() {
+        assert_eq!(
+            default_timeout_for_payload(&commands::write_flash_block(0x01, &[0x04, 0x88], true)),
+            DEFAULT_SLOW_COMMAND_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn finish_flash_block_uses_extended_default_timeout() {
+        assert_eq!(
+            default_timeout_for_payload(&commands::finish_flash_block(0x01)),
+            DEFAULT_SLOW_COMMAND_TIMEOUT
         );
     }
 

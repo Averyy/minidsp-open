@@ -390,17 +390,19 @@ let wifi = Provisioner::new(wifi, nvs)
 ### Data partition wear math
 
 **Assumptions for minidsp-open:**
-- Data partition size: 5 MB (enough for UI + catalogue + biquads + overhead)
-- 5 MB / 4 KB = 1,280 sectors
-- With ESP-IDF wear leveling: erases distributed across all 1,280 sectors
+- Current data partition size: `0xBF0000` bytes = ~11.94 MB
+- 11.94 MB / 4 KB = 3,056 sectors
+- Current measured payload build (2026-04-13): `catalogue.bin` ~3.0 MB, UI files ~1.35 MB, total site payload ~4.3 MB
+- With ESP-IDF wear leveling: erases are distributed across all 3,056 sectors
 
 **Update scenarios:**
 
 | Event | Frequency | Data written | Sectors erased |
 |-------|-----------|-------------|----------------|
 | Boot (no update needed) | Daily | 0 | 0 |
-| Catalogue update | ~2x/week | ~3 MB | ~768 sectors |
-| UI update | ~4x/year | ~1 MB | ~256 sectors |
+| Catalogue update | ~2x/week | ~3.1 MB | ~772 sectors |
+| UI update | ~4x/year | ~1.35 MB | ~330 sectors |
+| Full site refresh | Uncommon | ~4.3 MB | ~1,101 sectors |
 | NVS writes (device state) | Rare | 4 KB | 1 sector |
 
 **Worst case: catalogue updates twice per week**

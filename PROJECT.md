@@ -429,7 +429,7 @@ Canonical compatibility reference:
 - JSON: serde_json (standard crate — ESP32 has enough heap, ~167KB free)
 - WiFi provisioning: SoftAP + captive portal (DNS hijack + DHCP Option 114), SSID/password saved to NVS
 - WiFi reconnection: app-level exponential backoff (ESP-IDF does NOT auto-reconnect)
-- Data partition: LittleFS (wear leveling + power-loss safety), ~5 MB for UI + catalogue
+- Data partition: LittleFS (wear leveling + power-loss safety), current partition table allocates ~11.94 MB for UI + catalogue data on 16 MB boards
 - Diagnostics: 4KB ring buffer + `/debug/log` + `/debug/info` endpoints (~4.2KB persistent RAM)
 - USB bus: Mutex-serialized blocking `command()` API, shared across HTTP handler threads
 - mDNS: `EspMdns` from `esp-idf-svc` (singleton, own FreeRTOS task). Component from IDF Component Registry (`espressif/mdns`).

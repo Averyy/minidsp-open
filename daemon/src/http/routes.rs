@@ -111,7 +111,21 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             post(restore_measurement_mode),
         )
         .route("/devices/{id}/tokens", get(get_tokens))
+        .route("/devices/{id}/verify-program", get(get_verify_program))
         .route("/devices/{id}/preset/copy", post(copy_preset))
+        .route(
+            "/devices/{id}/preset/reset",
+            post(reset_active_preset_to_defaults),
+        )
+        .route(
+            "/devices/{id}/preset/{preset}/reset",
+            post(reset_preset_to_defaults_route),
+        )
+        .route(
+            "/devices/{id}/preset/reset-all",
+            post(initialize_all_presets_to_defaults),
+        )
+        .route("/devices/{id}/reboot", post(reboot_device_route))
         .route("/devices/{id}/bm", get(get_bm_state))
         .route("/devices/{id}/bm/channel/{ch}", post(set_bm_channel_route))
         .route(
@@ -1187,6 +1201,32 @@ async fn get_tokens(
     }
 }
 
+async fn get_verify_program(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let resp = client
+        .raw_command(
+            minidsp_protocol::commands::read_flash(0xFF, 0xA3, 9),
+            minidsp::queue::Priority::Normal,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match resp {
+        minidsp_protocol::commands::Response::FlashData(bytes) => {
+            let status = bytes.first().copied().unwrap_or(0);
+            Ok(Json(serde_json::json!({
+                "status": status,
+                "ok": minidsp_protocol::eeprom::is_verify_program_ok(status),
+                "bytes": bytes,
+            }))
+            .into_response())
+        }
+        _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 /// `POST /devices/{id}/peq/reset` — write the identity passthrough biquad
 /// to every PEQ band on every input and output channel, mirroring the
 /// official Device Console "Initialize to default Settings" action. Bumps
@@ -1311,7 +1351,7 @@ async fn copy_preset(
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
     // CopyPreset is followed by a verifyProgram read at 0xFFA3 to confirm the
-    // device persisted the destination preset cleanly. A status byte > 0x0D
+    // device persisted the copied preset slots cleanly. A status byte > 0x0D
     // means the flash write failed and the cached preset is corrupt — bail
     // before bumping the modification token so we don't lie to clients about
     // a successful save.
@@ -1319,8 +1359,8 @@ async fn copy_preset(
         .copy_preset_verified()
         .await
         .map_err(client_error_to_status)?;
-    // CopyPreset overwrites the destination preset's contents — that's a real
-    // preset mutation, not a transient master-status change. Bump the active
+    // CopyPreset overwrites the other preset slots from the active preset —
+    // that's a real preset mutation, not a transient master-status change. Bump the active
     // preset's modification token so any client (Device Console, ezBEQ) that
     // had a cached `<timestamp>` for it correctly detects the drift on next
     // read instead of trusting stale state.
@@ -1328,6 +1368,68 @@ async fn copy_preset(
         .persist_device_shadow_after_preset_mutation(&client)
         .await;
     Ok(StatusCode::OK)
+}
+
+async fn reset_active_preset_to_defaults(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let preset = client
+        .reset_active_preset_to_defaults()
+        .await
+        .map_err(client_error_to_status)?;
+    state.persist_device_shadow(&client).await;
+    Ok(Json(serde_json::json!({
+        "status": "preset_reset",
+        "preset": preset,
+    })))
+}
+
+async fn reset_preset_to_defaults_route(
+    State(state): State<Arc<DaemonState>>,
+    Path((id, preset)): Path<(usize, u8)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    client
+        .reset_preset_to_defaults(preset)
+        .await
+        .map_err(client_error_to_status)?;
+    state.persist_device_shadow(&client).await;
+    Ok(Json(serde_json::json!({
+        "status": "preset_reset",
+        "preset": preset,
+    })))
+}
+
+async fn initialize_all_presets_to_defaults(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    client
+        .initialize_all_presets_to_defaults(true)
+        .await
+        .map_err(client_error_to_status)?;
+    state.persist_device_shadow(&client).await;
+    Ok(Json(serde_json::json!({
+        "status": "all_presets_reset",
+        "rebooted": true,
+    })))
+}
+
+async fn reboot_device_route(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    client
+        .reboot_device()
+        .await
+        .map_err(client_error_to_status)?;
+    Ok(Json(serde_json::json!({
+        "status": "rebooted",
+    })))
 }
 
 async fn enter_measurement_mode(
@@ -1510,8 +1612,23 @@ async fn openapi() -> impl IntoResponse {
             "/devices/{id}/tokens": {
                 "get": { "summary": "Read modification tokens", "responses": { "200": { "description": "Token values" } } }
             },
+            "/devices/{id}/verify-program": {
+                "get": { "summary": "Read the verify-program status byte and trailing EEPROM bytes at 0xFFA3", "responses": { "200": { "description": "Verify-program bytes" } } }
+            },
             "/devices/{id}/preset/copy": {
-                "post": { "summary": "Copy current preset to flash", "responses": { "200": { "description": "Preset copied" } } }
+                "post": { "summary": "Copy the active preset to the remaining preset slots", "responses": { "200": { "description": "Preset copied" } } }
+            },
+            "/devices/{id}/preset/reset": {
+                "post": { "summary": "Reset the active preset to the official default image", "responses": { "200": { "description": "Preset reset" } } }
+            },
+            "/devices/{id}/preset/{preset}/reset": {
+                "post": { "summary": "Reset a specific preset slot to the official default image", "responses": { "200": { "description": "Preset reset" } } }
+            },
+            "/devices/{id}/preset/reset-all": {
+                "post": { "summary": "Reset preset 1, copy it to all slots, and reboot the device", "responses": { "200": { "description": "All presets reset" } } }
+            },
+            "/devices/{id}/reboot": {
+                "post": { "summary": "Reboot the MiniDSP unit", "responses": { "200": { "description": "Device rebooted" } } }
             },
             "/devices/{id}/ws": {
                 "get": {

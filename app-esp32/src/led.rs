@@ -389,10 +389,14 @@ fn run_led_controller(mut led: Led<'static>, rx: Receiver<LedCommand>) {
             thread::sleep(Duration::from_secs(1));
         }
 
-        match rx.recv_timeout(BREATH_STEP) {
+        // On ESP-IDF, std mpsc recv_timeout() can busy-yield through pthread/
+        // sched_yield, which starves IDLE0 and trips the task watchdog.
+        // Sleep explicitly across a FreeRTOS tick boundary, then poll again.
+        thread::sleep(BREATH_STEP);
+        match rx.try_recv() {
             Ok(command) => apply_command(&mut status, command),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
                 let _ = led.off();
                 break;
             }

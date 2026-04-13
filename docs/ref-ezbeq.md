@@ -243,6 +243,12 @@ A GitHub Action in our repo runs every 15 minutes (~80 lines of Python):
    - **`catalogue-biquads.bin`** — compact binary index mapping `entry_id → biquad coefficients` at each sample rate (48kHz, 96kHz). ~4000 entries × ~10 filters × 5 coefficients × 4 bytes ≈ **~1 MB**. The ESP32 uses this to resolve entry IDs into actual DSP writes.
 4. Publish to GitHub Pages + update `manifest.json`
 
+Future watcher/matching extension:
+
+- If Apple TV Companion matching needs a search-oriented catalogue view on the device, extend this same derived artifact set instead of introducing a second catalogue source.
+- The likely shape is a compact watcher-search index containing fields such as normalized title, original title, runtime/duration, year, content type, and digest.
+- That keeps the external ezBEQ catalogue as the only source of truth while still letting the ESP32 do local title/runtime matching against a small index.
+
 **ezBEQ UI sync (on ezBEQ release):**
 1. Same Action also checks the latest `3ll3d00d/ezbeq` release tag via GitHub API
 2. If new, downloads the pre-built React static files from their release

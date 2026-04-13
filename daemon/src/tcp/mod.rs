@@ -135,6 +135,7 @@ async fn handle_client(
                         read_buf.drain(..consumed);
 
                         if let Some(client) = state.get_device(0).await {
+                            let tcp_request = payload.clone();
                             let result = {
                                 let _guard = bridge_mutex.lock().await;
                                 crate::bridge::execute_raw_bridge_command(&state, &client, payload)
@@ -142,7 +143,11 @@ async fn handle_client(
                             };
                             match result {
                                 Ok(raw_resp) => {
-                                    let frame = packet::encode_tcp_response(&raw_resp);
+                                    let frame = packet::encode_device_console_tcp_response(
+                                        &tcp_request,
+                                        &raw_resp,
+                                        &client.profile().dialect,
+                                    );
                                     if let Err(e) = stream.write_all(&frame).await {
                                         tracing::warn!("TCP bridge write error ({peer}): {e}");
                                         return;

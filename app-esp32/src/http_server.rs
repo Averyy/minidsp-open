@@ -25,7 +25,9 @@ use minidsp_protocol::status::{BmChannelPatch, BmMixerCellPatch, DeviceConfig, S
 use serde_json::json;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const REBOOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// Shared device state — None when USB disconnected, Some when connected.
 pub type SharedDeviceState = Arc<Mutex<Option<Arc<DeviceState>>>>;
@@ -44,11 +46,11 @@ pub fn start(
 ) -> Result<EspHttpServer<'static>, Box<dyn std::error::Error>> {
     let config = Configuration {
         http_port: port,
-        // STA mode with ezBEQ enabled now registers low-60s handlers:
+        // STA mode with ezBEQ enabled now registers into the 70s:
         // core device routes, debug routes, WS endpoints, ezBEQ API, UI/static
-        // routes, and CORS/catch-all handlers. Keep some headroom so the HTTP
-        // server doesn't fail with ESP_ERR_HTTPD_HANDLERS_FULL as routes evolve.
-        max_uri_handlers: 72,
+        // routes, and CORS/catch-all handlers. Keep real headroom so small
+        // diagnostics additions don't tear down the entire HTTP server at boot.
+        max_uri_handlers: 88,
         // `/devices/0/play` does request parsing, source switching, and
         // playback-thread orchestration before handing back the response.
         // The default 16 KiB httpd task stack is not enough on real hardware.
@@ -482,118 +484,99 @@ pub fn start(
                         Some(i) => i as usize,
                         None => return send_error(req, 400, "input missing 'index' field"),
                     };
-                    if let Some(input_ch) = table.inputs.get(idx) {
-                        // PEQ bands
-                        if let Some(peqs) = input.get("peq").and_then(|v| v.as_array()) {
-                            for peq in peqs {
-                                let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
-                                    Some(i) => i as usize,
-                                    None => {
-                                        return send_error(req, 400, "peq missing 'index' field");
-                                    }
+                    let input_ch = match table.inputs.get(idx) {
+                        Some(ch) => ch,
+                        None => return send_error(req, 400, "input index out of range"),
+                    };
+                    // PEQ bands
+                    if let Some(peqs) = input.get("peq").and_then(|v| v.as_array()) {
+                        for peq in peqs {
+                            let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
+                                Some(i) => i as usize,
+                                None => return send_error(req, 400, "peq missing 'index' field"),
+                            };
+                            let band = match input_ch.peq.get(band_idx) {
+                                Some(band) => band,
+                                None => {
+                                    return send_error(req, 400, "input peq index out of range")
+                                }
+                            };
+                            if let Some(coeff) = peq.get("coeff") {
+                                let c = match parse_biquad_coefficients(coeff) {
+                                    Ok(coeffs) => coeffs,
+                                    Err(msg) => return send_error(req, 400, msg),
                                 };
-                                if let Some(band) = input_ch.peq.get(band_idx) {
-                                    if let Some(coeff) = peq.get("coeff") {
-                                        let c = match parse_biquad_coefficients(coeff) {
-                                            Ok(coeffs) => coeffs,
-                                            Err(msg) => return send_error(req, 400, msg),
-                                        };
-                                        if let Err(e) = dev.write_biquad(band.addr, &c) {
-                                            return send_error(
-                                                req,
-                                                500,
-                                                &format!("write_biquad: {e}"),
-                                            );
-                                        }
-                                    }
-                                    if let Some(bypass) =
-                                        peq.get("bypass").and_then(|v| v.as_bool())
-                                    {
-                                        if let Err(e) = dev.bypass_filter(band.addr, bypass) {
-                                            return send_error(
-                                                req,
-                                                500,
-                                                &format!("bypass_filter: {e}"),
-                                            );
-                                        }
-                                    }
+                                if let Err(e) = dev.write_biquad(band.addr, &c) {
+                                    return send_error(req, 500, &format!("write_biquad: {e}"));
+                                }
+                            }
+                            if let Some(bypass) = peq.get("bypass").and_then(|v| v.as_bool()) {
+                                if let Err(e) = dev.bypass_filter(band.addr, bypass) {
+                                    return send_error(req, 500, &format!("bypass_filter: {e}"));
                                 }
                             }
                         }
-                        // Per-channel gain
-                        if let Some(gain) = input.get("gain").and_then(|v| v.as_f64()) {
-                            if !gain.is_finite() || gain.abs() > 120.0 {
-                                return send_error(
-                                    req,
-                                    400,
-                                    "gain out of range (must be finite, |gain| <= 120 dB)",
-                                );
-                            }
-                            if let Some(gain_addr) = input_ch.gain {
-                                if let Err(e) = dev.set_channel_gain(gain_addr, gain as f32) {
-                                    return send_error(req, 500, &format!("set_gain: {e}"));
-                                }
+                    }
+                    // Per-channel gain
+                    if let Some(gain) = input.get("gain").and_then(|v| v.as_f64()) {
+                        if !gain.is_finite() || gain.abs() > 120.0 {
+                            return send_error(
+                                req,
+                                400,
+                                "gain out of range (must be finite, |gain| <= 120 dB)",
+                            );
+                        }
+                        if let Some(gain_addr) = input_ch.gain {
+                            if let Err(e) = dev.set_channel_gain(gain_addr, gain as f32) {
+                                return send_error(req, 500, &format!("set_gain: {e}"));
                             }
                         }
-                        // Per-channel mute
-                        if let Some(mute) = input.get("mute").and_then(|v| v.as_bool()) {
-                            if let Some(mute_addr) = input_ch.mute {
-                                if let Err(e) = dev.set_channel_mute(mute_addr, mute) {
-                                    return send_error(req, 500, &format!("set_mute: {e}"));
-                                }
+                    }
+                    // Per-channel mute
+                    if let Some(mute) = input.get("mute").and_then(|v| v.as_bool()) {
+                        if let Some(mute_addr) = input_ch.mute {
+                            if let Err(e) = dev.set_channel_mute(mute_addr, mute) {
+                                return send_error(req, 500, &format!("set_mute: {e}"));
                             }
                         }
-                        if let Some(routes) = input.get("routing").and_then(|v| v.as_array()) {
-                            for route in routes {
-                                let output = match route.get("output").and_then(|v| v.as_u64()) {
-                                    Some(v) => v as u8,
-                                    None => {
-                                        return send_error(
-                                            req,
-                                            400,
-                                            "routing missing 'output' field",
-                                        );
-                                    }
-                                };
-                                let enabled = match route.get("enabled").and_then(|v| v.as_bool()) {
-                                    Some(v) => v,
-                                    None => {
-                                        return send_error(
-                                            req,
-                                            400,
-                                            "routing missing 'enabled' field",
-                                        );
-                                    }
-                                };
-                                let gain_db = match route.get("gain_db").and_then(|v| v.as_f64()) {
-                                    Some(v) if v.is_finite() => v as f32,
-                                    Some(_) => {
-                                        return send_error(req, 400, "routing gain must be finite");
-                                    }
-                                    None => {
-                                        return send_error(
-                                            req,
-                                            400,
-                                            "routing missing 'gain_db' field",
-                                        );
-                                    }
-                                };
-                                if let Err(e) = dev.set_routing(idx as u8, output, enabled, gain_db)
+                    }
+                    if let Some(routes) = input.get("routing").and_then(|v| v.as_array()) {
+                        for route in routes {
+                            let output = match route.get("output").and_then(|v| v.as_u64()) {
+                                Some(v) => v as u8,
+                                None => {
+                                    return send_error(req, 400, "routing missing 'output' field");
+                                }
+                            };
+                            let enabled = match route.get("enabled").and_then(|v| v.as_bool()) {
+                                Some(v) => v,
+                                None => {
+                                    return send_error(req, 400, "routing missing 'enabled' field");
+                                }
+                            };
+                            let gain_db = match route.get("gain_db").and_then(|v| v.as_f64()) {
+                                Some(v) if v.is_finite() => v as f32,
+                                Some(_) => {
+                                    return send_error(req, 400, "routing gain must be finite");
+                                }
+                                None => {
+                                    return send_error(req, 400, "routing missing 'gain_db' field");
+                                }
+                            };
+                            if let Err(e) = dev.set_routing(idx as u8, output, enabled, gain_db) {
+                                return send_error(req, 500, &format!("set_routing: {e}"));
+                            }
+                            if let Some(inverted) =
+                                route.get("polarity_inverted").and_then(|v| v.as_bool())
+                            {
+                                if let Err(e) =
+                                    dev.set_routing_polarity(idx as u8, output, inverted)
                                 {
-                                    return send_error(req, 500, &format!("set_routing: {e}"));
-                                }
-                                if let Some(inverted) =
-                                    route.get("polarity_inverted").and_then(|v| v.as_bool())
-                                {
-                                    if let Err(e) =
-                                        dev.set_routing_polarity(idx as u8, output, inverted)
-                                    {
-                                        return send_error(
-                                            req,
-                                            500,
-                                            &format!("set_routing_polarity: {e}"),
-                                        );
-                                    }
+                                    return send_error(
+                                        req,
+                                        500,
+                                        &format!("set_routing_polarity: {e}"),
+                                    );
                                 }
                             }
                         }
@@ -608,131 +591,122 @@ pub fn start(
                         Some(i) => i as usize,
                         None => return send_error(req, 400, "output missing 'index' field"),
                     };
-                    if let Some(output_ch) = table.outputs.get(idx) {
-                        // PEQ bands
-                        if let Some(peqs) = output.get("peq").and_then(|v| v.as_array()) {
-                            for peq in peqs {
-                                let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
-                                    Some(i) => i as usize,
+                    let output_ch = match table.outputs.get(idx) {
+                        Some(ch) => ch,
+                        None => return send_error(req, 400, "output index out of range"),
+                    };
+                    // PEQ bands
+                    if let Some(peqs) = output.get("peq").and_then(|v| v.as_array()) {
+                        for peq in peqs {
+                            let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
+                                Some(i) => i as usize,
+                                None => return send_error(req, 400, "peq missing 'index' field"),
+                            };
+                            let band = match output_ch.peq.get(band_idx) {
+                                Some(band) => band,
+                                None => {
+                                    return send_error(req, 400, "output peq index out of range")
+                                }
+                            };
+                            info!(
+                                "config write output[{idx}] peq[{band_idx}] addr=0x{:04x}",
+                                band.addr
+                            );
+                            if let Some(coeff) = peq.get("coeff") {
+                                let c = match parse_biquad_coefficients(coeff) {
+                                    Ok(coeffs) => coeffs,
+                                    Err(msg) => return send_error(req, 400, msg),
+                                };
+                                if let Err(e) = dev.write_biquad(band.addr, &c) {
+                                    return send_error(req, 500, &format!("write_biquad: {e}"));
+                                }
+                            }
+                            if let Some(bypass) = peq.get("bypass").and_then(|v| v.as_bool()) {
+                                if let Err(e) = dev.bypass_filter(band.addr, bypass) {
+                                    return send_error(req, 500, &format!("bypass_filter: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    // Per-channel gain
+                    if let Some(gain) = output.get("gain").and_then(|v| v.as_f64()) {
+                        debug!("config write output[{idx}] gain -> {gain}");
+                        if !gain.is_finite() || gain.abs() > 120.0 {
+                            return send_error(
+                                req,
+                                400,
+                                "gain out of range (must be finite, |gain| <= 120 dB)",
+                            );
+                        }
+                        if let Err(e) = dev.set_channel_gain(output_ch.gain, gain as f32) {
+                            return send_error(req, 500, &format!("set_gain: {e}"));
+                        }
+                    }
+                    // Per-channel mute
+                    if let Some(mute) = output.get("mute").and_then(|v| v.as_bool()) {
+                        debug!("config write output[{idx}] mute -> {mute}");
+                        if let Err(e) = dev.set_channel_mute(output_ch.mute, mute) {
+                            return send_error(req, 500, &format!("set_mute: {e}"));
+                        }
+                    }
+                    // Delay (Duration format: {secs, nanos} or float seconds)
+                    if let Some(delay) = output.get("delay") {
+                        let secs = if let Some(s) = delay.get("secs").and_then(|v| v.as_f64()) {
+                            let nanos = delay.get("nanos").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            s + nanos / 1_000_000_000.0
+                        } else {
+                            delay.as_f64().unwrap_or(0.0)
+                        };
+                        debug!("config write output[{idx}] delay_secs -> {secs}");
+                        if let Some(delay_addr) = output_ch.delay {
+                            let delay_ms = secs as f32 * 1000.0;
+                            let samples = dev.profile().delay_ms_to_samples(delay_ms);
+                            if let Err(e) = dev.set_channel_delay_samples(delay_addr, samples) {
+                                return send_error(req, 500, &format!("set_delay: {e}"));
+                            }
+                        }
+                    }
+                    // Polarity inversion (dialect-aware encoding)
+                    if let Some(invert) = output.get("invert").and_then(|v| v.as_bool()) {
+                        debug!("config write output[{idx}] invert -> {invert}");
+                        if let Some(polarity_addr) = output_ch.polarity {
+                            if let Err(e) = dev.set_invert(polarity_addr, invert) {
+                                return send_error(req, 500, &format!("set_polarity: {e}"));
+                            }
+                        }
+                    }
+                    if let Some(crossover_groups) =
+                        output.get("crossover").and_then(|v| v.as_array())
+                    {
+                        if let Some(xover) = output_ch.crossover {
+                            for group in crossover_groups {
+                                let group_idx = match group.get("index").and_then(|v| v.as_u64()) {
+                                    Some(v) => v as u8,
                                     None => {
-                                        return send_error(req, 400, "peq missing 'index' field");
+                                        return send_error(
+                                            req,
+                                            400,
+                                            "crossover missing 'index' field",
+                                        );
                                     }
                                 };
-                                if let Some(band) = output_ch.peq.get(band_idx) {
-                                    info!(
-                                        "config write output[{idx}] peq[{band_idx}] addr=0x{:04x}",
-                                        band.addr
-                                    );
-                                    if let Some(coeff) = peq.get("coeff") {
-                                        let c = match parse_biquad_coefficients(coeff) {
-                                            Ok(coeffs) => coeffs,
-                                            Err(msg) => return send_error(req, 400, msg),
-                                        };
-                                        if let Err(e) = dev.write_biquad(band.addr, &c) {
-                                            return send_error(
-                                                req,
-                                                500,
-                                                &format!("write_biquad: {e}"),
-                                            );
-                                        }
+                                let base_addr = match group_idx {
+                                    0 => xover.lpf_addr,
+                                    1 => xover.hpf_addr,
+                                    _ => {
+                                        return send_error(
+                                            req,
+                                            400,
+                                            "crossover index out of range",
+                                        );
                                     }
-                                    if let Some(bypass) =
-                                        peq.get("bypass").and_then(|v| v.as_bool())
-                                    {
-                                        if let Err(e) = dev.bypass_filter(band.addr, bypass) {
-                                            return send_error(
-                                                req,
-                                                500,
-                                                &format!("bypass_filter: {e}"),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Per-channel gain
-                        if let Some(gain) = output.get("gain").and_then(|v| v.as_f64()) {
-                            debug!("config write output[{idx}] gain -> {gain}");
-                            if !gain.is_finite() || gain.abs() > 120.0 {
-                                return send_error(
-                                    req,
-                                    400,
-                                    "gain out of range (must be finite, |gain| <= 120 dB)",
-                                );
-                            }
-                            if let Err(e) = dev.set_channel_gain(output_ch.gain, gain as f32) {
-                                return send_error(req, 500, &format!("set_gain: {e}"));
-                            }
-                        }
-                        // Per-channel mute
-                        if let Some(mute) = output.get("mute").and_then(|v| v.as_bool()) {
-                            debug!("config write output[{idx}] mute -> {mute}");
-                            if let Err(e) = dev.set_channel_mute(output_ch.mute, mute) {
-                                return send_error(req, 500, &format!("set_mute: {e}"));
-                            }
-                        }
-                        // Delay (Duration format: {secs, nanos} or float seconds)
-                        if let Some(delay) = output.get("delay") {
-                            let secs = if let Some(s) = delay.get("secs").and_then(|v| v.as_f64()) {
-                                let nanos =
-                                    delay.get("nanos").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                s + nanos / 1_000_000_000.0
-                            } else {
-                                delay.as_f64().unwrap_or(0.0)
-                            };
-                            debug!("config write output[{idx}] delay_secs -> {secs}");
-                            if let Some(delay_addr) = output_ch.delay {
-                                let delay_ms = secs as f32 * 1000.0;
-                                let samples = dev.profile().delay_ms_to_samples(delay_ms);
-                                if let Err(e) = dev.set_channel_delay_samples(delay_addr, samples) {
-                                    return send_error(req, 500, &format!("set_delay: {e}"));
-                                }
-                            }
-                        }
-                        // Polarity inversion (dialect-aware encoding)
-                        if let Some(invert) = output.get("invert").and_then(|v| v.as_bool()) {
-                            debug!("config write output[{idx}] invert -> {invert}");
-                            if let Some(polarity_addr) = output_ch.polarity {
-                                if let Err(e) = dev.set_invert(polarity_addr, invert) {
-                                    return send_error(req, 500, &format!("set_polarity: {e}"));
-                                }
-                            }
-                        }
-                        if let Some(crossover_groups) =
-                            output.get("crossover").and_then(|v| v.as_array())
-                        {
-                            if let Some(xover) = output_ch.crossover {
-                                for group in crossover_groups {
-                                    let group_idx =
-                                        match group.get("index").and_then(|v| v.as_u64()) {
-                                            Some(v) => v as u8,
-                                            None => {
-                                                return send_error(
-                                                    req,
-                                                    400,
-                                                    "crossover missing 'index' field",
-                                                );
-                                            }
-                                        };
-                                    let base_addr = match group_idx {
-                                        0 => xover.lpf_addr,
-                                        1 => xover.hpf_addr,
-                                        _ => {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                "crossover index out of range",
-                                            );
-                                        }
-                                    };
-                                    if let Some(filters) =
-                                        group.get("filters").and_then(|v| v.as_array())
-                                    {
-                                        for filter in filters {
-                                            let filter_idx = match filter
-                                                .get("index")
-                                                .and_then(|v| v.as_u64())
-                                            {
+                                };
+                                if let Some(filters) =
+                                    group.get("filters").and_then(|v| v.as_array())
+                                {
+                                    for filter in filters {
+                                        let filter_idx =
+                                            match filter.get("index").and_then(|v| v.as_u64()) {
                                                 Some(v) if v < 4 => v as u16,
                                                 Some(_) => {
                                                     return send_error(
@@ -749,118 +723,109 @@ pub fn start(
                                                     );
                                                 }
                                             };
-                                            if let Some(coeff) = filter.get("coeff") {
-                                                let c = match parse_biquad_coefficients(coeff) {
-                                                    Ok(coeffs) => coeffs,
-                                                    Err(msg) => return send_error(req, 400, msg),
-                                                };
-                                                if let Err(e) =
-                                                    dev.write_biquad(base_addr + filter_idx * 5, &c)
-                                                {
-                                                    return send_error(
-                                                        req,
-                                                        500,
-                                                        &format!("write_crossover_biquad: {e}"),
-                                                    );
-                                                }
+                                        if let Some(coeff) = filter.get("coeff") {
+                                            let c = match parse_biquad_coefficients(coeff) {
+                                                Ok(coeffs) => coeffs,
+                                                Err(msg) => return send_error(req, 400, msg),
+                                            };
+                                            if let Err(e) =
+                                                dev.write_biquad(base_addr + filter_idx * 5, &c)
+                                            {
+                                                return send_error(
+                                                    req,
+                                                    500,
+                                                    &format!("write_crossover_biquad: {e}"),
+                                                );
                                             }
                                         }
                                     }
-                                    if let Some(bypass) =
-                                        group.get("bypass").and_then(|v| v.as_bool())
-                                    {
-                                        if let Err(e) = dev.bypass_filter(base_addr, bypass) {
-                                            return send_error(
-                                                req,
-                                                500,
-                                                &format!("set_crossover_bypass: {e}"),
-                                            );
-                                        }
+                                }
+                                if let Some(bypass) = group.get("bypass").and_then(|v| v.as_bool())
+                                {
+                                    if let Err(e) = dev.bypass_filter(base_addr, bypass) {
+                                        return send_error(
+                                            req,
+                                            500,
+                                            &format!("set_crossover_bypass: {e}"),
+                                        );
                                     }
                                 }
                             }
                         }
-                        if let Some(fir) = output.get("fir") {
-                            if let Some(fir_def) = output_ch.fir {
-                                if let Some(bypass) = fir.get("bypass").and_then(|v| v.as_bool()) {
-                                    if let Err(e) = dev.set_status_bypass(fir_def.bypass, bypass) {
+                    }
+                    if let Some(fir) = output.get("fir") {
+                        if let Some(fir_def) = output_ch.fir {
+                            if let Some(bypass) = fir.get("bypass").and_then(|v| v.as_bool()) {
+                                if let Err(e) = dev.set_status_bypass(fir_def.bypass, bypass) {
+                                    return send_error(req, 500, &format!("set_fir_bypass: {e}"));
+                                }
+                            }
+                            if let Some(coefficients) =
+                                fir.get("coefficients").and_then(|v| v.as_array())
+                            {
+                                let mut taps = Vec::with_capacity(coefficients.len());
+                                for coeff in coefficients {
+                                    let Some(value) = coeff.as_f64() else {
                                         return send_error(
                                             req,
-                                            500,
-                                            &format!("set_fir_bypass: {e}"),
+                                            400,
+                                            "fir coefficients must be numbers",
+                                        );
+                                    };
+                                    if !value.is_finite() {
+                                        return send_error(
+                                            req,
+                                            400,
+                                            "fir coefficients must be finite",
                                         );
                                     }
+                                    taps.push(value as f32);
                                 }
-                                if let Some(coefficients) =
-                                    fir.get("coefficients").and_then(|v| v.as_array())
-                                {
-                                    let mut taps = Vec::with_capacity(coefficients.len());
-                                    for coeff in coefficients {
-                                        let Some(value) = coeff.as_f64() else {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                "fir coefficients must be numbers",
-                                            );
-                                        };
-                                        if !value.is_finite() {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                "fir coefficients must be finite",
-                                            );
-                                        }
-                                        taps.push(value as f32);
-                                    }
-                                    if let Err(e) = dev.load_fir_coefficients(fir_def, &taps) {
-                                        return send_error(req, 500, &format!("load_fir: {e}"));
-                                    }
+                                if let Err(e) = dev.load_fir_coefficients(fir_def, &taps) {
+                                    return send_error(req, 500, &format!("load_fir: {e}"));
                                 }
                             }
                         }
-                        if let Some(compressor) = output.get("compressor") {
-                            if let Some(comp) = output_ch.compressor {
-                                if let Some(bypass) =
-                                    compressor.get("bypass").and_then(|v| v.as_bool())
-                                {
-                                    if let Err(e) = dev.set_status_bypass(comp.bypass, bypass) {
+                    }
+                    if let Some(compressor) = output.get("compressor") {
+                        if let Some(comp) = output_ch.compressor {
+                            if let Some(bypass) = compressor.get("bypass").and_then(|v| v.as_bool())
+                            {
+                                if let Err(e) = dev.set_status_bypass(comp.bypass, bypass) {
+                                    return send_error(
+                                        req,
+                                        500,
+                                        &format!("set_compressor_bypass: {e}"),
+                                    );
+                                }
+                            }
+                            for (name, addr) in [
+                                ("threshold", comp.threshold),
+                                ("gain", comp.gain),
+                                ("ratio", comp.ratio),
+                                ("knee", comp.knee),
+                                ("attack", comp.attack),
+                                ("release", comp.release),
+                            ] {
+                                if let Some(value) = compressor.get(name).and_then(|v| v.as_f64()) {
+                                    if !value.is_finite() {
+                                        return send_error(
+                                            req,
+                                            400,
+                                            &format!("compressor {name} must be finite"),
+                                        );
+                                    }
+                                    if let Err(e) = dev.write_dsp_verified(
+                                        addr,
+                                        value as f32,
+                                        true,
+                                        &format!("set compressor {name}"),
+                                    ) {
                                         return send_error(
                                             req,
                                             500,
-                                            &format!("set_compressor_bypass: {e}"),
+                                            &format!("set_compressor_{name}: {e}"),
                                         );
-                                    }
-                                }
-                                for (name, addr) in [
-                                    ("threshold", comp.threshold),
-                                    ("gain", comp.gain),
-                                    ("ratio", comp.ratio),
-                                    ("knee", comp.knee),
-                                    ("attack", comp.attack),
-                                    ("release", comp.release),
-                                ] {
-                                    if let Some(value) =
-                                        compressor.get(name).and_then(|v| v.as_f64())
-                                    {
-                                        if !value.is_finite() {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                &format!("compressor {name} must be finite"),
-                                            );
-                                        }
-                                        if let Err(e) = dev.write_dsp_verified(
-                                            addr,
-                                            value as f32,
-                                            true,
-                                            &format!("set compressor {name}"),
-                                        ) {
-                                            return send_error(
-                                                req,
-                                                500,
-                                                &format!("set_compressor_{name}: {e}"),
-                                            );
-                                        }
                                     }
                                 }
                             }
@@ -1610,6 +1575,31 @@ fn register_device_feature_routes(
         })?;
     }
 
+    // GET /devices/0/verify-program
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/verify-program", Method::Get, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            let _op = dev.begin_operation();
+            match dev.read_flash_data(0xFF, 0xA3, 9) {
+                Ok(bytes) => {
+                    let status = bytes.first().copied().unwrap_or(0);
+                    let body = serde_json::to_string(&serde_json::json!({
+                        "status": status,
+                        "ok": minidsp_protocol::eeprom::is_verify_program_ok(status),
+                        "bytes": bytes,
+                    }))
+                    .unwrap_or_default();
+                    send_json(req, 200, &body)
+                }
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
     // POST /devices/0/preset/copy
     {
         let st = state.clone();
@@ -1621,6 +1611,111 @@ fn register_device_feature_routes(
             let _op = dev.begin_operation();
             match dev.copy_preset() {
                 Ok(()) => send_empty_200(req),
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
+    // POST /devices/0/preset/reset
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/preset/reset", Method::Post, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            if !dev.supports_default_preset_reset() {
+                return send_error(req, 501, "default preset reset not supported");
+            }
+            match dev.reset_active_preset_to_defaults() {
+                Ok(preset) => {
+                    let body = serde_json::to_string(&json!({
+                        "status": "preset_reset",
+                        "preset": preset,
+                    }))
+                    .unwrap_or_default();
+                    send_json(req, 200, &body)
+                }
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
+    // POST /devices/0/preset/{preset}/reset
+    {
+        let st = state.clone();
+        // Safe because the handler captures only owned `Arc` state and the
+        // server owns the closure for the same lifetime as `state`.
+        unsafe {
+            server.fn_handler_nonstatic("/devices/0/preset/*/reset", Method::Post, move |req| {
+                let dev = match get_device(&st) {
+                    Some(d) => d,
+                    None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                };
+                if !dev.supports_default_preset_reset() {
+                    return send_error(req, 501, "default preset reset not supported");
+                }
+                let path = req.uri().trim_matches('/');
+                let parts: Vec<_> = path.split('/').collect();
+                let Some(&preset_text) = parts.get(3) else {
+                    return send_error(req, 400, "missing preset");
+                };
+                let Ok(preset) = preset_text.parse::<u8>() else {
+                    return send_error(req, 400, "invalid preset");
+                };
+                match dev.reset_preset_to_defaults(preset) {
+                    Ok(()) => {
+                        let body = serde_json::to_string(&json!({
+                            "status": "preset_reset",
+                            "preset": preset,
+                        }))
+                        .unwrap_or_default();
+                        send_json(req, 200, &body)
+                    }
+                    Err(e) => send_error(req, 500, &e.to_string()),
+                }
+            })?;
+        }
+    }
+
+    // POST /devices/0/preset/reset-all
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/preset/reset-all", Method::Post, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            if !dev.supports_default_preset_reset() {
+                return send_error(req, 501, "default preset reset not supported");
+            }
+            match dev.initialize_all_presets_to_defaults(true) {
+                Ok(()) => match wait_for_rebooted_device(&st, &dev, REBOOT_RECOVERY_TIMEOUT) {
+                    Ok(()) => send_json(
+                        req,
+                        200,
+                        r#"{"status":"all_presets_reset","rebooted":true}"#,
+                    ),
+                    Err(e) => send_error(req, 500, &e),
+                },
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
+    // POST /devices/0/reboot
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/reboot", Method::Post, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            match dev.reboot_device() {
+                Ok(()) => match wait_for_rebooted_device(&st, &dev, REBOOT_RECOVERY_TIMEOUT) {
+                    Ok(()) => send_json(req, 200, r#"{"status":"rebooted"}"#),
+                    Err(e) => send_error(req, 500, &e),
+                },
                 Err(e) => send_error(req, 500, &e.to_string()),
             }
         })?;
@@ -1896,6 +1991,49 @@ pub fn get_device(state: &SharedDeviceState) -> Option<Arc<DeviceState>> {
     state.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+fn wait_for_rebooted_device(
+    state: &SharedDeviceState,
+    previous: &Arc<DeviceState>,
+    timeout: Duration,
+) -> Result<(), String> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let started = Instant::now();
+    let deadline = Instant::now() + timeout;
+    let expected_hw_id = previous.hw_id().hw_id;
+    let expected_dsp = previous.dsp_version();
+    let expected_serial = previous.serial();
+
+    loop {
+        if let Some(current) = get_device(state) {
+            let same_identity = current.hw_id().hw_id == expected_hw_id
+                && current.dsp_version() == expected_dsp
+                && (expected_serial == 0 || current.serial() == expected_serial);
+
+            if same_identity && !Arc::ptr_eq(&current, previous) {
+                info!(
+                    "HTTP reboot wait: device recovered after {:?}",
+                    started.elapsed()
+                );
+                return Ok(());
+            }
+        }
+
+        if Instant::now() >= deadline {
+            warn!(
+                "HTTP reboot wait: timed out after {:?} waiting for hw_id={} dsp={} serial={}",
+                started.elapsed(),
+                expected_hw_id,
+                expected_dsp,
+                expected_serial
+            );
+            return Err("device did not recover after reboot".into());
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 fn parse_bm_channel_path(uri: &str) -> Option<u8> {
     let parts = path_segments(uri);
     match parts.as_slice() {
@@ -2112,9 +2250,9 @@ fn config_json(dev: &DeviceState, config: DeviceConfig) -> String {
     let mut body = String::with_capacity(8192);
     body.push('{');
     body.push_str("\"master_status\":");
-    body.push_str(&serde_json::to_string(&master_status["master_status"]).unwrap_or_else(|_| {
-        "{}".into()
-    }));
+    body.push_str(
+        &serde_json::to_string(&master_status["master_status"]).unwrap_or_else(|_| "{}".into()),
+    );
     body.push_str(",\"inputs\":[");
     for (idx, input) in inputs.iter().enumerate() {
         if idx > 0 {
@@ -2186,8 +2324,23 @@ fn openapi_json() -> String {
             "/devices/0/tokens": {
                 "get": { "summary": "Read modification tokens" }
             },
+            "/devices/0/verify-program": {
+                "get": { "summary": "Read the verify-program status byte and trailing EEPROM bytes at 0xFFA3" }
+            },
             "/devices/0/preset/copy": {
-                "post": { "summary": "Copy current preset to flash" }
+                "post": { "summary": "Copy the active preset to the remaining preset slots" }
+            },
+            "/devices/0/preset/reset": {
+                "post": { "summary": "Reset the active preset to the official default image" }
+            },
+            "/devices/0/preset/{preset}/reset": {
+                "post": { "summary": "Reset a specific preset slot to the official default image" }
+            },
+            "/devices/0/preset/reset-all": {
+                "post": { "summary": "Reset preset 1, copy it to all slots, and reboot the device" }
+            },
+            "/devices/0/reboot": {
+                "post": { "summary": "Reboot the MiniDSP unit" }
             },
             "/devices/0/peq/reset": {
                 "post": { "summary": "Reset every PEQ band to defaults" }
@@ -2837,9 +2990,7 @@ fn write_audio_chunk_with_retry(
                 if attempt == max_attempts {
                     break;
                 }
-                warn!(
-                    "{context}: write attempt {attempt}/{max_attempts} failed: {err}; retrying"
-                );
+                warn!("{context}: write attempt {attempt}/{max_attempts} failed: {err}; retrying");
                 std::thread::sleep(Duration::from_millis(retry_delay_ms));
             }
         }
@@ -3372,14 +3523,24 @@ fn register_ezbeq_ws(
 
             // Send initial Catalogue meta
             let catalogue_meta = build_catalogue_meta();
-            ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), catalogue_meta.as_bytes())?;
+            ws_send_logged(
+                ws,
+                "ezBEQ WS",
+                FrameType::Text(false),
+                catalogue_meta.as_bytes(),
+            )?;
 
             // Send initial DeviceState
             if let Some(dev) = get_device(&st) {
                 let _op = dev.begin_operation();
                 let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
                 let state_json = crate::ezbeq::device_state_json(&dev, &beq_guard);
-                ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), state_json.as_bytes())?;
+                ws_send_logged(
+                    ws,
+                    "ezBEQ WS",
+                    FrameType::Text(false),
+                    state_json.as_bytes(),
+                )?;
             }
 
             // Store a detached sender for REST → WS broadcasts
@@ -3718,7 +3879,9 @@ fn proxy_catalogue_file<C: esp_idf_svc::http::server::Connection>(
     };
     let mut buf = [0u8; 4096];
     let mut total_sent = 0usize;
-    let expected_len = content_length.as_deref().and_then(|len| len.parse::<usize>().ok());
+    let expected_len = content_length
+        .as_deref()
+        .and_then(|len| len.parse::<usize>().ok());
     loop {
         let n = match conn.read(&mut buf) {
             Ok(0) => break,

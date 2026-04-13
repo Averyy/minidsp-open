@@ -344,11 +344,6 @@ fn register_disconnect_reason_handler(
                 LAST_DISCONNECT_REASON.store(reason, Ordering::Relaxed);
                 WIFI_CONNECTED.store(false, Ordering::Relaxed);
                 crate::led::set_mode(crate::led::LedMode::WifiConnecting);
-                warn!(
-                    "WiFi disconnect reason {} ({})",
-                    reason,
-                    disconnect_reason_name(reason)
-                );
             }
         })
         .map_err(|e| WifiError::Init(format!("wifi disconnect subscription: {e}")))
@@ -362,12 +357,12 @@ fn register_disconnect_reason_handler(
 pub fn start_monitor(
     wifi: Arc<std::sync::Mutex<BlockingWifi<EspWifi<'static>>>>,
     nvs: EspDefaultNvsPartition,
-) {
+) -> Result<(), std::io::Error> {
     std::thread::Builder::new()
         .name("wifi_mon".into())
         .stack_size(8192)
         .spawn(move || monitor_loop(wifi, nvs))
-        .expect("failed to spawn wifi monitor thread");
+        .map(|_| ())
 }
 
 fn monitor_loop(

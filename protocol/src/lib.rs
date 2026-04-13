@@ -8,6 +8,7 @@
 
 pub mod biquad;
 pub mod commands;
+pub mod default_preset;
 pub mod device;
 pub mod dialect;
 pub mod discovery;

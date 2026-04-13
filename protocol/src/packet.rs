@@ -219,6 +219,55 @@ pub fn encode_tcp_response(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Encode a TCP bridge response in the compact format the official Device
+/// Console network parser expects.
+///
+/// The app does not accept raw echoed write opcodes like `[len][0x06 ...]` for
+/// successful writes. Instead it expects:
+///
+/// - `0x01` for generic OK
+/// - `0x00` for error
+/// - `0x02 0xAA` / `0x02 0xAB` for reset / preset completion
+/// - `0x02 <block_id>` for `FinishFlashBlock`
+/// - `[len][cmd ...]` only for true read-style payloads
+pub fn encode_device_console_tcp_response(
+    request: &[u8],
+    raw_resp: &[u8],
+    dialect: &crate::dialect::Dialect,
+) -> Vec<u8> {
+    let parsed = crate::commands::parse_response_for_request(request, raw_resp, dialect);
+
+    if request.first() == Some(&crate::commands::CMD_FINISH_FLASH_BLOCK)
+        && matches!(parsed, crate::commands::Response::Ack)
+    {
+        let block_id = raw_resp
+            .get(1)
+            .copied()
+            .or_else(|| request.get(1).copied())
+            .unwrap_or(0);
+        return vec![crate::commands::RESP_EVENT, block_id];
+    }
+
+    match parsed {
+        crate::commands::Response::Ack => vec![crate::commands::RESP_OK],
+        crate::commands::Response::Error(_) => vec![crate::commands::RESP_ERROR],
+        crate::commands::Response::ResetComplete => {
+            vec![
+                crate::commands::RESP_EVENT,
+                crate::commands::RESP_RESET_COMPLETE,
+            ]
+        }
+        crate::commands::Response::PresetComplete => {
+            vec![
+                crate::commands::RESP_EVENT,
+                crate::commands::RESP_PRESET_COMPLETE,
+            ]
+        }
+        crate::commands::Response::Overflow => vec![crate::commands::RESP_OVERFLOW],
+        _ => encode_tcp_response(raw_resp),
+    }
+}
+
 /// Decode a TCP server response frame. Server responses use `[len][payload]` with
 /// NO checksum (unlike client requests which include a checksum byte).
 /// Skips leading zero-byte padding (WI-DG compat).
@@ -440,5 +489,89 @@ mod tests {
         assert_eq!(frame[0], 9); // self-inclusive length = 8 + 1
         let decoded = decode_frame(&frame).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn device_console_write_flash_block_echo_becomes_ok() {
+        let request = [0x06u8, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00];
+        let raw_resp = request;
+        assert_eq!(
+            encode_device_console_tcp_response(&request, &raw_resp, &crate::dialect::Dialect::NEW),
+            vec![crate::commands::RESP_OK]
+        );
+    }
+
+    #[test]
+    fn device_console_finish_flash_block_echo_becomes_block_event() {
+        let request = [crate::commands::CMD_FINISH_FLASH_BLOCK, 0x02];
+        let raw_resp = request;
+        assert_eq!(
+            encode_device_console_tcp_response(&request, &raw_resp, &crate::dialect::Dialect::NEW),
+            vec![crate::commands::RESP_EVENT, 0x02]
+        );
+    }
+
+    #[test]
+    fn device_console_finish_flash_block_event_stays_block_event() {
+        let request = [crate::commands::CMD_FINISH_FLASH_BLOCK, 0x02];
+        let raw_resp = [crate::commands::RESP_EVENT, 0x02];
+        assert_eq!(
+            encode_device_console_tcp_response(&request, &raw_resp, &crate::dialect::Dialect::NEW),
+            vec![crate::commands::RESP_EVENT, 0x02]
+        );
+    }
+
+    #[test]
+    fn device_console_finish_flash_block_bare_event_uses_request_block_id() {
+        let request = [crate::commands::CMD_FINISH_FLASH_BLOCK, 0x02];
+        let raw_resp = [crate::commands::RESP_EVENT];
+        assert_eq!(
+            encode_device_console_tcp_response(&request, &raw_resp, &crate::dialect::Dialect::NEW),
+            vec![crate::commands::RESP_EVENT, 0x02]
+        );
+    }
+
+    #[test]
+    fn device_console_finish_flash_block_ok_becomes_block_event() {
+        let request = [crate::commands::CMD_FINISH_FLASH_BLOCK, 0x01];
+        let raw_resp = [crate::commands::RESP_OK];
+        assert_eq!(
+            encode_device_console_tcp_response(&request, &raw_resp, &crate::dialect::Dialect::NEW),
+            vec![crate::commands::RESP_EVENT, 0x01]
+        );
+    }
+
+    #[test]
+    fn device_console_reload_same_preset_stays_preset_complete_event() {
+        let request =
+            crate::commands::set_config(0, crate::commands::PRESET_CHANGE_RELOAD_SAME_SLOT);
+        let raw_resp = [crate::commands::RESP_PRESET_COMPLETE];
+        assert_eq!(
+            encode_device_console_tcp_response(&request, &raw_resp, &crate::dialect::Dialect::NEW),
+            vec![
+                crate::commands::RESP_EVENT,
+                crate::commands::RESP_PRESET_COMPLETE
+            ]
+        );
+    }
+
+    #[test]
+    fn device_console_set_config_without_reset_becomes_ok() {
+        let request = crate::commands::set_config(0, crate::commands::PRESET_CHANGE_WITHOUT_RESET);
+        let raw_resp = [crate::commands::RESP_OK];
+        assert_eq!(
+            encode_device_console_tcp_response(&request, &raw_resp, &crate::dialect::Dialect::NEW),
+            vec![crate::commands::RESP_OK]
+        );
+    }
+
+    #[test]
+    fn device_console_read_flash_keeps_command_frame_shape() {
+        let request = crate::commands::read_flash(0xff, 0xa3, 1);
+        let raw_resp = [crate::commands::CMD_READ_FLASH, 0xff, 0xa3, 0x03];
+        assert_eq!(
+            encode_device_console_tcp_response(&request, &raw_resp, &crate::dialect::Dialect::NEW),
+            vec![5, crate::commands::CMD_READ_FLASH, 0xff, 0xa3, 0x03]
+        );
     }
 }

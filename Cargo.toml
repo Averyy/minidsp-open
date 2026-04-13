@@ -5,6 +5,7 @@ members = [
     "minidsp",
     "daemon",
     "app-desktop",
+    "atv-companion-spike",
     # "app-esp32",  # Cross-compiled separately with ESP-IDF toolchain
 ]
 exclude = ["app-esp32"]

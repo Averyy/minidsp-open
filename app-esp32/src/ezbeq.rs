@@ -417,7 +417,9 @@ pub fn broadcast_state(
         })
     {
         log::warn!("failed to spawn ezBEQ WS send thread for fd {session_fd}: {e}");
-        let mut guard = beq_state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut guard = beq_state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if guard.ws_sender.as_ref().map(|active| active.session()) == Some(session_fd) {
             guard.ws_sender = None;
         }
@@ -711,14 +713,9 @@ pub fn register_routes(
                             beq_guard.slots[slot_idx].last = "Empty".into();
                             beq_guard.slots[slot_idx].author = None;
                         } else {
-                            let title = slot
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(digest);
-                            let author = slot
-                                .get("author")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let title =
+                                slot.get("title").and_then(|v| v.as_str()).unwrap_or(digest);
+                            let author = slot.get("author").and_then(|v| v.as_str()).unwrap_or("");
                             if let Err(e) = load_filter(&dev, digest, title, author) {
                                 return send_error(req, 500, &e);
                             }
@@ -732,34 +729,28 @@ pub fn register_routes(
                     }
 
                     let gains = match slot.get("gains") {
-                        Some(value) => match serde_json::from_value::<Vec<ChannelValue<f32>>>(
-                            value.clone(),
-                        ) {
-                            Ok(gains) => gains,
-                            Err(_) => return send_error(req, 400, "invalid slot gains"),
-                        },
+                        Some(value) => {
+                            match serde_json::from_value::<Vec<ChannelValue<f32>>>(value.clone()) {
+                                Ok(gains) => gains,
+                                Err(_) => return send_error(req, 400, "invalid slot gains"),
+                            }
+                        }
                         None => Vec::new(),
                     };
                     let mutes = match slot.get("mutes") {
-                        Some(value) => match serde_json::from_value::<Vec<ChannelValue<bool>>>(
-                            value.clone(),
-                        ) {
-                            Ok(mutes) => mutes,
-                            Err(_) => return send_error(req, 400, "invalid slot mutes"),
-                        },
+                        Some(value) => {
+                            match serde_json::from_value::<Vec<ChannelValue<bool>>>(value.clone()) {
+                                Ok(mutes) => mutes,
+                                Err(_) => return send_error(req, 400, "invalid slot mutes"),
+                            }
+                        }
                         None => Vec::new(),
                     };
 
                     if let Err(e) = set_input_gain_mute_state(&dev, &gains, &mutes) {
                         return send_error(req, 500, &e);
                     }
-                    sync_slot_state(
-                        &mut beq_guard.slots[slot_idx],
-                        None,
-                        None,
-                        &gains,
-                        &mutes,
-                    );
+                    sync_slot_state(&mut beq_guard.slots[slot_idx], None, None, &gains, &mutes);
                     for (i, state_slot) in beq_guard.slots.iter_mut().enumerate() {
                         state_slot.active = i == slot_idx;
                     }

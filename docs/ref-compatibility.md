@@ -542,7 +542,7 @@ These are allowed, but they are not part of the compatibility contract unless la
 - display endpoints
 - DRE endpoints
 - modification-token endpoints
-- `POST /devices/{id}/preset/copy` (CopyPreset + verifyProgram round-trip — bails before bumping tokens if `0xFFA3` indicates a corrupt save)
+- `POST /devices/{id}/preset/copy` (CopyPreset + verifyProgram round-trip — copies the active preset to the remaining preset slots and bails before bumping tokens if `0xFFA3` indicates a corrupt save)
 - bass management endpoints for the HT/HTx 113 + 115 firmware variants (returns `501 Not Implemented` on every other family):
   - `GET /devices/{id}/bm` — full BM snapshot (8 gain channels + 9 × 8 mixer cells, LFE virtual row at index 8)
   - `POST /devices/{id}/bm/channel/{ch}` — partial patch `{gain_db?, muted?}`
@@ -558,7 +558,7 @@ Additive rule:
 - additive features should prefer new routes over behavior changes on compatibility routes
 
 Current verification note:
-- TCP bridge write-ack framing is fixed and wire-verified on the physical 2x4 HD (2026-04-10) via Python TCP client against the live daemon: `WriteDSP` shrank from 64 bytes to 9 bytes, `SetVolume` from 64 to 3 bytes, `SetMute` from 64 to 3 bytes, and read responses are unchanged at 12 bytes each. The specific `Unexpected DSP command code 1` crash in the official Device Console's parser can no longer be triggered by this response shape. Pending: end-to-end verification by actually launching the official MiniDSP Device Console Electron app against the fixed daemon and exercising status reads, volume/mute/preset/source writes, routing edits, and PEQ edits. Tracked in `PROGRESS.md` Active Work and `docs/todo-checker.md` Section 4.2.
+- TCP bridge write-ack framing is fixed and wire-verified on the physical 2x4 HD (2026-04-10) via Python TCP client against the live daemon: `WriteDSP` shrank from 64 bytes to 9 bytes, `SetVolume` from 64 to 3 bytes, `SetMute` from 64 to 3 bytes, and read responses are unchanged at 12 bytes each. The follow-up live official-app check on 2026-04-13 also proved the stock macOS Device Console can now complete the network-device `Initialize to Default Settings` flow over the ESP32 bridge without the previous parser/reload failure. Remaining official-app work is the broader interactive surface: status reads, volume/mute/preset/source writes, routing edits, and PEQ edits. Tracked in `PROGRESS.md` Active Work and `docs/todo-checker.md` Section 4.2.
 - Desktop `GET /devices/{id}` is live-verified on the physical 2x4 HD after the 2026-04-10 meter fallback fix: malformed DSP100 meter replies now degrade to `-140 dB` silence instead of stalling compatibility status.
 - Desktop config read-back is implemented, but on DSP100 / 2x4 HD some fields still rely on verified shadow state rather than authoritative live hardware readback. Fresh-daemon `/devices/{id}/config` now clamps bogus low-address DSP100 scalar/tap reads to verified shadow or conservative zero instead of surfacing garbage values.
 - Desktop daemon preset-content writes now also mirror the official app's explicit modification-token save model on the physical 2x4 HD, so `/devices/{id}/config` shadow restore is keyed by a real active-preset freshness marker rather than by raw runtime writes that never touched `0xFFC8`.

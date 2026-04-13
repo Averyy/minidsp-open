@@ -129,25 +129,28 @@ fn main() {
             None
         }
     };
-
-    if bus.is_some() {
-        if let Err(e) = usb_audio::install(audio_state.clone()) {
-            error!("UAC2 audio init failed: {e} — audio playback unavailable");
-        }
-    }
-
     // Step 4: Wait for MiniDSP device (up to 30s)
     let mut usb_state = UsbState::Absent;
+    let mut audio_driver_installed = false;
+    if bus.is_some() {
+        // Register the UAC2 client before the first HID attach/probe pass so
+        // a MiniDSP already present at boot still delivers the audio connect
+        // callback without needing a second physical reconnect.
+        ensure_audio_driver_installed(&audio_state, &mut audio_driver_installed);
+    }
     if let Some(ref bus) = bus {
         match discover_and_activate_device(bus, Duration::from_secs(30)) {
             Ok(state) => {
                 usb_state = UsbState::ProtocolReady;
                 on_device_activated(state, &device_state, &beq_state, &nvs);
+                ensure_audio_driver_installed(&audio_state, &mut audio_driver_installed);
+                audio_state.resume_opening("initial HID attach complete");
                 led::set_device_ready(true);
             }
             Err(e) => {
                 usb_state = UsbState::Absent;
                 warn!("No MiniDSP device found: {e} — will retry in background");
+                audio_state.pause_opening("initial HID attach failed");
                 led::set_device_ready(false);
             }
         }
@@ -216,9 +219,12 @@ fn main() {
     if let Some(handle) = wifi_handle {
         if handle.is_sta {
             let wifi_mutex = Arc::new(std::sync::Mutex::new(handle.wifi));
-            wifi::start_monitor(wifi_mutex, nvs.clone());
+            if let Err(e) = wifi::start_monitor(wifi_mutex, nvs.clone()) {
+                error!("failed to spawn WiFi monitor thread: {e}");
+            }
 
-            // Background catalogue update (initial check after WiFi is stable, then every 24h)
+            // The WiFi monitor is required for reconnect stability; start the
+            // catalogue updater only after the monitor has claimed its task.
             if let Err(e) = updater::start_background_updater(nvs.clone()) {
                 error!("failed to spawn update thread: {e}");
             }
@@ -238,8 +244,13 @@ fn main() {
 
     // Main loop: diagnostics tick + USB device detection/reconnection
     let mut usb_backoff = Duration::from_secs(5);
+    let mut next_diagnostics = Instant::now();
+    let mut next_usb_scan = Instant::now();
     loop {
-        diagnostics::tick();
+        if Instant::now() >= next_diagnostics {
+            diagnostics::tick();
+            next_diagnostics = Instant::now() + Duration::from_secs(5);
+        }
 
         // Check for USB device — handles both initial detection and reconnection
         if let Some(ref bus) = bus {
@@ -248,33 +259,54 @@ fn main() {
             if has_device && !bus.is_connected() {
                 // Device was connected but is now gone
                 warn!("USB device lost — clearing device state");
+                bus.cleanup_after_expected_disconnect("main loop device loss");
                 *device_state.lock().unwrap() = None;
                 usb_state = UsbState::Absent;
+                audio_state.pause_opening("HID session lost");
                 led::set_device_ready(false);
+                next_usb_scan = Instant::now();
             }
 
             // Scan if we don't have a working device (regardless of is_connected,
             // since non-MiniDSP devices can set the flag)
-            if device_state.lock().unwrap().is_none() {
+            if device_state.lock().unwrap().is_none() && Instant::now() >= next_usb_scan {
                 log_usb_state_transition(&mut usb_state, UsbState::Absent, "device missing");
                 info!("USB: scanning for device (timeout: {usb_backoff:?})");
+                let scan_started = Instant::now();
                 match discover_and_activate_device(bus, usb_backoff) {
                     Ok(state) => {
                         usb_backoff = Duration::from_secs(5);
+                        next_usb_scan = Instant::now();
                         usb_state = UsbState::ProtocolReady;
                         on_device_activated(state, &device_state, &beq_state, &nvs);
+                        ensure_audio_driver_installed(&audio_state, &mut audio_driver_installed);
+                        audio_state.resume_opening("HID protocol ready");
                         led::set_device_ready(true);
                     }
                     Err(_) => {
                         // No device found within timeout — back off
+                        audio_state.pause_opening("HID scan failed");
                         led::set_device_ready(false);
+                        let retry_wait = usb_backoff.saturating_sub(scan_started.elapsed());
+                        next_usb_scan = Instant::now() + retry_wait;
                         usb_backoff = (usb_backoff * 2).min(Duration::from_secs(60));
                     }
                 }
             }
         }
 
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn ensure_audio_driver_installed(audio_state: &usb_audio::SharedAudioState, installed: &mut bool) {
+    if *installed {
+        return;
+    }
+
+    match usb_audio::install(audio_state.clone()) {
+        Ok(()) => *installed = true,
+        Err(e) => error!("UAC2 audio init failed: {e} — audio playback unavailable"),
     }
 }
 
@@ -326,7 +358,7 @@ fn probe_device_with_retries(
             }
             Err(usb_hid::UsbHidError::Transfer(msg)) => {
                 warn!("USB state: transport failure during probe attempt {attempt}: {msg}");
-                if bus.is_connected() || bus.has_present_device().unwrap_or(false) {
+                if bus.is_connected() {
                     match bus.reopen_present_device() {
                         Ok(Some((_vid, _pid))) => info!("USB state: reopened HID session"),
                         Ok(None) => warn!("USB state: no present device found while reopening HID"),
@@ -338,22 +370,8 @@ fn probe_device_with_retries(
                 usb_hid::UsbHidError::Transfer(msg)
             }
             Err(usb_hid::UsbHidError::Disconnected) => {
-                if bus.is_connected() || bus.has_present_device().unwrap_or(false) {
-                    warn!("USB state: HID session dropped during probe, retrying attach");
-                    match bus.reopen_present_device() {
-                        Ok(Some((_vid, _pid))) => {
-                            info!("USB state: reopened HID session after disconnect")
-                        }
-                        Ok(None) => warn!(
-                            "USB state: no present device found while reopening after disconnect"
-                        ),
-                        Err(err) => warn!("USB state: HID reopen after disconnect failed: {err}"),
-                    }
-                    usb_hid::UsbHidError::Disconnected
-                } else {
-                    warn!("USB state: device disconnected during probe");
-                    return Err(usb_hid::UsbHidError::Disconnected);
-                }
+                warn!("USB state: device disconnected during probe");
+                return Err(usb_hid::UsbHidError::Disconnected);
             }
             Err(err) => return Err(err),
         };
@@ -513,13 +531,11 @@ fn tcp_bridge(state: http_server::SharedDeviceState) {
                 };
                 let response = {
                     let _op = dev.begin_operation();
-                    dev.raw_command(&payload)
+                    dev.tcp_bridge_command(&payload)
                 };
 
                 match response {
-                    Ok(resp) => {
-                        // TCP response: [len][payload] — no checksum (server responses per protocol)
-                        let resp_frame = minidsp_protocol::packet::encode_tcp_response(&resp);
+                    Ok(resp_frame) => {
                         if stream.write_all(&resp_frame).is_err() {
                             break;
                         }

@@ -10,10 +10,11 @@ use std::sync::Arc;
 /// Execute a raw bridge command against the live device and return the raw
 /// MiniDSP payload that should be framed back to the client.
 ///
-/// `SetConfig` and `Reset` are special on the physical 2x4 HD: the command can
-/// succeed while never yielding a usable raw completion frame. Route them
-/// through the verified high-level client path and synthesize the standard
-/// completion payload so daemon WS/TCP clients still see a successful response.
+/// `SetConfig`, `Reset`, and `EnterBootloader` are special on the physical
+/// 2x4 HD: the command can succeed while never yielding a usable raw
+/// completion frame. Route them through the verified high-level client path
+/// and synthesize the standard completion payload so daemon WS/TCP clients
+/// still see a successful response.
 pub async fn execute_raw_bridge_command(
     state: &DaemonState,
     client: &Arc<MiniDspClient>,
@@ -32,7 +33,11 @@ pub async fn execute_raw_bridge_command(
             .await
             .map_err(|e| e.to_string())?;
 
-        let raw_resp = vec![commands::RESP_PRESET_COMPLETE];
+        let raw_resp = vec![if reset_mode == commands::PRESET_CHANGE_WITHOUT_RESET {
+            commands::RESP_OK
+        } else {
+            commands::RESP_PRESET_COMPLETE
+        }];
         client
             .mirror_raw_command_if_success(&request, &raw_resp)
             .await;
@@ -45,6 +50,17 @@ pub async fn execute_raw_bridge_command(
             .reset_with_verification()
             .await
             .map_err(|e| e.to_string())?;
+
+        let raw_resp = vec![commands::RESP_RESET_COMPLETE];
+        client
+            .mirror_raw_command_if_success(&request, &raw_resp)
+            .await;
+        state.persist_device_shadow(client).await;
+        return Ok(raw_resp);
+    }
+
+    if payload.first().copied() == Some(commands::CMD_ENTER_BOOTLOADER) {
+        client.reboot_device().await.map_err(|e| e.to_string())?;
 
         let raw_resp = vec![commands::RESP_RESET_COMPLETE];
         client

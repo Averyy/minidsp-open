@@ -66,6 +66,7 @@ impl std::fmt::Display for UsbHidError {
 struct XferSync {
     done: AtomicBool,
     status: AtomicI32,
+    session_generation: AtomicU8,
     mutex: Mutex<()>,
     condvar: Condvar,
 }
@@ -75,6 +76,7 @@ impl XferSync {
         Self {
             done: AtomicBool::new(false),
             status: AtomicI32::new(-1),
+            session_generation: AtomicU8::new(0),
             mutex: Mutex::new(()),
             condvar: Condvar::new(),
         }
@@ -83,6 +85,16 @@ impl XferSync {
     fn reset(&self) {
         self.done.store(false, Ordering::SeqCst);
         self.status.store(-1, Ordering::SeqCst);
+    }
+
+    fn prepare_for_submit(&self, session_generation: u8) {
+        self.reset();
+        self.session_generation
+            .store(session_generation, Ordering::SeqCst);
+    }
+
+    fn session_generation(&self) -> u8 {
+        self.session_generation.load(Ordering::SeqCst)
     }
 
     fn signal(&self, status: i32) {
@@ -112,10 +124,24 @@ struct CallbackState {
     dev_event: (Mutex<bool>, Condvar),
     /// Set to true when device is connected, false on DEV_GONE.
     device_present: AtomicBool,
-    /// Incremented each time a new device connects (used to detect reconnection).
-    connect_generation: AtomicU8,
     /// esp_timer_get_time()/1000 when the latest attach was observed.
     last_attach_ms: AtomicU32,
+    /// Incremented for each NEW_DEV so reconnect logic can notice a fresh attach
+    /// even if another thread already consumed or cleared the queued address.
+    attach_generation: AtomicU32,
+    /// Snapshot of attach_generation at the most recent DEV_GONE. Cleanup uses
+    /// this to avoid wiping a newer attach that raced with teardown.
+    last_disconnect_attach_generation: AtomicU32,
+    /// Incremented whenever the HID bus installs a fresh logical session.
+    session_generation: AtomicU8,
+    /// Transfer completion diagnostics for distinguishing dead callbacks from stalled endpoints.
+    out_submit_count: AtomicU32,
+    in_submit_count: AtomicU32,
+    out_completion_count: AtomicU32,
+    in_completion_count: AtomicU32,
+    last_xfer_ep: AtomicU8,
+    last_xfer_status: AtomicI32,
+    last_xfer_ms: AtomicU32,
 }
 
 static CB_STATE: OnceLock<CallbackState> = OnceLock::new();
@@ -125,9 +151,46 @@ fn cb_state() -> &'static CallbackState {
         new_dev_addr: Mutex::new(None),
         dev_event: (Mutex::new(false), Condvar::new()),
         device_present: AtomicBool::new(false),
-        connect_generation: AtomicU8::new(0),
         last_attach_ms: AtomicU32::new(0),
+        attach_generation: AtomicU32::new(0),
+        last_disconnect_attach_generation: AtomicU32::new(0),
+        session_generation: AtomicU8::new(0),
+        out_submit_count: AtomicU32::new(0),
+        in_submit_count: AtomicU32::new(0),
+        out_completion_count: AtomicU32::new(0),
+        in_completion_count: AtomicU32::new(0),
+        last_xfer_ep: AtomicU8::new(0),
+        last_xfer_status: AtomicI32::new(-1),
+        last_xfer_ms: AtomicU32::new(0),
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransferStats {
+    out_completion_count: u32,
+    in_completion_count: u32,
+    last_xfer_ep: u8,
+    last_xfer_status: i32,
+    last_xfer_age_ms: Option<u32>,
+}
+
+fn transfer_stats_snapshot() -> TransferStats {
+    let cb = cb_state();
+    let now_ms = (unsafe { esp_timer_get_time() } / 1000) as u32;
+    let last_xfer_ms = cb.last_xfer_ms.load(Ordering::SeqCst);
+    let last_xfer_age_ms = if last_xfer_ms == 0 || now_ms < last_xfer_ms {
+        None
+    } else {
+        Some(now_ms - last_xfer_ms)
+    };
+
+    TransferStats {
+        out_completion_count: cb.out_completion_count.load(Ordering::SeqCst),
+        in_completion_count: cb.in_completion_count.load(Ordering::SeqCst),
+        last_xfer_ep: cb.last_xfer_ep.load(Ordering::SeqCst),
+        last_xfer_status: cb.last_xfer_status.load(Ordering::SeqCst),
+        last_xfer_age_ms,
+    }
 }
 
 /// USB HID bus — thread-safe handle for communicating with a MiniDSP device.
@@ -152,6 +215,180 @@ unsafe impl Send for UsbHidBus {}
 unsafe impl Sync for UsbHidBus {}
 
 impl UsbHidBus {
+    fn begin_new_session(&self) -> u8 {
+        let cb = cb_state();
+        let generation = cb
+            .session_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        cb.out_submit_count.store(0, Ordering::SeqCst);
+        cb.in_submit_count.store(0, Ordering::SeqCst);
+        cb.out_completion_count.store(0, Ordering::SeqCst);
+        cb.in_completion_count.store(0, Ordering::SeqCst);
+        cb.last_xfer_ep.store(0, Ordering::SeqCst);
+        cb.last_xfer_status.store(-1, Ordering::SeqCst);
+        cb.last_xfer_ms.store(0, Ordering::SeqCst);
+        generation
+    }
+
+    fn current_session_generation(&self) -> u8 {
+        cb_state().session_generation.load(Ordering::SeqCst)
+    }
+
+    fn submit_count_for_ep(&self, ep: u8) -> u32 {
+        let cb = cb_state();
+        if ep & EP_DIR_IN != 0 {
+            cb.in_submit_count.load(Ordering::SeqCst)
+        } else {
+            cb.out_submit_count.load(Ordering::SeqCst)
+        }
+    }
+
+    fn completion_count_for_ep(&self, ep: u8) -> u32 {
+        let cb = cb_state();
+        if ep & EP_DIR_IN != 0 {
+            cb.in_completion_count.load(Ordering::SeqCst)
+        } else {
+            cb.out_completion_count.load(Ordering::SeqCst)
+        }
+    }
+
+    fn bump_submit_count_for_ep(&self, ep: u8) -> u32 {
+        let cb = cb_state();
+        if ep & EP_DIR_IN != 0 {
+            cb.in_submit_count.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            cb.out_submit_count.fetch_add(1, Ordering::SeqCst) + 1
+        }
+    }
+
+    fn endpoint_has_inflight_transfer(&self, ep: u8) -> bool {
+        self.submit_count_for_ep(ep) > self.completion_count_for_ep(ep)
+    }
+
+    fn wait_for_endpoint_retirement(
+        &self,
+        ep: u8,
+        target_completion: u32,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.completion_count_for_ep(ep) >= target_completion {
+                // Let usb_host_client_handle_events() finish updating num_urb_inflight
+                // before interface_release() inspects endpoint state.
+                std::thread::sleep(Duration::from_millis(20));
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_endpoint_quiesce(&self, ep: u8, timeout: Duration, reason: &str) -> bool {
+        if ep == 0 {
+            return true;
+        }
+        let submitted = self.submit_count_for_ep(ep);
+        let completed = self.completion_count_for_ep(ep);
+        if submitted <= completed {
+            return true;
+        }
+
+        debug!(
+            "USB endpoint 0x{ep:02X}: waiting for callbacks to retire after {reason} (submitted={submitted}, completed={completed})"
+        );
+        self.wait_for_endpoint_retirement(ep, submitted, timeout)
+    }
+
+    fn wait_for_inflight_endpoints_to_quiesce(&self, timeout: Duration, reason: &str) {
+        let ep_out = self.ep_out.load(Ordering::SeqCst);
+        let ep_in = self.ep_in.load(Ordering::SeqCst);
+
+        unsafe {
+            let unblock = usb_host_client_unblock(self.client_hdl);
+            if unblock != ESP_OK as i32 {
+                warn!("USB client unblock failed during {reason}: 0x{unblock:04x}");
+            }
+        }
+
+        let out_quiesced = self.wait_for_endpoint_quiesce(ep_out, timeout, reason);
+        let in_quiesced = self.wait_for_endpoint_quiesce(ep_in, timeout, reason);
+        if !out_quiesced || !in_quiesced {
+            warn!(
+                "USB endpoints did not quiesce after {reason} (ep_out submitted={}, completed={}; ep_in submitted={}, completed={})",
+                self.submit_count_for_ep(ep_out),
+                self.completion_count_for_ep(ep_out),
+                self.submit_count_for_ep(ep_in),
+                self.completion_count_for_ep(ep_in),
+            );
+        }
+    }
+
+    fn retire_endpoint_if_needed(&self, dev_hdl: usb_device_handle_t, ep: u8, reason: &str) {
+        const RETIRE_TIMEOUT: Duration = Duration::from_secs(2);
+
+        if dev_hdl.is_null() || ep == 0 {
+            return;
+        }
+
+        let had_inflight = self.endpoint_has_inflight_transfer(ep);
+        let target_completion = self.submit_count_for_ep(ep);
+        if !had_inflight {
+            return;
+        }
+
+        debug!(
+            "USB endpoint 0x{ep:02X}: retiring inflight URB for {reason} (submitted={target_completion}, completed={})",
+            self.completion_count_for_ep(ep)
+        );
+
+        unsafe {
+            let halt = usb_host_endpoint_halt(dev_hdl, ep);
+            if halt != ESP_OK as i32
+                && halt != ESP_ERR_INVALID_STATE as i32
+                && halt != ESP_ERR_NOT_FOUND as i32
+            {
+                warn!("USB endpoint 0x{ep:02X} halt failed during {reason}: 0x{halt:04x}");
+            }
+            let flush = usb_host_endpoint_flush(dev_hdl, ep);
+            if flush != ESP_OK as i32
+                && flush != ESP_ERR_INVALID_STATE as i32
+                && flush != ESP_ERR_NOT_FOUND as i32
+            {
+                warn!("USB endpoint 0x{ep:02X} flush failed during {reason}: 0x{flush:04x}");
+            }
+            let clear = usb_host_endpoint_clear(dev_hdl, ep);
+            if clear != ESP_OK as i32
+                && clear != ESP_ERR_INVALID_STATE as i32
+                && clear != ESP_ERR_NOT_FOUND as i32
+            {
+                warn!("USB endpoint 0x{ep:02X} clear failed during {reason}: 0x{clear:04x}");
+            }
+            let unblock = usb_host_client_unblock(self.client_hdl);
+            if unblock != ESP_OK as i32 {
+                warn!("USB client unblock failed during {reason}: 0x{unblock:04x}");
+            }
+        }
+
+        if !self.wait_for_endpoint_retirement(ep, target_completion, RETIRE_TIMEOUT) {
+            warn!(
+                "USB endpoint 0x{ep:02X} did not retire after {reason} (submitted={}, completed={})",
+                self.submit_count_for_ep(ep),
+                self.completion_count_for_ep(ep)
+            );
+        }
+    }
+
+    fn retire_inflight_endpoints(&self, dev_hdl: usb_device_handle_t, reason: &str) {
+        let ep_out = self.ep_out.load(Ordering::SeqCst);
+        let ep_in = self.ep_in.load(Ordering::SeqCst);
+        self.retire_endpoint_if_needed(dev_hdl, ep_out, reason);
+        self.retire_endpoint_if_needed(dev_hdl, ep_in, reason);
+    }
+
     fn clear_transfers(&self) {
         let mut out = self.out_xfer.lock().unwrap();
         if !(*out).is_null() {
@@ -166,11 +403,22 @@ impl UsbHidBus {
         }
     }
 
+    fn clear_session_state(&self) {
+        *self.dev_hdl.lock().unwrap() = ptr::null_mut();
+        self.clear_transfers();
+        self.ep_in.store(0, Ordering::SeqCst);
+        self.ep_out.store(0, Ordering::SeqCst);
+        self.hid_intf.store(0, Ordering::SeqCst);
+        self.vid.store(0, Ordering::SeqCst);
+        self.pid.store(0, Ordering::SeqCst);
+    }
+
     fn install_open_device(
         &self,
         device: (usb_device_handle_t, u16, u16, u8, u8, u8),
     ) -> Result<(u16, u16), UsbHidError> {
         let (dev_hdl, vid, pid, hid_intf, ep_in, ep_out) = device;
+        self.begin_new_session();
 
         let new_out = alloc_transfer(dev_hdl, ep_out)?;
         let new_in = alloc_transfer(dev_hdl, ep_in)?;
@@ -190,53 +438,6 @@ impl UsbHidBus {
         Ok((vid, pid))
     }
 
-    fn reset_transfers_for_device(
-        &self,
-        dev_hdl: usb_device_handle_t,
-        ep_in: u8,
-        ep_out: u8,
-    ) -> Result<(), UsbHidError> {
-        let new_out = alloc_transfer(dev_hdl, ep_out)?;
-        let new_in = alloc_transfer(dev_hdl, ep_in)?;
-        self.clear_transfers();
-        *self.out_xfer.lock().unwrap() = new_out;
-        *self.in_xfer.lock().unwrap() = new_in;
-        Ok(())
-    }
-
-    fn recover_endpoints_after_timeout(&self) {
-        let dev_hdl = *self.dev_hdl.lock().unwrap();
-        if dev_hdl.is_null() {
-            return;
-        }
-
-        let ep_in = self.ep_in.load(Ordering::SeqCst);
-        let ep_out = self.ep_out.load(Ordering::SeqCst);
-        for ep in [ep_out, ep_in] {
-            if ep == 0 {
-                continue;
-            }
-            unsafe {
-                let halt = usb_host_endpoint_halt(dev_hdl, ep);
-                if halt != ESP_OK as i32 && halt != ESP_ERR_INVALID_STATE as i32 {
-                    warn!("USB endpoint 0x{ep:02X} halt failed: 0x{halt:04x}");
-                }
-                let flush = usb_host_endpoint_flush(dev_hdl, ep);
-                if flush != ESP_OK as i32 && flush != ESP_ERR_INVALID_STATE as i32 {
-                    warn!("USB endpoint 0x{ep:02X} flush failed: 0x{flush:04x}");
-                }
-                let clear = usb_host_endpoint_clear(dev_hdl, ep);
-                if clear != ESP_OK as i32 && clear != ESP_ERR_INVALID_STATE as i32 {
-                    warn!("USB endpoint 0x{ep:02X} clear failed: 0x{clear:04x}");
-                }
-            }
-        }
-
-        if let Err(err) = self.reset_transfers_for_device(dev_hdl, ep_in, ep_out) {
-            warn!("USB transfer reset after timeout failed: {err}");
-        }
-    }
-
     fn submit_out_transfer(
         &self,
         out_xfer: *mut usb_transfer_t,
@@ -244,7 +445,9 @@ impl UsbHidBus {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(), UsbHidError> {
-        self.out_sync.reset();
+        let ep_out = unsafe { (*out_xfer).bEndpointAddress };
+        self.out_sync
+            .prepare_for_submit(self.current_session_generation());
         unsafe {
             ptr::copy_nonoverlapping(out_buf.as_ptr(), (*out_xfer).data_buffer, USB_REPORT_SIZE);
             (*out_xfer).num_bytes = USB_REPORT_SIZE as i32;
@@ -252,14 +455,30 @@ impl UsbHidBus {
             esp_ok(usb_host_transfer_submit(out_xfer))
                 .map_err(|e| UsbHidError::Transfer(format!("submit OUT: {e}")))?;
         }
+        self.bump_submit_count_for_ep(ep_out);
         debug!("USB OUT submitted for payload: {:02x?}", payload);
         let status = self.out_sync.wait(timeout).map_err(|e| {
-            warn!("USB OUT wait failed for {:02x?}: {}", payload, e);
-            self.recover_endpoints_after_timeout();
+            let stats = transfer_stats_snapshot();
+            warn!(
+                "USB OUT wait failed (out_cb={}, in_cb={}, last_ep=0x{:02X}, last_status={}, last_age_ms={})",
+                stats.out_completion_count,
+                stats.in_completion_count,
+                stats.last_xfer_ep,
+                stats.last_xfer_status,
+                stats
+                    .last_xfer_age_ms
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_else(|| "n/a".into())
+            );
+            debug!("USB OUT wait failed for {:02x?}: {}", payload, e);
+            if let Err(cleanup_err) = self.cleanup_device() {
+                warn!("USB cleanup after OUT timeout failed: {cleanup_err}");
+            }
             e
         })?;
         if status != 0 {
-            warn!("USB OUT completion status {} for {:02x?}", status, payload);
+            warn!("USB OUT completion status {status}");
+            debug!("USB OUT completion status {status} for {:02x?}", payload);
             return Err(UsbHidError::Transfer(format!("OUT status: {status}")));
         }
         debug!("USB OUT completed for payload: {:02x?}", payload);
@@ -287,7 +506,7 @@ impl UsbHidBus {
         // Start background event task
         std::thread::Builder::new()
             .name("usb_events".into())
-            .stack_size(16384)
+            .stack_size(24576)
             .spawn(usb_host_event_loop)
             .map_err(|e| UsbHidError::Init(format!("spawn event task: {e}")))?;
 
@@ -315,7 +534,7 @@ impl UsbHidBus {
         let client_hdl_copy = client_hdl as usize;
         std::thread::Builder::new()
             .name("usb_client".into())
-            .stack_size(16384)
+            .stack_size(24576)
             .spawn(move || usb_client_event_loop(client_hdl_copy as usb_host_client_handle_t))
             .map_err(|e| UsbHidError::Init(format!("spawn client task: {e}")))?;
 
@@ -374,15 +593,28 @@ impl UsbHidBus {
     /// Returns the VID and PID of the found device.
     pub fn wait_for_device(&self, timeout: Duration) -> Result<(u16, u16), UsbHidError> {
         let _lock = self.lock.lock().unwrap();
+        let attach_generation_at_start = cb_state().attach_generation.load(Ordering::SeqCst);
 
         // Close old device if any (required for USB host to detect reconnection)
-        self.cleanup_device();
-
-        if let Some(device) = try_open_present_device(self.client_hdl, "scan")? {
-            return self.install_open_device(device);
+        if let Err(err) = self.cleanup_device() {
+            warn!("USB cleanup before scan failed: {err}");
         }
 
-        let device = wait_and_open_device(self.client_hdl, timeout)?;
+        let require_new_event = !cb_state().device_present.load(Ordering::SeqCst);
+        if !require_new_event {
+            if let Some(device) = try_open_present_device(self.client_hdl, "scan")? {
+                return self.install_open_device(device);
+            }
+        } else {
+            debug!("USB wait_for_device: requiring a fresh NEW_DEV event before reopening");
+        }
+
+        let device = wait_and_open_device(
+            self.client_hdl,
+            timeout,
+            require_new_event,
+            attach_generation_at_start,
+        )?;
         self.install_open_device(device)
     }
 
@@ -392,7 +624,9 @@ impl UsbHidBus {
 
     pub fn reopen_present_device(&self) -> Result<Option<(u16, u16)>, UsbHidError> {
         let _lock = self.lock.lock().unwrap();
-        self.cleanup_device();
+        if let Err(err) = self.cleanup_device() {
+            warn!("USB cleanup before reopen failed: {err}");
+        }
         match try_open_present_device(self.client_hdl, "reopen")? {
             Some(device) => self.install_open_device(device).map(Some),
             None => Ok(None),
@@ -401,7 +635,32 @@ impl UsbHidBus {
 
     /// True if the USB device is currently connected.
     pub fn is_connected(&self) -> bool {
-        cb_state().device_present.load(Ordering::SeqCst)
+        cb_state().device_present.load(Ordering::SeqCst) && !self.dev_hdl.lock().unwrap().is_null()
+    }
+
+    pub fn cleanup_after_expected_disconnect(&self, reason: &str) {
+        let cb = cb_state();
+        let disconnect_attach_generation =
+            cb.last_disconnect_attach_generation.load(Ordering::SeqCst);
+        let (lock, _) = &cb.dev_event;
+        let mut guard = lock.lock().unwrap();
+        if cb.attach_generation.load(Ordering::SeqCst) == disconnect_attach_generation {
+            cb.device_present.store(false, Ordering::SeqCst);
+            cb.last_attach_ms.store(0, Ordering::SeqCst);
+            *cb.new_dev_addr.lock().unwrap() = None;
+            *guard = false;
+        } else {
+            debug!(
+                "USB cleanup after {reason}: preserving newer attach state (disconnect_attach_gen={}, current_attach_gen={})",
+                disconnect_attach_generation,
+                cb.attach_generation.load(Ordering::SeqCst)
+            );
+        }
+        drop(guard);
+        let _lock = self.lock.lock().unwrap();
+        if let Err(err) = self.cleanup_device() {
+            warn!("USB cleanup after expected disconnect ({reason}) failed: {err}");
+        }
     }
 
     pub fn last_attach_age(&self) -> Option<Duration> {
@@ -440,7 +699,8 @@ impl UsbHidBus {
 
         // Check connection under lock to avoid TOCTOU race
         if !self.is_connected() {
-            warn!("USB command rejected while disconnected: {:02x?}", payload);
+            warn!("USB command rejected while disconnected");
+            debug!("USB command rejected while disconnected: {:02x?}", payload);
             return Err(UsbHidError::Disconnected);
         }
 
@@ -470,21 +730,39 @@ impl UsbHidBus {
             }
 
             // Submit IN transfer
-            self.in_sync.reset();
+            self.in_sync
+                .prepare_for_submit(self.current_session_generation());
+            let ep_in = unsafe { (*in_xfer).bEndpointAddress };
             unsafe {
                 (*in_xfer).num_bytes = USB_REPORT_SIZE as i32;
                 (*in_xfer).context = &self.in_sync as *const XferSync as *mut core::ffi::c_void;
                 esp_ok(usb_host_transfer_submit(in_xfer))
                     .map_err(|e| UsbHidError::Transfer(format!("submit IN: {e}")))?;
             }
+            self.bump_submit_count_for_ep(ep_in);
             debug!("USB IN submitted for payload: {:02x?}", payload);
             let status = self.in_sync.wait(remaining).map_err(|e| {
-                warn!("USB IN wait failed for {:02x?}: {}", payload, e);
-                self.recover_endpoints_after_timeout();
+                let stats = transfer_stats_snapshot();
+                warn!(
+                    "USB IN wait failed (out_cb={}, in_cb={}, last_ep=0x{:02X}, last_status={}, last_age_ms={})",
+                    stats.out_completion_count,
+                    stats.in_completion_count,
+                    stats.last_xfer_ep,
+                    stats.last_xfer_status,
+                    stats
+                        .last_xfer_age_ms
+                        .map(|ms| ms.to_string())
+                        .unwrap_or_else(|| "n/a".into())
+                );
+                debug!("USB IN wait failed for {:02x?}: {}", payload, e);
+                if let Err(cleanup_err) = self.cleanup_device() {
+                    warn!("USB cleanup after IN timeout failed: {cleanup_err}");
+                }
                 e
             })?;
             if status != 0 {
-                warn!("USB IN completion status {} for {:02x?}", status, payload);
+                warn!("USB IN completion status {status}");
+                debug!("USB IN completion status {status} for {:02x?}", payload);
                 return Err(UsbHidError::Transfer(format!("IN status: {status}")));
             }
             debug!("USB IN completed for payload: {:02x?}", payload);
@@ -550,45 +828,89 @@ impl UsbHidBus {
     }
 
     /// Best-effort cleanup of the current device (release interface, close).
-    fn cleanup_device(&self) {
+    fn cleanup_device(&self) -> Result<(), UsbHidError> {
+        const RELEASE_RETRY_DELAY: Duration = Duration::from_millis(20);
+        const RELEASE_RETRIES: usize = 150;
+        const CLOSE_SETTLE_DELAY: Duration = Duration::from_millis(10);
+        const DEV_GONE_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
         let dev_hdl = *self.dev_hdl.lock().unwrap();
         if dev_hdl.is_null() {
-            self.clear_transfers();
-            return;
+            self.clear_session_state();
+            return Ok(());
         }
         let hid_intf = self.hid_intf.load(Ordering::SeqCst);
-        self.recover_endpoints_after_timeout();
+        let device_present = cb_state().device_present.load(Ordering::SeqCst);
+        if device_present {
+            self.retire_inflight_endpoints(dev_hdl, "cleanup");
+        } else {
+            debug!("USB cleanup: waiting for endpoint callbacks after DEV_GONE");
+            self.wait_for_inflight_endpoints_to_quiesce(DEV_GONE_DRAIN_TIMEOUT, "cleanup after DEV_GONE");
+        }
+
+        let mut release_err = ESP_OK as i32;
+        let mut result = Ok(());
         unsafe {
-            for attempt in 0..5 {
-                let err = usb_host_interface_release(self.client_hdl, dev_hdl, hid_intf);
-                if err == ESP_OK as i32 {
-                    break;
-                }
-                if attempt == 4 {
-                    warn!("USB interface_release({hid_intf}) failed: 0x{err:04x}");
-                }
-                if attempt < 4 {
-                    std::thread::sleep(Duration::from_millis(20));
+            if hid_intf != 0 {
+                for attempt in 0..RELEASE_RETRIES {
+                    let err = usb_host_interface_release(self.client_hdl, dev_hdl, hid_intf);
+                    if err == ESP_OK as i32 || err == ESP_ERR_NOT_FOUND as i32 {
+                        release_err = ESP_OK as i32;
+                        if attempt > 0 {
+                            info!(
+                                "USB interface_release({hid_intf}) succeeded after {} attempt(s)",
+                                attempt + 1
+                            );
+                        }
+                        break;
+                    }
+                    release_err = err;
+                    if err == ESP_ERR_INVALID_STATE as i32 {
+                        if device_present {
+                            self.retire_inflight_endpoints(dev_hdl, "cleanup retry");
+                        } else {
+                            self.wait_for_inflight_endpoints_to_quiesce(
+                                Duration::from_millis(100),
+                                "cleanup retry after DEV_GONE",
+                            );
+                        }
+                        let unblock = usb_host_client_unblock(self.client_hdl);
+                        if unblock != ESP_OK as i32 {
+                            warn!(
+                                "USB client unblock failed during cleanup retry: 0x{unblock:04x}"
+                            );
+                        }
+                    }
+                    if attempt + 1 < RELEASE_RETRIES {
+                        std::thread::sleep(RELEASE_RETRY_DELAY);
+                    }
                 }
             }
-            let err = usb_host_device_close(self.client_hdl, dev_hdl);
-            if err != ESP_OK as i32 {
-                warn!("USB device_close failed: 0x{err:04x}");
+
+            if release_err != ESP_OK as i32 {
+                warn!("USB interface_release({hid_intf}) failed: 0x{release_err:04x}");
+                result = Err(UsbHidError::Transfer(format!(
+                    "cleanup interface release failed: 0x{release_err:04x}"
+                )));
+            } else {
+                let err = usb_host_device_close(self.client_hdl, dev_hdl);
+                if err != ESP_OK as i32 {
+                    warn!("USB device_close failed: 0x{err:04x}");
+                    result = Err(UsbHidError::Transfer(format!(
+                        "cleanup device close failed: 0x{err:04x}"
+                    )));
+                }
             }
         }
-        *self.dev_hdl.lock().unwrap() = ptr::null_mut();
-        self.clear_transfers();
-        self.ep_in.store(0, Ordering::SeqCst);
-        self.ep_out.store(0, Ordering::SeqCst);
-        self.hid_intf.store(0, Ordering::SeqCst);
-        self.vid.store(0, Ordering::SeqCst);
-        self.pid.store(0, Ordering::SeqCst);
+        self.clear_session_state();
+        std::thread::sleep(CLOSE_SETTLE_DELAY);
+        result
     }
 }
 
 impl Drop for UsbHidBus {
     fn drop(&mut self) {
-        self.cleanup_device();
+        let _ = self.cleanup_device();
     }
 }
 
@@ -598,6 +920,8 @@ impl Drop for UsbHidBus {
 fn wait_and_open_device(
     client_hdl: usb_host_client_handle_t,
     timeout: Duration,
+    require_new_event: bool,
+    attach_generation_at_start: u32,
 ) -> Result<(usb_device_handle_t, u16, u16, u8, u8, u8), UsbHidError> {
     const ADDR_SCAN_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -605,6 +929,7 @@ fn wait_and_open_device(
 
     let cb = cb_state();
     let deadline = std::time::Instant::now() + timeout;
+    let mut saw_new_event = !require_new_event;
 
     // Loop: wait for device events, try to open each one, skip non-MiniDSP devices
     loop {
@@ -613,8 +938,17 @@ fn wait_and_open_device(
             return Err(UsbHidError::DeviceNotFound);
         }
 
-        if let Some(device) = try_open_present_device(client_hdl, "wait")? {
-            return Ok(device);
+        if !saw_new_event
+            && cb.attach_generation.load(Ordering::SeqCst) != attach_generation_at_start
+        {
+            debug!("USB wait_for_device: attach generation advanced without a queued address");
+            saw_new_event = true;
+        }
+
+        if saw_new_event {
+            if let Some(device) = try_open_present_device(client_hdl, "wait")? {
+                return Ok(device);
+            }
         }
 
         // Wait for a device address under the dev_event lock (callback sets both
@@ -638,7 +972,8 @@ fn wait_and_open_device(
                 None => continue,
             }
         };
-        if let Some(device) = open_device_at_addr(client_hdl, dev_addr)? {
+        saw_new_event = true;
+        if let Some(device) = open_device_at_addr_when_settled(client_hdl, dev_addr, "new-dev event")? {
             return Ok(device);
         }
     } // end loop
@@ -656,11 +991,43 @@ fn try_open_present_device(
 
     info!("USB: host addr list ({reason}) = {addrs:?}");
     for addr in addrs {
-        if let Some(device) = open_device_at_addr(client_hdl, addr)? {
+        if let Some(device) = open_device_at_addr_when_settled(client_hdl, addr, reason)? {
             return Ok(Some(device));
         }
     }
     Ok(None)
+}
+
+fn wait_for_attach_settle(reason: &str) {
+    const OPEN_SETTLE: Duration = Duration::from_secs(20);
+
+    let attached_at = cb_state().last_attach_ms.load(Ordering::SeqCst);
+    if attached_at == 0 {
+        return;
+    }
+
+    let now = (unsafe { esp_timer_get_time() } / 1000) as u32;
+    if now < attached_at {
+        return;
+    }
+
+    let age = Duration::from_millis((now - attached_at) as u64);
+    if age >= OPEN_SETTLE {
+        return;
+    }
+
+    let wait = OPEN_SETTLE - age;
+    info!("USB: waiting {wait:?} before opening device ({reason})");
+    std::thread::sleep(wait);
+}
+
+fn open_device_at_addr_when_settled(
+    client_hdl: usb_host_client_handle_t,
+    dev_addr: u8,
+    reason: &str,
+) -> Result<Option<(usb_device_handle_t, u16, u16, u8, u8, u8)>, UsbHidError> {
+    wait_for_attach_settle(reason);
+    open_device_at_addr(client_hdl, dev_addr)
 }
 
 fn list_present_device_addrs() -> Result<Vec<u8>, UsbHidError> {
@@ -855,11 +1222,11 @@ unsafe extern "C" fn client_event_callback(
         let addr = event.__bindgen_anon_1.new_dev.address;
         info!("USB device connected: addr={addr}");
         cb.device_present.store(true, Ordering::SeqCst);
-        cb.connect_generation.fetch_add(1, Ordering::SeqCst);
         cb.last_attach_ms.store(
             (unsafe { esp_timer_get_time() } / 1000) as u32,
             Ordering::SeqCst,
         );
+        cb.attach_generation.fetch_add(1, Ordering::SeqCst);
         // Set address and signal under the same lock to avoid races with the waiter
         let (lock, cvar) = &cb.dev_event;
         {
@@ -870,6 +1237,10 @@ unsafe extern "C" fn client_event_callback(
         }
     } else if event.event == usb_host_client_event_t_USB_HOST_CLIENT_EVENT_DEV_GONE {
         warn!("USB device disconnected");
+        cb.last_disconnect_attach_generation.store(
+            cb.attach_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         cb.device_present.store(false, Ordering::SeqCst);
         cb.last_attach_ms.store(0, Ordering::SeqCst);
         crate::led::set_device_ready(false);
@@ -881,21 +1252,44 @@ unsafe extern "C" fn client_event_callback(
 /// Transfer completion callback — signals the waiting thread.
 unsafe extern "C" fn transfer_complete_callback(xfer: *mut usb_transfer_t) {
     let ctx = (*xfer).context;
+    let cb = cb_state();
+    let ep = (*xfer).bEndpointAddress;
+    let status = (*xfer).status as i32;
+    cb.last_xfer_ep.store(ep, Ordering::SeqCst);
+    cb.last_xfer_status.store(status, Ordering::SeqCst);
+    cb.last_xfer_ms
+        .store((esp_timer_get_time() / 1000) as u32, Ordering::SeqCst);
     if ctx.is_null() {
         return; // No waiter — transfer was not submitted by command()
     }
     let sync = &*(ctx as *const XferSync);
-    sync.signal((*xfer).status as i32);
+    if sync.session_generation() == cb.session_generation.load(Ordering::SeqCst) {
+        if ep & EP_DIR_IN != 0 {
+            cb.in_completion_count.fetch_add(1, Ordering::SeqCst);
+        } else {
+            cb.out_completion_count.fetch_add(1, Ordering::SeqCst);
+        }
+    } else {
+        debug!(
+            "USB completion from stale session ignored (ep=0x{ep:02X}, status={status}, session={}, current={})",
+            sync.session_generation(),
+            cb.session_generation.load(Ordering::SeqCst)
+        );
+    }
+    sync.signal(status);
 }
 
 // -- Background tasks --
 
 /// USB host library event handling loop (runs in background thread).
 fn usb_host_event_loop() {
+    const EVENT_TIMEOUT_MS: u32 = 1000;
+
+    info!("USB host library event loop started");
     loop {
         let mut flags: u32 = 0;
         unsafe {
-            let err = usb_host_lib_handle_events(u32::MAX, &mut flags);
+            let err = usb_host_lib_handle_events(EVENT_TIMEOUT_MS, &mut flags);
             if err != ESP_OK as i32 && err != ESP_ERR_TIMEOUT as i32 {
                 error!("usb_host_lib_handle_events: 0x{err:04x}");
                 std::thread::sleep(Duration::from_millis(100));
@@ -906,9 +1300,12 @@ fn usb_host_event_loop() {
 
 /// USB host client event handling loop (runs in background thread).
 fn usb_client_event_loop(client_hdl: usb_host_client_handle_t) {
+    const EVENT_TIMEOUT_MS: u32 = 1000;
+
+    info!("USB host client event loop started");
     loop {
         unsafe {
-            let err = usb_host_client_handle_events(client_hdl, u32::MAX);
+            let err = usb_host_client_handle_events(client_hdl, EVENT_TIMEOUT_MS);
             if err != ESP_OK as i32 && err != ESP_ERR_TIMEOUT as i32 {
                 error!("usb_host_client_handle_events: 0x{err:04x}");
                 std::thread::sleep(Duration::from_millis(100));

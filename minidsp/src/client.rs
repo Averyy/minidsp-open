@@ -4,6 +4,7 @@ use crate::queue::{CommandQueue, Priority};
 use crate::transport::{Transport, TransportError};
 use getrandom::getrandom;
 use minidsp_protocol::commands::{self, HardwareId, Response};
+use minidsp_protocol::default_preset::{DefaultPresetImage, default_preset_image_for_dsp};
 use minidsp_protocol::device::DeviceProfile;
 use minidsp_protocol::device::dsp::{BassManagement, FirFilter};
 use minidsp_protocol::device::probe;
@@ -103,6 +104,9 @@ const GAIN_VERIFY_TOLERANCE_DB: f32 = 0.2;
 const SILENT_METER_DB: f32 = -140.0;
 const DSP_READ_TIMEOUT: Duration = Duration::from_millis(750);
 const METER_READ_TIMEOUT: Duration = Duration::from_millis(750);
+const FLASH_BLOCK_PRESET_VALUES: u8 = 0x01;
+const FLASH_BLOCK_PRESET_BYPASS: u8 = 0x02;
+const RECOVERY_MODIFICATION_TOKEN: [u8; 4] = [0xFE, 0xEF, 0x8F, 0xCF];
 
 fn generate_modification_token() -> Result<[u8; 4], ClientError> {
     let mut token = [0u8; 4];
@@ -110,6 +114,186 @@ fn generate_modification_token() -> Result<[u8; 4], ClientError> {
         ClientError::Protocol(format!("failed to generate modification token: {err}"))
     })?;
     Ok(token)
+}
+
+fn build_preset_values_block(params: &[u8]) -> Vec<u8> {
+    let total_len = params.len() + 7;
+    let size = (total_len as u32).to_be_bytes();
+    let mut block = vec![
+        (size[1] & 0xF0) | 0x04,
+        size[2],
+        size[3],
+        0x13,
+        0x0F,
+        0x00,
+        0x00,
+    ];
+    block.extend_from_slice(params);
+    block
+}
+
+fn build_preset_bypass_block(bypass: &[u8]) -> Vec<u8> {
+    let total_len = bypass.len() + 3;
+    let size = (total_len as u32).to_be_bytes();
+    let mut block = vec![0x05, size[2], size[3]];
+    block.extend_from_slice(bypass);
+    block
+}
+
+fn default_bypass_map(image: &DefaultPresetImage) -> HashMap<u16, bool> {
+    let mut map = HashMap::new();
+    for chunk in image.bypass.chunks_exact(3) {
+        let addr = u16::from_be_bytes([chunk[1], chunk[2]]);
+        map.insert(addr, chunk[0] & 0x80 != 0);
+    }
+    map
+}
+
+fn default_param_word(image: &DefaultPresetImage, addr: u16) -> Option<u32> {
+    let offset = addr as usize * 4;
+    let bytes: [u8; 4] = image.params.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn default_param_coeffs(image: &DefaultPresetImage, addr: u16) -> Option<[f32; 5]> {
+    let mut coeffs = [0.0; 5];
+    for (idx, coeff) in coeffs.iter_mut().enumerate() {
+        *coeff = f32::from_bits(default_param_word(image, addr + idx as u16)?);
+    }
+    Some(coeffs)
+}
+
+fn default_preset_shadow(profile: &DeviceProfile, image: &DefaultPresetImage) -> PresetShadowState {
+    let mut snapshot = PresetShadowState::default();
+    let bypass = default_bypass_map(image);
+    let Some(table) = profile.dsp_table else {
+        return snapshot;
+    };
+
+    for input in table.inputs {
+        if let Some(mute) = input.mute
+            && let Some(value) = default_param_word(image, mute)
+        {
+            snapshot.selector.insert(mute, value as u16);
+        }
+        if let Some(gain) = input.gain
+            && let Some(value) = default_param_word(image, gain)
+        {
+            snapshot.scalar.insert(gain, value);
+        }
+        if let Some(polarity) = input.polarity
+            && let Some(value) = default_param_word(image, polarity)
+        {
+            snapshot.selector.insert(polarity, value as u16);
+        }
+        for band in input.peq {
+            if let Some(coeffs) = default_param_coeffs(image, band.addr) {
+                snapshot.peq.insert(
+                    band.addr,
+                    CachedPeqShadow {
+                        coeffs,
+                        bypass: bypass.get(&band.addr).copied().unwrap_or(false),
+                    },
+                );
+            }
+        }
+        if let Some(fir) = input.fir
+            && let Some(value) = default_param_word(image, fir.taps_count)
+        {
+            snapshot.selector.insert(fir.taps_count, value as u16);
+        }
+    }
+
+    for output in table.outputs {
+        if let Some(value) = default_param_word(image, output.mute) {
+            snapshot.selector.insert(output.mute, value as u16);
+        }
+        if let Some(value) = default_param_word(image, output.gain) {
+            snapshot.scalar.insert(output.gain, value);
+        }
+        if let Some(delay) = output.delay
+            && let Some(value) = default_param_word(image, delay)
+        {
+            snapshot.scalar.insert(delay, value);
+        }
+        if let Some(polarity) = output.polarity
+            && let Some(value) = default_param_word(image, polarity)
+        {
+            snapshot.selector.insert(polarity, value as u16);
+        }
+        for band in output.peq {
+            if let Some(coeffs) = default_param_coeffs(image, band.addr) {
+                snapshot.peq.insert(
+                    band.addr,
+                    CachedPeqShadow {
+                        coeffs,
+                        bypass: bypass.get(&band.addr).copied().unwrap_or(false),
+                    },
+                );
+            }
+        }
+        if let Some(fir) = output.fir {
+            if let Some(value) = default_param_word(image, fir.bypass) {
+                snapshot.selector.insert(fir.bypass, value as u16);
+            }
+            if let Some(value) = default_param_word(image, fir.taps_count) {
+                snapshot.selector.insert(fir.taps_count, value as u16);
+            }
+        }
+        if let Some(crossover) = output.crossover {
+            for base in [crossover.lpf_addr, crossover.hpf_addr] {
+                for idx in 0..4u16 {
+                    let addr = base + idx * 5;
+                    if let Some(coeffs) = default_param_coeffs(image, addr) {
+                        snapshot.peq.insert(
+                            addr,
+                            CachedPeqShadow {
+                                coeffs,
+                                bypass: bypass.get(&addr).copied().unwrap_or(false),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(comp) = output.compressor {
+            if let Some(value) = default_param_word(image, comp.bypass) {
+                snapshot.selector.insert(comp.bypass, value as u16);
+            }
+            for addr in [
+                comp.threshold,
+                comp.gain,
+                comp.ratio,
+                comp.knee,
+                comp.attack,
+                comp.release,
+            ] {
+                if let Some(value) = default_param_word(image, addr) {
+                    snapshot.scalar.insert(addr, value);
+                }
+            }
+        }
+    }
+
+    let routing_span = table.routing.rows as u16 * table.routing.cols as u16;
+    for offset in 0..routing_span {
+        let status_addr = table.routing.status_base + offset;
+        if let Some(value) = default_param_word(image, status_addr) {
+            snapshot.selector.insert(status_addr, value as u16);
+        }
+        let gain_addr = table.routing.gain_base + offset;
+        if let Some(value) = default_param_word(image, gain_addr) {
+            snapshot.scalar.insert(gain_addr, value);
+        }
+        if let Some(polarity_base) = table.routing.polarity_base {
+            let polarity_addr = polarity_base + offset;
+            if let Some(value) = default_param_word(image, polarity_addr) {
+                snapshot.selector.insert(polarity_addr, value as u16);
+            }
+        }
+    }
+
+    snapshot
 }
 
 /// Connected MiniDSP device client.
@@ -623,14 +807,11 @@ impl MiniDspClient {
             .await
     }
 
-    /// Switch preset (0-3) using an explicit device reset mode.
-    pub async fn set_config_with_mode(
+    async fn set_config_with_mode_locked(
         &self,
         preset: u8,
         reset_mode: u8,
     ) -> Result<eeprom::MasterStatusRaw, ClientError> {
-        let _state_transition_guard = self.state_transition_lock.lock().await;
-
         if preset >= self.profile.presets {
             return Err(ClientError::Protocol(format!(
                 "preset {} out of range (max {})",
@@ -639,7 +820,7 @@ impl MiniDspClient {
             )));
         }
         let before = self.get_master_status().await?;
-        if before.preset == preset {
+        if before.preset == preset && reset_mode != commands::PRESET_CHANGE_RELOAD_SAME_SLOT {
             return Ok(before);
         }
         self.queue.pause_levels();
@@ -684,11 +865,19 @@ impl MiniDspClient {
         result
     }
 
+    /// Switch preset (0-3) using an explicit device reset mode.
+    pub async fn set_config_with_mode(
+        &self,
+        preset: u8,
+        reset_mode: u8,
+    ) -> Result<eeprom::MasterStatusRaw, ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
+        self.set_config_with_mode_locked(preset, reset_mode).await
+    }
+
     /// Reset the device and verify that it becomes temporarily unavailable and
     /// then responsive again when the hardware does not return `ResetComplete`.
-    pub async fn reset_with_verification(&self) -> Result<(), ClientError> {
-        let _state_transition_guard = self.state_transition_lock.lock().await;
-
+    async fn reset_with_verification_locked(&self) -> Result<(), ClientError> {
         self.queue.pause_levels();
         let result = async {
             match self
@@ -716,6 +905,52 @@ impl MiniDspClient {
         .await;
         self.queue.resume_levels();
         result
+    }
+
+    /// Reboot the device using the official initialize-all flow semantics:
+    /// `EnterBootloader (0x3E)` followed by an expected temporary outage and
+    /// master-status recovery.
+    async fn reboot_with_verification_locked(&self) -> Result<(), ClientError> {
+        self.queue.pause_levels();
+        let result = async {
+            match self
+                .execute_write_with_timeout(
+                    commands::enter_bootloader(),
+                    Priority::Critical,
+                    RESET_RESPONSE_TIMEOUT,
+                    "enter bootloader reboot",
+                )
+                .await
+            {
+                Ok(()) => {
+                    tracing::debug!(
+                        "enter bootloader returned an explicit response; verifying recovery"
+                    );
+                }
+                Err(ClientError::Transport(TransportError::Timeout))
+                | Err(ClientError::Transport(TransportError::Disconnected))
+                | Err(ClientError::Timeout) => {
+                    tracing::debug!(
+                        "enter bootloader response dropped during reboot; verifying via master-status recovery"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+
+            self.wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT)
+                .await?;
+            Ok(())
+        }
+        .await;
+        self.queue.resume_levels();
+        result
+    }
+
+    /// Reset the device and verify that it becomes temporarily unavailable and
+    /// then responsive again when the hardware does not return `ResetComplete`.
+    pub async fn reset_with_verification(&self) -> Result<(), ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
+        self.reset_with_verification_locked().await
     }
 
     /// Set source by index.
@@ -1472,6 +1707,160 @@ impl MiniDspClient {
             )));
         }
         Ok(())
+    }
+
+    fn default_preset_image(&self) -> Result<&'static DefaultPresetImage, ClientError> {
+        default_preset_image_for_dsp(self.dsp_version).ok_or(ClientError::Unsupported)
+    }
+
+    async fn write_flash_image_block(
+        &self,
+        block_id: u8,
+        block: &[u8],
+        context: &str,
+    ) -> Result<(), ClientError> {
+        for (chunk_idx, chunk) in block.chunks(0x20).enumerate() {
+            self.execute_write(
+                commands::write_flash_block(block_id, chunk, chunk_idx == 0),
+                Priority::Critical,
+                context,
+            )
+            .await?;
+        }
+        self.execute_write(
+            commands::finish_flash_block(block_id),
+            Priority::Critical,
+            context,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_preset_defaults_locked(&self) -> Result<(), ClientError> {
+        let image = self.default_preset_image()?;
+        self.write_flash_image_block(
+            FLASH_BLOCK_PRESET_VALUES,
+            &build_preset_values_block(image.params),
+            "write default preset values",
+        )
+        .await?;
+        self.write_flash_image_block(
+            FLASH_BLOCK_PRESET_BYPASS,
+            &build_preset_bypass_block(image.bypass),
+            "write default preset bypass",
+        )
+        .await?;
+
+        let status = self.read_verify_program_status().await?;
+        if !eeprom::is_verify_program_ok(status) {
+            return Err(ClientError::Protocol(format!(
+                "verifyProgram failed after default preset write: status=0x{status:02X} > 0x{:02X}",
+                eeprom::VERIFY_PROGRAM_OK_MAX
+            )));
+        }
+        Ok(())
+    }
+
+    async fn save_preset_token_locked(
+        &self,
+        preset: u8,
+        token: [u8; 4],
+    ) -> Result<(), ClientError> {
+        let (hi, lo) = eeprom::token_addr_for_slot(preset);
+        self.execute_write(
+            commands::write_flash(hi, lo, &token),
+            Priority::High,
+            "save modification token",
+        )
+        .await?;
+        self.set_preset_token(preset, token).await;
+        Ok(())
+    }
+
+    /// Returns true when this profile has an exact default-preset image
+    /// bundled for device-side reset/recovery.
+    pub fn supports_default_preset_reset(&self) -> bool {
+        self.default_preset_image().is_ok()
+    }
+
+    /// Rebuild the active preset from the official default preset image and
+    /// persist a fresh modification token for it.
+    pub async fn reset_active_preset_to_defaults(&self) -> Result<u8, ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
+        let preset = self.get_master_status().await?.preset;
+        self.write_preset_defaults_locked().await?;
+        let token = generate_modification_token()?;
+        self.save_preset_token_locked(preset, token).await?;
+        self.set_config_with_mode_locked(preset, commands::PRESET_CHANGE_RELOAD_SAME_SLOT)
+            .await?;
+        let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
+        self.store_preset_shadow_snapshot(preset, snapshot).await;
+        Ok(preset)
+    }
+
+    /// Switch to a preset without resetting the DSP pipeline, rebuild that slot
+    /// from the official default preset image, and persist a fresh token.
+    pub async fn reset_preset_to_defaults(&self, preset: u8) -> Result<(), ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
+        self.set_config_with_mode_locked(preset, commands::PRESET_CHANGE_WITHOUT_RESET)
+            .await?;
+        self.write_preset_defaults_locked().await?;
+        let token = generate_modification_token()?;
+        self.save_preset_token_locked(preset, token).await?;
+        self.set_config_with_mode_locked(preset, commands::PRESET_CHANGE_RELOAD_SAME_SLOT)
+            .await?;
+        let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
+        self.store_preset_shadow_snapshot(preset, snapshot).await;
+        Ok(())
+    }
+
+    /// Device-only recovery path matching the official "initialize to default
+    /// settings" flow for non-Dirac families: rebuild preset 1, copy it to the
+    /// remaining slots, overwrite all four tokens with the recovery marker, and
+    /// optionally reboot the unit.
+    pub async fn initialize_all_presets_to_defaults(
+        &self,
+        reboot: bool,
+    ) -> Result<(), ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
+        self.set_config_with_mode_locked(0, commands::PRESET_CHANGE_WITHOUT_RESET)
+            .await?;
+        self.write_preset_defaults_locked().await?;
+        self.save_preset_token_locked(0, RECOVERY_MODIFICATION_TOKEN)
+            .await?;
+        self.set_config_with_mode_locked(0, commands::PRESET_CHANGE_RELOAD_SAME_SLOT)
+            .await?;
+        self.copy_preset_verified().await?;
+
+        let token_bytes = RECOVERY_MODIFICATION_TOKEN;
+        let mut all_tokens = Vec::with_capacity(self.profile.presets as usize * 4);
+        for _ in 0..self.profile.presets {
+            all_tokens.extend_from_slice(&token_bytes);
+        }
+        self.execute_write(
+            commands::write_flash(eeprom::TOKENS_ADDR.0, eeprom::TOKENS_ADDR.1, &all_tokens),
+            Priority::High,
+            "write recovery modification tokens",
+        )
+        .await?;
+
+        let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
+        for preset in 0..self.profile.presets {
+            self.store_preset_shadow_snapshot(preset, snapshot.clone())
+                .await;
+            self.set_preset_token(preset, token_bytes).await;
+        }
+
+        if reboot {
+            self.reboot_with_verification_locked().await?;
+        }
+        Ok(())
+    }
+
+    /// Manual reboot of the MiniDSP unit.
+    pub async fn reboot_device(&self) -> Result<(), ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
+        self.reboot_with_verification_locked().await
     }
 
     /// Read raw bytes from the device's full flash-address space.

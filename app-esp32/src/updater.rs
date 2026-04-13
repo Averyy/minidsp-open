@@ -17,7 +17,7 @@ use std::time::Duration;
 
 /// Base URL for catalogue data on GitHub Pages.
 const BASE_URL: &str = "https://averyy.github.io/minidsp-open";
-const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(5);
+const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(30);
 const PERIODIC_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// NVS namespace and key for tracking installed catalogue version.
@@ -27,7 +27,7 @@ const NVS_BASE_URL_KEY: &str = "base_url";
 
 /// Chunk size for streaming downloads to flash (4KB).
 const DOWNLOAD_CHUNK: usize = 4096;
-const UPDATER_THREAD_STACK_BYTES: usize = 24 * 1024;
+const UPDATER_THREAD_STACK_BYTES: usize = 16 * 1024;
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Cooldown between user-triggered refreshes so repeated 404s on a missing
@@ -92,12 +92,11 @@ struct Manifest {
 impl Manifest {
     /// Combined version string for NVS tracking (detects changes in either component).
     fn combined_version(&self) -> String {
-        if let Some(version) = &self.version {
-            return version.clone();
-        }
-        match &self.ui_version {
-            Some(ui) => format!("{}+ui{}", self.catalogue_version, ui),
-            None => self.catalogue_version.clone(),
+        match (&self.version, &self.ui_version) {
+            (Some(version), Some(ui)) => format!("{version}+ui{ui}"),
+            (Some(version), None) => version.clone(),
+            (None, Some(ui)) => format!("{}+ui{}", self.catalogue_version, ui),
+            (None, None) => self.catalogue_version.clone(),
         }
     }
 }
@@ -333,56 +332,66 @@ fn download_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{base_url}/{filename}");
     let path = storage::full_path(filename);
+    let temp_path = format!("{path}.part");
 
     // Create parent directories
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut conn = create_connection(Duration::from_secs(120))?;
-    conn.initiate_request(Method::Get, &url, &[])?;
-    conn.initiate_response()?;
-    let status = conn.status();
-    if status != 200 {
-        return Err(format!("HTTP {status} for {url}").into());
-    }
-
-    // Stream to file in chunks, computing SHA-256 on the fly
-    let mut file = std::fs::File::create(&path)?;
-    let mut buf = [0u8; DOWNLOAD_CHUNK];
-    let mut total = 0u64;
-    let mut hasher = Sha256::new();
-
-    loop {
-        let n = conn.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        let mut conn = create_connection(Duration::from_secs(120))?;
+        conn.initiate_request(Method::Get, &url, &[])?;
+        conn.initiate_response()?;
+        let status = conn.status();
+        if status != 200 {
+            return Err(format!("HTTP {status} for {url}").into());
         }
-        std::io::Write::write_all(&mut file, &buf[..n])?;
-        hasher.update(&buf[..n]);
-        total += n as u64;
+
+        // Stream to a temporary file in chunks, computing SHA-256 on the fly.
+        let mut file = std::fs::File::create(&temp_path)?;
+        let mut buf = [0u8; DOWNLOAD_CHUNK];
+        let mut total = 0u64;
+        let mut hasher = Sha256::new();
+
+        loop {
+            let n = conn.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut file, &buf[..n])?;
+            hasher.update(&buf[..n]);
+            total += n as u64;
+        }
+
+        if total != info.size {
+            return Err(format!(
+                "size mismatch for {filename}: got {total}, expected {}",
+                info.size
+            )
+            .into());
+        }
+
+        let digest = hasher.finish_hex();
+        if digest != info.sha256 {
+            return Err(format!(
+                "SHA-256 mismatch for {filename}: got {digest}, expected {}",
+                info.sha256
+            )
+            .into());
+        }
+
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
     }
 
-    if total != info.size {
-        let _ = std::fs::remove_file(&path);
-        return Err(format!(
-            "size mismatch for {filename}: got {total}, expected {}",
-            info.size
-        )
-        .into());
-    }
-
-    // Verify SHA-256 integrity
-    let digest = hasher.finish_hex();
-    if digest != info.sha256 {
-        let _ = std::fs::remove_file(&path);
-        return Err(format!(
-            "SHA-256 mismatch for {filename}: got {digest}, expected {}",
-            info.sha256
-        )
-        .into());
-    }
-
+    let _ = std::fs::remove_file(&path);
+    std::fs::rename(&temp_path, &path)?;
     Ok(())
 }
 
@@ -469,6 +478,35 @@ fn write_nvs_base_url(
 /// Get the currently installed catalogue version (if any).
 pub fn installed_version(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
     read_nvs_version(nvs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_version_tracks_ui_when_manifest_version_exists() {
+        let manifest = Manifest {
+            version: Some("2026.04.13".into()),
+            catalogue_version: "2026.04.13".into(),
+            ui_version: Some("42".into()),
+            files: std::collections::HashMap::new(),
+        };
+
+        assert_eq!(manifest.combined_version(), "2026.04.13+ui42");
+    }
+
+    #[test]
+    fn combined_version_falls_back_to_catalogue_when_ui_missing() {
+        let manifest = Manifest {
+            version: None,
+            catalogue_version: "2026.04.13".into(),
+            ui_version: None,
+            files: std::collections::HashMap::new(),
+        };
+
+        assert_eq!(manifest.combined_version(), "2026.04.13");
+    }
 }
 
 /// Get the configured updater base URL, falling back to the built-in default.

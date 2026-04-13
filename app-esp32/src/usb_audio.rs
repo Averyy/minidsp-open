@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 
 pub type SharedAudioState = Arc<AudioState>;
@@ -20,16 +21,78 @@ pub struct AudioState {
     connected_flag: Mutex<bool>,
     pub connected: Condvar,
     pub playing: AtomicBool,
+    open_gate: Mutex<AudioOpenGate>,
+    open_gate_changed: Condvar,
+    open_tx: mpsc::Sender<(u8, u8)>,
+    cleanup_tx: mpsc::Sender<Arc<Uac2Device>>,
+}
+
+#[derive(Debug)]
+struct AudioOpenGate {
+    enabled: bool,
+    cleanup_inflight: usize,
 }
 
 impl AudioState {
     pub fn new() -> SharedAudioState {
-        Arc::new(Self {
-            device: Mutex::new(None),
-            connected_flag: Mutex::new(false),
-            connected: Condvar::new(),
-            playing: AtomicBool::new(false),
-        })
+        let (open_tx, open_rx) = mpsc::channel::<(u8, u8)>();
+        let (cleanup_tx, cleanup_rx) = mpsc::channel::<Arc<Uac2Device>>();
+        let state = Arc::new_cyclic(|weak: &std::sync::Weak<AudioState>| {
+            if let Err(err) = std::thread::Builder::new()
+                .name("uac2_open".into())
+                .stack_size(12 * 1024)
+                .spawn({
+                    let weak = weak.clone();
+                    move || {
+                        while let Ok((addr, iface_num)) = open_rx.recv() {
+                            let Some(state) = weak.upgrade() else {
+                                break;
+                            };
+                            state.wait_until_open_allowed();
+                            open_tx_device(state, addr, iface_num);
+                        }
+                    }
+                })
+            {
+                error!("failed to spawn UAC2 open worker: {err}");
+            }
+
+            Self {
+                device: Mutex::new(None),
+                connected_flag: Mutex::new(false),
+                connected: Condvar::new(),
+                playing: AtomicBool::new(false),
+                open_gate: Mutex::new(AudioOpenGate {
+                    enabled: false,
+                    cleanup_inflight: 0,
+                }),
+                open_gate_changed: Condvar::new(),
+                open_tx,
+                cleanup_tx,
+            }
+        });
+
+        if let Err(err) = std::thread::Builder::new()
+            .name("uac2_cleanup".into())
+            .stack_size(8 * 1024)
+            .spawn({
+                let weak: std::sync::Weak<AudioState> = Arc::downgrade(&state);
+                move || {
+                    while let Ok(device) = cleanup_rx.recv() {
+                        drop(device);
+                        if let Some(state) = weak.upgrade() {
+                            state.finish_cleanup();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            })
+        {
+            error!("failed to spawn UAC2 cleanup worker: {err}");
+        }
+
+        state
     }
 
     pub fn current_device(&self) -> Option<Arc<Uac2Device>> {
@@ -60,6 +123,21 @@ impl AudioState {
         }
     }
 
+    pub fn defer_device_cleanup(&self, device: Arc<Uac2Device>) {
+        self.begin_cleanup();
+        if let Err(err) = self.cleanup_tx.send(device) {
+            error!("UAC2 cleanup queue send failed: {err}");
+            self.finish_cleanup();
+            drop(err.0);
+        }
+    }
+
+    pub fn queue_open(&self, addr: u8, iface_num: u8) {
+        if let Err(err) = self.open_tx.send((addr, iface_num)) {
+            error!("UAC2 open queue send failed: {err}");
+        }
+    }
+
     pub fn try_begin_playback(&self) -> bool {
         self.playing
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -70,8 +148,44 @@ impl AudioState {
         self.playing.store(false, Ordering::SeqCst);
     }
 
-    pub fn is_playing(&self) -> bool {
-        self.playing.load(Ordering::SeqCst)
+    pub fn pause_opening(&self, reason: &str) {
+        let mut gate = self.open_gate.lock().unwrap();
+        if gate.enabled {
+            info!("UAC2 open gate: enabled -> paused ({reason})");
+        }
+        gate.enabled = false;
+    }
+
+    pub fn resume_opening(&self, reason: &str) {
+        let mut gate = self.open_gate.lock().unwrap();
+        if !gate.enabled {
+            info!("UAC2 open gate: paused -> enabled ({reason})");
+        }
+        gate.enabled = true;
+        self.open_gate_changed.notify_all();
+    }
+
+    fn wait_until_open_allowed(&self) {
+        let mut gate = self.open_gate.lock().unwrap();
+        while !gate.enabled || gate.cleanup_inflight != 0 {
+            gate = self
+                .open_gate_changed
+                .wait(gate)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn begin_cleanup(&self) {
+        let mut gate = self.open_gate.lock().unwrap();
+        gate.cleanup_inflight += 1;
+    }
+
+    fn finish_cleanup(&self) {
+        let mut gate = self.open_gate.lock().unwrap();
+        if gate.cleanup_inflight != 0 {
+            gate.cleanup_inflight -= 1;
+        }
+        self.open_gate_changed.notify_all();
     }
 }
 
@@ -297,13 +411,7 @@ extern "C" fn driver_event_cb(
     }
 
     let state = clone_audio_state(arg);
-    if let Err(err) = std::thread::Builder::new()
-        .name("uac2_open".into())
-        .stack_size(12 * 1024)
-        .spawn(move || open_tx_device(state, addr, iface_num))
-    {
-        error!("failed to spawn UAC2 open thread: {err}");
-    }
+    state.queue_open(addr, iface_num);
 }
 
 extern "C" fn device_event_cb(
@@ -316,9 +424,7 @@ extern "C" fn device_event_cb(
         uac2_host_device_event_t::UAC2_HOST_DEVICE_EVENT_DISCONNECTED => {
             warn!("UAC2 device disconnected");
             if let Some(device) = state.clear_device_by_handle(dev) {
-                if !state.is_playing() {
-                    defer_drop(device);
-                }
+                state.defer_device_cleanup(device);
             }
         }
         uac2_host_device_event_t::UAC2_HOST_DEVICE_EVENT_TRANSFER_ERROR => {
@@ -336,6 +442,11 @@ extern "C" fn device_event_cb(
 }
 
 fn open_tx_device(state: SharedAudioState, addr: u8, iface_num: u8) {
+    if state.current_device().is_some() {
+        debug!("UAC2 open skipped: TX device already present");
+        return;
+    }
+
     let config = uac2_host_device_config_t {
         addr,
         iface_num,
@@ -351,7 +462,7 @@ fn open_tx_device(state: SharedAudioState, addr: u8, iface_num: u8) {
         Ok(()) => {
             let device = Arc::new(Uac2Device::new(handle));
             if let Some(previous) = state.replace_device(device) {
-                drop(previous);
+                state.defer_device_cleanup(previous);
             }
             info!("UAC2 TX interface opened: addr={addr} iface={iface_num}");
         }
@@ -361,18 +472,6 @@ fn open_tx_device(state: SharedAudioState, addr: u8, iface_num: u8) {
             ));
             error!("{open_err}");
         }
-    }
-}
-
-fn defer_drop(device: Arc<Uac2Device>) {
-    let clone = device.clone();
-    if let Err(err) = std::thread::Builder::new()
-        .name("uac2_gc".into())
-        .stack_size(8 * 1024)
-        .spawn(move || drop(clone))
-    {
-        error!("failed to spawn UAC2 cleanup thread: {err}");
-        std::mem::forget(device);
     }
 }
 

@@ -24,20 +24,23 @@ Flash with `esptool.py` (not espflash — it panics on our CH340 boards). The bu
 ```bash
 # 1. Close serial-mcp session
 # 2. Convert ELF → bin, then flash all three parts
-esp esptool.py --chip esp32s3 elf2image target/xtensa-esp32s3-espidf/debug/minidsp-esp32 -o /tmp/app.bin
-esp esptool.py --chip esp32s3 -p /dev/ttyUSB1 -b 460800 write_flash \
-  --flash_size 16MB 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 /tmp/app.bin
+esp esptool.py --chip esp32s3 elf2image app-esp32/target/xtensa-esp32s3-espidf/debug/minidsp-esp32 -o /tmp/app.bin
+esp esptool.py --chip esp32s3 -p /dev/ttyUSB0 -b 460800 write_flash \
+  --flash_size 16MB \
+  0x0 app-esp32/target/xtensa-esp32s3-espidf/debug/bootloader.bin \
+  0x8000 app-esp32/target/xtensa-esp32s3-espidf/debug/partition-table.bin \
+  0x10000 /tmp/app.bin
 # 3. Reopen serial-mcp
 ```
 
-Bootloader/partition-table binaries are in `target/xtensa-esp32s3-espidf/debug/`. If the port is stuck (Resource busy), `lsof` and `kill` the holding process — you have permission.
+Bootloader/partition-table binaries are in `app-esp32/target/xtensa-esp32s3-espidf/debug/`. If the port is stuck (Resource busy), `lsof` and `kill` the holding process — you have permission.
 
 ## ESP32 Dev Boards
 
 | Serial | Port | Role |
 |--------|------|------|
-| firmware-board | `/dev/ttyUSB0` | miniDSP 2x4 HD simulator (TinyUSB device) |
-| simulator-board | `/dev/ttyUSB1` | minidsp-open firmware target (USB host) |
+| firmware-board | `/dev/ttyUSB0` | minidsp-open firmware target (USB host) |
+| simulator-board | `/dev/ttyUSB1` | retired original firmware target board; defective, do not use |
 
 ## Key Files
 

@@ -4,7 +4,7 @@ CONFIG_IDF_TARGET="esp32s3"
 # Flash size (DevKitC-1 N8R8 = 8MB flash, but our boards have 16MB)
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
-# Custom partition table (3MB app + 960KB data)
+# Custom partition table (4MB app + 11.94MB LittleFS data on 16MB flash)
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
@@ -19,7 +19,7 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 CONFIG_LWIP_MAX_SOCKETS=16
 
 # Stack sizes for blocking I/O
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 
 # Stack overflow detection (hardware watchpoint at end of stack)
