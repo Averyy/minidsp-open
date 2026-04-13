@@ -81,6 +81,8 @@ impl Drop for UpdateRunGuard {
 /// Manifest from the catalogue server.
 #[derive(serde::Deserialize)]
 struct Manifest {
+    #[serde(default)]
+    version: Option<String>,
     catalogue_version: String,
     #[serde(default)]
     ui_version: Option<String>,
@@ -90,6 +92,9 @@ struct Manifest {
 impl Manifest {
     /// Combined version string for NVS tracking (detects changes in either component).
     fn combined_version(&self) -> String {
+        if let Some(version) = &self.version {
+            return version.clone();
+        }
         match &self.ui_version {
             Some(ui) => format!("{}+ui{}", self.catalogue_version, ui),
             None => self.catalogue_version.clone(),
@@ -169,7 +174,9 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
     if let Err(e) = write_nvs_version(nvs, &new_version) {
         warn!("failed to save version to NVS: {e}");
     }
-    let _ = storage::write_file("version.txt", new_version.as_bytes());
+    if let Err(e) = storage::write_file("version.txt", new_version.as_bytes()) {
+        warn!("failed to save version.txt to data partition: {e}");
+    }
 
     UpdateResult::Updated {
         version: new_version,
@@ -422,7 +429,7 @@ fn read_nvs_version(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<St
     use esp_idf_svc::nvs::EspNvs;
 
     let nvs = EspNvs::new(nvs.clone(), NVS_NAMESPACE, false).ok()?;
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 128];
     let val = nvs.get_str(NVS_VERSION_KEY, &mut buf).ok()?;
     val.map(|s| s.to_string())
 }

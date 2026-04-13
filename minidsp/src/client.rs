@@ -217,6 +217,11 @@ impl MiniDspClient {
         Self::ensure_write_response(resp, context)
     }
 
+    pub async fn close(&self) -> Result<(), ClientError> {
+        self.queue.close().await?;
+        Ok(())
+    }
+
     /// Connect to a device via transport, probe its identity, and return a client.
     pub async fn connect(transport: Box<dyn Transport>) -> Result<Self, ClientError> {
         let transport_url = transport.url();

@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::Layer;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -512,16 +512,28 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return Err("no MiniDSP devices found".into());
         }
         for client in &mut clients {
-            apply_force_kind(client, &cli).await?;
-            execute_command(client, &cli).await?;
+            let result = async {
+                apply_force_kind(client, &cli).await?;
+                execute_command(client, &cli).await
+            }
+            .await;
+            let close_result = client.close().await;
+            result?;
+            close_result?;
         }
         return Ok(());
     }
 
     // Connect to device
     let mut client = connect(&cli).await?;
-    apply_force_kind(&mut client, &cli).await?;
-    execute_command(&mut client, &cli).await?;
+    let result = async {
+        apply_force_kind(&mut client, &cli).await?;
+        execute_command(&mut client, &cli).await
+    }
+    .await;
+    let close_result = client.close().await;
+    result?;
+    close_result?;
     Ok(())
 }
 
@@ -898,8 +910,7 @@ pub(crate) async fn discover_daemon_tcp(
     let mut stream = tokio::net::TcpStream::connect(&addr).await?;
     let request = format!("GET /devices HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    let buf = read_http_response(&mut stream).await?;
     parse_device_list_response(&buf)
 }
 
@@ -910,14 +921,14 @@ pub(crate) async fn discover_daemon_unix(
     let mut stream = tokio::net::UnixStream::connect(path).await?;
     let request = "GET /devices HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     stream.write_all(request.as_bytes()).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    let buf = read_http_response(&mut stream).await?;
     parse_device_list_response(&buf)
 }
 
 fn parse_device_list_response(data: &[u8]) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
-    let text = std::str::from_utf8(data)?;
-    let (head, body) = text.split_once("\r\n\r\n").ok_or("invalid HTTP response")?;
+    let headers_end = find_subslice(data, b"\r\n\r\n").ok_or("invalid HTTP response")?;
+    let head = std::str::from_utf8(&data[..headers_end])?;
+    let raw_body = &data[headers_end + 4..];
     if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
         return Err(format!(
             "unexpected HTTP response: {}",
@@ -925,8 +936,151 @@ fn parse_device_list_response(data: &[u8]) -> Result<Vec<DeviceJson>, Box<dyn st
         )
         .into());
     }
-    let devices: Vec<DeviceJson> = serde_json::from_str(body)?;
+
+    let body = if header_contains_token(head, "Transfer-Encoding", "chunked") {
+        decode_chunked_body(raw_body)?
+    } else if let Some(content_len) =
+        header_value(head, "Content-Length").and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        raw_body[..raw_body.len().min(content_len)].to_vec()
+    } else {
+        raw_body.to_vec()
+    };
+
+    let devices: Vec<DeviceJson> = serde_json::from_slice(&body)?;
     Ok(devices)
+}
+
+async fn read_http_response<R>(stream: &mut R) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 4096];
+
+    loop {
+        if let Some(expected_len) = expected_http_response_len(&buf)? {
+            if buf.len() >= expected_len {
+                buf.truncate(expected_len);
+                return Ok(buf);
+            }
+        }
+
+        let read = stream.read(&mut scratch).await?;
+        if read == 0 {
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&scratch[..read]);
+    }
+}
+
+fn expected_http_response_len(data: &[u8]) -> io::Result<Option<usize>> {
+    let Some(headers_end) = find_subslice(data, b"\r\n\r\n") else {
+        return Ok(None);
+    };
+
+    let head = std::str::from_utf8(&data[..headers_end])
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let body = &data[headers_end + 4..];
+
+    if header_contains_token(head, "Transfer-Encoding", "chunked") {
+        return Ok(chunked_body_total_len(body).map(|body_len| headers_end + 4 + body_len));
+    }
+
+    if let Some(content_len) =
+        header_value(head, "Content-Length").and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        if body.len() >= content_len {
+            return Ok(Some(headers_end + 4 + content_len));
+        }
+    }
+
+    Ok(None)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then_some(value.trim())
+    })
+}
+
+fn header_contains_token(head: &str, name: &str, token: &str) -> bool {
+    header_value(head, name).is_some_and(|value| {
+        value
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case(token))
+    })
+}
+
+fn chunked_body_total_len(body: &[u8]) -> Option<usize> {
+    let mut offset = 0usize;
+
+    loop {
+        let line_end = find_subslice(&body[offset..], b"\r\n")?;
+        let size_line = std::str::from_utf8(&body[offset..offset + line_end]).ok()?;
+        let size = usize::from_str_radix(size_line.split(';').next()?.trim(), 16).ok()?;
+        offset += line_end + 2;
+
+        if body.len() < offset + size + 2 {
+            return None;
+        }
+
+        offset += size;
+        if &body[offset..offset + 2] != b"\r\n" {
+            return None;
+        }
+        offset += 2;
+
+        if size == 0 {
+            return Some(offset);
+        }
+    }
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+
+    loop {
+        let line_end = find_subslice(&body[offset..], b"\r\n").ok_or("invalid chunk header")?;
+        let size_line = std::str::from_utf8(&body[offset..offset + line_end])?;
+        let size = usize::from_str_radix(
+            size_line
+                .split(';')
+                .next()
+                .ok_or("invalid chunk size line")?
+                .trim(),
+            16,
+        )?;
+        offset += line_end + 2;
+
+        if body.len() < offset + size + 2 {
+            return Err("truncated chunk body".into());
+        }
+
+        out.extend_from_slice(&body[offset..offset + size]);
+        offset += size;
+
+        if &body[offset..offset + 2] != b"\r\n" {
+            return Err("invalid chunk terminator".into());
+        }
+        offset += 2;
+
+        if size == 0 {
+            break;
+        }
+    }
+
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1018,6 +1172,15 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].product_name, "2x4HD");
         assert_eq!(devices[0].version.hw_id, 10);
+    }
+
+    #[test]
+    fn parse_chunked_devices_http_response() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n9b\r\n[{\"product_name\":\"2x4HD\",\"url\":\"ws://192.0.2.251:5380/devices/0/ws\",\"version\":{\"dsp_version\":100,\"fw_major\":1,\"fw_minor\":85,\"hw_id\":10,\"serial\":912345}}]\r\n0\r\n\r\n";
+        let devices = parse_device_list_response(resp).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].product_name, "2x4HD");
+        assert_eq!(devices[0].version.serial, 912345);
     }
 
     #[test]

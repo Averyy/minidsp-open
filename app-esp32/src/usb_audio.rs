@@ -3,7 +3,7 @@
 //! This wraps the external `esp-uac2-host` component and maintains shared
 //! playback state independently from the HID device state.
 
-use esp_idf_sys::{esp_err_t, esp_timer_get_time, BaseType_t, ESP_OK};
+use esp_idf_sys::{esp_err_t, esp_timer_get_time, BaseType_t, EspError, ESP_OK};
 use log::{debug, error, info, warn};
 use minidsp_protocol::playback::BitDepth;
 use std::ffi::c_void;
@@ -388,7 +388,10 @@ fn esp_ok(err: esp_err_t) -> Result<(), String> {
     if err == ESP_OK as esp_err_t {
         Ok(())
     } else {
-        Err(format!("0x{err:04x}"))
+        let name = EspError::from(err)
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "UNKNOWN".into());
+        Err(format!("{name} (0x{err:04x})"))
     }
 }
 

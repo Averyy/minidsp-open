@@ -110,6 +110,11 @@ impl CommandQueue {
         *self.dialect.lock().await = dialect;
     }
 
+    pub async fn close(&self) -> Result<(), TransportError> {
+        let transport = self.transport.lock().await;
+        transport.close().await
+    }
+
     /// Returns the total number of queued commands across all priority levels.
     pub async fn queue_depth(&self) -> usize {
         let queues = self.queues.lock().await;

@@ -11,6 +11,7 @@
 use crate::device::DeviceState;
 use crate::diagnostics;
 use crate::usb_audio;
+use esp_idf_svc::http::client::{Configuration as HttpClientConfiguration, EspHttpConnection};
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::io::Write;
@@ -20,10 +21,11 @@ use minidsp_protocol::playback::{
     BitDepth, PlayRequest, PlayResponse, PlaybackPlan, SyncRequest, SyncResponse,
 };
 use minidsp_protocol::source::Source;
-use minidsp_protocol::status::StatusSummary;
+use minidsp_protocol::status::{BmChannelPatch, BmMixerCellPatch, DeviceConfig, StatusSummary};
 use serde_json::json;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Shared device state — None when USB disconnected, Some when connected.
 pub type SharedDeviceState = Arc<Mutex<Option<Arc<DeviceState>>>>;
@@ -42,11 +44,11 @@ pub fn start(
 ) -> Result<EspHttpServer<'static>, Box<dyn std::error::Error>> {
     let config = Configuration {
         http_port: port,
-        // STA mode with ezBEQ enabled currently registers 58 handlers:
+        // STA mode with ezBEQ enabled now registers low-60s handlers:
         // core device routes, debug routes, WS endpoints, ezBEQ API, UI/static
         // routes, and CORS/catch-all handlers. Keep some headroom so the HTTP
         // server doesn't fail with ESP_ERR_HTTPD_HANDLERS_FULL as routes evolve.
-        max_uri_handlers: 64,
+        max_uri_handlers: 72,
         // `/devices/0/play` does request parsing, source switching, and
         // playback-thread orchestration before handing back the response.
         // The default 16 KiB httpd task stack is not enough on real hardware.
@@ -265,7 +267,12 @@ pub fn start(
                     if let Some(source) = restore_source {
                         if let Some(index) = dev.profile().sources.index_for_source(source) {
                             let _op = dev.begin_operation();
-                            let _ = dev.set_source(index);
+                            if let Err(restore_err) = dev.set_source(index) {
+                                warn!(
+                                    "failed to restore source after sine spawn failure to {}: {}",
+                                    source, restore_err
+                                );
+                            }
                         }
                     }
                     audio.finish_playback();
@@ -383,9 +390,9 @@ pub fn start(
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
             let _op = dev.begin_operation();
-            match dev.read_config() {
+            match dev.read_device_config() {
                 Ok(config) => {
-                    let body = serde_json::to_string(&config).unwrap_or_else(|_| "{}".into());
+                    let body = config_json(&dev, config);
                     send_json(req, 200, &body)
                 }
                 Err(e) if e.to_string().contains("unsupported") => {
@@ -405,10 +412,10 @@ pub fn start(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let body = match read_request_body(&mut req, 8192) {
+            let body = match read_request_body(&mut req, 128 * 1024) {
                 Ok(body) => body,
                 Err("request body too large") => {
-                    return send_error(req, 413, "request body too large")
+                    return send_error(req, 413, "request body too large");
                 }
                 Err(_) => return send_error(req, 400, "failed to read request body"),
             };
@@ -482,30 +489,15 @@ pub fn start(
                                 let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
                                     Some(i) => i as usize,
                                     None => {
-                                        return send_error(req, 400, "peq missing 'index' field")
+                                        return send_error(req, 400, "peq missing 'index' field");
                                     }
                                 };
                                 if let Some(band) = input_ch.peq.get(band_idx) {
                                     if let Some(coeff) = peq.get("coeff") {
-                                        let c = [
-                                            coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                            coeff.get("b1").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                            coeff.get("b2").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                            coeff.get("a1").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                            coeff.get("a2").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                        ];
-                                        if c.iter().any(|v| !v.is_finite()) {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                "biquad coefficients must be finite",
-                                            );
-                                        }
+                                        let c = match parse_biquad_coefficients(coeff) {
+                                            Ok(coeffs) => coeffs,
+                                            Err(msg) => return send_error(req, 400, msg),
+                                        };
                                         if let Err(e) = dev.write_biquad(band.addr, &c) {
                                             return send_error(
                                                 req,
@@ -560,7 +552,7 @@ pub fn start(
                                             req,
                                             400,
                                             "routing missing 'output' field",
-                                        )
+                                        );
                                     }
                                 };
                                 let enabled = match route.get("enabled").and_then(|v| v.as_bool()) {
@@ -570,25 +562,38 @@ pub fn start(
                                             req,
                                             400,
                                             "routing missing 'enabled' field",
-                                        )
+                                        );
                                     }
                                 };
                                 let gain_db = match route.get("gain_db").and_then(|v| v.as_f64()) {
                                     Some(v) if v.is_finite() => v as f32,
                                     Some(_) => {
-                                        return send_error(req, 400, "routing gain must be finite")
+                                        return send_error(req, 400, "routing gain must be finite");
                                     }
                                     None => {
                                         return send_error(
                                             req,
                                             400,
                                             "routing missing 'gain_db' field",
-                                        )
+                                        );
                                     }
                                 };
                                 if let Err(e) = dev.set_routing(idx as u8, output, enabled, gain_db)
                                 {
                                     return send_error(req, 500, &format!("set_routing: {e}"));
+                                }
+                                if let Some(inverted) =
+                                    route.get("polarity_inverted").and_then(|v| v.as_bool())
+                                {
+                                    if let Err(e) =
+                                        dev.set_routing_polarity(idx as u8, output, inverted)
+                                    {
+                                        return send_error(
+                                            req,
+                                            500,
+                                            &format!("set_routing_polarity: {e}"),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -610,7 +615,7 @@ pub fn start(
                                 let band_idx = match peq.get("index").and_then(|v| v.as_u64()) {
                                     Some(i) => i as usize,
                                     None => {
-                                        return send_error(req, 400, "peq missing 'index' field")
+                                        return send_error(req, 400, "peq missing 'index' field");
                                     }
                                 };
                                 if let Some(band) = output_ch.peq.get(band_idx) {
@@ -619,25 +624,10 @@ pub fn start(
                                         band.addr
                                     );
                                     if let Some(coeff) = peq.get("coeff") {
-                                        let c = [
-                                            coeff.get("b0").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                            coeff.get("b1").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                            coeff.get("b2").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                            coeff.get("a1").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                            coeff.get("a2").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                                as f32,
-                                        ];
-                                        if c.iter().any(|v| !v.is_finite()) {
-                                            return send_error(
-                                                req,
-                                                400,
-                                                "biquad coefficients must be finite",
-                                            );
-                                        }
+                                        let c = match parse_biquad_coefficients(coeff) {
+                                            Ok(coeffs) => coeffs,
+                                            Err(msg) => return send_error(req, 400, msg),
+                                        };
                                         if let Err(e) = dev.write_biquad(band.addr, &c) {
                                             return send_error(
                                                 req,
@@ -708,6 +698,173 @@ pub fn start(
                                 }
                             }
                         }
+                        if let Some(crossover_groups) =
+                            output.get("crossover").and_then(|v| v.as_array())
+                        {
+                            if let Some(xover) = output_ch.crossover {
+                                for group in crossover_groups {
+                                    let group_idx =
+                                        match group.get("index").and_then(|v| v.as_u64()) {
+                                            Some(v) => v as u8,
+                                            None => {
+                                                return send_error(
+                                                    req,
+                                                    400,
+                                                    "crossover missing 'index' field",
+                                                );
+                                            }
+                                        };
+                                    let base_addr = match group_idx {
+                                        0 => xover.lpf_addr,
+                                        1 => xover.hpf_addr,
+                                        _ => {
+                                            return send_error(
+                                                req,
+                                                400,
+                                                "crossover index out of range",
+                                            );
+                                        }
+                                    };
+                                    if let Some(filters) =
+                                        group.get("filters").and_then(|v| v.as_array())
+                                    {
+                                        for filter in filters {
+                                            let filter_idx = match filter
+                                                .get("index")
+                                                .and_then(|v| v.as_u64())
+                                            {
+                                                Some(v) if v < 4 => v as u16,
+                                                Some(_) => {
+                                                    return send_error(
+                                                        req,
+                                                        400,
+                                                        "crossover filter index out of range",
+                                                    );
+                                                }
+                                                None => {
+                                                    return send_error(
+                                                        req,
+                                                        400,
+                                                        "crossover filter missing 'index' field",
+                                                    );
+                                                }
+                                            };
+                                            if let Some(coeff) = filter.get("coeff") {
+                                                let c = match parse_biquad_coefficients(coeff) {
+                                                    Ok(coeffs) => coeffs,
+                                                    Err(msg) => return send_error(req, 400, msg),
+                                                };
+                                                if let Err(e) =
+                                                    dev.write_biquad(base_addr + filter_idx * 5, &c)
+                                                {
+                                                    return send_error(
+                                                        req,
+                                                        500,
+                                                        &format!("write_crossover_biquad: {e}"),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(bypass) =
+                                        group.get("bypass").and_then(|v| v.as_bool())
+                                    {
+                                        if let Err(e) = dev.bypass_filter(base_addr, bypass) {
+                                            return send_error(
+                                                req,
+                                                500,
+                                                &format!("set_crossover_bypass: {e}"),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(fir) = output.get("fir") {
+                            if let Some(fir_def) = output_ch.fir {
+                                if let Some(bypass) = fir.get("bypass").and_then(|v| v.as_bool()) {
+                                    if let Err(e) = dev.set_status_bypass(fir_def.bypass, bypass) {
+                                        return send_error(
+                                            req,
+                                            500,
+                                            &format!("set_fir_bypass: {e}"),
+                                        );
+                                    }
+                                }
+                                if let Some(coefficients) =
+                                    fir.get("coefficients").and_then(|v| v.as_array())
+                                {
+                                    let mut taps = Vec::with_capacity(coefficients.len());
+                                    for coeff in coefficients {
+                                        let Some(value) = coeff.as_f64() else {
+                                            return send_error(
+                                                req,
+                                                400,
+                                                "fir coefficients must be numbers",
+                                            );
+                                        };
+                                        if !value.is_finite() {
+                                            return send_error(
+                                                req,
+                                                400,
+                                                "fir coefficients must be finite",
+                                            );
+                                        }
+                                        taps.push(value as f32);
+                                    }
+                                    if let Err(e) = dev.load_fir_coefficients(fir_def, &taps) {
+                                        return send_error(req, 500, &format!("load_fir: {e}"));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(compressor) = output.get("compressor") {
+                            if let Some(comp) = output_ch.compressor {
+                                if let Some(bypass) =
+                                    compressor.get("bypass").and_then(|v| v.as_bool())
+                                {
+                                    if let Err(e) = dev.set_status_bypass(comp.bypass, bypass) {
+                                        return send_error(
+                                            req,
+                                            500,
+                                            &format!("set_compressor_bypass: {e}"),
+                                        );
+                                    }
+                                }
+                                for (name, addr) in [
+                                    ("threshold", comp.threshold),
+                                    ("gain", comp.gain),
+                                    ("ratio", comp.ratio),
+                                    ("knee", comp.knee),
+                                    ("attack", comp.attack),
+                                    ("release", comp.release),
+                                ] {
+                                    if let Some(value) =
+                                        compressor.get(name).and_then(|v| v.as_f64())
+                                    {
+                                        if !value.is_finite() {
+                                            return send_error(
+                                                req,
+                                                400,
+                                                &format!("compressor {name} must be finite"),
+                                            );
+                                        }
+                                        if let Err(e) = dev.write_dsp_verified(
+                                            addr,
+                                            value as f32,
+                                            true,
+                                            &format!("set compressor {name}"),
+                                        ) {
+                                            return send_error(
+                                                req,
+                                                500,
+                                                &format!("set_compressor_{name}: {e}"),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -723,7 +880,7 @@ pub fn start(
     }
 
     // Display, DRE, tokens, preset copy, measurement-mode
-    register_device_feature_routes(&mut server, state.clone(), nvs.clone())?;
+    register_device_feature_routes(&mut server, state.clone(), nvs.clone(), beq_state.clone())?;
 
     // Debug / diagnostics endpoints
     register_debug_routes(&mut server, state.clone(), nvs.clone())?;
@@ -739,6 +896,16 @@ pub fn start(
         register_ezbeq_ws(&mut server, state.clone(), beq.clone())?;
     }
 
+    // JSON fallback for unsupported /devices/* mutations. Register after all
+    // concrete device routes so exact handlers and WS endpoints always win.
+    register_device_api_fallbacks(&mut server)?;
+
+    // GET /openapi.json
+    server.fn_handler("/openapi.json", Method::Get, |req| {
+        let spec = openapi_json();
+        send_json(req, 200, &spec)
+    })?;
+
     // GET /llms.txt
     server.fn_handler("/llms.txt", Method::Get, |req| {
         send_text(
@@ -746,6 +913,17 @@ pub fn start(
             "# minidsp-open\nMiniDSP audio processor controller.\nHTTP API on port 5380.\n",
         )
     })?;
+
+    // GET /database.json — same-origin proxy for the full ezBEQ catalogue JSON.
+    // The board stores only the compact biquad index locally; proxy the larger
+    // browser catalogue from the configured upstream so the UI avoids CORS issues
+    // and still talks to the board origin only.
+    {
+        let nvs_catalogue = nvs.clone();
+        server.fn_handler("/database.json", Method::Get, move |req| {
+            proxy_catalogue_file(req, &nvs_catalogue, "database.json", "application/json")
+        })?;
+    }
 
     // CORS preflight handler — responds to OPTIONS on any path
     server.fn_handler("/*", Method::Options, |req| send_cors_preflight(req))?;
@@ -848,6 +1026,7 @@ pub fn start(
             let uri = req.uri();
             // Strip query string for file path lookup
             let path = uri.split('?').next().unwrap_or(uri);
+            let relative = path.trim_start_matches('/');
 
             // Never serve HTML for API paths — return 404 JSON instead
             if path.starts_with("/api/")
@@ -867,10 +1046,19 @@ pub fn start(
                 return send_json(req, 400, r#"{"error":"bad path"}"#);
             }
 
+            if !relative.is_empty() {
+                let storage_path = crate::storage::full_path(relative);
+                if std::path::Path::new(&storage_path).is_file() {
+                    return send_static_file(req, &storage_path);
+                }
+            }
+
             let file_path = crate::storage::full_path(&format!("ui{path}"));
 
             if std::path::Path::new(&file_path).is_file() {
                 send_static_file(req, &file_path)
+            } else if relative.contains('.') {
+                send_json(req, 404, r#"{"error":"not found"}"#)
             } else {
                 // SPA fallback: serve index.html for client-side routing
                 let index = crate::storage::full_path("ui/index.html");
@@ -1186,74 +1374,75 @@ fn register_volume_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
-    for dir in &["up", "down", "toggle_mute"] {
-        let st = state.clone();
-        let direction = dir.to_string();
-        let path = format!("/devices/0/volume/{dir}");
-        server.fn_handler(&path, Method::Post, move |req| {
-            let dev = match get_device(&st) {
-                Some(d) => d,
-                None => return send_json(req, 503, r#"{"error":"no device"}"#),
-            };
-            let _op = dev.begin_operation();
-            let ms = match dev.get_master_status() {
-                Ok(ms) => ms,
-                Err(e) => return send_error(req, 500, &e.to_string()),
-            };
-            let result = match direction.as_str() {
-                "up" => dev.set_volume(ms.volume.saturating_sub(1)),
-                "down" => dev.set_volume(ms.volume.saturating_add(1)),
-                "toggle_mute" => dev.set_mute(!ms.is_muted()),
-                _ => Ok(()),
-            };
-            if let Err(e) = result {
-                return send_error(req, 500, &e.to_string());
-            }
-            match dev.get_status_summary() {
-                Ok(status) => send_json(req, 200, &master_status_json(&status)),
-                Err(e) => send_error(req, 500, &e.to_string()),
-            }
-        })?;
-    }
+    let st = state.clone();
+    server.fn_handler("/devices/0/volume/*", Method::Post, move |req| {
+        let dev = match get_device(&st) {
+            Some(d) => d,
+            None => return send_json(req, 503, r#"{"error":"no device"}"#),
+        };
+        let uri = req.uri().to_string();
+        let Some(direction) = parse_volume_path(&uri) else {
+            return send_error(req, 400, "invalid volume path");
+        };
+        let _op = dev.begin_operation();
+        let ms = match dev.get_master_status() {
+            Ok(ms) => ms,
+            Err(e) => return send_error(req, 500, &e.to_string()),
+        };
+        let result = match direction.as_str() {
+            "up" => dev.set_volume(ms.volume.saturating_sub(1)),
+            "down" => dev.set_volume(ms.volume.saturating_add(1)),
+            "toggle_mute" => dev.set_mute(!ms.is_muted()),
+            _ => return send_error(req, 400, "unknown volume direction"),
+        };
+        if let Err(e) = result {
+            return send_error(req, 500, &e.to_string());
+        }
+        match dev.get_status_summary() {
+            Ok(status) => send_json(req, 200, &master_status_json(&status)),
+            Err(e) => send_error(req, 500, &e.to_string()),
+        }
+    })?;
     Ok(())
 }
 
-/// Register source routes for all known source names. The source is resolved
-/// dynamically from the device profile at request time, so this works even if the
-/// device wasn't connected at boot.
+/// Register a wildcard source route. The source name is parsed from the URI
+/// at request time so PascalCase names and device-specific sources (bluetooth,
+/// rca/xlr, lan, etc.) work even though the connected device is unknown at
+/// boot.
 fn register_source_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
-    // Register routes for all common MiniDSP sources (covers all device types)
-    for name in &["analog", "toslink", "spdif", "usb", "aesebu", "hdmi"] {
-        let st = state.clone();
-        let source_name = name.to_string();
-        let path = format!("/devices/0/source/{name}");
-        server.fn_handler(&path, Method::Post, move |req| {
-            let dev = match get_device(&st) {
-                Some(d) => d,
-                None => return send_json(req, 503, r#"{"error":"no device"}"#),
-            };
-            let _op = dev.begin_operation();
-            // Resolve source name to index via the device profile
-            let src = match minidsp_protocol::source::Source::from_str_lowercase(&source_name) {
-                Some(s) => s,
-                None => return send_error(req, 400, "unknown source"),
-            };
-            let idx = match dev.profile().sources.index_for_source(src) {
-                Some(i) => i,
-                None => return send_error(req, 400, "source not available on this device"),
-            };
-            if let Err(e) = dev.set_source(idx) {
-                return send_error(req, 500, &e.to_string());
-            }
-            match dev.get_status_summary() {
-                Ok(status) => send_json(req, 200, &master_status_json(&status)),
-                Err(e) => send_error(req, 500, &e.to_string()),
-            }
-        })?;
-    }
+    let st = state.clone();
+    server.fn_handler("/devices/0/source/*", Method::Post, move |req| {
+        let dev = match get_device(&st) {
+            Some(d) => d,
+            None => return send_json(req, 503, r#"{"error":"no device"}"#),
+        };
+        let uri = req.uri().to_string();
+        let Some(source_name) = parse_source_path(&uri) else {
+            return send_error(req, 400, "invalid source path");
+        };
+        let _op = dev.begin_operation();
+        let src = match Source::from_str_lowercase(&source_name)
+            .or_else(|| Source::from_str_pascal(&source_name))
+        {
+            Some(s) => s,
+            None => return send_error(req, 400, "unknown source"),
+        };
+        let idx = match dev.profile().sources.index_for_source(src) {
+            Some(i) => i,
+            None => return send_error(req, 400, "source not available on this device"),
+        };
+        if let Err(e) = dev.set_source(idx) {
+            return send_error(req, 500, &e.to_string());
+        }
+        match dev.get_status_summary() {
+            Ok(status) => send_json(req, 200, &master_status_json(&status)),
+            Err(e) => send_error(req, 500, &e.to_string()),
+        }
+    })?;
     Ok(())
 }
 
@@ -1286,6 +1475,7 @@ fn register_device_feature_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
     nvs: EspDefaultNvsPartition,
+    beq_state: Option<crate::ezbeq::SharedEzBeqState>,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     // GET /devices/0/display
     {
@@ -1294,7 +1484,7 @@ fn register_device_feature_routes(
             let dev = match get_device(&st) {
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 Some(d) if !d.profile().has_display => {
-                    return send_json(req, 404, r#"{"error":"not supported"}"#)
+                    return send_json(req, 404, r#"{"error":"not supported"}"#);
                 }
                 Some(d) => d,
             };
@@ -1316,7 +1506,7 @@ fn register_device_feature_routes(
             let dev = match get_device(&st) {
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 Some(d) if !d.profile().has_display => {
-                    return send_json(req, 404, r#"{"error":"not supported"}"#)
+                    return send_json(req, 404, r#"{"error":"not supported"}"#);
                 }
                 Some(d) => d,
             };
@@ -1356,7 +1546,7 @@ fn register_device_feature_routes(
             let dev = match get_device(&st) {
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 Some(d) if !d.profile().has_dre => {
-                    return send_json(req, 404, r#"{"error":"not supported"}"#)
+                    return send_json(req, 404, r#"{"error":"not supported"}"#);
                 }
                 Some(d) => d,
             };
@@ -1378,7 +1568,7 @@ fn register_device_feature_routes(
             let dev = match get_device(&st) {
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 Some(d) if !d.profile().has_dre => {
-                    return send_json(req, 404, r#"{"error":"not supported"}"#)
+                    return send_json(req, 404, r#"{"error":"not supported"}"#);
                 }
                 Some(d) => d,
             };
@@ -1430,7 +1620,7 @@ fn register_device_feature_routes(
             };
             let _op = dev.begin_operation();
             match dev.copy_preset() {
-                Ok(()) => send_json(req, 200, r#"{"status":"ok"}"#),
+                Ok(()) => send_empty_200(req),
                 Err(e) => send_error(req, 500, &e.to_string()),
             }
         })?;
@@ -1482,7 +1672,221 @@ fn register_device_feature_routes(
         )?;
     }
 
+    // POST /devices/0/peq/reset
+    {
+        let st = state.clone();
+        let nvs = nvs.clone();
+        let beq = beq_state.clone();
+        server.fn_handler("/devices/0/peq/reset", Method::Post, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            let _op = dev.begin_operation();
+            match dev.reset_all_peq_to_defaults() {
+                Ok(touched) => {
+                    dev.save_peq_shadow_to_nvs(&nvs);
+                    if let Some(ref beq_state) = beq {
+                        if let Ok(master) = dev.get_master_status() {
+                            sync_ezbeq_slot_after_peq_reset(
+                                &dev,
+                                beq_state.clone(),
+                                master.preset as usize,
+                            );
+                        }
+                    }
+                    let body = serde_json::to_string(&json!({
+                        "status": "peq_reset",
+                        "bands_reset": touched,
+                        "default_frequencies_hz": dev.default_peq_frequencies(),
+                    }))
+                    .unwrap_or_default();
+                    send_json(req, 200, &body)
+                }
+                Err(e) if e.to_string().contains("unsupported") => {
+                    send_error(req, 501, "config read unsupported")
+                }
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
+    // GET /devices/0/peq/default-frequencies
+    {
+        let st = state.clone();
+        server.fn_handler(
+            "/devices/0/peq/default-frequencies",
+            Method::Get,
+            move |req| {
+                let dev = match get_device(&st) {
+                    Some(d) => d,
+                    None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                };
+                let body = serde_json::to_string(&json!({
+                    "frequencies_hz": dev.default_peq_frequencies(),
+                }))
+                .unwrap_or_default();
+                send_json(req, 200, &body)
+            },
+        )?;
+    }
+
+    // GET /devices/0/bm
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/bm", Method::Get, move |req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            if !dev.supports_bass_management() {
+                return send_error(req, 501, "device does not support bass management");
+            }
+            let _op = dev.begin_operation();
+            match dev.read_bass_management_state() {
+                Ok(state) => {
+                    let body = serde_json::to_string(&state).unwrap_or_default();
+                    send_json(req, 200, &body)
+                }
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
+    // POST /devices/0/bm/channel/{ch}
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/bm/channel/*", Method::Post, move |mut req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            if !dev.supports_bass_management() {
+                return send_error(req, 501, "device does not support bass management");
+            }
+            let uri = req.uri().to_string();
+            let Some(ch) = parse_bm_channel_path(&uri) else {
+                return send_error(req, 400, "invalid bm channel path");
+            };
+            let body = match read_request_body(&mut req, 2048) {
+                Ok(b) => b,
+                Err(msg) => return send_error(req, 413, msg),
+            };
+            let patch = match serde_json::from_slice::<BmChannelPatch>(&body) {
+                Ok(v) => v,
+                Err(_) => return send_error(req, 400, "invalid JSON"),
+            };
+            let _op = dev.begin_operation();
+            match dev
+                .set_bm_channel(ch, patch)
+                .and_then(|()| dev.read_bm_channel(ch))
+            {
+                Ok(channel) => {
+                    let body = serde_json::to_string(&channel).unwrap_or_default();
+                    send_json(req, 200, &body)
+                }
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
+    // POST /devices/0/bm/mixer/{row}/{col}
+    {
+        let st = state.clone();
+        server.fn_handler("/devices/0/bm/mixer/*", Method::Post, move |mut req| {
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            if !dev.supports_bass_management() {
+                return send_error(req, 501, "device does not support bass management");
+            }
+            let uri = req.uri().to_string();
+            let Some((row, col)) = parse_bm_mixer_path(&uri) else {
+                return send_error(req, 400, "invalid bm mixer path");
+            };
+            let body = match read_request_body(&mut req, 2048) {
+                Ok(b) => b,
+                Err(msg) => return send_error(req, 413, msg),
+            };
+            let patch = match serde_json::from_slice::<BmMixerCellPatch>(&body) {
+                Ok(v) => v,
+                Err(_) => return send_error(req, 400, "invalid JSON"),
+            };
+            let _op = dev.begin_operation();
+            match dev
+                .set_bm_mixer_cell(row, col, patch)
+                .and_then(|()| dev.read_bm_mixer_cell(row, col))
+            {
+                Ok(cell) => {
+                    let body = serde_json::to_string(&cell).unwrap_or_default();
+                    send_json(req, 200, &body)
+                }
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
     Ok(())
+}
+
+fn register_device_api_fallbacks(
+    server: &mut EspHttpServer<'static>,
+) -> Result<(), esp_idf_svc::sys::EspError> {
+    for method in [Method::Post, Method::Put, Method::Patch, Method::Delete] {
+        server.fn_handler("/devices/*", method, move |req| {
+            let status = match parse_device_index(req.uri()) {
+                Some(0) => 405,
+                Some(_) => 404,
+                None => 404,
+            };
+            let message = if status == 405 {
+                "method not allowed"
+            } else {
+                "not found"
+            };
+            send_error(req, status, message)
+        })?;
+    }
+    Ok(())
+}
+
+fn sync_ezbeq_slot_after_peq_reset(
+    dev: &DeviceState,
+    beq_state: crate::ezbeq::SharedEzBeqState,
+    preset_idx: usize,
+) {
+    if preset_idx >= 4 {
+        return;
+    }
+
+    let mut guard = beq_state.lock().unwrap_or_else(|e| e.into_inner());
+    for (idx, slot) in guard.slots.iter_mut().enumerate() {
+        slot.active = idx == preset_idx;
+    }
+
+    let slot = &mut guard.slots[preset_idx];
+    slot.last = "Empty".into();
+    slot.author = None;
+    for gain in &mut slot.gains {
+        gain.value = 0.0;
+    }
+    for mute in &mut slot.mutes {
+        mute.value = false;
+    }
+
+    #[cfg(esp_idf_httpd_ws_support)]
+    let ws_update = guard
+        .ws_sender
+        .as_ref()
+        .cloned()
+        .map(|sender| (sender, crate::ezbeq::device_state_json(dev, &guard)));
+    drop(guard);
+
+    #[cfg(esp_idf_httpd_ws_support)]
+    if let Some((sender, json)) = ws_update {
+        crate::ezbeq::broadcast_state(beq_state, sender, json);
+    }
 }
 
 // -- Helpers --
@@ -1490,6 +1894,331 @@ fn register_device_feature_routes(
 /// Extract the current device from shared state.
 pub fn get_device(state: &SharedDeviceState) -> Option<Arc<DeviceState>> {
     state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn parse_bm_channel_path(uri: &str) -> Option<u8> {
+    let parts = path_segments(uri);
+    match parts.as_slice() {
+        ["devices", "0", "bm", "channel", ch] => ch.parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_bm_mixer_path(uri: &str) -> Option<(u8, u8)> {
+    let parts = path_segments(uri);
+    match parts.as_slice() {
+        ["devices", "0", "bm", "mixer", row, col] => Some((row.parse().ok()?, col.parse().ok()?)),
+        _ => None,
+    }
+}
+
+fn parse_device_index(uri: &str) -> Option<usize> {
+    let parts = path_segments(uri);
+    match parts.as_slice() {
+        ["devices", idx, ..] => idx.parse().ok(),
+        _ => None,
+    }
+}
+
+fn path_segments(uri: &str) -> Vec<&str> {
+    uri.split('?')
+        .next()
+        .unwrap_or(uri)
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn parse_source_path(uri: &str) -> Option<String> {
+    let parts = path_segments(uri);
+    match parts.as_slice() {
+        ["devices", "0", "source", source] => Some((*source).to_string()),
+        _ => None,
+    }
+}
+
+fn parse_volume_path(uri: &str) -> Option<String> {
+    let parts = path_segments(uri);
+    match parts.as_slice() {
+        ["devices", "0", "volume", direction] => Some((*direction).to_string()),
+        _ => None,
+    }
+}
+
+fn config_json(dev: &DeviceState, config: DeviceConfig) -> String {
+    let Some(table) = dev.profile().dsp_table else {
+        return "{}".into();
+    };
+
+    let inputs = config
+        .inputs
+        .into_iter()
+        .map(|input| {
+            let mut input_obj = serde_json::Map::new();
+            input_obj.insert("index".into(), json!(input.index));
+            input_obj.insert(
+                "peq".into(),
+                json!(input
+                    .peq
+                    .into_iter()
+                    .map(|peq| json!({
+                        "index": peq.index,
+                        "coeff": {
+                            "b0": peq.coeff.b0,
+                            "b1": peq.coeff.b1,
+                            "b2": peq.coeff.b2,
+                            "a1": peq.coeff.a1,
+                            "a2": peq.coeff.a2,
+                        },
+                        "bypass": peq.bypass,
+                    }))
+                    .collect::<Vec<_>>()),
+            );
+            input_obj.insert(
+                "gain".into(),
+                input.gain.map_or(serde_json::Value::Null, |v| json!(v)),
+            );
+            input_obj.insert(
+                "mute".into(),
+                input.mute.map_or(serde_json::Value::Null, |v| json!(v)),
+            );
+            input_obj.insert(
+                "routing".into(),
+                json!(input
+                    .routing
+                    .into_iter()
+                    .map(|route| {
+                        let mut route_obj = serde_json::Map::new();
+                        route_obj.insert("output".into(), json!(route.output));
+                        route_obj.insert("enabled".into(), json!(route.enabled));
+                        route_obj.insert("gain_db".into(), json!(route.gain_db));
+                        if let Some(inverted) = route.polarity_inverted {
+                            route_obj.insert("polarity_inverted".into(), json!(inverted));
+                        }
+                        serde_json::Value::Object(route_obj)
+                    })
+                    .collect::<Vec<_>>()),
+            );
+            serde_json::Value::Object(input_obj)
+        })
+        .collect::<Vec<_>>();
+
+    let outputs = config
+        .outputs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, output)| {
+            let invert = table
+                .outputs
+                .get(idx)
+                .and_then(|ch| ch.polarity)
+                .and_then(|addr| dev.read_channel_invert(addr).ok());
+
+            let mut output_obj = serde_json::Map::new();
+            output_obj.insert("index".into(), json!(output.index));
+            output_obj.insert(
+                "peq".into(),
+                json!(output
+                    .peq
+                    .into_iter()
+                    .map(|peq| json!({
+                        "index": peq.index,
+                        "coeff": {
+                            "b0": peq.coeff.b0,
+                            "b1": peq.coeff.b1,
+                            "b2": peq.coeff.b2,
+                            "a1": peq.coeff.a1,
+                            "a2": peq.coeff.a2,
+                        },
+                        "bypass": peq.bypass,
+                    }))
+                    .collect::<Vec<_>>()),
+            );
+            output_obj.insert("gain".into(), json!(output.gain));
+            output_obj.insert("mute".into(), json!(output.mute));
+            output_obj.insert(
+                "delay".into(),
+                json!(std::time::Duration::from_secs_f32(output.delay / 1000.0)),
+            );
+            output_obj.insert(
+                "invert".into(),
+                invert.map_or(serde_json::Value::Null, |v| json!(v)),
+            );
+            if !output.crossover.is_empty() {
+                output_obj.insert(
+                    "crossover".into(),
+                    json!(output
+                        .crossover
+                        .into_iter()
+                        .map(|group| json!({
+                            "index": group.index,
+                            "filters": group
+                                .filters
+                                .into_iter()
+                                .map(|filter| json!({
+                                    "index": filter.index,
+                                    "coeff": {
+                                        "b0": filter.coeff.b0,
+                                        "b1": filter.coeff.b1,
+                                        "b2": filter.coeff.b2,
+                                        "a1": filter.coeff.a1,
+                                        "a2": filter.coeff.a2,
+                                    }
+                                }))
+                                .collect::<Vec<_>>(),
+                            "bypass": group.bypass,
+                        }))
+                        .collect::<Vec<_>>()),
+                );
+            }
+            if let Some(fir) = output.fir {
+                output_obj.insert(
+                    "fir".into(),
+                    json!({
+                        "bypass": fir.bypass,
+                        "active_taps": fir.active_taps,
+                    }),
+                );
+            }
+            if let Some(compressor) = output.compressor {
+                output_obj.insert(
+                    "compressor".into(),
+                    json!({
+                        "bypass": compressor.bypass,
+                        "threshold": compressor.threshold,
+                        "gain": compressor.gain,
+                        "ratio": compressor.ratio,
+                        "knee": compressor.knee,
+                        "attack": compressor.attack,
+                        "release": compressor.release,
+                    }),
+                );
+            }
+            serde_json::Value::Object(output_obj)
+        })
+        .collect::<Vec<_>>();
+
+    let master_status = json!({
+        "master_status": {
+            "preset": config.master_status.preset,
+            "source": config.master_status.source,
+            "volume": config.master_status.volume,
+            "mute": config.master_status.mute,
+            "dirac": config.master_status.dirac,
+        },
+    });
+
+    let mut body = String::with_capacity(8192);
+    body.push('{');
+    body.push_str("\"master_status\":");
+    body.push_str(&serde_json::to_string(&master_status["master_status"]).unwrap_or_else(|_| {
+        "{}".into()
+    }));
+    body.push_str(",\"inputs\":[");
+    for (idx, input) in inputs.iter().enumerate() {
+        if idx > 0 {
+            body.push(',');
+        }
+        body.push_str(&serde_json::to_string(input).unwrap_or_else(|_| "null".into()));
+        if idx + 1 < inputs.len() {
+            // Cross a FreeRTOS tick so the HTTP worker does not starve IDLE
+            // while formatting large config responses.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    body.push_str("],\"outputs\":[");
+    for (idx, output) in outputs.iter().enumerate() {
+        if idx > 0 {
+            body.push(',');
+        }
+        body.push_str(&serde_json::to_string(output).unwrap_or_else(|_| "null".into()));
+        if idx + 1 < outputs.len() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    body.push_str("]}");
+    body
+}
+
+fn openapi_json() -> String {
+    serde_json::to_string_pretty(&json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "minidsp-open ESP32 API",
+            "description": "MiniDSP controller HTTP API served by the ESP32 firmware.",
+            "version": "0.1.0",
+            "license": { "name": "MIT" }
+        },
+        "paths": {
+            "/devices": { "get": { "summary": "List connected devices" } },
+            "/devices/0": {
+                "get": { "summary": "Get device status" },
+                "post": { "summary": "Set master status" }
+            },
+            "/devices/0/config": {
+                "get": { "summary": "Read full device config" },
+                "post": { "summary": "Write device config" }
+            },
+            "/devices/0/volume/{direction}": {
+                "post": { "summary": "Volume up/down/toggle_mute" }
+            },
+            "/devices/0/source/{source}": {
+                "post": { "summary": "Set input source" }
+            },
+            "/devices/0/preset/{preset}": {
+                "post": { "summary": "Switch preset" }
+            },
+            "/devices/0/display": {
+                "get": { "summary": "Get display settings" },
+                "post": { "summary": "Set display brightness/idle time" }
+            },
+            "/devices/0/dre": {
+                "get": { "summary": "Get DRE state" },
+                "post": { "summary": "Set DRE enabled/disabled" }
+            },
+            "/devices/0/measurement-mode": {
+                "post": { "summary": "Enter measurement mode" }
+            },
+            "/devices/0/measurement-mode/restore": {
+                "post": { "summary": "Restore measurement mode" }
+            },
+            "/devices/0/tokens": {
+                "get": { "summary": "Read modification tokens" }
+            },
+            "/devices/0/preset/copy": {
+                "post": { "summary": "Copy current preset to flash" }
+            },
+            "/devices/0/peq/reset": {
+                "post": { "summary": "Reset every PEQ band to defaults" }
+            },
+            "/devices/0/peq/default-frequencies": {
+                "get": { "summary": "Return the default PEQ frequency schedule" }
+            },
+            "/devices/0/bm": {
+                "get": { "summary": "Read bass-management state" }
+            },
+            "/devices/0/bm/channel/{ch}": {
+                "post": { "summary": "Patch one bass-management channel" }
+            },
+            "/devices/0/bm/mixer/{row}/{col}": {
+                "post": { "summary": "Patch one bass-management mixer cell" }
+            },
+            "/devices/0/play": {
+                "post": { "summary": "Play a diagnostic or measurement signal" }
+            },
+            "/sync": {
+                "post": { "summary": "Clock sync helper" }
+            },
+            "/openapi.json": {
+                "get": { "summary": "This OpenAPI specification" }
+            },
+            "/llms.txt": {
+                "get": { "summary": "LLM discovery file" }
+            }
+        }
+    }))
+    .unwrap_or_else(|_| "{}".into())
 }
 
 pub fn send_json<C: esp_idf_svc::http::server::Connection>(
@@ -1626,6 +2355,21 @@ fn read_request_body<C: esp_idf_svc::http::server::Connection>(
     }
 
     Ok(body)
+}
+
+fn parse_biquad_coefficients(coeff: &serde_json::Value) -> Result<[f32; 5], &'static str> {
+    let mut out = [0.0f32; 5];
+    for (idx, key) in ["b0", "b1", "b2", "a1", "a2"].iter().enumerate() {
+        let value = coeff
+            .get(*key)
+            .and_then(|v| v.as_f64())
+            .ok_or("biquad coefficients must include numeric b0/b1/b2/a1/a2 fields")?;
+        if !value.is_finite() {
+            return Err("biquad coefficients must be finite");
+        }
+        out[idx] = value as f32;
+    }
+    Ok(out)
 }
 
 pub fn send_error<C: esp_idf_svc::http::server::Connection>(
@@ -1945,6 +2689,10 @@ fn run_inline_sine_test(
     const DURATION_SEC: u32 = 5;
     const TOTAL_CHUNKS: u32 = DURATION_SEC * (1000 / CHUNK_MS);
     const PREFILL_CHUNKS: u32 = 5; // 50ms
+    const PREFILL_WRITE_TIMEOUT_MS: u32 = 500;
+    const STREAM_WRITE_TIMEOUT_MS: u32 = 250;
+    const STREAM_WRITE_MAX_ATTEMPTS: usize = 4;
+    const STREAM_WRITE_RETRY_DELAY_MS: u64 = 10;
 
     let _wifi_ps = WifiPsGuard::disable_ps();
 
@@ -1967,7 +2715,7 @@ fn run_inline_sine_test(
     // Pre-fill 50ms into the ring buffer, matching standalone
     for _ in 0..PREFILL_CHUNKS {
         fill_sine_16bit_stereo(&mut buf, &mut phase, phase_inc, AMPLITUDE);
-        if let Err(err) = audio_device.write(&buf, 100) {
+        if let Err(err) = audio_device.write(&buf, PREFILL_WRITE_TIMEOUT_MS) {
             let _ = audio_device.stop_stream();
             let _ = started_tx.send(Err(format!("prefill write: {err}")));
             audio_state.finish_playback();
@@ -2003,7 +2751,14 @@ fn run_inline_sine_test(
     let mut writes: u32 = 0;
     for _ in 0..TOTAL_CHUNKS {
         fill_sine_16bit_stereo(&mut buf, &mut phase, phase_inc, AMPLITUDE);
-        match audio_device.write(&buf, 100) {
+        match write_audio_chunk_with_retry(
+            &audio_device,
+            &buf,
+            STREAM_WRITE_TIMEOUT_MS,
+            STREAM_WRITE_MAX_ATTEMPTS,
+            STREAM_WRITE_RETRY_DELAY_MS,
+            "inline sine",
+        ) {
             Ok(()) => writes += 1,
             Err(err) => {
                 warn!("inline sine write failed at chunk {writes}: {err}");
@@ -2018,7 +2773,12 @@ fn run_inline_sine_test(
     let fb_frac = ((fb_raw & 0xFFFF) as u64 * 10000) / 65536;
     info!(
         "inline sine test complete: {} writes in {} ms, feedback=0x{:08x} ({}.{:04} Hz), tx_need_data={}",
-        writes, stream_elapsed_ms, fb_raw, fb_hz, fb_frac, usb_audio::tx_need_data_count()
+        writes,
+        stream_elapsed_ms,
+        fb_raw,
+        fb_hz,
+        fb_frac,
+        usb_audio::tx_need_data_count()
     );
 
     if let Err(err) = audio_device.stop_stream() {
@@ -2058,6 +2818,34 @@ fn fill_sine_16bit_stereo(buf: &mut [u8], phase: &mut f32, phase_inc: f32, ampli
         buf[offset + 2] = bytes[0];
         buf[offset + 3] = bytes[1];
     }
+}
+
+fn write_audio_chunk_with_retry(
+    audio_device: &usb_audio::Uac2Device,
+    data: &[u8],
+    timeout_ms: u32,
+    max_attempts: usize,
+    retry_delay_ms: u64,
+    context: &str,
+) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 1..=max_attempts {
+        match audio_device.write(data, timeout_ms) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err.to_string());
+                if attempt == max_attempts {
+                    break;
+                }
+                warn!(
+                    "{context}: write attempt {attempt}/{max_attempts} failed: {err}; retrying"
+                );
+                std::thread::sleep(Duration::from_millis(retry_delay_ms));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "unknown write failure".into()))
 }
 
 struct PlaybackStart {
@@ -2217,8 +3005,14 @@ fn register_ws_routes(
                 }
 
                 // WebSocket upgrade — parse query params for poll interval
-                let (_poll, levels) = unsafe { ws_parse_query(raw_req) };
-                let interval_ms: u64 = if levels { 250 } else { 1000 };
+                let (poll, levels) = unsafe { ws_parse_query(raw_req) };
+                let interval_ms: u64 = if levels {
+                    250
+                } else if poll {
+                    1000
+                } else {
+                    0
+                };
 
                 // Stop any previous polling thread
                 if let Ok(mut guard) = ws_ref.lock() {
@@ -2227,30 +3021,32 @@ fn register_ws_routes(
                     }
                 }
 
-                // Create detached sender for push-based streaming
-                match ws.create_detached_sender() {
-                    Ok(sender) => {
-                        let stop = Arc::new(AtomicBool::new(false));
-                        let fd = ws.session();
-                        if let Ok(mut guard) = ws_ref.lock() {
-                            *guard = Some(ActiveWs {
-                                stop: stop.clone(),
-                                fd,
-                            });
-                        }
+                if interval_ms > 0 {
+                    // Create detached sender for push-based streaming
+                    match ws.create_detached_sender() {
+                        Ok(sender) => {
+                            let stop = Arc::new(AtomicBool::new(false));
+                            let fd = ws.session();
+                            if let Ok(mut guard) = ws_ref.lock() {
+                                *guard = Some(ActiveWs {
+                                    stop: stop.clone(),
+                                    fd,
+                                });
+                            }
 
-                        let dev_state = st.clone();
-                        if let Err(e) = std::thread::Builder::new()
-                            .name("ws_compat".into())
-                            .stack_size(16384)
-                            .spawn(move || {
-                                ws_poll_loop(sender, dev_state, stop, interval_ms);
-                            })
-                        {
-                            log::warn!("WebSocket compat: failed to spawn poll thread: {e}");
+                            let dev_state = st.clone();
+                            if let Err(e) = std::thread::Builder::new()
+                                .name("ws_compat".into())
+                                .stack_size(8192)
+                                .spawn(move || {
+                                    ws_poll_loop(sender, dev_state, stop, interval_ms);
+                                })
+                            {
+                                log::warn!("WebSocket compat: failed to spawn poll thread: {e}");
+                            }
                         }
+                        Err(e) => log::warn!("WebSocket compat: failed to create sender: {e:?}"),
                     }
-                    Err(e) => log::warn!("WebSocket compat: failed to create sender: {e:?}"),
                 }
                 return Ok(());
             }
@@ -2269,9 +3065,8 @@ fn register_ws_routes(
             }
 
             // Handle incoming WebSocket frames
-            let mut buf = [0u8; 256];
-            match ws.recv(&mut buf) {
-                Ok((FrameType::Text(_), _)) | Ok((FrameType::Binary(_), _)) => {
+            match ws_recv_frame(ws, "WebSocket compat", 512)? {
+                Some((FrameType::Text(_), _)) | Some((FrameType::Binary(_), _)) => {
                     let json = match get_device(&st) {
                         Some(dev) => {
                             let _op = dev.begin_operation();
@@ -2282,15 +3077,23 @@ fn register_ws_routes(
                         }
                         None => r#"{"error":"no device"}"#.to_string(),
                     };
-                    let _ = ws.send(FrameType::Text(false), json.as_bytes());
+                    ws_send_logged(
+                        ws,
+                        "WebSocket compat",
+                        FrameType::Text(false),
+                        json.as_bytes(),
+                    )?;
                 }
-                Ok((FrameType::Close, _)) => {
-                    let _ = ws.send(FrameType::Close, &[]);
+                Some((FrameType::Close, _)) => {
+                    ws_send_logged(ws, "WebSocket compat", FrameType::Close, &[])?;
                 }
-                Ok((FrameType::Ping, _)) => {
-                    let _ = ws.send(FrameType::Pong, &[]);
+                Some((FrameType::Ping, _)) => {
+                    ws_send_logged(ws, "WebSocket compat", FrameType::Pong, &[])?;
                 }
-                _ => {}
+                Some((FrameType::Pong, _))
+                | Some((FrameType::SocketClose, _))
+                | Some((FrameType::Continue(_), _))
+                | None => {}
             }
             Ok(())
         })?;
@@ -2305,20 +3108,19 @@ fn register_ws_routes(
         server.ws_handler("/devices/0/ws", None, move |ws| {
             // Raw frame bridge — NO status polling thread. Only responds to binary frames.
             if ws.is_new() {
-                log::info!("WS raw bridge: client connected");
+                log::debug!("WS raw bridge: client connected (fd={})", ws.session());
                 return Ok::<(), esp_idf_svc::sys::EspError>(());
             }
 
             if ws.is_closed() {
-                log::info!("WS raw bridge: client disconnected");
+                log::debug!("WS raw bridge: client disconnected (fd={})", ws.session());
                 return Ok(());
             }
 
-            let mut buf = [0u8; 256];
-            match ws.recv(&mut buf) {
-                Ok((FrameType::Binary(_), len)) => {
+            match ws_recv_frame(ws, "WS raw bridge", 512)? {
+                Some((FrameType::Binary(_), frame)) => {
                     // Raw frame bridge: decode framed packet, forward payload to device
-                    if let Some(payload) = minidsp_protocol::packet::decode_frame(&buf[..len]) {
+                    if let Some(payload) = minidsp_protocol::packet::decode_frame(&frame) {
                         match get_device(&st) {
                             Some(dev) => match {
                                 let _op = dev.begin_operation();
@@ -2326,7 +3128,12 @@ fn register_ws_routes(
                             } {
                                 Ok(resp) => {
                                     let frame = minidsp_protocol::packet::encode_frame(&resp);
-                                    let _ = ws.send(FrameType::Binary(false), &frame);
+                                    ws_send_logged(
+                                        ws,
+                                        "WS raw bridge",
+                                        FrameType::Binary(false),
+                                        &frame,
+                                    )?;
                                 }
                                 Err(e) => {
                                     log::warn!("WS raw bridge: device error: {e}");
@@ -2337,30 +3144,25 @@ fn register_ws_routes(
                             }
                         }
                     } else {
-                        log::warn!("WS raw bridge: invalid frame ({len} bytes)");
+                        log::warn!("WS raw bridge: invalid frame ({} bytes)", frame.len());
                     }
                 }
-                Ok((FrameType::Text(_), _)) => {
-                    // Text frames: return status JSON (compat with clients that send text)
-                    let json = match get_device(&st) {
-                        Some(dev) => {
-                            let _op = dev.begin_operation();
-                            match dev.get_status_summary() {
-                                Ok(status) => status_json(&status),
-                                Err(_) => r#"{"error":"device read failed"}"#.to_string(),
-                            }
-                        }
-                        None => r#"{"error":"no device"}"#.to_string(),
-                    };
-                    let _ = ws.send(FrameType::Text(false), json.as_bytes());
+                Some((FrameType::Text(_), frame)) => {
+                    log::info!(
+                        "WS raw bridge: ignoring unexpected text frame ({} bytes)",
+                        frame.len()
+                    );
                 }
-                Ok((FrameType::Close, _)) => {
-                    let _ = ws.send(FrameType::Close, &[]);
+                Some((FrameType::Close, _)) => {
+                    ws_send_logged(ws, "WS raw bridge", FrameType::Close, &[])?;
                 }
-                Ok((FrameType::Ping, _)) => {
-                    let _ = ws.send(FrameType::Pong, &[]);
+                Some((FrameType::Ping, _)) => {
+                    ws_send_logged(ws, "WS raw bridge", FrameType::Pong, &[])?;
                 }
-                _ => {}
+                Some((FrameType::Pong, _))
+                | Some((FrameType::SocketClose, _))
+                | Some((FrameType::Continue(_), _))
+                | None => {}
             }
             Ok(())
         })?;
@@ -2417,6 +3219,61 @@ unsafe fn ws_send_http_json(raw_req: *mut esp_idf_svc::sys::httpd_req_t, status:
     }
 }
 
+#[cfg(esp_idf_httpd_ws_support)]
+fn ws_recv_frame(
+    ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection,
+    context: &str,
+    max_len: usize,
+) -> Result<Option<(esp_idf_svc::ws::FrameType, Vec<u8>)>, esp_idf_svc::sys::EspError> {
+    use esp_idf_svc::ws::FrameType;
+
+    let (frame_type, len) = match ws.recv(&mut []) {
+        Ok(frame) => frame,
+        Err(e) => {
+            log::warn!("{context}: recv header failed: {e:?}");
+            return Err(e);
+        }
+    };
+
+    if len > max_len {
+        log::warn!("{context}: frame too large ({len} bytes > {max_len})");
+        let _ = ws.send(FrameType::Close, &[]);
+        return Ok(None);
+    }
+
+    let mut payload = vec![0u8; len];
+    if len == 0 {
+        return Ok(Some((frame_type, payload)));
+    }
+
+    match ws.recv(&mut payload) {
+        Ok((confirmed_type, confirmed_len)) => {
+            payload.truncate(confirmed_len);
+            Ok(Some((confirmed_type, payload)))
+        }
+        Err(e) => {
+            log::warn!("{context}: recv payload failed: {e:?}");
+            Err(e)
+        }
+    }
+}
+
+#[cfg(esp_idf_httpd_ws_support)]
+fn ws_send_logged(
+    ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection,
+    context: &str,
+    frame_type: esp_idf_svc::ws::FrameType,
+    payload: &[u8],
+) -> Result<(), esp_idf_svc::sys::EspError> {
+    match ws.send(frame_type, payload) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::warn!("{context}: send failed: {e:?}");
+            Err(e)
+        }
+    }
+}
+
 /// Background thread that pushes device status over WebSocket at a configurable interval.
 #[cfg(esp_idf_httpd_ws_support)]
 fn ws_poll_loop(
@@ -2445,7 +3302,12 @@ fn ws_poll_loop(
     }
 
     while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+        let mut remaining_ms = interval_ms;
+        while remaining_ms > 0 && !stop.load(Ordering::Relaxed) {
+            let sleep_ms = remaining_ms.min(50);
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            remaining_ms = remaining_ms.saturating_sub(sleep_ms);
+        }
 
         if stop.load(Ordering::Relaxed) {
             break;
@@ -2510,14 +3372,14 @@ fn register_ezbeq_ws(
 
             // Send initial Catalogue meta
             let catalogue_meta = build_catalogue_meta();
-            let _ = ws.send(FrameType::Text(false), catalogue_meta.as_bytes());
+            ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), catalogue_meta.as_bytes())?;
 
             // Send initial DeviceState
             if let Some(dev) = get_device(&st) {
                 let _op = dev.begin_operation();
                 let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
                 let state_json = crate::ezbeq::device_state_json(&dev, &beq_guard);
-                let _ = ws.send(FrameType::Text(false), state_json.as_bytes());
+                ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), state_json.as_bytes())?;
             }
 
             // Store a detached sender for REST → WS broadcasts
@@ -2559,21 +3421,20 @@ fn register_ezbeq_ws(
         }
 
         // Handle incoming messages
-        let mut buf = [0u8; 256];
-        match ws.recv(&mut buf) {
-            Ok((ft, len)) => {
-                let msg = std::str::from_utf8(&buf[..len])
+        match ws_recv_frame(ws, "ezBEQ WS", 512)? {
+            Some((ft, frame)) => {
+                let msg = std::str::from_utf8(&frame)
                     .unwrap_or("")
                     .trim_end_matches('\0')
                     .trim();
-                log::info!("ezBEQ WS: ft={ft:?} len={len} msg='{msg}'");
+                log::info!("ezBEQ WS: ft={ft:?} len={} msg='{msg}'", frame.len());
 
                 if msg == "load catalogue" {
                     // Browser JS shim handles catalogue loading from our Pages mirror.
                     // Send empty response as safety fallback (shim intercepts before this fires).
                     log::info!("load catalogue: handled by browser shim");
                     let empty = r#"{"message":"CatalogueEntries","data":[]}"#;
-                    let _ = ws.send(FrameType::Text(false), empty.as_bytes());
+                    ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), empty.as_bytes())?;
                 } else if msg.starts_with("subscribe levels") {
                     if let Ok(mut beq_guard) = beq.lock() {
                         if let Some(sender) = beq_guard.ws_sender.take() {
@@ -2610,14 +3471,12 @@ fn register_ezbeq_ws(
                 }
 
                 if matches!(ft, FrameType::Close) {
-                    let _ = ws.send(FrameType::Close, &[]);
+                    ws_send_logged(ws, "ezBEQ WS", FrameType::Close, &[])?;
                 } else if matches!(ft, FrameType::Ping) {
-                    let _ = ws.send(FrameType::Pong, &[]);
+                    ws_send_logged(ws, "ezBEQ WS", FrameType::Pong, &[])?;
                 }
             }
-            Err(e) => {
-                log::warn!("ezBEQ WS recv error: {e:?}");
-            }
+            None => {}
         }
         Ok(())
     })?;
@@ -2762,6 +3621,9 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
         Some("js") => "application/javascript",
         Some("css") => "text/css",
         Some("json") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("webmanifest") => "application/manifest+json",
+        Some("xml") => "application/xml",
         Some("png") => "image/png",
         Some("svg") => "image/svg+xml",
         Some("ico") => "image/x-icon",
@@ -2771,11 +3633,19 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
         Some("map") => "application/json",
         _ => "application/octet-stream",
     };
+    let cache_control = if path.ends_with("index.html")
+        || path.ends_with("ezbeq-shim.js")
+        || path.ends_with("version.txt")
+    {
+        "no-store"
+    } else {
+        "public, max-age=3600"
+    };
     let headers = [
         ("Server", "miniDSP-Open"),
         ("Content-Type", content_type),
         ("Access-Control-Allow-Origin", "*"),
-        ("Cache-Control", "public, max-age=3600"),
+        ("Cache-Control", cache_control),
     ];
     let mut resp = req.into_response(200, None, &headers)?;
     let mut buf = [0u8; 4096];
@@ -2785,6 +3655,87 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
             break;
         }
         resp.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+fn proxy_catalogue_file<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    nvs: &EspDefaultNvsPartition,
+    relative_path: &str,
+    content_type: &str,
+) -> Result<(), C::Error> {
+    let base_url = crate::updater::base_url(nvs);
+    let url = format!("{base_url}/{relative_path}");
+    let config = HttpClientConfiguration {
+        buffer_size: Some(4096),
+        timeout: Some(Duration::from_secs(120)),
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    };
+    let mut conn = match EspHttpConnection::new(&config) {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!("catalogue proxy: failed to create client for {url}: {e}");
+            return send_error(req, 502, "catalogue proxy unavailable");
+        }
+    };
+    if let Err(e) = conn.initiate_request(Method::Get, &url, &[]) {
+        warn!("catalogue proxy: request start failed for {url}: {e}");
+        return send_error(req, 502, "catalogue proxy request failed");
+    }
+    if let Err(e) = conn.initiate_response() {
+        warn!("catalogue proxy: response start failed for {url}: {e}");
+        return send_error(req, 502, "catalogue proxy response failed");
+    }
+
+    let status = conn.status();
+    if status != 200 {
+        warn!("catalogue proxy: upstream {url} returned HTTP {status}");
+        return send_error(req, 502, &format!("catalogue upstream HTTP {status}"));
+    }
+    let content_length = conn
+        .header("Content-Length")
+        .and_then(|len| len.parse::<usize>().ok())
+        .map(|len| len.to_string());
+    let mut resp = if let Some(ref len) = content_length {
+        let headers = [
+            ("Server", "miniDSP-Open"),
+            ("Content-Type", content_type),
+            ("Access-Control-Allow-Origin", "*"),
+            ("Cache-Control", "no-store"),
+            ("Content-Length", len.as_str()),
+        ];
+        req.into_response(200, None, &headers)?
+    } else {
+        let headers = [
+            ("Server", "miniDSP-Open"),
+            ("Content-Type", content_type),
+            ("Access-Control-Allow-Origin", "*"),
+            ("Cache-Control", "no-store"),
+        ];
+        req.into_response(200, None, &headers)?
+    };
+    let mut buf = [0u8; 4096];
+    let mut total_sent = 0usize;
+    let expected_len = content_length.as_deref().and_then(|len| len.parse::<usize>().ok());
+    loop {
+        let n = match conn.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                warn!("catalogue proxy: upstream read failed for {url}: {e}");
+                break;
+            }
+        };
+        total_sent = total_sent.saturating_add(n);
+        if let Err(e) = resp.write_all(&buf[..n]) {
+            warn!("catalogue proxy: downstream write failed for {url}: {e}");
+            break;
+        }
+        if expected_len.is_some_and(|len| total_sent >= len) {
+            break;
+        }
     }
     Ok(())
 }
@@ -2807,4 +3758,72 @@ fn urldecode(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        openapi_json, parse_bm_channel_path, parse_bm_mixer_path, parse_device_index,
+        parse_source_path, parse_volume_path,
+    };
+
+    #[test]
+    fn parses_bm_channel_path() {
+        assert_eq!(parse_bm_channel_path("/devices/0/bm/channel/7"), Some(7));
+        assert_eq!(
+            parse_bm_channel_path("/devices/0/bm/channel/3?x=1"),
+            Some(3)
+        );
+        assert_eq!(parse_bm_channel_path("/devices/0/bm/channel"), None);
+    }
+
+    #[test]
+    fn parses_bm_mixer_path() {
+        assert_eq!(parse_bm_mixer_path("/devices/0/bm/mixer/8/7"), Some((8, 7)));
+        assert_eq!(
+            parse_bm_mixer_path("/devices/0/bm/mixer/1/2?x=1"),
+            Some((1, 2))
+        );
+        assert_eq!(parse_bm_mixer_path("/devices/0/bm/mixer/1"), None);
+    }
+
+    #[test]
+    fn parses_device_index() {
+        assert_eq!(parse_device_index("/devices/0"), Some(0));
+        assert_eq!(parse_device_index("/devices/17/config?x=1"), Some(17));
+        assert_eq!(parse_device_index("/devices"), None);
+        assert_eq!(parse_device_index("/api/2/devices"), None);
+    }
+
+    #[test]
+    fn parses_source_path() {
+        assert_eq!(
+            parse_source_path("/devices/0/source/Usb?x=1"),
+            Some("Usb".into())
+        );
+        assert_eq!(
+            parse_source_path("/devices/0/source/bluetooth"),
+            Some("bluetooth".into())
+        );
+        assert_eq!(parse_source_path("/devices/0/source"), None);
+    }
+
+    #[test]
+    fn parses_volume_path() {
+        assert_eq!(
+            parse_volume_path("/devices/0/volume/toggle_mute?x=1"),
+            Some("toggle_mute".into())
+        );
+        assert_eq!(parse_volume_path("/devices/0/volume/up"), Some("up".into()));
+        assert_eq!(parse_volume_path("/devices/0/volume"), None);
+    }
+
+    #[test]
+    fn openapi_lists_esp32_parity_routes() {
+        let spec = openapi_json();
+        assert!(spec.contains("/openapi.json"));
+        assert!(spec.contains("/devices/0/bm"));
+        assert!(spec.contains("/devices/0/peq/reset"));
+        assert!(spec.contains("/devices/0/peq/default-frequencies"));
+    }
 }

@@ -13,7 +13,6 @@ use minidsp_protocol::dialect::{Dialect, ValueFormat};
 use minidsp_protocol::eeprom;
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::*;
-use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,6 +22,19 @@ use std::time::{Duration, Instant};
 struct PeqShadow {
     coeffs: [f32; 5],
     bypass: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPeqShadow {
+    coeffs: [f32; 5],
+    bypass: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PresetShadowState {
+    peq: HashMap<u16, CachedPeqShadow>,
+    selector: HashMap<u16, u16>,
+    scalar: HashMap<u16, u32>,
 }
 
 /// Snapshot of all PEQ bands captured when entering measurement mode.
@@ -46,49 +58,13 @@ pub struct DeviceState {
     serial: u32,
     operation_lock: Mutex<()>,
     peq_shadow: Mutex<HashMap<u16, PeqShadow>>,
+    selector_shadow: Mutex<HashMap<u16, u16>>,
+    scalar_shadow: Mutex<HashMap<u16, u32>>,
+    preset_shadows: Mutex<HashMap<u8, PresetShadowState>>,
+    active_preset: Mutex<Option<u8>>,
     /// Measurement-mode snapshot — `Some` while PEQ bypass is in effect,
     /// `None` once the client has explicitly restored state.
     saved_peq: Mutex<Option<SavedPeqState>>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConfigReadResponse {
-    pub inputs: Vec<InputConfigRead>,
-    pub outputs: Vec<OutputConfigRead>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct InputConfigRead {
-    pub index: u8,
-    pub peq: Option<Vec<PeqConfigRead>>,
-    pub gain: Option<f32>,
-    pub mute: Option<bool>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub routing: Vec<RoutingConfigRead>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct OutputConfigRead {
-    pub index: u8,
-    pub peq: Option<Vec<PeqConfigRead>>,
-    pub gain: Option<f32>,
-    pub mute: Option<bool>,
-    pub delay: Option<std::time::Duration>,
-    pub invert: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PeqConfigRead {
-    pub index: u8,
-    pub coeff: Option<BiquadCoeffs>,
-    pub bypass: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RoutingConfigRead {
-    pub output: u8,
-    pub enabled: bool,
-    pub gain_db: f32,
 }
 
 fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
@@ -115,6 +91,19 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
                     },
                 );
             }
+            if let Some(crossover) = output.crossover {
+                for base in [crossover.lpf_addr, crossover.hpf_addr] {
+                    for i in 0..4u16 {
+                        shadow.insert(
+                            base + i * 5,
+                            PeqShadow {
+                                coeffs: minidsp_protocol::biquad::BYPASS,
+                                bypass: false,
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
     shadow
@@ -122,8 +111,31 @@ fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
 
 /// Timeout for slow commands that write to flash (preset copy, set_config).
 const SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
+/// FIR load end can legitimately take longer than normal flash-style commands.
+const FIR_LOAD_END_TIMEOUT: Duration = Duration::from_secs(60);
+const GAIN_VERIFY_TOLERANCE_DB: f32 = 0.2;
 
 impl DeviceState {
+    const BM_NUM_CHANNELS: u8 = 8;
+
+    fn expect_write_ok_with_timeout(
+        &self,
+        payload: &[u8],
+        timeout: Duration,
+        context: &str,
+    ) -> Result<(), UsbHidError> {
+        let resp = self.bus.command_with_timeout(payload, timeout)?;
+        match commands::parse_response_for_request(payload, &resp, self.dialect()) {
+            Response::Ack | Response::PresetComplete | Response::ResetComplete => Ok(()),
+            Response::Error(data) => Err(UsbHidError::Protocol(format!(
+                "{context}: device error {data:02x?}"
+            ))),
+            other => Err(UsbHidError::Protocol(format!(
+                "{context}: unexpected response {other:?}"
+            ))),
+        }
+    }
+
     fn expect_write_ok(&self, payload: &[u8], context: &str) -> Result<(), UsbHidError> {
         let resp = self.bus.command(payload)?;
         match commands::parse_response_for_request(payload, &resp, self.dialect()) {
@@ -138,18 +150,7 @@ impl DeviceState {
     }
 
     fn expect_write_ok_slow(&self, payload: &[u8], context: &str) -> Result<(), UsbHidError> {
-        let resp = self
-            .bus
-            .command_with_timeout(payload, SLOW_COMMAND_TIMEOUT)?;
-        match commands::parse_response_for_request(payload, &resp, self.dialect()) {
-            Response::Ack | Response::PresetComplete | Response::ResetComplete => Ok(()),
-            Response::Error(data) => Err(UsbHidError::Protocol(format!(
-                "{context}: device error {data:02x?}"
-            ))),
-            other => Err(UsbHidError::Protocol(format!(
-                "{context}: unexpected response {other:?}"
-            ))),
-        }
+        self.expect_write_ok_with_timeout(payload, SLOW_COMMAND_TIMEOUT, context)
     }
 
     pub fn probe_with_timeout(bus: Arc<UsbHidBus>, timeout: Duration) -> Result<Self, UsbHidError> {
@@ -214,7 +215,7 @@ impl DeviceState {
         let profile = probe::identify(hw_id.hw_id, dsp_version);
         let peq_shadow = build_peq_shadow(&profile);
 
-        Ok(DeviceState {
+        let state = DeviceState {
             bus,
             profile,
             hw_id,
@@ -222,8 +223,18 @@ impl DeviceState {
             serial,
             operation_lock: Mutex::new(()),
             peq_shadow: Mutex::new(peq_shadow),
+            selector_shadow: Mutex::new(HashMap::new()),
+            scalar_shadow: Mutex::new(HashMap::new()),
+            preset_shadows: Mutex::new(HashMap::new()),
+            active_preset: Mutex::new(None),
             saved_peq: Mutex::new(None),
-        })
+        };
+
+        // Seed the active preset cache early so preset-scoped shadow state
+        // does not get wiped the first time status is polled after boot.
+        let _ = state.get_master_status();
+
+        Ok(state)
     }
 
     /// Serialize whole logical operations so multi-command reads/writes cannot
@@ -260,6 +271,145 @@ impl DeviceState {
         &self.profile.dialect
     }
 
+    fn capture_active_shadow(&self) -> PresetShadowState {
+        let peq = self
+            .peq_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(&addr, entry)| {
+                (
+                    addr,
+                    CachedPeqShadow {
+                        coeffs: entry.coeffs,
+                        bypass: entry.bypass,
+                    },
+                )
+            })
+            .collect();
+        let selector = self
+            .selector_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let scalar = self
+            .scalar_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        PresetShadowState {
+            peq,
+            selector,
+            scalar,
+        }
+    }
+
+    fn apply_active_shadow_snapshot(&self, snapshot: Option<PresetShadowState>) {
+        {
+            let mut peq_shadow = self.peq_shadow.lock().unwrap_or_else(|e| e.into_inner());
+            *peq_shadow = build_peq_shadow(&self.profile);
+            if let Some(snapshot) = &snapshot {
+                for (&addr, entry) in &snapshot.peq {
+                    peq_shadow.insert(
+                        addr,
+                        PeqShadow {
+                            coeffs: entry.coeffs,
+                            bypass: entry.bypass,
+                        },
+                    );
+                }
+            }
+        }
+        {
+            let mut selector_shadow = self
+                .selector_shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            selector_shadow.clear();
+            if let Some(snapshot) = &snapshot {
+                selector_shadow.extend(
+                    snapshot
+                        .selector
+                        .iter()
+                        .map(|(&addr, &value)| (addr, value)),
+                );
+            }
+        }
+        {
+            let mut scalar_shadow = self.scalar_shadow.lock().unwrap_or_else(|e| e.into_inner());
+            scalar_shadow.clear();
+            if let Some(snapshot) = &snapshot {
+                scalar_shadow.extend(snapshot.scalar.iter().map(|(&addr, &value)| (addr, value)));
+            }
+        }
+    }
+
+    fn update_active_preset(&self, preset: u8) {
+        let previous = {
+            let mut active_preset = self.active_preset.lock().unwrap_or_else(|e| e.into_inner());
+            if *active_preset == Some(preset) {
+                return;
+            }
+            let previous = *active_preset;
+            *active_preset = Some(preset);
+            previous
+        };
+
+        if let Some(previous) = previous {
+            let snapshot = self.capture_active_shadow();
+            self.preset_shadows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(previous, snapshot);
+        }
+
+        let snapshot = self
+            .preset_shadows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&preset)
+            .cloned();
+        self.apply_active_shadow_snapshot(snapshot);
+    }
+
+    fn prefers_scalar_shadow_for_addr(&self, addr: u16) -> bool {
+        if !self.profile.has_unreliable_selector_readback {
+            return false;
+        }
+        let Some(table) = self.profile.dsp_table else {
+            return false;
+        };
+        if table
+            .inputs
+            .iter()
+            .filter_map(|input| input.gain)
+            .any(|gain| gain == addr)
+        {
+            return true;
+        }
+
+        if table.outputs.iter().any(|output| {
+            output.gain == addr
+                || output.delay == Some(addr)
+                || output.compressor.is_some_and(|comp| {
+                    [
+                        comp.threshold,
+                        comp.gain,
+                        comp.ratio,
+                        comp.knee,
+                        comp.attack,
+                        comp.release,
+                    ]
+                    .contains(&addr)
+                })
+        }) {
+            return true;
+        }
+
+        let routing_span = table.routing.rows as u16 * table.routing.cols as u16;
+        addr >= table.routing.gain_base && addr < table.routing.gain_base + routing_span
+    }
+
     // -- Master status --
 
     pub fn get_master_status(&self) -> Result<eeprom::MasterStatusRaw, UsbHidError> {
@@ -291,8 +441,10 @@ impl DeviceState {
         let resp = self.bus.command(&req)?;
         match commands::parse_response_for_request(&req, &resp, self.dialect()) {
             Response::FlashData(data) if data.len() >= 4 => {
-                eeprom::MasterStatusRaw::from_bytes(&data)
-                    .ok_or_else(|| UsbHidError::Protocol("bad master status".into()))
+                let master = eeprom::MasterStatusRaw::from_bytes(&data)
+                    .ok_or_else(|| UsbHidError::Protocol("bad master status".into()))?;
+                self.update_active_preset(master.preset);
+                Ok(master)
             }
             other => Err(UsbHidError::Protocol(format!("master status: {other:?}"))),
         }
@@ -347,24 +499,35 @@ impl DeviceState {
         })
     }
 
-    pub fn read_config(&self) -> Result<ConfigReadResponse, UsbHidError> {
+    pub fn read_device_config(&self) -> Result<DeviceConfig, UsbHidError> {
         let table = self
             .profile
             .dsp_table
             .ok_or_else(|| UsbHidError::Protocol("config read unsupported".into()))?;
 
+        let master_raw = self.get_master_status()?;
+        let source_name = self
+            .profile
+            .sources
+            .source_for_index(master_raw.source)
+            .map(|s| s.pascal_case().to_string())
+            .unwrap_or_else(|| format!("Unknown({})", master_raw.source));
+        let dirac = if self.profile.has_dirac {
+            self.read_dirac_state().ok()
+        } else {
+            None
+        };
+
         let mut inputs = Vec::new();
         for (ch_idx, input) in table.inputs.iter().enumerate() {
-            let mut peqs = Vec::new();
+            let mut peq = Vec::new();
             for (band_idx, band) in input.peq.iter().enumerate() {
                 match self.read_peq_coeffs(band.addr) {
                     Ok(coeffs) => {
-                        peqs.push(PeqConfigRead {
+                        peq.push(PeqBandConfig {
                             index: band_idx as u8,
-                            coeff: Some(BiquadCoeffs::from_array(&[
-                                coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
-                            ])),
-                            bypass: self.read_peq_bypass(band.addr),
+                            coeff: BiquadCoeffs::from_array(&coeffs),
+                            bypass: self.read_peq_bypass(band.addr).unwrap_or(false),
                         });
                     }
                     _ => {}
@@ -375,75 +538,134 @@ impl DeviceState {
                 .gain
                 .and_then(|addr| self.read_config_gain_db(addr).ok());
             let mute = input.mute.and_then(|addr| self.read_config_mute(addr).ok());
-            let mut routing = Vec::new();
+            let mut routing_entries = Vec::new();
             let matrix = table.routing;
             if ch_idx < matrix.rows as usize {
                 for output in 0..matrix.cols {
                     let flat_idx = ch_idx as u16 * matrix.cols as u16 + output as u16;
                     let status_addr = matrix.status_base + flat_idx;
                     let gain_addr = matrix.gain_base + flat_idx;
-                    let status = self.read_param_word(status_addr).unwrap_or(0);
-                    // Mixer status readback via 0x14 is boolean-collapsed on
-                    // devices with unreliable selector readback: write values
-                    // 2 (enabled) and 1 (disabled) both read back as 1.
-                    // Treat non-zero as enabled on all dialects.
-                    let enabled = status != 0;
+                    let enabled = match self.profile.dialect.value_format {
+                        ValueFormat::Float32 => {
+                            self.read_routing_enabled(status_addr).unwrap_or(false)
+                        }
+                        ValueFormat::FixedPoint => {
+                            self.read_param_word(status_addr).unwrap_or(0) != 0
+                        }
+                    };
                     let gain_db = self.read_config_gain_db(gain_addr).unwrap_or(0.0);
-                    routing.push(RoutingConfigRead {
+                    let polarity_inverted = matrix
+                        .polarity_base
+                        .and_then(|base| self.read_channel_invert(base + flat_idx).ok());
+                    routing_entries.push(RoutingConfig {
                         output,
                         enabled,
                         gain_db,
+                        polarity_inverted,
                     });
                 }
             }
 
-            inputs.push(InputConfigRead {
+            inputs.push(InputChannelConfig {
                 index: ch_idx as u8,
-                peq: Some(peqs),
+                peq,
                 gain,
                 mute,
-                routing,
+                routing: routing_entries,
             });
         }
 
         let mut outputs = Vec::new();
         for (ch_idx, output) in table.outputs.iter().enumerate() {
-            let mut peqs = Vec::new();
+            let mut peq = Vec::new();
             for (band_idx, band) in output.peq.iter().enumerate() {
                 match self.read_peq_coeffs(band.addr) {
                     Ok(coeffs) => {
-                        peqs.push(PeqConfigRead {
+                        peq.push(PeqBandConfig {
                             index: band_idx as u8,
-                            coeff: Some(BiquadCoeffs::from_array(&[
-                                coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4],
-                            ])),
-                            bypass: self.read_peq_bypass(band.addr),
+                            coeff: BiquadCoeffs::from_array(&coeffs),
+                            bypass: self.read_peq_bypass(band.addr).unwrap_or(false),
                         });
                     }
                     _ => {}
                 }
             }
 
-            let gain = self.read_config_gain_db(output.gain).ok();
-            let mute = self.read_config_mute(output.mute).ok();
-            let delay = output
-                .delay
-                .and_then(|addr| self.read_config_delay(addr).ok());
-            let invert = output
-                .polarity
-                .and_then(|addr| self.read_config_invert(addr).ok());
+            let mut crossover = Vec::new();
+            if let Some(xover) = output.crossover {
+                for (group_idx, base_addr) in [(0u8, xover.lpf_addr), (1u8, xover.hpf_addr)] {
+                    let mut filters = Vec::new();
+                    for band_idx in 0..4u8 {
+                        let addr = base_addr + band_idx as u16 * 5;
+                        if let Ok(coeffs) = self.read_peq_coeffs(addr) {
+                            filters.push(IndexedBiquadConfig {
+                                index: band_idx,
+                                coeff: BiquadCoeffs::from_array(&coeffs),
+                            });
+                        }
+                    }
+                    crossover.push(CrossoverGroupConfig {
+                        index: group_idx,
+                        filters,
+                        bypass: self.read_peq_bypass(base_addr).unwrap_or(false),
+                    });
+                }
+            }
 
-            outputs.push(OutputConfigRead {
+            let fir = if let Some(fir) = output.fir {
+                Some(FirConfig {
+                    bypass: self.read_config_bypass(fir.bypass).unwrap_or(false),
+                    active_taps: self.read_fir_tap_count(fir.index).unwrap_or(0),
+                })
+            } else {
+                None
+            };
+
+            let compressor = if let Some(comp) = &output.compressor {
+                Some(CompressorConfig {
+                    bypass: self.read_config_bypass(comp.bypass).unwrap_or(false),
+                    threshold: self.read_config_gain_db(comp.threshold).unwrap_or(0.0),
+                    gain: self.read_config_gain_db(comp.gain).unwrap_or(0.0),
+                    ratio: self.read_config_gain_db(comp.ratio).unwrap_or(0.0),
+                    knee: self.read_config_gain_db(comp.knee).unwrap_or(0.0),
+                    attack: self.read_config_gain_db(comp.attack).unwrap_or(0.0),
+                    release: self.read_config_gain_db(comp.release).unwrap_or(0.0),
+                })
+            } else {
+                None
+            };
+
+            let delay = if let Some(delay_addr) = output.delay {
+                self.read_config_delay(delay_addr)
+                    .map(|delay| delay.as_secs_f32() * 1000.0)
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            outputs.push(OutputChannelConfig {
                 index: ch_idx as u8,
-                peq: Some(peqs),
-                gain,
-                mute,
+                gain: self.read_config_gain_db(output.gain).unwrap_or(0.0),
+                mute: self.read_config_mute(output.mute).unwrap_or(false),
                 delay,
-                invert,
+                peq,
+                crossover,
+                fir,
+                compressor,
             });
         }
 
-        Ok(ConfigReadResponse { inputs, outputs })
+        Ok(DeviceConfig {
+            master_status: MasterStatusView {
+                preset: master_raw.preset,
+                source: source_name,
+                volume: master_raw.volume_db(),
+                mute: master_raw.is_muted(),
+                dirac,
+            },
+            inputs,
+            outputs,
+        })
     }
 
     /// Read float values from DSP memory starting at `addr`.
@@ -486,6 +708,17 @@ impl DeviceState {
             .ok_or_else(|| UsbHidError::Protocol("empty typed param response".into()))
     }
 
+    fn read_param_scalar_u32(&self, addr: u16) -> Result<u32, UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.read_param_word(addr),
+            ValueFormat::FixedPoint => self
+                .read_param_words_be(addr, 1)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| UsbHidError::Protocol("empty integer param response".into())),
+        }
+    }
+
     fn read_peq_coeffs(&self, addr: u16) -> Result<[f32; 5], UsbHidError> {
         // On devices with unreliable selector readback (DSP100), always prefer
         // shadow state — live reads can return collapsed/bogus values.
@@ -522,7 +755,26 @@ impl DeviceState {
 
     fn read_config_gain_db(&self, addr: u16) -> Result<f32, UsbHidError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => Ok(f32::from_bits(self.read_param_word(addr)?)),
+            ValueFormat::Float32 => {
+                if self.prefers_scalar_shadow_for_addr(addr) {
+                    if let Some(raw) = self
+                        .scalar_shadow
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&addr)
+                        .copied()
+                    {
+                        return Ok(f32::from_bits(raw));
+                    }
+                }
+                let raw = self.read_param_word(addr)?;
+                if self.prefers_scalar_shadow_for_addr(addr) {
+                    if let Some(value) = sanitize_shadow_preferred_scalar(raw) {
+                        return Ok(value);
+                    }
+                }
+                Ok(f32::from_bits(raw))
+            }
             ValueFormat::FixedPoint => {
                 let linear = self
                     .read_floats(addr, 1)?
@@ -536,7 +788,7 @@ impl DeviceState {
 
     fn read_config_mute(&self, addr: u16) -> Result<bool, UsbHidError> {
         match self.profile.dialect.value_format {
-            ValueFormat::Float32 => Ok(self.read_param_word(addr)? == 1),
+            ValueFormat::Float32 => Ok(self.read_selector_word(addr)? == 1),
             ValueFormat::FixedPoint => {
                 let value = self
                     .read_floats(addr, 1)?
@@ -548,9 +800,37 @@ impl DeviceState {
         }
     }
 
+    fn read_config_bypass(&self, addr: u16) -> Result<bool, UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => Ok(matches!(self.read_selector_word(addr)?, 1 | 3)),
+            ValueFormat::FixedPoint => self.read_config_mute(addr),
+        }
+    }
+
     fn read_config_delay(&self, addr: u16) -> Result<std::time::Duration, UsbHidError> {
         let samples = match self.profile.dialect.value_format {
-            ValueFormat::Float32 => self.read_param_word(addr)? as f32,
+            ValueFormat::Float32 => {
+                if self.prefers_scalar_shadow_for_addr(addr) {
+                    if let Some(raw) = self
+                        .scalar_shadow
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&addr)
+                        .copied()
+                    {
+                        raw as f32
+                    } else {
+                        let raw = self.read_param_word(addr)?;
+                        if raw <= 2 {
+                            0.0
+                        } else {
+                            raw as f32
+                        }
+                    }
+                } else {
+                    self.read_param_word(addr)? as f32
+                }
+            }
             ValueFormat::FixedPoint => self
                 .read_param_words_be(addr, 1)?
                 .into_iter()
@@ -574,6 +854,56 @@ impl DeviceState {
                     .ok_or_else(|| UsbHidError::Protocol("empty invert response".into()))?;
                 Ok(value < 0.0)
             }
+        }
+    }
+
+    pub fn read_channel_invert(&self, addr: u16) -> Result<bool, UsbHidError> {
+        self.read_config_invert(addr)
+    }
+
+    fn read_selector_word(&self, addr: u16) -> Result<u16, UsbHidError> {
+        let raw = self.read_param_word(addr)? as u16;
+        if raw == 1 {
+            if let Some(&shadow) = self
+                .selector_shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&addr)
+            {
+                if shadow != 1 {
+                    return Ok(shadow);
+                }
+            }
+        }
+        Ok(raw)
+    }
+
+    fn selector_shadow_value(&self, addr: u16) -> Option<u16> {
+        self.selector_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&addr)
+            .copied()
+    }
+
+    fn read_routing_enabled(&self, addr: u16) -> Result<bool, UsbHidError> {
+        if let Some(shadow) = self.selector_shadow_value(addr) {
+            return Ok(shadow == 2);
+        }
+        Ok(self.read_param_word(addr)? != 0)
+    }
+
+    pub fn read_fir_tap_count(&self, fir_index: u8) -> Result<u16, UsbHidError> {
+        let req = commands::get_num_fir_taps(fir_index);
+        let resp = self.bus.command(&req)?;
+        match commands::parse_response_for_request(&req, &resp, self.dialect()) {
+            Response::FirLoadInfo { max_coeffs } => Ok(max_coeffs),
+            Response::Error(data) => Err(UsbHidError::Protocol(format!(
+                "get_num_fir_taps({fir_index}): device error {data:02x?}"
+            ))),
+            other => Err(UsbHidError::Protocol(format!(
+                "get_num_fir_taps({fir_index}): unexpected response {other:?}"
+            ))),
         }
     }
 
@@ -687,6 +1017,143 @@ impl DeviceState {
             )));
         }
         Ok(())
+    }
+
+    pub fn supports_bass_management(&self) -> bool {
+        self.profile
+            .dsp_table
+            .and_then(|table| table.bass_management)
+            .is_some()
+    }
+
+    fn require_bm_table(
+        &self,
+    ) -> Result<&'static minidsp_protocol::device::dsp::BassManagement, UsbHidError> {
+        self.profile
+            .dsp_table
+            .and_then(|table| table.bass_management)
+            .ok_or_else(|| UsbHidError::Protocol("device does not support bass management".into()))
+    }
+
+    fn check_bm_channel(ch: u8) -> Result<(), UsbHidError> {
+        if ch >= Self::BM_NUM_CHANNELS {
+            return Err(UsbHidError::Protocol(format!(
+                "bm channel {ch} out of range (0..{})",
+                Self::BM_NUM_CHANNELS
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn read_bm_channel(&self, ch: u8) -> Result<BmChannelConfig, UsbHidError> {
+        let bm = self.require_bm_table()?;
+        Self::check_bm_channel(ch)?;
+        let status_addr = bm.gain_status_base + ch as u16;
+        let gain_addr = bm.gain_base + ch as u16;
+        let muted = self.read_param_word(status_addr)? as u16 == 1;
+        let gain_db = self.read_config_gain_db(gain_addr)?;
+        Ok(BmChannelConfig {
+            index: ch,
+            muted,
+            gain_db,
+        })
+    }
+
+    pub fn set_bm_channel_gain(&self, ch: u8, gain_db: f32) -> Result<(), UsbHidError> {
+        let bm = self.require_bm_table()?;
+        Self::check_bm_channel(ch)?;
+        let addr = bm.gain_base + ch as u16;
+        self.set_channel_gain(addr, gain_db)
+    }
+
+    pub fn set_bm_channel_mute(&self, ch: u8, muted: bool) -> Result<(), UsbHidError> {
+        let bm = self.require_bm_table()?;
+        Self::check_bm_channel(ch)?;
+        let addr = bm.gain_status_base + ch as u16;
+        self.set_channel_mute(addr, muted)
+    }
+
+    pub fn read_bm_mixer_cell(&self, row: u8, col: u8) -> Result<BmMixerCellConfig, UsbHidError> {
+        let bm = self.require_bm_table()?;
+        let mixer = bm.bm_routing;
+        let status_addr = mixer.status_addr(row, col).ok_or_else(|| {
+            UsbHidError::Protocol(format!(
+                "bm mixer cell ({row},{col}) out of range ({}x{})",
+                mixer.rows, mixer.cols
+            ))
+        })?;
+        let gain_addr = mixer.gain_addr(row, col).expect("validated by status_addr");
+        let polarity_addr = mixer
+            .polarity_addr(row, col)
+            .expect("validated by status_addr");
+        Ok(BmMixerCellConfig {
+            row,
+            col,
+            enabled: self.read_param_word(status_addr)? as u16 == 2,
+            gain_db: self.read_config_gain_db(gain_addr)?,
+            polarity_inverted: self.read_param_word(polarity_addr)? as u16 != 0,
+        })
+    }
+
+    pub fn set_bm_mixer_cell(
+        &self,
+        row: u8,
+        col: u8,
+        patch: BmMixerCellPatch,
+    ) -> Result<(), UsbHidError> {
+        let bm = self.require_bm_table()?;
+        let mixer = bm.bm_routing;
+        let status_addr = mixer.status_addr(row, col).ok_or_else(|| {
+            UsbHidError::Protocol(format!(
+                "bm mixer cell ({row},{col}) out of range ({}x{})",
+                mixer.rows, mixer.cols
+            ))
+        })?;
+        let gain_addr = mixer.gain_addr(row, col).expect("validated by status_addr");
+        let polarity_addr = mixer
+            .polarity_addr(row, col)
+            .expect("validated by status_addr");
+        if let Some(gain_db) = patch.gain_db {
+            self.set_channel_gain(gain_addr, gain_db)?;
+        }
+        if let Some(enabled) = patch.enabled {
+            self.write_dsp_selector_u32(status_addr, if enabled { 2 } else { 1 })?;
+        }
+        if let Some(polarity_inverted) = patch.polarity_inverted {
+            self.set_invert(polarity_addr, polarity_inverted)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_bm_channel(&self, ch: u8, patch: BmChannelPatch) -> Result<(), UsbHidError> {
+        if let Some(gain_db) = patch.gain_db {
+            self.set_bm_channel_gain(ch, gain_db)?;
+        }
+        if let Some(muted) = patch.muted {
+            self.set_bm_channel_mute(ch, muted)?;
+        }
+        Ok(())
+    }
+
+    pub fn read_bass_management_state(&self) -> Result<BmStateConfig, UsbHidError> {
+        let bm = self.require_bm_table()?;
+        let mixer = bm.bm_routing;
+        let mut channels = Vec::with_capacity(Self::BM_NUM_CHANNELS as usize);
+        for ch in 0..Self::BM_NUM_CHANNELS {
+            channels.push(self.read_bm_channel(ch)?);
+        }
+        let mut mixer_cells = Vec::with_capacity(mixer.cell_count() as usize);
+        for row in 0..mixer.rows {
+            for col in 0..mixer.cols {
+                mixer_cells.push(self.read_bm_mixer_cell(row, col)?);
+            }
+        }
+        Ok(BmStateConfig {
+            channels,
+            mixer: mixer_cells,
+            rows: mixer.rows,
+            cols: mixer.cols,
+        })
     }
 
     fn read_verify_program_status(&self) -> Result<u8, UsbHidError> {
@@ -982,7 +1449,42 @@ impl DeviceState {
         self.expect_write_ok(
             &commands::write_dsp(addr, value, save, self.dialect()),
             "write dsp",
-        )
+        )?;
+        if self.profile.dialect.value_format == ValueFormat::Float32 {
+            self.scalar_shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr, value.to_bits());
+        }
+        Ok(())
+    }
+
+    pub fn write_dsp_verified(
+        &self,
+        addr: u16,
+        value: f32,
+        save: bool,
+        context: &str,
+    ) -> Result<(), UsbHidError> {
+        if self.profile.dialect.value_format != ValueFormat::Float32 {
+            return self.write_dsp(addr, value, save);
+        }
+        let before = self.read_param_word(addr)?;
+        let expected = value.to_bits();
+        self.write_dsp(addr, value, save)?;
+        let after = self.read_param_word(addr)?;
+        if after != expected {
+            if self.prefers_scalar_shadow_for_addr(addr) {
+                info!(
+                    "accepting shadow-backed scalar write at addr {addr} despite non-authoritative live readback (before=0x{before:08X}, expected=0x{expected:08X}, after=0x{after:08X})"
+                );
+                return Ok(());
+            }
+            return Err(UsbHidError::Protocol(format!(
+                "{context} at addr {addr} did not persist (before=0x{before:08X}, expected=0x{expected:08X}, after=0x{after:08X})"
+            )));
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -995,7 +1497,14 @@ impl DeviceState {
         self.expect_write_ok(
             &commands::write_dsp_delay(addr, samples, save, self.dialect()),
             "write dsp delay",
-        )
+        )?;
+        if self.profile.dialect.value_format == ValueFormat::Float32 {
+            self.scalar_shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr, samples.min(u16::MAX as u32));
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -1003,7 +1512,19 @@ impl DeviceState {
         self.expect_write_ok(
             &commands::write_dsp_u32_le_with_ctrl(addr, value, 0x80),
             "write dsp selector",
-        )
+        )?;
+        self.selector_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(addr, value as u16);
+        Ok(())
+    }
+
+    pub fn set_status_bypass(&self, addr: u16, bypass: bool) -> Result<(), UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp_selector_u32(addr, if bypass { 3 } else { 2 }),
+            ValueFormat::FixedPoint => self.write_dsp(addr, if bypass { 1.0 } else { 0.0 }, true),
+        }
     }
 
     /// Set channel polarity inversion using dialect-aware encoding.
@@ -1020,10 +1541,24 @@ impl DeviceState {
 
     #[allow(dead_code)]
     pub fn set_channel_gain(&self, addr: u16, db: f32) -> Result<(), UsbHidError> {
+        let before = self.read_config_gain_db(addr)?;
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => self.write_dsp(addr, db, false),
             ValueFormat::FixedPoint => self.write_dsp(addr, 10.0f32.powf(db / 20.0), true),
+        }?;
+        let after = self.read_config_gain_db(addr)?;
+        if (after - db).abs() > GAIN_VERIFY_TOLERANCE_DB {
+            if self.prefers_scalar_shadow_for_addr(addr) {
+                info!(
+                    "accepting shadow-backed gain write at addr {addr} despite non-authoritative live readback (before={before:.6}, expected={db:.6}, after={after:.6})"
+                );
+                return Ok(());
+            }
+            return Err(UsbHidError::Protocol(format!(
+                "set channel gain at addr {addr} did not persist (before={before:.6}, expected={db:.6}, after={after:.6})"
+            )));
         }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -1064,6 +1599,31 @@ impl DeviceState {
         }
     }
 
+    pub fn set_routing_polarity(
+        &self,
+        input: u8,
+        output: u8,
+        inverted: bool,
+    ) -> Result<(), UsbHidError> {
+        let table = self
+            .profile
+            .dsp_table
+            .ok_or_else(|| UsbHidError::Protocol("routing unsupported".into()))?;
+        let routing = table.routing;
+        if input >= routing.rows || output >= routing.cols {
+            return Err(UsbHidError::Protocol(format!(
+                "routing index ({input}, {output}) out of range (max {}x{})",
+                routing.rows, routing.cols
+            )));
+        }
+        let polarity_base = routing
+            .polarity_base
+            .ok_or_else(|| UsbHidError::Protocol("routing polarity unsupported".into()))?;
+        let flat_idx = input as u16 * routing.cols as u16 + output as u16;
+        let polarity_addr = polarity_base + flat_idx;
+        self.set_invert(polarity_addr, inverted)
+    }
+
     #[allow(dead_code)]
     pub fn set_channel_mute(&self, addr: u16, muted: bool) -> Result<(), UsbHidError> {
         match self.profile.dialect.value_format {
@@ -1094,10 +1654,114 @@ impl DeviceState {
 
     #[allow(dead_code)]
     pub fn set_channel_delay_samples(&self, addr: u16, samples: u32) -> Result<(), UsbHidError> {
+        let before = self.read_param_scalar_u32(addr)?;
+        let expected = match self.profile.dialect.value_format {
+            ValueFormat::Float32 => samples.min(u16::MAX as u32),
+            ValueFormat::FixedPoint => samples,
+        };
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => self.write_dsp_delay(addr, samples, false),
             ValueFormat::FixedPoint => self.write_dsp_delay(addr, samples, true),
+        }?;
+        let after = self.read_param_scalar_u32(addr)?;
+        if after != expected {
+            if self.prefers_scalar_shadow_for_addr(addr) {
+                info!(
+                    "accepting shadow-backed delay write at addr {addr} despite non-authoritative live readback (before={before}, expected={expected}, after={after})"
+                );
+                return Ok(());
+            }
+            return Err(UsbHidError::Protocol(format!(
+                "set channel delay at addr {addr} did not persist (before={before}, expected={expected}, after={after})"
+            )));
         }
+        Ok(())
+    }
+
+    pub fn load_fir_coefficients(
+        &self,
+        fir: minidsp_protocol::device::dsp::FirFilter,
+        coeffs: &[f32],
+    ) -> Result<(), UsbHidError> {
+        if coeffs.len() > fir.max_taps as usize {
+            return Err(UsbHidError::Protocol(format!(
+                "FIR has {} taps but device maximum is {}",
+                coeffs.len(),
+                fir.max_taps
+            )));
+        }
+
+        let master = self.get_master_status()?;
+        self.expect_write_ok(
+            &commands::write_dsp_int(fir.taps_count, coeffs.len() as u16),
+            "set fir tap count",
+        )?;
+
+        let start = commands::fir_load_start(fir.index);
+        let start_resp = self.bus.command(&start)?;
+        let max_coeffs =
+            match commands::parse_response_for_request(&start, &start_resp, self.dialect()) {
+                Response::FirLoadInfo { max_coeffs } => max_coeffs,
+                Response::Error(data) => {
+                    return Err(UsbHidError::Protocol(format!(
+                        "fir load start: device error {data:02x?}"
+                    )));
+                }
+                other => {
+                    return Err(UsbHidError::Protocol(format!(
+                        "fir load start: unexpected response {other:?}"
+                    )));
+                }
+            };
+        if coeffs.len() > max_coeffs as usize {
+            return Err(UsbHidError::Protocol(format!(
+                "FIR has {} taps but device reported runtime maximum {}",
+                coeffs.len(),
+                max_coeffs
+            )));
+        }
+
+        for chunk in coeffs.chunks(14) {
+            self.expect_write_ok(&commands::fir_load_data(fir.index, chunk), "fir load data")?;
+        }
+        self.expect_write_ok_with_timeout(
+            &commands::fir_load_end(),
+            FIR_LOAD_END_TIMEOUT,
+            "fir load end",
+        )?;
+        self.selector_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(fir.taps_count, coeffs.len() as u16);
+        self.set_mute(master.is_muted())?;
+        Ok(())
+    }
+
+    pub fn reset_all_peq_to_defaults(&self) -> Result<usize, UsbHidError> {
+        let table = self
+            .profile
+            .dsp_table
+            .ok_or_else(|| UsbHidError::Protocol("config read unsupported".into()))?;
+        let mut touched = 0usize;
+        for input in table.inputs {
+            for band in input.peq {
+                self.write_biquad(band.addr, &minidsp_protocol::biquad::BYPASS)?;
+                self.bypass_filter(band.addr, false)?;
+                touched += 1;
+            }
+        }
+        for output in table.outputs {
+            for band in output.peq {
+                self.write_biquad(band.addr, &minidsp_protocol::biquad::BYPASS)?;
+                self.bypass_filter(band.addr, false)?;
+                touched += 1;
+            }
+        }
+        Ok(touched)
+    }
+
+    pub fn default_peq_frequencies(&self) -> &'static [u32; 10] {
+        &minidsp_protocol::device::dsp::DEFAULT_PEQ_FREQS_HZ
     }
 
     // -- Flash reads --
@@ -1150,7 +1814,8 @@ impl DeviceState {
     // -- Raw command --
 
     /// Execute a raw command and mirror successful write side-effects into
-    /// the PEQ shadow so `/config` reflects TCP bridge / WebSocket activity.
+    /// the in-memory shadow state so `/config` reflects TCP bridge /
+    /// WebSocket activity.
     pub fn raw_command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
         let mut resp = self.bus.command(payload)?;
         // Trim HID echo garbage: for write commands, real DSP100/2x4 HD hardware
@@ -1176,23 +1841,10 @@ impl DeviceState {
         Ok(resp)
     }
 
-    /// Parse a raw write payload and update the PEQ shadow accordingly.
+    /// Parse a raw write payload and update in-memory shadow state for
+    /// successful bridge / WebSocket writes.
     fn mirror_raw_to_shadow(&self, payload: &[u8]) {
-        // Biquad write: CMD_WRITE_BIQUAD (0x13), ctrl=0x80, addr[2], pad[2], coeffs[20]
-        if payload.first().copied() == Some(commands::CMD_WRITE_BIQUAD)
-            && payload.len() >= 26
-            && payload[1] == 0x80
-        {
-            let addr = u16::from_be_bytes([payload[2], payload[3]]);
-            let mut coeffs = [0.0f32; 5];
-            let mut offset = 6;
-            for coeff in &mut coeffs {
-                if let Some(bytes) = payload.get(offset..offset + 4) {
-                    let arr: [u8; 4] = bytes.try_into().unwrap();
-                    *coeff = minidsp_protocol::dialect::decode_value(&arr, self.dialect());
-                    offset += 4;
-                }
-            }
+        if let Some((addr, coeffs)) = parse_raw_write_biquad(payload, self.dialect()) {
             if let Ok(mut shadow) = self.peq_shadow.lock() {
                 if let Some(entry) = shadow.get_mut(&addr) {
                     entry.coeffs = coeffs;
@@ -1201,15 +1853,35 @@ impl DeviceState {
             return;
         }
 
-        // Bypass filter: CMD_BYPASS_FILTER (0x13 with ctrl bit pattern)
-        if payload.first().copied() == Some(commands::CMD_BYPASS_FILTER) && payload.len() >= 6 {
-            let addr = u16::from_be_bytes([payload[2], payload[3]]);
-            let bypass = payload[1] & 0x80 != 0;
+        if let Some((addr, bypass)) = parse_raw_bypass_filter(payload) {
             if let Ok(mut shadow) = self.peq_shadow.lock() {
                 if let Some(entry) = shadow.get_mut(&addr) {
                     entry.bypass = bypass;
                 }
             }
+            return;
+        }
+
+        if let Some((addr, value)) = parse_raw_selector_write(payload, self.dialect())
+            .or_else(|| parse_raw_linked_selector_write(payload, self.dialect()))
+        {
+            self.selector_shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr, value);
+            return;
+        }
+
+        if self.profile.dialect.value_format == ValueFormat::Float32
+            && payload.first().copied() == Some(commands::CMD_WRITE_DSP)
+            && payload.len() >= 8
+        {
+            let addr = u16::from_be_bytes([payload[2], payload[3]]);
+            let raw = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            self.scalar_shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr, raw);
         }
     }
 
@@ -1248,6 +1920,86 @@ const PEQ_SHADOW_FORMAT_V1: u8 = 0x01;
 
 fn peq_nvs_key(serial: u32) -> String {
     format!("s{serial:08x}")
+}
+
+fn sanitize_shadow_preferred_scalar(raw: u32) -> Option<f32> {
+    if raw <= 2 {
+        return Some(0.0);
+    }
+
+    let value = f32::from_bits(raw);
+    if !value.is_finite() || value.abs() > 10_000.0 {
+        return Some(0.0);
+    }
+
+    None
+}
+
+fn parse_raw_write_biquad(payload: &[u8], dialect: &Dialect) -> Option<(u16, [f32; 5])> {
+    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 26 {
+        return None;
+    }
+    if payload[1] != 0x80 {
+        return None;
+    }
+    let addr = u16::from_be_bytes([payload[2], payload[3]]);
+    let mut coeffs = [0.0f32; 5];
+    let mut offset = 6;
+    for coeff in &mut coeffs {
+        let bytes: [u8; 4] = payload.get(offset..offset + 4)?.try_into().ok()?;
+        *coeff = minidsp_protocol::dialect::decode_value(&bytes, dialect);
+        offset += 4;
+    }
+    Some((addr, coeffs))
+}
+
+fn parse_raw_bypass_filter(payload: &[u8]) -> Option<(u16, bool)> {
+    if payload.first().copied()? != commands::CMD_BYPASS_FILTER || payload.len() < 6 {
+        return None;
+    }
+    let addr = u16::from_be_bytes([payload[2], payload[3]]);
+    Some((addr, payload[1] & 0x80 != 0))
+}
+
+fn parse_raw_selector_write(payload: &[u8], dialect: &Dialect) -> Option<(u16, u16)> {
+    if dialect.value_format != ValueFormat::Float32 {
+        return None;
+    }
+    if payload.first().copied()? != commands::CMD_WRITE_DSP || payload.len() < 8 {
+        return None;
+    }
+    if payload[1] != 0x80 || payload[6] != 0 || payload[7] != 0 {
+        return None;
+    }
+    let addr = u16::from_be_bytes([payload[2], payload[3]]);
+    let value = u16::from_le_bytes([payload[4], payload[5]]);
+    Some((addr, value))
+}
+
+fn parse_raw_linked_selector_write(payload: &[u8], dialect: &Dialect) -> Option<(u16, u16)> {
+    if dialect.value_format != ValueFormat::Float32 {
+        return None;
+    }
+    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 10 {
+        return None;
+    }
+    let ctrl = payload[1];
+    if ctrl < 0x80 {
+        return None;
+    }
+    let linked_count = (ctrl - 0x80) as usize;
+    let linked_bytes = if linked_count == 0 {
+        2
+    } else {
+        linked_count * 2
+    };
+    let value_offset = 4 + linked_bytes;
+    let value_bytes: [u8; 4] = payload
+        .get(value_offset..value_offset + 4)?
+        .try_into()
+        .ok()?;
+    let addr = u16::from_be_bytes([payload[2], payload[3]]);
+    Some((addr, u32::from_le_bytes(value_bytes) as u16))
 }
 
 /// Binary-encode the PEQ shadow for NVS persistence. Layout:
@@ -1361,5 +2113,27 @@ mod peq_shadow_tests {
     fn decode_rejects_truncated() {
         let blob = vec![PEQ_SHADOW_FORMAT_V1, 2, 0];
         assert!(decode_peq_shadow(&blob).is_none());
+    }
+
+    #[test]
+    fn sanitize_shadow_preferred_scalar_clamps_placeholder_and_absurd_values() {
+        assert_eq!(sanitize_shadow_preferred_scalar(0), Some(0.0));
+        assert_eq!(sanitize_shadow_preferred_scalar(2), Some(0.0));
+        assert_eq!(sanitize_shadow_preferred_scalar(0x4A03_9901), Some(0.0));
+        assert_eq!(sanitize_shadow_preferred_scalar(9.5f32.to_bits()), None);
+    }
+
+    #[test]
+    fn parse_raw_selector_write_extracts_selector_value() {
+        let payload = commands::write_dsp_u32_le_with_ctrl(0x1234, 2, 0x80);
+        let parsed = parse_raw_selector_write(&payload, &Dialect::FLOAT32LE);
+        assert_eq!(parsed, Some((0x1234, 2)));
+    }
+
+    #[test]
+    fn parse_raw_linked_selector_write_extracts_primary_value() {
+        let payload = commands::write_dsp_linked_u32(0x1234, 3, &[0x2000, 0x2001]);
+        let parsed = parse_raw_linked_selector_write(&payload, &Dialect::FLOAT32LE);
+        assert_eq!(parsed, Some((0x1234, 3)));
     }
 }

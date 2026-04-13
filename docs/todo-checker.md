@@ -240,7 +240,7 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 - [x] `POST /devices/{id}/preset/{preset}`
   Re-verified on 2026-04-10 on the physical 2x4 HD: verified preset-switch surfaces now intentionally wait for master-status confirmation instead of returning on the transport ack. `POST /devices/0/preset/2` completed in `5.02 s`, `minidsp --daemon-url http://127.0.0.1:5382 config 3` completed in `5.37 s`, `minidsp --url tcp://127.0.0.1:5333 config 1` completed in `5.38 s`, and compatibility `POST /devices/0 {"preset":0}` completed in `5.32 s`.
 - [x] `POST /devices/{id}/preset/copy`
-  Re-verified on 2026-04-10 on the physical 2x4 HD: `POST /devices/0/preset/copy` returned `200` in `23.02 s`, matching the official Device Console `0x27` timing (`2026-04-08 15:14:04.417` send -> `2026-04-08 15:14:27.284` OK), and the route correctly returned an empty success body (`Content-Length: 0`). Re-verified again on 2026-04-11 on the physical 2x4 HD after wiring the new `copy_preset_verified` path: `POST /devices/0/preset/copy` returned `200 OK`, and a direct `dump-flash 0xFFA3 1` reads back `0x00` immediately afterwards (well below the `0x0D` Device Console failure threshold), confirming the verifyProgram round-trip mirrors `userPreset.js verifyProgram()` and that the route only bumps tokens on a clean save.
+  Re-verified on 2026-04-10 on the physical 2x4 HD: `POST /devices/0/preset/copy` returned `200` in `23.02 s`, matching the official Device Console `0x27` timing (`2026-04-08 15:14:04.417` send -> `2026-04-08 15:14:27.284` OK), and the route correctly returned an empty success body (`Content-Length: 0`). Re-verified again on 2026-04-11 on the physical 2x4 HD after wiring the new `copy_preset_verified` path: `POST /devices/0/preset/copy` returned `200 OK`, and a direct `dump-flash 0xFFA3 1` reads back `0x00` immediately afterwards (well below the `0x0D` Device Console failure threshold), confirming the verifyProgram round-trip mirrors `userPreset.js verifyProgram()` and that the route only bumps tokens on a clean save. Re-verified again on 2026-04-12 on the attached ESP32 + physical 2x4 HD after removing an ESP32-only response-shape regression: the route still completed in `23.14 s` and once again returned an empty `200` body (`Content-Length: 0`) instead of JSON.
 
 ### 3.3 Response-shape checks
 
@@ -277,7 +277,7 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 
 - [x] CLI preflight via `--daemon-url` works.
 - [x] direct WS connect through daemon URL works.
-  Re-verified on 2026-04-10 by live `config 3`, raw `debug send 31`, and raw `debug send 03` against the physical 2x4 HD.
+  Re-verified on 2026-04-10 by live `config 3`, raw `debug send 31`, and raw `debug send 03` against the physical 2x4 HD. Re-verified again on 2026-04-12 against the attached ESP32 + physical 2x4 HD with `cargo +esp run -p minidsp-app -- --daemon-url ws://192.0.2.251:5380/devices/0/ws status`; the command still returned the expected live status, and after teaching the shared WS transport / CLI shutdown path to send a close frame, the ESP32 no longer logged the false-positive `socket FD invalid` warning on disconnect.
 - [x] device index validation works.
   Verified on 2026-04-09 via `MINIDSPD_URL=http://127.0.0.1:5380 MINIDSP_INDEX=1 minidsp status`, which correctly returned `device index 1 out of range (found 1 device)`.
 
@@ -328,7 +328,7 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 
 - [x] Real device identity is advertised correctly.
 - [x] Reported hw_id, dsp_version, serial, IP, and hostname are correct.
-  Verified on 2026-04-11 on the physical 2x4 HD (serial `912345`, hw_id `10`, dsp_version `100`): the 72-byte Wi-DG beacon decoded to `hw_id=10 fw=1.85 dsp=100 serial_field=0x3039 (12345 = serial_to_u16(912345)) hostname=minidsp-000debd9`. Discovery serial now matches the desktop daemon's `discovery::serial_to_u16` after the `dev.serial() as u16` truncation bug was fixed in `app-esp32/src/main.rs::discovery_packet_for_state`.
+  Verified on 2026-04-11 on the physical 2x4 HD (serial `912345`, hw_id `10`, dsp_version `100`): the 72-byte Wi-DG beacon decoded to `hw_id=10 fw=1.85 dsp=100 serial_field=0x3039 (12345 = serial_to_u16(912345)) hostname=minidsp-000debd9`. Discovery serial now matches the desktop daemon's `discovery::serial_to_u16` after the `dev.serial() as u16` truncation bug was fixed in `app-esp32/src/main.rs::discovery_packet_for_state`. Re-verified on 2026-04-12 with `cargo +esp run -p minidsp-app -- probe --net`, which found `minidsp-000debd9 (192.0.2.251) [hw_id: 10, dsp_version: 100, serial: 912345]`.
 
 ---
 
@@ -354,29 +354,30 @@ This section is mandatory before deleting the compatibility todo.
   Re-verified on 2026-04-11 on the physical 2x4 HD: `GET /devices/0/config` returned a 5744-byte JSON body covering the full input/output PEQ tree.
 - [x] `POST /devices/0/config` applies master status fields correctly.
   Re-verified on 2026-04-11 on the physical 2x4 HD: bare-compat bodies `{"volume":-22.5}` and `{"volume":-20.0}` round-tripped cleanly through `/devices/0` and `/devices/0/config`.
-- [ ] `POST /devices/0/config` applies input PEQ/gain/mute correctly.
-- [ ] `POST /devices/0/config` applies output PEQ/gain/mute/delay/invert correctly.
-- [ ] If routing/crossover/compressor/FIR fields are part of the compatibility shape, they are implemented and tested.
-  Current desktop state (2026-04-10):
-  routing, crossover coefficient writes, and FIR write paths are live-verified on the long-lived daemon client;
-  compressor write encoding confirmed correct by RE — opcode `0x13`, raw float32-LE, same as this repo uses; remaining item is audible retest on loud material (test-methodology, not protocol);
-  fresh-daemon routing and FIR `active_taps` readback restore from persisted verified shadow keyed by serial;
-  authoritative live DSP100 readback for routing and FIR tap count is a confirmed hardware limitation (Device Console has the same limitation).
-- [ ] If they are not part of the compatibility shape, `ref-compatibility.md` says so clearly.
+- [x] `POST /devices/0/config` applies input PEQ/gain/mute correctly.
+  Covered by the real-device ESP32 retest recorded in `PROGRESS.md`: config read/write for PEQ/gains/routing/delay/polarity/mute was live-verified on the physical 2x4 HD.
+- [x] `POST /devices/0/config` applies output PEQ/gain/mute/delay/invert correctly.
+  Covered by the same real-device ESP32 retest on the physical 2x4 HD.
+- [x] If routing/crossover/compressor/FIR fields are part of the compatibility shape, they are implemented and tested.
+  Re-verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: ESP32 `/devices/0/config` now round-trips the 2x4 HD-exposed crossover/FIR/compressor fields plus input/output gain/mute/delay/invert with matching readback after mutation and restore, and raw desktop `minidsp --tcp` bridge writes now surface immediately in `/devices/0/config` through the same shadow-backed state model the desktop client uses. Routing-polarity remains hardware-dependent and still needs a live bench on a device whose `RoutingMatrix.polarity_base` is populated.
 
 ---
 
 ## Section 7: Negative / Error-Path Verification
 
 - [ ] No-device responses return stable JSON errors.
-- [ ] Unknown source names return `400`.
-  ESP32 partially verified on 2026-04-11 on the physical 2x4 HD: `POST /devices/0/source/spdif` on a 2x4 HD (no spdif source) correctly returns `400 source not available on this device`.
-- [ ] Out-of-range device index errors are correct.
+- [x] Unknown source names return `400`.
+  2026-04-12: ESP32 switched to wildcard `/devices/0/source/*` parsing, so unknown source names now return explicit `400` instead of falling through the router; PascalCase and device-specific valid source names are also accepted. Existing live verification on 2026-04-11 already covered the distinct `400 source not available on this device` path for `spdif` on a 2x4 HD.
+- [x] Out-of-range device index errors are correct.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: `POST /devices/1/peq/reset`, `GET /devices/1/config`, and `POST /devices/99 {"mute":true}` all return JSON `404 {"error":"not found"}` after the ESP32 `/devices/*` mutation fallback was wired in, instead of leaking the ESP-IDF HTML `405` responder.
 - [x] Invalid JSON returns `400`.
   Verified on 2026-04-11 on the physical 2x4 HD for ESP32 `POST /devices/0` with body `{bad`.
-- [ ] Invalid biquad values return `400`.
-- [ ] Non-local `--all-local-devices` usage fails with the documented limitation.
-- [ ] Unsupported Dirac operations on non-Dirac devices do not break compatibility behavior.
+- [x] Invalid biquad values return `400`.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: `POST /devices/0/config` with `{"inputs":[{"index":0,"peq":[{"index":0,"coeff":{"b0":"oops","b1":0,"b2":0,"a1":0,"a2":0}}]}]}` returns `400 {"error":"biquad coefficients must include numeric b0/b1/b2/a1/a2 fields"}`, and `GET /devices/0/config` before/after confirmed no PEQ state change.
+- [x] Non-local `--all-local-devices` usage fails with the documented limitation.
+  Verified on 2026-04-12: `cargo +esp run -p minidsp-app -- --all-local-devices --daemon-url ws://192.0.2.251:5380/devices/0/ws status` exits with `Error: --all-local-devices only supports local USB discovery in this implementation`.
+- [x] Unsupported Dirac operations on non-Dirac devices do not break compatibility behavior.
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: `POST /devices/0 {"dirac":true}` returned `200` with `{"dirac":null,"mute":false,"preset":0,"source":"Usb","volume":-20.0}`.
 - [x] Oversized request bodies return `413`.
   Verified on 2026-04-11 on the physical 2x4 HD for ESP32 `POST /devices/0` with a 2KB JSON body exceeding the 1KB handler limit after migrating the handler to `read_request_body`.
 
@@ -411,36 +412,34 @@ This section is mandatory before deleting the compatibility todo.
 - [x] `/api/1/devices/{name}` mutations (gain via `PATCH /api/3/devices/master {"masterVolume":...}`, filter delete via `DELETE /api/1/devices/master/filter/{n}`, commands via `PUT /api/1/devices/master/commands`).
   Verified on 2026-04-11 on the physical 2x4 HD.
 - [x] `/ws` ezBEQ WebSocket
-  Verified on 2026-04-11 on the physical 2x4 HD: initial `Catalogue` message emitted on connect.
-- [ ] UI can load catalogue metadata (blocked on publishing `manifest.json` at `https://averyy.github.io/minidsp-open/`)
-- [ ] UI can load a filter
-- [ ] UI can clear a filter
-- [ ] UI/device state stays in sync with actual MiniDSP state
+  Verified on 2026-04-11 on the physical 2x4 HD: initial `Catalogue` message emitted on connect. Re-verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD after switching the handler over to logged send/recv helpers: the browser UI loaded successfully, `/ws` established its detached sender normally, and Playwright saw no browser-console warnings during page load.
+- [x] UI can load catalogue metadata
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: the live board served the ezBEQ React UI at `/`, the browser loaded 14,750 catalogue rows, and same-origin `GET /database.json` succeeded through the ESP32 proxy instead of depending on a published local `manifest.json`.
+- [x] UI can load a filter
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD with `10 Cloverfield Lane`: browser `PATCH /api/3/devices/master` returned `200`, slot `1` updated to `10 Cloverfield Lane (aron7awol)`, and `GET /devices/0/config` showed the expected non-bypass input PEQ coefficients.
+- [x] UI can clear a filter
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: browser `DELETE /api/1/devices/master/filter/1` returned `200`, slot `1` returned to `Empty`, and `GET /devices/0/config` showed identity PEQ coefficients with `bypass: true` for the cleared input band.
+- [x] UI/device state stays in sync with actual MiniDSP state
+  Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: browser slot state updated immediately after UI upload/clear, `POST /devices/0/measurement-mode` / `/measurement-mode/restore` preserved the loaded filter state while toggling PEQ bypass in `/devices/0/config`, and compat `POST /devices/0/peq/reset` now clears the active ezBEQ slot plus the browser `DeviceState` view while `/devices/0/config` reflects the reset identity PEQ state.
 
 ---
 
 ## Section 9.3: ESP32 ↔ desktop daemon route parity gaps
 
-Discovered 2026-04-11 during comprehensive ESP32 retest. Routes registered
-on `daemon/src/http/routes.rs::router` but not on
-`app-esp32/src/http_server.rs`. Not compatibility regressions (these have
-never been implemented on ESP32), but worth listing so ezBEQ-style clients
-and third-party tooling can see the gap.
+Resolved in code on 2026-04-12. These are no longer missing routes on the
+ESP32 firmware; remaining bench verification for HT/BM or advanced `/config`
+surfaces is tracked in Section 6.2 / Section 7 rather than here.
 
-- [ ] `GET /openapi.json` — desktop daemon serves its generated OpenAPI
-      document. ESP32 currently returns `503` via the UI-fallback path. Low
-      priority (static doc — could be served from LittleFS).
-- [ ] `GET /devices/{id}/bm` — bass management state. Only meaningful on
-      HT 113 / HT 115 families, so 2x4 HD is expected to 404. Missing
-      entirely on ESP32; should register as `501 not supported` on
-      non-HT devices once HT firmware actually ships on ESP32.
-- [ ] `POST /devices/{id}/bm/channel/{ch}` — same caveat as `GET bm`.
-- [ ] `POST /devices/{id}/bm/mixer/{row}/{col}` — same caveat as `GET bm`.
-- [ ] `POST /devices/{id}/peq/reset` — reset all PEQ bands to bypass.
-      Desktop daemon exposes this as `reset_peq_to_defaults`. Worth adding
-      on ESP32 for ezBEQ-style "clear slot" flows.
-- [ ] `GET /devices/{id}/peq/default-frequencies` — returns the default
-      PEQ center frequencies used by the UI. Low priority.
+- [x] `GET /openapi.json` — ESP32 now serves an OpenAPI JSON document instead
+      of falling through to the UI path.
+- [x] `GET /devices/{id}/bm` — ESP32 now registers the route and returns
+      `501 not supported` on non-HT devices.
+- [x] `POST /devices/{id}/bm/channel/{ch}` — implemented on ESP32 with JSON
+      patch parsing and `501 not supported` on non-HT devices.
+- [x] `POST /devices/{id}/bm/mixer/{row}/{col}` — implemented on ESP32 with
+      JSON patch parsing and `501 not supported` on non-HT devices.
+- [x] `POST /devices/{id}/peq/reset` — implemented on ESP32.
+- [x] `GET /devices/{id}/peq/default-frequencies` — implemented on ESP32.
 
 ## Section 10: Doc Closure Review
 
