@@ -539,6 +539,15 @@ These are allowed, but they are not part of the compatibility contract unless la
 - `GET /devices/{id}/config` full config read-back
 - extended `/devices/{id}/config` fields beyond the compatibility request body documented above (including the optional `polarity_inverted` per routing entry on families whose `RoutingMatrix.polarity_base` is populated — DSP_110 Flex Eight, DSP_113 / DSP_115 Flex HT/HTx, legacy DDRC-88BM)
 - measurement-mode endpoints
+- measurement playback endpoints:
+  - `POST /sync` echoes `clientTimeUs` and returns `serverTimeUs` from the same platform clock basis used by `/play.startedAtUs`
+  - desktop currently uses `SystemTime`-derived Unix-epoch microseconds for both values; ESP32 uses the `esp_timer_get_time()` domain, with `/play.startedAtUs` preferring the UAC2 hardware start timestamp and falling back into that same timer domain
+  - `POST /devices/{id}/play` uses the canonical request fields `sweepDurationSec`, `sweepStartHz`, `sweepEndHz`, `sweepFadeSec`, `markerBefore`, `markerAfter`, `markerGapMs`, `markerFrequencyHz`, `markerCycles`, `decaySec`, `sampleRate`, and `bitDepth`
+  - `{}` is the canonical default measurement bundle: fixed `2 s` low-level preamble, one pre-marker, `50 ms` gap, the sweep, `50 ms` gap, one post-marker, and `2 s` decay
+  - omitted `markerBefore`/`markerAfter` default to `true`, omitted `markerCycles` defaults to `1`, and omitted `markerGapMs` defaults to `50`
+  - `markerCycles = 0` disables both marker sections entirely and removes their gaps, even if `markerBefore` / `markerAfter` remain `true`
+  - sweep-only playback is explicit via `{"markerBefore":false,"markerAfter":false}`
+  - legacy nested request fields such as `sweep`, `toneBurst`, `tailToneBurst`, `preambleSec`, and `gapSec` are rejected
 - display endpoints
 - DRE endpoints
 - modification-token endpoints

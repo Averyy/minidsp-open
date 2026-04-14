@@ -56,6 +56,7 @@ pub fn run_playback(
         started_at_us: 0,
         tone_burst_offset_samples: plan.offsets().tone_burst_offset_samples,
         sweep_offset_samples: plan.offsets().sweep_offset_samples,
+        tail_tone_burst_offset_samples: plan.offsets().tail_tone_burst_offset_samples,
         total_samples: plan.offsets().total_samples,
         sample_rate: plan.request.sample_rate,
         source_changed,
@@ -170,7 +171,7 @@ impl PlaybackLifecycle {
     }
 }
 
-fn server_time_us() -> i64 {
+pub(crate) fn server_time_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)

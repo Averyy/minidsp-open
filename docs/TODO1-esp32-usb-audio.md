@@ -109,9 +109,10 @@ Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a
 - The shared `/play` default has now been updated to match REW/MSO-style measurement conventions instead of the old measurement bundle:
   - in code, the default request is now a `5-400 Hz`, `5.46 s`, `16-bit` sweep with `2 s` low-level dither pre-silence, `2 s` post-silence, and `20 ms` raised-cosine fade-in/out
   - when the sweep starts below `10 Hz`, the generator follows REW's hybrid behavior: linear chirp from `5 Hz` to `10 Hz`, then logarithmic from `10 Hz` to `400 Hz`
-  - desktop direct-USB verification confirmed the current shared default reaches the physical 2x4 HD cleanly with `toneBurstOffsetSamples=96000`, `sweepOffsetSamples=96000`, and `totalSamples=454058` while keeping source/routing unchanged before and after playback
+  - the canonical public request shape is now marker-aware: `{}` means `toneBurstOffsetSamples=96000`, `sweepOffsetSamples=99000`, `tailToneBurstOffsetSamples=363458`, and `totalSamples=460058`; sweep-only playback is explicit via `{"markerBefore":false,"markerAfter":false}` and returns `totalSamples=454058`
+  - desktop direct-USB verification on the physical 2x4 HD confirmed the sweep-only path, marker-only diagnostic path, and combined default marker+sweep path all sound clean on the real sub route
   - the older measurement-bundle default (`5-500 Hz` with BRAP bursts) remains retired as historical context only
-  - the remaining question is audible quality on the real sub, not whether the old measurement-bundle default should be defended
+  - the remaining question is ESP32-path runtime signoff against the same contract, not whether the old measurement-bundle default should be defended
 - The ESP32 `/play` blip regression that was tracked in `PROGRESS.md` as "periodic audio dropouts (~3 blips per 3 seconds)" is now fixed on the physical 2x4 HD (2026-04-10):
   - root cause was system environment, not the data pipeline: the UAC2 driver task that runs `stream_tx_xfer_submit` every isochronous frame was pinned to core `0` alongside WiFi, mDNS, UDP discovery, HID, HTTP, and the periodic updater/diagnostics tasks
   - `UAC2_TASK_CORE` moved from `0` to `1` in `app-esp32/src/usb_audio.rs` so the UAC2 driver task and its TX transfer callbacks run on core `1`, away from core-`0` interference
@@ -166,23 +167,31 @@ Goal: explain and, if possible, eliminate the remaining gap between nominal sign
 
 ## Definition of Done
 
+Interpretation note for the checklists below:
+
+- `[x]` means the behavior is implemented and either enforced by code/tests or already backed by earlier live evidence called out in this doc / `PROGRESS.md`
+- `[ ]` means the current contract still needs explicit runtime signoff for the present shared default and marker-enabled profiles
+
+So the unchecked items below are the real remaining work; the checked items should not be read as fresh end-to-end hardware proof from this particular diff.
+
 The feature is complete when:
 - [ ] `curl -X POST http://<esp32>:5380/devices/0/play` plays the current default shared sweep through the miniDSP's analog outputs
 - [x] A single `0x13` route-enable written by our code on DSP100 / 2x4 HD is enough to make USB playback audible on the targeted output, without requiring the official app as a follow-up step
   - confirmed live on 2026-04-09 on physical output `3` after the shared HID echo-decoder fix
-- [ ] The response arrives within ~200ms (before playback finishes) and contains a real `startedAtUs` hardware timestamp plus correct sample offsets
-- [ ] `curl -X POST http://<esp32>:5380/sync -d '{"clientTimeUs":0}'` returns an ESP32 timestamp (works with or without a miniDSP connected)
+- [ ] The response arrives before playback finishes and within the current documented startup window (about `0.35 s` already on `Usb`, about `0.4-0.5 s` when `/play` first switches from `Toslink` to `Usb`) and contains a real `startedAtUs` hardware timestamp plus correct sample offsets
+- [x] `curl -X POST http://<esp32>:5380/sync -d '{"clientTimeUs":0}'` returns an ESP32 timestamp (works with or without a miniDSP connected)
 - [ ] HID control (volume, mute, config, etc.) continues working normally during and after audio playback
+  - post-play HID recovery is already verified; concurrent HID polling during playback still needs final signoff
 - [ ] Audio playback at the current documented default parameters has no audible glitches over the full sweep duration
 - [ ] The default or documented subwoofer `/play` profile sounds like a normal smooth low-frequency sweep on the real sub, not a bursty `BRAP` pattern
 - [ ] USB disconnect mid-playback doesn't crash — cleans up gracefully
-- [ ] The sweep generator has desktop unit tests (`cargo test` in the workspace, no ESP32 needed)
+- [x] The sweep generator has desktop unit tests (`cargo test` in the workspace, no ESP32 needed)
 - [ ] The firmware builds and boots cleanly with zero new warnings
 - [x] Back-to-back plays work: sweep finishes, immediately `POST /play` again — full stop→cleanup→re-init cycle succeeds
 - [x] Play then HID: after a sweep completes, `GET /devices/0/config` and other HID commands still work correctly
 - [x] Heap survives playback: free heap doesn't drop dangerously low with WiFi + HTTP + HID + UAC2 all active (log free heap before/during/after)
-- [ ] HID-only device: `POST /play` on a device without USB audio (e.g., 2x4 non-HD) returns a clear error, not a crash or hang
-- [ ] Malformed requests: empty body uses defaults, garbage JSON returns 400, missing Content-Type is handled gracefully
+- [x] HID-only device: `POST /play` on a device without USB audio (e.g., 2x4 non-HD) returns a clear error, not a crash or hang
+- [x] Malformed requests: empty body uses defaults, garbage JSON returns 400, missing Content-Type is handled gracefully
 - [ ] Sample rate switch between plays: play at 48kHz, then play at 44.1kHz — clock reconfiguration works
 - [x] ESP32 already running with no device, then MiniDSP appears later: `/devices`, `/sync`, and `/play` all recover
 - [x] ESP32 reboot with MiniDSP off, then MiniDSP appears later: `/devices`, `/sync`, and `/play` all recover
@@ -384,17 +393,20 @@ Total: ~9.5 seconds at 48kHz = ~454,058 samples after zero-crossing truncation o
 x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
 ```
 
-**Default parameters** (overridable via API):
-- `f1 = 5 Hz`
-- `f2 = 400 Hz`
-- `duration = 5.46 seconds` (REW-style `256k` sweep window at `48 kHz`, rounded in the API docs)
-- `fs = 48000 Hz`
+**Canonical default signal shape**:
+- `sweepStartHz = 5`
+- `sweepEndHz = 400`
+- `sweepDurationSec = 5.46` (REW-style `256k` sweep window at `48 kHz`, rounded in the API docs)
+- `sampleRate = 48000`
 - `bitDepth = 16`
-- `preambleSec = 2.0` (`-60 dBFS` dither for device lock-in, matching REW)
-- `toneBurst.cycles = 0`
-- `gapSec = 0`
+- fixed preamble: `2.0 s` of `-60 dBFS` dither for device lock-in, matching REW
+- `markerBefore = true`
+- `markerAfter = true`
+- `markerFrequencyHz = 80`
+- `markerCycles = 1`
+- `markerGapMs = 50`
 - `decaySec = 2.0` (clean post-silence)
-- `fadeDuration = 0.02 seconds` on both ends (raised-cosine envelope)
+- `sweepFadeSec = 0.02` on both ends (raised-cosine envelope)
 - hybrid sweep mode below `10 Hz`: linear `5-10 Hz`, then logarithmic `10-400 Hz`
 
 **REW comparison note:** the current shared `/play` default is now intentionally aligned with REW/MSO measurement conventions: low-level dither before the sweep, a hybrid linear+log sweep below `20 Hz`, and a clean post-silence tail. The old measurement-bundle default with `BRAP` bursts stays retired; callers that want a different profile should request it explicitly instead of relying on hidden expansion or marker sections.
@@ -419,7 +431,17 @@ x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
 
 **Preamble**: supported via API and enabled by default as low-level dither so the device locks in the same way REW does.
 
-**Tone burst**: supported via API, but disabled by default for the same reason.
+**Tone burst / markers**: the public `/play` request shape is now `sweepDurationSec`, `sweepStartHz`, `sweepEndHz`, `sweepFadeSec`, `markerBefore`, `markerAfter`, `markerGapMs`, `markerFrequencyHz`, `markerCycles`, `decaySec`, `sampleRate`, and `bitDepth`. Older nested request fields such as `sweep`, `toneBurst`, and `tailToneBurst` are intentionally rejected.
+
+**Default semantics**:
+- `{}` now means the canonical measurement bundle: fixed `2 s` low-level preamble, pre-marker enabled, `50 ms` pre-marker gap, sweep, `50 ms` post-marker gap, post-marker enabled, and `2 s` decay
+- omitted `markerBefore`/`markerAfter` default to `true`
+- omitted `markerCycles` defaults to `1`
+- omitted `markerGapMs` defaults to `50`
+- `markerCycles = 0` disables both marker sections entirely and removes their gaps, even if `markerBefore` / `markerAfter` are `true`
+- `markerGapMs` applies both between the pre-marker and the sweep, and between the sweep and the post-marker
+- `markerGapMs` is constrained to `0..=2000`
+- sweep-only playback is requested explicitly with `{"markerBefore":false,"markerAfter":false}`
 
 **PCM encoding:**
 - 24-bit: pack each `f32` sample as 3 bytes little-endian (multiply by 2^23 - 1, clamp, take lower 3 bytes)
@@ -428,7 +450,7 @@ x(t) = sin(2pi * f1 * T / ln(f2/f1) * (exp(t * ln(f2/f1) / T) - 1))
 
 **Acceptance criteria:**
 - [ ] A module (`app-esp32/src/sweep_gen.rs`) that generates the complete signal
-- [ ] Configurable parameters: f1, f2, duration, fade, tone burst frequency/cycles, preamble/gap/decay durations, sample rate, bit depth
+- [ ] Configurable parameters: sweep band/duration/fade, marker enable/frequency/cycles/gap, decay, sample rate, bit depth
 - [ ] Produces PCM bytes on demand (iterator/callback pattern, not allocating the entire signal)
 - [ ] 16-bit stereo PCM at 48kHz by default
 - [ ] Total sample count is deterministic and known before generation starts
@@ -444,43 +466,46 @@ POST /devices/{deviceIndex}/play
 Content-Type: application/json
 
 {
-  "sweep": {
-    "f1": 5,
-    "f2": 400,
-    "duration": 5.46,
-    "fadeDuration": 0.02
-  },
-  "toneBurst": {
-    "frequency": 80,
-    "cycles": 0
-  },
-  "preambleSec": 2,
-  "gapSec": 0,
+  "sweepDurationSec": 5.46,
+  "sweepStartHz": 5,
+  "sweepEndHz": 400,
+  "sweepFadeSec": 0.02,
+  "markerBefore": true,
+  "markerAfter": true,
+  "markerGapMs": 50,
+  "markerFrequencyHz": 80,
+  "markerCycles": 1,
   "decaySec": 2,
   "sampleRate": 48000,
   "bitDepth": 16
 }
 ```
 
-All fields are optional — use defaults above when omitted.
+All fields are optional.
+
+- `{}` plays the canonical default measurement bundle shown above.
+- Sweep-only playback is `{"markerBefore":false,"markerAfter":false}`.
+- Legacy nested request fields (`sweep`, `toneBurst`, `tailToneBurst`, `preambleSec`, `gapSec`) are rejected with `400`.
 
 **Response** (returned after playback starts, not after it finishes):
 ```json
 {
   "startedAtUs": 1719482837291456,
   "toneBurstOffsetSamples": 96000,
-  "sweepOffsetSamples": 96000,
-  "totalSamples": 454058,
+  "sweepOffsetSamples": 99000,
+  "tailToneBurstOffsetSamples": 363458,
+  "totalSamples": 460058,
   "sampleRate": 48000,
   "sourceChanged": true,
-  "previousSource": "toslink"
+  "previousSource": "Toslink"
 }
 ```
 
 - `startedAtUs` — from `uac2_host_device_get_start_time()`, the ESP32 `esp_timer_get_time()` value when the first isochronous URB was submitted. Microsecond precision.
-- `toneBurstOffsetSamples` — sample index where tone burst begins (= preamble_samples)
-- `sweepOffsetSamples` — sample index where sweep begins (= preamble + tone_burst + gap samples)
-- `totalSamples` — total signal length in samples (reflects zero-crossing-truncated sweep length)
+- `toneBurstOffsetSamples` — sample index of the pre-marker slot immediately after the preamble; when `markerBefore` is enabled and `markerCycles > 0`, the pre-marker begins here
+- `sweepOffsetSamples` — sample index where the sweep begins (= preamble + optional pre-marker + optional pre-marker gap)
+- `tailToneBurstOffsetSamples` — sample index where the optional post-sweep marker begins. Omitted when no post-marker is enabled, including `markerCycles = 0`.
+- `totalSamples` — total signal length in samples (reflects zero-crossing-truncated sweep length, any configured marker gaps, optional markers, and decay)
 - `sourceChanged` — `true` if `/play` switched the device source to USB, `false` if it was already on USB
 - `previousSource` — the source that was active before `/play` switched (only present when `sourceChanged` is `true`). Source will be restored after playback completes.
 
@@ -514,20 +539,23 @@ All fields are optional — use defaults above when omitted.
 - If the USB device disconnects mid-playback, the write calls will fail — clean up gracefully (clear `playing`, skip source restore).
 
 **Acceptance criteria:**
+
+These checkboxes mix implementation-level completion and runtime signoff. For the current remaining work, treat the unchecked items in this section as the live validation backlog.
+
 - [ ] `POST /devices/{id}/play` with default parameters plays the documented shared default sweep through the miniDSP's audio interface
 - [ ] The default parameters are actually suitable for subwoofer measurement sanity checks on real hardware, not just mathematically convenient
-- [ ] Response is returned within ~200ms of the request (not 12 seconds later)
-- [ ] `startedAtUs` value is a real ESP32 hardware timer reading, not a fake timestamp
-- [ ] `toneBurstOffsetSamples` and `sweepOffsetSamples` are correct (match the actual signal structure)
-- [ ] Concurrent requests return 409 Conflict
-- [ ] Request on a device where `has_usb_audio` is `false` returns 400 ("device does not support USB audio playback")
-- [ ] Request with `has_usb_audio: true` but no UAC2 connection returns 503 Service Unavailable
-- [ ] Source auto-switch: if device is not on USB source, `/play` switches to USB before playback and restores the previous source after completion
-- [ ] Source auto-switch: `sourceChanged` and `previousSource` are correct in the response
-- [ ] Source auto-switch: if device is already on USB, no switch occurs and `sourceChanged` is `false`
-- [ ] Audio plays at 48kHz (default), not at `DeviceProfile.sample_rate`
-- [ ] Playback completes and cleans up (stops stream, restores source, clears `playing` flag)
-- [ ] Custom parameters (e.g., different f1/f2, different duration) are honored
+- [ ] Response is returned before playback finishes and within the current documented startup window (about `0.35 s` already on `Usb`, about `0.4-0.5 s` when `/play` first switches to `Usb`)
+- [x] `startedAtUs` value is a real ESP32 hardware timer reading, not a fake timestamp
+- [x] `toneBurstOffsetSamples`, `sweepOffsetSamples`, and `tailToneBurstOffsetSamples` (when enabled) are correct and match the actual signal structure
+- [x] Concurrent requests return 409 Conflict
+- [x] Request on a device where `has_usb_audio` is `false` returns 400 ("device does not support USB audio playback")
+- [x] Request with `has_usb_audio: true` but no UAC2 connection returns 503 Service Unavailable
+- [x] Source auto-switch: if device is not on USB source, `/play` switches to USB before playback and restores the previous source after completion
+- [x] Source auto-switch: `sourceChanged` and `previousSource` are correct in the response
+- [x] Source auto-switch: if device is already on USB, no switch occurs and `sourceChanged` is `false`
+- [x] Audio plays at 48kHz (default), not at `DeviceProfile.sample_rate`
+- [x] Playback completes and cleans up (stops stream, restores source, clears `playing` flag)
+- [x] Custom parameters (e.g., different f1/f2, different duration) are honored
 
 ### Task 6: POST /sync endpoint
 
@@ -552,10 +580,13 @@ Content-Type: application/json
 `serverTimeUs` is `esp_timer_get_time()` — same clock as `startedAtUs` from the play endpoint.
 
 **Acceptance criteria:**
+
+The unchecked timing target below is still a runtime signoff item; the checked items only confirm the implemented clock semantics.
+
 - [ ] `POST /sync` returns within <5ms (it's just a clock read)
-- [ ] `serverTimeUs` is a real `esp_timer_get_time()` value
-- [ ] `clientTimeUs` is echoed back unchanged
-- [ ] Works without any USB device connected (it's just a clock endpoint)
+- [x] `serverTimeUs` is a real `esp_timer_get_time()` value
+- [x] `clientTimeUs` is echoed back unchanged
+- [x] Works without any USB device connected (it's just a clock endpoint)
 
 ## USB Audio + HID Coexistence
 

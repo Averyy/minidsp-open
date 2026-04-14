@@ -116,6 +116,9 @@ impl AudioState {
             .as_ref()
             .is_some_and(|device| device.handle_ptr() == handle);
         if should_clear {
+            if let Some(device) = slot.as_ref() {
+                device.mark_disconnected();
+            }
             *self.connected_flag.lock().unwrap() = false;
             slot.take()
         } else {
@@ -246,6 +249,7 @@ impl std::error::Error for UsbAudioError {}
 
 pub struct Uac2Device {
     handle: Mutex<uac2_host_device_handle_t>,
+    connected: AtomicBool,
 }
 
 unsafe impl Send for Uac2Device {}
@@ -255,11 +259,20 @@ impl Uac2Device {
     fn new(handle: uac2_host_device_handle_t) -> Self {
         Self {
             handle: Mutex::new(handle),
+            connected: AtomicBool::new(true),
         }
     }
 
     pub fn handle_ptr(&self) -> uac2_host_device_handle_t {
         *self.handle.lock().unwrap()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst) && !self.handle_ptr().is_null()
+    }
+
+    fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::SeqCst);
     }
 
     pub fn start_stream(&self, sample_rate: u32, bit_depth: BitDepth) -> Result<(), UsbAudioError> {
@@ -383,9 +396,12 @@ impl Uac2Device {
         }
 
         let current = *handle;
+        let was_connected = self.connected.swap(false, Ordering::SeqCst);
         *handle = ptr::null_mut();
         unsafe {
-            let _ = uac2_host_device_stop(current);
+            if was_connected {
+                let _ = uac2_host_device_stop(current);
+            }
             esp_ok(uac2_host_device_close(current))
                 .map_err(|e| UsbAudioError::Stop(format!("uac2_host_device_close: {e}")))
         }

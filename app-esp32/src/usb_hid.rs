@@ -845,7 +845,10 @@ impl UsbHidBus {
             self.retire_inflight_endpoints(dev_hdl, "cleanup");
         } else {
             debug!("USB cleanup: waiting for endpoint callbacks after DEV_GONE");
-            self.wait_for_inflight_endpoints_to_quiesce(DEV_GONE_DRAIN_TIMEOUT, "cleanup after DEV_GONE");
+            self.wait_for_inflight_endpoints_to_quiesce(
+                DEV_GONE_DRAIN_TIMEOUT,
+                "cleanup after DEV_GONE",
+            );
         }
 
         let mut release_err = ESP_OK as i32;
@@ -973,7 +976,9 @@ fn wait_and_open_device(
             }
         };
         saw_new_event = true;
-        if let Some(device) = open_device_at_addr_when_settled(client_hdl, dev_addr, "new-dev event")? {
+        if let Some(device) =
+            open_device_at_addr_when_settled(client_hdl, dev_addr, "new-dev event")?
+        {
             return Ok(device);
         }
     } // end loop

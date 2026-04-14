@@ -2711,6 +2711,7 @@ fn run_playback_thread(
             start.response.previous_source = previous_source.clone();
             start
         });
+    let allow_source_restore;
 
     match start_result {
         Ok(start) => {
@@ -2735,6 +2736,7 @@ fn run_playback_thread(
             // Max 10ms chunk: 480 frames × 2ch × 3 bytes (24-bit) = 2880.
             let mut sram_buf = [0u8; 2880];
             let mut pos = start.first_write_bytes;
+            let mut stream_failed = false;
             while pos < pcm_data.len() {
                 let end = (pos + chunk_bytes).min(pcm_data.len());
                 let len = end - pos;
@@ -2742,6 +2744,7 @@ fn run_playback_thread(
                 let write_started_us = usb_audio::server_time_us();
                 if let Err(err) = audio_device.write(&sram_buf[..len], 250) {
                     warn!("playback stream failed: {err}");
+                    stream_failed = true;
                     break;
                 }
                 let write_elapsed_us = usb_audio::server_time_us() - write_started_us;
@@ -2762,14 +2765,11 @@ fn run_playback_thread(
                 }
             }
 
-            let fb_raw = audio_device.feedback_raw();
-            let fb_hz = fb_raw >> 16;
-            let fb_frac = ((fb_raw & 0xFFFF) as u64 * 10000) / 65536;
-            info!("USB feedback at end of playback: raw=0x{fb_raw:08x} ({fb_hz}.{fb_frac:04} Hz)");
+            let stream_connected = audio_device.is_connected();
+            allow_source_restore = !stream_failed && stream_connected;
+            log_audio_feedback_if_connected(&audio_device, "playback");
             let stop_started_us = usb_audio::server_time_us();
-            if let Err(err) = audio_device.stop_stream() {
-                warn!("UAC2 stop failed after playback: {err}");
-            }
+            stop_audio_stream_if_connected(&audio_device, "playback");
             let stop_finished_us = usb_audio::server_time_us();
             let (
                 write_min_us,
@@ -2800,23 +2800,51 @@ fn run_playback_thread(
             );
         }
         Err(err) => {
+            allow_source_restore = false;
             let _ = started_tx.send(Err(err));
         }
     }
 
-    if let Some(source) = restore_source {
-        if let Some(index) = dev.profile().sources.index_for_source(source) {
-            let _op = dev.begin_operation();
-            if let Err(err) = dev.set_source(index) {
-                warn!("failed to restore source after playback: {err}");
-            } else {
-                info!("restored source after playback to {}", source);
+    if allow_source_restore {
+        if let Some(source) = restore_source {
+            if let Some(index) = dev.profile().sources.index_for_source(source) {
+                let _op = dev.begin_operation();
+                if let Err(err) = dev.set_source(index) {
+                    warn!("failed to restore source after playback: {err}");
+                } else {
+                    info!("restored source after playback to {}", source);
+                }
             }
         }
+    } else if restore_source.is_some() {
+        warn!("skipping source restore after interrupted or disconnected playback");
     }
 
     audio_state.finish_playback();
     // _wifi_ps guard restores WiFi PS on drop
+}
+
+fn log_audio_feedback_if_connected(audio_device: &usb_audio::Uac2Device, context: &str) {
+    if !audio_device.is_connected() {
+        warn!("{context}: skipping USB feedback read after disconnect");
+        return;
+    }
+
+    let fb_raw = audio_device.feedback_raw();
+    let fb_hz = fb_raw >> 16;
+    let fb_frac = ((fb_raw & 0xFFFF) as u64 * 10000) / 65536;
+    info!("USB feedback at end of {context}: raw=0x{fb_raw:08x} ({fb_hz}.{fb_frac:04} Hz)");
+}
+
+fn stop_audio_stream_if_connected(audio_device: &usb_audio::Uac2Device, context: &str) {
+    if !audio_device.is_connected() {
+        warn!("{context}: skipping UAC2 stop after disconnect");
+        return;
+    }
+
+    if let Err(err) = audio_device.stop_stream() {
+        warn!("UAC2 stop failed after {context}: {err}");
+    }
 }
 
 /// Inline sine test: generates sin(2πft) on the stack and writes to USB
@@ -2869,7 +2897,7 @@ fn run_inline_sine_test(
     for _ in 0..PREFILL_CHUNKS {
         fill_sine_16bit_stereo(&mut buf, &mut phase, phase_inc, AMPLITUDE);
         if let Err(err) = audio_device.write(&buf, PREFILL_WRITE_TIMEOUT_MS) {
-            let _ = audio_device.stop_stream();
+            stop_audio_stream_if_connected(&audio_device, "inline sine prefill");
             let _ = started_tx.send(Err(format!("prefill write: {err}")));
             audio_state.finish_playback();
             return;
@@ -2877,9 +2905,13 @@ fn run_inline_sine_test(
     }
 
     // Wait for stream to actually start (first SOF)
-    let mut started_at_us = audio_device.start_time_us();
+    let mut started_at_us = if audio_device.is_connected() {
+        audio_device.start_time_us()
+    } else {
+        0
+    };
     for _ in 0..20 {
-        if started_at_us != 0 {
+        if started_at_us != 0 || !audio_device.is_connected() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2893,6 +2925,7 @@ fn run_inline_sine_test(
         started_at_us,
         tone_burst_offset_samples: 0,
         sweep_offset_samples: 0,
+        tail_tone_burst_offset_samples: None,
         total_samples: FRAMES_PER_CHUNK * (TOTAL_CHUNKS + PREFILL_CHUNKS) as usize,
         sample_rate: SAMPLE_RATE,
         source_changed,
@@ -2902,6 +2935,7 @@ fn run_inline_sine_test(
     // Tight write loop — generate inline, write immediately
     let stream_start_us = usb_audio::server_time_us();
     let mut writes: u32 = 0;
+    let mut stream_failed = false;
     for _ in 0..TOTAL_CHUNKS {
         fill_sine_16bit_stereo(&mut buf, &mut phase, phase_inc, AMPLITUDE);
         match write_audio_chunk_with_retry(
@@ -2915,38 +2949,38 @@ fn run_inline_sine_test(
             Ok(()) => writes += 1,
             Err(err) => {
                 warn!("inline sine write failed at chunk {writes}: {err}");
+                stream_failed = true;
                 break;
             }
         }
     }
     let stream_elapsed_ms = (usb_audio::server_time_us() - stream_start_us) / 1000;
 
-    let fb_raw = audio_device.feedback_raw();
-    let fb_hz = fb_raw >> 16;
-    let fb_frac = ((fb_raw & 0xFFFF) as u64 * 10000) / 65536;
+    let stream_connected = audio_device.is_connected();
+    let allow_source_restore = !stream_failed && stream_connected;
+    log_audio_feedback_if_connected(&audio_device, "inline sine");
     info!(
-        "inline sine test complete: {} writes in {} ms, feedback=0x{:08x} ({}.{:04} Hz), tx_need_data={}",
+        "inline sine test complete: {} writes in {} ms, tx_need_data={}",
         writes,
         stream_elapsed_ms,
-        fb_raw,
-        fb_hz,
-        fb_frac,
         usb_audio::tx_need_data_count()
     );
 
-    if let Err(err) = audio_device.stop_stream() {
-        warn!("UAC2 stop failed after sine test: {err}");
-    }
+    stop_audio_stream_if_connected(&audio_device, "inline sine");
 
-    if let Some(source) = restore_source {
-        if let Some(index) = dev.profile().sources.index_for_source(source) {
-            let _op = dev.begin_operation();
-            if let Err(err) = dev.set_source(index) {
-                warn!("failed to restore source after sine test: {err}");
-            } else {
-                info!("restored source after sine test to {}", source);
+    if allow_source_restore {
+        if let Some(source) = restore_source {
+            if let Some(index) = dev.profile().sources.index_for_source(source) {
+                let _op = dev.begin_operation();
+                if let Err(err) = dev.set_source(index) {
+                    warn!("failed to restore source after sine test: {err}");
+                } else {
+                    info!("restored source after sine test to {}", source);
+                }
             }
         }
+    } else if restore_source.is_some() {
+        warn!("skipping source restore after interrupted or disconnected sine test");
     }
 
     audio_state.finish_playback();
@@ -3062,6 +3096,7 @@ fn start_playback_pregenerated(
             started_at_us,
             tone_burst_offset_samples: plan.offsets().tone_burst_offset_samples,
             sweep_offset_samples: plan.offsets().sweep_offset_samples,
+            tail_tone_burst_offset_samples: plan.offsets().tail_tone_burst_offset_samples,
             total_samples: plan.offsets().total_samples,
             sample_rate: plan.request.sample_rate,
             source_changed: false,

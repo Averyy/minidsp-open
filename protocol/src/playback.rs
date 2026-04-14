@@ -14,6 +14,9 @@ const DEFAULT_SWEEP_DURATION_SEC: f32 = 5.46;
 const DEFAULT_FADE_DURATION_SEC: f32 = 0.02;
 const DEFAULT_TONE_FREQUENCY_HZ: f32 = 80.0;
 const DEFAULT_TONE_CYCLES: f32 = 0.0;
+const DEFAULT_MARKER_CYCLES: f32 = 1.0;
+const DEFAULT_MARKER_GAP_MS: u32 = 50;
+const DEFAULT_TONE_FADE_OUT_SEC: f32 = 0.005;
 const DEFAULT_PREAMBLE_SEC: f32 = 2.0;
 const DEFAULT_GAP_SEC: f32 = 0.0;
 const DEFAULT_DECAY_SEC: f32 = 2.0;
@@ -104,34 +107,64 @@ impl Default for ToneBurstParams {
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "std", serde(rename_all = "camelCase", deny_unknown_fields))]
 pub struct PlayRequest {
-    #[cfg_attr(feature = "std", serde(default))]
-    pub sweep: SweepParams,
-    #[cfg_attr(feature = "std", serde(default))]
-    pub tone_burst: ToneBurstParams,
-    #[cfg_attr(feature = "std", serde(default = "default_preamble_sec"))]
-    pub preamble_sec: f32,
-    #[cfg_attr(feature = "std", serde(default = "default_gap_sec"))]
-    pub gap_sec: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_sweep_duration_sec"))]
+    pub sweep_duration_sec: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_f1_hz"))]
+    pub sweep_start_hz: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_f2_hz"))]
+    pub sweep_end_hz: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_fade_duration_sec"))]
+    pub sweep_fade_sec: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_marker_enabled"))]
+    pub marker_before: bool,
+    #[cfg_attr(feature = "std", serde(default = "default_marker_enabled"))]
+    pub marker_after: bool,
+    #[cfg_attr(feature = "std", serde(default = "default_marker_gap_ms"))]
+    pub marker_gap_ms: u32,
+    #[cfg_attr(feature = "std", serde(default = "default_tone_frequency_hz"))]
+    pub marker_frequency_hz: f32,
+    #[cfg_attr(feature = "std", serde(default = "default_marker_cycles"))]
+    pub marker_cycles: f32,
     #[cfg_attr(feature = "std", serde(default = "default_decay_sec"))]
     pub decay_sec: f32,
     #[cfg_attr(feature = "std", serde(default = "default_sample_rate_hz"))]
     pub sample_rate: u32,
     #[cfg_attr(feature = "std", serde(default))]
     pub bit_depth: BitDepth,
+    #[cfg_attr(feature = "std", serde(skip))]
+    pub resolved_sweep: SweepParams,
+    #[cfg_attr(feature = "std", serde(skip))]
+    pub resolved_tone_burst: ToneBurstParams,
+    #[cfg_attr(feature = "std", serde(skip))]
+    pub resolved_tail_tone_burst: Option<ToneBurstParams>,
+    #[cfg_attr(feature = "std", serde(skip))]
+    pub resolved_preamble_sec: f32,
+    #[cfg_attr(feature = "std", serde(skip))]
+    pub resolved_gap_sec: f32,
 }
 
 impl Default for PlayRequest {
     fn default() -> Self {
         Self {
-            sweep: SweepParams::default(),
-            tone_burst: ToneBurstParams::default(),
-            preamble_sec: DEFAULT_PREAMBLE_SEC,
-            gap_sec: DEFAULT_GAP_SEC,
+            sweep_duration_sec: DEFAULT_SWEEP_DURATION_SEC,
+            sweep_start_hz: DEFAULT_F1_HZ,
+            sweep_end_hz: DEFAULT_F2_HZ,
+            sweep_fade_sec: DEFAULT_FADE_DURATION_SEC,
+            marker_before: true,
+            marker_after: true,
+            marker_gap_ms: default_marker_gap_ms(),
+            marker_frequency_hz: DEFAULT_TONE_FREQUENCY_HZ,
+            marker_cycles: DEFAULT_MARKER_CYCLES,
             decay_sec: DEFAULT_DECAY_SEC,
             sample_rate: DEFAULT_SAMPLE_RATE_HZ,
             bit_depth: BitDepth::default(),
+            resolved_sweep: SweepParams::default(),
+            resolved_tone_burst: ToneBurstParams::default(),
+            resolved_tail_tone_burst: None,
+            resolved_preamble_sec: DEFAULT_PREAMBLE_SEC,
+            resolved_gap_sec: DEFAULT_GAP_SEC,
         }
     }
 }
@@ -143,6 +176,8 @@ pub struct PlayResponse {
     pub started_at_us: i64,
     pub tone_burst_offset_samples: usize,
     pub sweep_offset_samples: usize,
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
+    pub tail_tone_burst_offset_samples: Option<usize>,
     pub total_samples: usize,
     pub sample_rate: u32,
     pub source_changed: bool,
@@ -169,6 +204,7 @@ pub struct SyncResponse {
 pub struct PlaybackOffsets {
     pub tone_burst_offset_samples: usize,
     pub sweep_offset_samples: usize,
+    pub tail_tone_burst_offset_samples: Option<usize>,
     pub total_samples: usize,
 }
 
@@ -197,6 +233,8 @@ pub struct PlaybackPlan {
     pub tone_burst_samples: usize,
     pub gap_samples: usize,
     pub sweep_samples: usize,
+    pub tail_marker_gap_samples: usize,
+    pub tail_tone_burst_samples: usize,
     pub decay_samples: usize,
     /// When f1 < 10 Hz, the sweep starts with a linear section from f1 to
     /// LINEAR_LOG_CROSSOVER_HZ, then switches to logarithmic. This field
@@ -206,13 +244,21 @@ pub struct PlaybackPlan {
     pub log_start_hz: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedPlayRequest {
+    request: PlayRequest,
+    tail_marker_gap_sec: f32,
+}
+
 impl PlaybackPlan {
     pub fn build(request: PlayRequest) -> Result<Self, PlaybackError> {
+        let resolved = resolve_play_request(request)?;
+        let request = resolved.request;
         validate_request(&request)?;
 
         let sample_rate = request.sample_rate as f32;
-        let sweep_f1 = request.sweep.f1;
-        let sweep_f2 = request.sweep.f2.min(sample_rate * 0.5);
+        let sweep_f1 = request.resolved_sweep.f1;
+        let sweep_f2 = request.resolved_sweep.f2.min(sample_rate * 0.5);
         if sweep_f1 >= sweep_f2 {
             return Err(PlaybackError::InvalidSweepRange { sweep_f1, sweep_f2 });
         }
@@ -230,20 +276,22 @@ impl PlaybackPlan {
                 let total_weight = linear_weight + log_octaves;
                 let linear_fraction = linear_weight / total_weight;
                 let linear_samples =
-                    (request.sweep.duration * linear_fraction * request.sample_rate as f32).round()
-                        as usize;
+                    (request.resolved_sweep.duration * linear_fraction
+                        * request.sample_rate as f32)
+                        .round() as usize;
                 (linear_samples, LINEAR_LOG_CROSSOVER_HZ)
             } else {
                 (0, sweep_f1)
             };
 
         let log_duration =
-            request.sweep.duration - linear_section_samples as f32 / request.sample_rate as f32;
-        let raw_sweep_samples = seconds_to_samples(request.sweep.duration, request.sample_rate);
+            request.resolved_sweep.duration - linear_section_samples as f32 / request.sample_rate as f32;
+        let raw_sweep_samples =
+            seconds_to_samples(request.resolved_sweep.duration, request.sample_rate);
 
         let sweep_samples = find_truncated_sweep_len(
             raw_sweep_samples,
-            request.sweep.duration,
+            request.resolved_sweep.duration,
             sweep_f1,
             sweep_f2,
             linear_section_samples,
@@ -266,9 +314,17 @@ impl PlaybackPlan {
             raw_sweep_samples,
             sweep_phase_scale,
             sweep_ratio_step,
-            preamble_samples: seconds_to_samples(request.preamble_sec, request.sample_rate),
-            tone_burst_samples: tone_burst_samples(&request),
-            gap_samples: seconds_to_samples(request.gap_sec, request.sample_rate),
+            preamble_samples: seconds_to_samples(request.resolved_preamble_sec, request.sample_rate),
+            tone_burst_samples: tone_burst_samples(request.resolved_tone_burst, request.sample_rate),
+            gap_samples: seconds_to_samples(request.resolved_gap_sec, request.sample_rate),
+            tail_marker_gap_samples: seconds_to_samples(
+                resolved.tail_marker_gap_sec,
+                request.sample_rate,
+            ),
+            tail_tone_burst_samples: tone_burst_samples(
+                request.resolved_tail_tone_burst.unwrap_or_default(),
+                request.sample_rate,
+            ),
             decay_samples: seconds_to_samples(request.decay_sec, request.sample_rate),
             sweep_samples,
             sweep_f1,
@@ -279,16 +335,74 @@ impl PlaybackPlan {
         })
     }
 
+    pub fn diagnostic_tail_marker(
+        tone: ToneBurstParams,
+        sample_rate: u32,
+        bit_depth: BitDepth,
+        decay_sec: f32,
+    ) -> Result<Self, PlaybackError> {
+        if sample_rate == 0 {
+            return Err(PlaybackError::InvalidRequest("sampleRate must be > 0"));
+        }
+        if decay_sec < 0.0 {
+            return Err(PlaybackError::InvalidRequest(
+                "segment durations must be >= 0",
+            ));
+        }
+        validate_tone_burst(
+            tone,
+            "markerCycles must be >= 0",
+            "markerFrequencyHz must be > 0 when markerCycles > 0",
+        )?;
+        if tone.cycles > 0.0 && tone_burst_samples(tone, sample_rate) == 0 {
+            return Err(PlaybackError::InvalidRequest(
+                "marker signal is too short for the requested sampleRate",
+            ));
+        }
+
+        let request = PlayRequest {
+            sample_rate,
+            bit_depth,
+            decay_sec,
+            resolved_tail_tone_burst: Some(tone),
+            ..PlayRequest::default()
+        };
+
+        Ok(Self {
+            request,
+            sweep_f1: DEFAULT_F1_HZ,
+            sweep_f2: DEFAULT_F2_HZ,
+            raw_sweep_samples: 0,
+            sweep_phase_scale: 0.0,
+            sweep_ratio_step: 1.0,
+            preamble_samples: 0,
+            tone_burst_samples: 0,
+            gap_samples: 0,
+            sweep_samples: 0,
+            tail_marker_gap_samples: 0,
+            tail_tone_burst_samples: tone_burst_samples(tone, sample_rate),
+            decay_samples: seconds_to_samples(decay_sec, sample_rate),
+            linear_section_samples: 0,
+            log_start_hz: DEFAULT_F1_HZ,
+        })
+    }
+
     pub const fn offsets(&self) -> PlaybackOffsets {
+        let sweep_offset_samples =
+            self.preamble_samples + self.tone_burst_samples + self.gap_samples;
+        let tail_tone_burst_offset_samples = if self.tail_tone_burst_samples > 0 {
+            Some(sweep_offset_samples + self.sweep_samples + self.tail_marker_gap_samples)
+        } else {
+            None
+        };
         PlaybackOffsets {
             tone_burst_offset_samples: self.preamble_samples,
-            sweep_offset_samples: self.preamble_samples
-                + self.tone_burst_samples
-                + self.gap_samples,
-            total_samples: self.preamble_samples
-                + self.tone_burst_samples
-                + self.gap_samples
+            sweep_offset_samples,
+            tail_tone_burst_offset_samples,
+            total_samples: sweep_offset_samples
                 + self.sweep_samples
+                + self.tail_marker_gap_samples
+                + self.tail_tone_burst_samples
                 + self.decay_samples,
         }
     }
@@ -306,7 +420,7 @@ impl PlaybackPlan {
             plan: self.clone(),
             offsets: self.offsets(),
             fade_samples: seconds_to_samples(
-                self.request.sweep.fade_duration,
+                self.request.resolved_sweep.fade_duration,
                 self.request.sample_rate,
             )
             .min(self.sweep_samples),
@@ -318,12 +432,19 @@ impl PlaybackPlan {
 
     pub fn sample_at(&self, index: usize) -> f32 {
         let offsets = self.offsets();
+        let tail_start = offsets
+            .tail_tone_burst_offset_samples
+            .unwrap_or(offsets.sweep_offset_samples + self.sweep_samples);
         if index < self.preamble_samples {
             return preamble_noise(index);
         }
         if index < self.preamble_samples + self.tone_burst_samples {
             let local = index - self.preamble_samples;
-            return tone_burst_sample(local, self.request.sample_rate, self.request.tone_burst);
+            return tone_burst_sample(
+                local,
+                self.request.sample_rate,
+                self.request.resolved_tone_burst,
+            );
         }
         if index < offsets.sweep_offset_samples {
             return 0.0;
@@ -332,9 +453,65 @@ impl PlaybackPlan {
             let local = index - offsets.sweep_offset_samples;
             return sweep_sample(local, self);
         }
+        if let Some(tail_offset) = offsets.tail_tone_burst_offset_samples
+            && index >= tail_offset
+            && index < tail_start + self.tail_tone_burst_samples
+        {
+            let local = index - tail_offset;
+            return tone_burst_sample(
+                local,
+                self.request.sample_rate,
+                self.request.resolved_tail_tone_burst.unwrap_or_default(),
+            );
+        }
         // Decay section: silence (post-sweep quiet period).
         0.0
     }
+}
+
+fn resolve_play_request(mut request: PlayRequest) -> Result<ResolvedPlayRequest, PlaybackError> {
+    request.resolved_sweep = SweepParams {
+        f1: request.sweep_start_hz,
+        f2: request.sweep_end_hz,
+        duration: request.sweep_duration_sec,
+        fade_duration: request.sweep_fade_sec,
+    };
+    request.resolved_preamble_sec = DEFAULT_PREAMBLE_SEC;
+    request.resolved_gap_sec = 0.0;
+    request.resolved_tone_burst = ToneBurstParams {
+        frequency: request.marker_frequency_hz,
+        cycles: 0.0,
+    };
+    request.resolved_tail_tone_burst = None;
+
+    if request.marker_gap_ms > 2_000 {
+        return Err(PlaybackError::InvalidRequest(
+            "markerGapMs must be <= 2000",
+        ));
+    }
+
+    let marker_gap_sec = request.marker_gap_ms as f32 / 1000.0;
+    let marker = ToneBurstParams {
+        frequency: request.marker_frequency_hz,
+        cycles: request.marker_cycles,
+    };
+
+    if request.marker_before && request.marker_cycles > 0.0 {
+        request.resolved_tone_burst = marker;
+        request.resolved_gap_sec = marker_gap_sec;
+    }
+    let tail_marker_gap_sec = if request.marker_after && request.marker_cycles > 0.0 {
+        marker_gap_sec
+    } else {
+        0.0
+    };
+    request.resolved_tail_tone_burst =
+        (request.marker_after && request.marker_cycles > 0.0).then_some(marker);
+
+    Ok(ResolvedPlayRequest {
+        request,
+        tail_marker_gap_sec,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -358,8 +535,18 @@ impl PlaybackGenerator {
         let tone_end = preamble_end + self.plan.tone_burst_samples;
         let sweep_start = self.offsets.sweep_offset_samples;
         let sweep_end = sweep_start + self.plan.sweep_samples;
+        let tail_start = self
+            .offsets
+            .tail_tone_burst_offset_samples
+            .unwrap_or(sweep_end);
+        let tail_end = tail_start + self.plan.tail_tone_burst_samples;
         let sample_rate = self.plan.request.sample_rate;
-        let tone = self.plan.request.tone_burst;
+        let tone = self.plan.request.resolved_tone_burst;
+        let tail_tone = self
+            .plan
+            .request
+            .resolved_tail_tone_burst
+            .unwrap_or_default();
         let mut frame_cursor = 0usize;
 
         match self.plan.layout().bit_depth {
@@ -393,6 +580,20 @@ impl PlaybackGenerator {
                         fill_sweep_pcm16(
                             self,
                             index - sweep_start,
+                            &mut out[frame_offset..frame_offset + segment_frames * frame_bytes],
+                        );
+                        frame_cursor += segment_frames;
+                    } else if index < tail_start {
+                        let segment_frames = (tail_start - index).min(frames - frame_cursor);
+                        out[frame_offset..frame_offset + segment_frames * frame_bytes].fill(0);
+                        frame_cursor += segment_frames;
+                    } else if index < tail_end {
+                        let segment_frames = (tail_end - index).min(frames - frame_cursor);
+                        fill_tone_pcm16(
+                            index - tail_start,
+                            segment_frames,
+                            sample_rate,
+                            tail_tone,
                             &mut out[frame_offset..frame_offset + segment_frames * frame_bytes],
                         );
                         frame_cursor += segment_frames;
@@ -432,6 +633,20 @@ impl PlaybackGenerator {
                         fill_sweep_pcm24(
                             self,
                             index - sweep_start,
+                            &mut out[frame_offset..frame_offset + segment_frames * frame_bytes],
+                        );
+                        frame_cursor += segment_frames;
+                    } else if index < tail_start {
+                        let segment_frames = (tail_start - index).min(frames - frame_cursor);
+                        out[frame_offset..frame_offset + segment_frames * frame_bytes].fill(0);
+                        frame_cursor += segment_frames;
+                    } else if index < tail_end {
+                        let segment_frames = (tail_end - index).min(frames - frame_cursor);
+                        fill_tone_pcm24(
+                            index - tail_start,
+                            segment_frames,
+                            sample_rate,
+                            tail_tone,
                             &mut out[frame_offset..frame_offset + segment_frames * frame_bytes],
                         );
                         frame_cursor += segment_frames;
@@ -616,12 +831,16 @@ fn default_tone_frequency_hz() -> f32 {
     DEFAULT_TONE_FREQUENCY_HZ
 }
 
-fn default_preamble_sec() -> f32 {
-    DEFAULT_PREAMBLE_SEC
+fn default_marker_enabled() -> bool {
+    true
 }
 
-fn default_gap_sec() -> f32 {
-    DEFAULT_GAP_SEC
+fn default_marker_gap_ms() -> u32 {
+    DEFAULT_MARKER_GAP_MS
+}
+
+fn default_marker_cycles() -> f32 {
+    DEFAULT_MARKER_CYCLES
 }
 
 fn default_decay_sec() -> f32 {
@@ -633,36 +852,55 @@ fn default_sample_rate_hz() -> u32 {
 }
 
 fn validate_request(request: &PlayRequest) -> Result<(), PlaybackError> {
-    if request.sweep.f1 <= 0.0 {
-        return Err(PlaybackError::InvalidRequest("sweep.f1 must be > 0"));
+    if request.resolved_sweep.f1 <= 0.0 {
+        return Err(PlaybackError::InvalidRequest("sweepStartHz must be > 0"));
     }
-    if request.sweep.f2 <= request.sweep.f1 {
+    if request.resolved_sweep.f2 <= request.resolved_sweep.f1 {
         return Err(PlaybackError::InvalidRequest(
-            "sweep.f2 must be greater than sweep.f1",
+            "sweepEndHz must be greater than sweepStartHz",
         ));
     }
-    if request.sweep.duration <= 0.0 {
-        return Err(PlaybackError::InvalidRequest("sweep.duration must be > 0"));
+    if request.resolved_sweep.duration <= 0.0 {
+        return Err(PlaybackError::InvalidRequest("sweepDurationSec must be > 0"));
     }
-    if request.sweep.fade_duration < 0.0 {
+    if request.resolved_sweep.fade_duration < 0.0 {
         return Err(PlaybackError::InvalidRequest(
-            "sweep.fadeDuration must be >= 0",
+            "sweepFadeSec must be >= 0",
         ));
     }
-    if request.tone_burst.cycles < 0.0 {
-        return Err(PlaybackError::InvalidRequest(
-            "toneBurst.cycles must be >= 0",
-        ));
-    }
-    if request.tone_burst.cycles > 0.0 && request.tone_burst.frequency <= 0.0 {
-        return Err(PlaybackError::InvalidRequest(
-            "toneBurst.frequency must be > 0 when toneBurst.cycles > 0",
-        ));
-    }
+    validate_tone_burst(
+        request.resolved_tone_burst,
+        "markerCycles must be >= 0",
+        "markerFrequencyHz must be > 0 when markerCycles > 0",
+    )?;
     if request.sample_rate == 0 {
         return Err(PlaybackError::InvalidRequest("sampleRate must be > 0"));
     }
-    if request.preamble_sec < 0.0 || request.gap_sec < 0.0 || request.decay_sec < 0.0 {
+    if request.resolved_tone_burst.cycles > 0.0
+        && tone_burst_samples(request.resolved_tone_burst, request.sample_rate) == 0
+    {
+        return Err(PlaybackError::InvalidRequest(
+            "marker signal is too short for the requested sampleRate",
+        ));
+    }
+    if let Some(tail_tone_burst) = request.resolved_tail_tone_burst {
+        validate_tone_burst(
+            tail_tone_burst,
+            "markerCycles must be >= 0",
+            "markerFrequencyHz must be > 0 when markerCycles > 0",
+        )?;
+        if tail_tone_burst.cycles > 0.0
+            && tone_burst_samples(tail_tone_burst, request.sample_rate) == 0
+        {
+            return Err(PlaybackError::InvalidRequest(
+                "marker signal is too short for the requested sampleRate",
+            ));
+        }
+    }
+    if request.resolved_preamble_sec < 0.0
+        || request.resolved_gap_sec < 0.0
+        || request.decay_sec < 0.0
+    {
         return Err(PlaybackError::InvalidRequest(
             "segment durations must be >= 0",
         ));
@@ -674,14 +912,33 @@ fn seconds_to_samples(seconds: f32, sample_rate: u32) -> usize {
     (seconds * sample_rate as f32).round() as usize
 }
 
-fn tone_burst_samples(request: &PlayRequest) -> usize {
-    if request.tone_burst.cycles <= 0.0 {
+fn validate_tone_burst(
+    tone_burst: ToneBurstParams,
+    cycles_error: &'static str,
+    frequency_error: &'static str,
+) -> Result<(), PlaybackError> {
+    if tone_burst.cycles < 0.0 {
+        return Err(PlaybackError::InvalidRequest(cycles_error));
+    }
+    if tone_burst.cycles > 0.0 && tone_burst.frequency <= 0.0 {
+        return Err(PlaybackError::InvalidRequest(frequency_error));
+    }
+    Ok(())
+}
+
+fn tone_burst_samples(tone_burst: ToneBurstParams, sample_rate: u32) -> usize {
+    if tone_burst.cycles <= 0.0 {
         return 0;
     }
-    seconds_to_samples(
-        request.tone_burst.cycles / request.tone_burst.frequency,
-        request.sample_rate,
-    )
+    seconds_to_samples(tone_burst.cycles / tone_burst.frequency, sample_rate)
+}
+
+fn tone_burst_fade_out_samples(tone_burst: ToneBurstParams, sample_rate: u32) -> usize {
+    let total_samples = tone_burst_samples(tone_burst, sample_rate);
+    if total_samples == 0 {
+        return 0;
+    }
+    seconds_to_samples(DEFAULT_TONE_FADE_OUT_SEC, sample_rate).min(total_samples / 2)
 }
 
 fn preamble_noise(index: usize) -> f32 {
@@ -710,8 +967,39 @@ fn preamble_noise_pcm24(index: usize) -> i32 {
 }
 
 fn tone_burst_sample(index: usize, sample_rate: u32, tone: ToneBurstParams) -> f32 {
+    let total_samples = tone_burst_samples(tone, sample_rate);
+    if index >= total_samples {
+        return 0.0;
+    }
+
     let t = index as f32 / sample_rate as f32;
-    fast_sin(2.0 * PI * tone.frequency * t)
+    let mut sample = fast_sin(2.0 * PI * tone.frequency * t);
+    let fade_out_samples = tone_burst_fade_out_samples(tone, sample_rate);
+    if fade_out_samples > 0 {
+        let fade_start = total_samples.saturating_sub(fade_out_samples);
+        if index >= fade_start {
+            let fade_index = index - fade_start;
+            let fade_phase = PI * (fade_index + 1) as f32 / fade_out_samples as f32;
+            sample *= 0.5 * (1.0 + fade_phase.cos());
+        }
+    }
+    sample
+}
+
+fn raised_cosine_fade_in_gain(index: usize, fade_samples: usize) -> f32 {
+    if fade_samples <= 1 {
+        return 0.0;
+    }
+    let denom = (fade_samples - 1) as f32;
+    0.5 * (1.0 - (PI * index as f32 / denom).cos())
+}
+
+fn raised_cosine_fade_out_gain(index: usize, fade_samples: usize) -> f32 {
+    if fade_samples <= 1 {
+        return 0.0;
+    }
+    let denom = (fade_samples - 1) as f32;
+    0.5 * (1.0 + (PI * index as f32 / denom).cos())
 }
 
 /// Generate a sweep sample for a hybrid linear+logarithmic sweep.
@@ -763,18 +1051,21 @@ fn hybrid_sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
 fn sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
     let mut sample = hybrid_sweep_sample(index, plan);
     let fade_samples =
-        seconds_to_samples(plan.request.sweep.fade_duration, plan.request.sample_rate)
+        seconds_to_samples(
+            plan.request.resolved_sweep.fade_duration,
+            plan.request.sample_rate,
+        )
             .min(plan.sweep_samples / 2);
     if fade_samples > 0 {
         // Fade-in
         if index < fade_samples {
-            sample *= 0.5 * (1.0 - (PI * index as f32 / fade_samples as f32).cos());
+            sample *= raised_cosine_fade_in_gain(index, fade_samples);
         }
         // Fade-out
         let tail_start = plan.sweep_samples.saturating_sub(fade_samples);
         if index >= tail_start {
             let tail_index = index - tail_start;
-            sample *= 0.5 * (1.0 + (PI * tail_index as f32 / fade_samples as f32).cos());
+            sample *= raised_cosine_fade_out_gain(tail_index, fade_samples);
         }
     }
     sample
@@ -914,21 +1205,24 @@ fn fast_sin_wrapped(phase: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn default_plan_matches_expected_offsets() {
         let plan = PlaybackPlan::build(PlayRequest::default()).unwrap();
         let offsets = plan.offsets();
-        // 2s preamble, 0.5s decay — matching REW's pre/post silence
         assert_eq!(plan.preamble_samples, 96_000); // 2s * 48kHz
-        assert_eq!(plan.tone_burst_samples, 0);
-        assert_eq!(plan.gap_samples, 0);
+        assert_eq!(plan.tone_burst_samples, 600);
+        assert_eq!(plan.gap_samples, 2_400);
+        assert_eq!(plan.tail_marker_gap_samples, 2_400);
+        assert_eq!(plan.tail_tone_burst_samples, 600);
         assert_eq!(plan.decay_samples, 96_000); // 2s * 48kHz
         assert_eq!(offsets.tone_burst_offset_samples, 96_000);
-        assert_eq!(offsets.sweep_offset_samples, 96_000);
+        assert_eq!(offsets.sweep_offset_samples, 99_000);
+        assert_eq!(offsets.tail_tone_burst_offset_samples, Some(363_458));
+        assert_eq!(offsets.total_samples, 460_058);
         assert_eq!(plan.sweep_f1, 5.0);
         assert_eq!(plan.sweep_f2, 400.0);
-        // Should have a linear section since f1 < 10 Hz
         assert!(plan.linear_section_samples > 0);
         assert_eq!(plan.log_start_hz, 10.0);
     }
@@ -936,12 +1230,9 @@ mod tests {
     #[test]
     fn requested_band_is_used_exactly() {
         let request = PlayRequest {
-            sweep: SweepParams {
-                f1: 50.0,
-                f2: 80.0,
-                duration: 6.0,
-                fade_duration: 0.02,
-            },
+            sweep_start_hz: 50.0,
+            sweep_end_hz: 80.0,
+            sweep_duration_sec: 6.0,
             ..PlayRequest::default()
         };
         let plan = PlaybackPlan::build(request).unwrap();
@@ -968,6 +1259,43 @@ mod tests {
     }
 
     #[test]
+    fn marker_controls_can_disable_both_markers_for_sweep_only() {
+        let request = PlayRequest {
+            marker_before: false,
+            marker_after: false,
+            ..PlayRequest::default()
+        };
+        let plan = PlaybackPlan::build(request).unwrap();
+        let offsets = plan.offsets();
+        assert_eq!(plan.tone_burst_samples, 0);
+        assert_eq!(plan.gap_samples, 0);
+        assert_eq!(plan.tail_marker_gap_samples, 0);
+        assert_eq!(plan.tail_tone_burst_samples, 0);
+        assert_eq!(offsets.sweep_offset_samples, 96_000);
+        assert_eq!(offsets.tail_tone_burst_offset_samples, None);
+        assert_eq!(offsets.total_samples, 454_058);
+        assert_eq!(plan.sample_at(offsets.total_samples - 1), 0.0);
+    }
+
+    #[test]
+    fn marker_cycles_zero_disables_markers_and_gaps() {
+        let plan = PlaybackPlan::build(PlayRequest {
+            marker_cycles: 0.0,
+            ..PlayRequest::default()
+        })
+        .unwrap();
+        let offsets = plan.offsets();
+
+        assert_eq!(plan.tone_burst_samples, 0);
+        assert_eq!(plan.gap_samples, 0);
+        assert_eq!(plan.tail_marker_gap_samples, 0);
+        assert_eq!(plan.tail_tone_burst_samples, 0);
+        assert_eq!(offsets.sweep_offset_samples, 96_000);
+        assert_eq!(offsets.tail_tone_burst_offset_samples, None);
+        assert_eq!(offsets.total_samples, 454_058);
+    }
+
+    #[test]
     fn pcm24_encoding_is_little_endian_and_stereo() {
         let layout = SampleLayout {
             sample_rate: 48_000,
@@ -982,17 +1310,46 @@ mod tests {
     #[test]
     fn invalid_request_rejects_bad_sweep() {
         let request = PlayRequest {
-            sweep: SweepParams {
-                f1: 100.0,
-                f2: 50.0,
-                ..SweepParams::default()
-            },
+            sweep_start_hz: 100.0,
+            sweep_end_hz: 50.0,
             ..PlayRequest::default()
         };
         let err = PlaybackPlan::build(request).unwrap_err();
         assert_eq!(
             err,
-            PlaybackError::InvalidRequest("sweep.f2 must be greater than sweep.f1")
+            PlaybackError::InvalidRequest("sweepEndHz must be greater than sweepStartHz")
+        );
+    }
+
+    #[test]
+    fn invalid_request_rejects_bad_marker_frequency() {
+        let request = PlayRequest {
+            marker_frequency_hz: 0.0,
+            marker_cycles: 3.0,
+            ..PlayRequest::default()
+        };
+        let err = PlaybackPlan::build(request).unwrap_err();
+        assert_eq!(
+            err,
+            PlaybackError::InvalidRequest(
+                "markerFrequencyHz must be > 0 when markerCycles > 0"
+            )
+        );
+    }
+
+    #[test]
+    fn invalid_request_rejects_marker_that_rounds_to_zero_samples() {
+        let request = PlayRequest {
+            sample_rate: 48_000,
+            marker_frequency_hz: 48_000.0,
+            marker_cycles: 0.4,
+            marker_after: false,
+            ..PlayRequest::default()
+        };
+        let err = PlaybackPlan::build(request).unwrap_err();
+        assert_eq!(
+            err,
+            PlaybackError::InvalidRequest("marker signal is too short for the requested sampleRate")
         );
     }
 
@@ -1014,5 +1371,153 @@ mod tests {
                 "phase={phase} expected={expected} actual={actual}"
             );
         }
+    }
+
+    #[test]
+    fn play_request_serializes_canonical_public_shape() {
+        let default_json = serde_json::to_value(PlayRequest::default()).unwrap();
+        assert!(
+            (default_json
+                .get("sweepDurationSec")
+                .unwrap()
+                .as_f64()
+                .unwrap()
+                - 5.46)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(default_json.get("sweepStartHz").unwrap(), &json!(5.0));
+        assert_eq!(default_json.get("sweepEndHz").unwrap(), &json!(400.0));
+        assert_eq!(default_json.get("markerBefore").unwrap(), true);
+        assert_eq!(default_json.get("markerAfter").unwrap(), true);
+        assert_eq!(default_json.get("markerGapMs").unwrap(), 50);
+        assert_eq!(default_json.get("markerFrequencyHz").unwrap(), &json!(80.0));
+        assert_eq!(default_json.get("markerCycles").unwrap(), &json!(1.0));
+        assert!(default_json.get("tailToneBurst").is_none());
+        assert!(default_json.get("toneBurst").is_none());
+        assert!(default_json.get("sweep").is_none());
+    }
+
+    #[test]
+    fn play_request_rejects_legacy_fields() {
+        let err = serde_json::from_value::<PlayRequest>(json!({
+            "tailToneBurst": { "frequency": 80.0, "cycles": 3.0 }
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("tailToneBurst"));
+    }
+
+    #[test]
+    fn marker_controls_default_to_one_cycle_and_50ms_gap() {
+        let plan = PlaybackPlan::build(PlayRequest::default()).unwrap();
+        let offsets = plan.offsets();
+
+        assert_eq!(plan.tone_burst_samples, 600);
+        assert_eq!(plan.gap_samples, 2_400);
+        assert_eq!(plan.tail_marker_gap_samples, 2_400);
+        assert_eq!(plan.tail_tone_burst_samples, 600);
+        assert_eq!(offsets.tone_burst_offset_samples, 96_000);
+        assert_eq!(offsets.sweep_offset_samples, 99_000);
+        assert_eq!(
+            offsets.tail_tone_burst_offset_samples,
+            Some(offsets.sweep_offset_samples + plan.sweep_samples + 2_400)
+        );
+    }
+
+    #[test]
+    fn marker_controls_can_disable_pre_marker() {
+        let plan = PlaybackPlan::build(PlayRequest {
+            marker_before: false,
+            marker_after: true,
+            ..PlayRequest::default()
+        })
+        .unwrap();
+        let offsets = plan.offsets();
+
+        assert_eq!(plan.tone_burst_samples, 0);
+        assert_eq!(plan.gap_samples, 0);
+        assert_eq!(plan.tail_marker_gap_samples, 2_400);
+        assert_eq!(offsets.sweep_offset_samples, 96_000);
+        assert_eq!(
+            offsets.tail_tone_burst_offset_samples,
+            Some(offsets.sweep_offset_samples + plan.sweep_samples + 2_400)
+        );
+    }
+
+    #[test]
+    fn marker_gap_ms_rejects_values_above_two_seconds() {
+        let err = PlaybackPlan::build(PlayRequest {
+            marker_gap_ms: 2_001,
+            ..PlayRequest::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, PlaybackError::InvalidRequest("markerGapMs must be <= 2000"));
+    }
+
+    #[test]
+    fn play_response_omits_tail_offset_when_marker_disabled() {
+        let without_tail = serde_json::to_value(PlayResponse {
+            started_at_us: 1,
+            tone_burst_offset_samples: 2,
+            sweep_offset_samples: 3,
+            tail_tone_burst_offset_samples: None,
+            total_samples: 4,
+            sample_rate: 48_000,
+            source_changed: false,
+            previous_source: None,
+        })
+        .unwrap();
+        assert!(without_tail.get("tailToneBurstOffsetSamples").is_none());
+
+        let with_tail = serde_json::to_value(PlayResponse {
+            started_at_us: 1,
+            tone_burst_offset_samples: 2,
+            sweep_offset_samples: 3,
+            tail_tone_burst_offset_samples: Some(4),
+            total_samples: 5,
+            sample_rate: 48_000,
+            source_changed: false,
+            previous_source: None,
+        })
+        .unwrap();
+        assert_eq!(with_tail.get("tailToneBurstOffsetSamples").unwrap(), 4);
+    }
+
+    #[test]
+    fn tone_burst_fades_to_zero_at_end() {
+        let tone = ToneBurstParams {
+            frequency: 80.0,
+            cycles: 3.0,
+        };
+        let sample_rate = 48_000;
+        let total_samples = tone_burst_samples(tone, sample_rate);
+        assert_eq!(tone_burst_fade_out_samples(tone, sample_rate), 240);
+        assert_eq!(tone_burst_sample(total_samples - 1, sample_rate, tone), 0.0);
+    }
+
+    #[test]
+    fn sweep_fade_reaches_zero_at_end() {
+        let plan = PlaybackPlan::build(PlayRequest::default()).unwrap();
+        assert_eq!(sweep_sample(plan.sweep_samples - 1, &plan), 0.0);
+    }
+
+    #[test]
+    fn diagnostic_tail_marker_starts_at_zero_without_sweep() {
+        let plan = PlaybackPlan::diagnostic_tail_marker(
+            ToneBurstParams {
+                frequency: 80.0,
+                cycles: 3.0,
+            },
+            48_000,
+            BitDepth::Pcm16,
+            2.0,
+        )
+        .unwrap();
+        let offsets = plan.offsets();
+        assert_eq!(offsets.sweep_offset_samples, 0);
+        assert_eq!(offsets.tone_burst_offset_samples, 0);
+        assert_eq!(offsets.tail_tone_burst_offset_samples, Some(0));
+        assert_eq!(offsets.total_samples, plan.tail_tone_burst_samples + plan.decay_samples);
+        assert_ne!(plan.sample_at(1), 0.0);
     }
 }

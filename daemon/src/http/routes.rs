@@ -14,10 +14,11 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use minidsp_protocol::playback::{PlayRequest, PlaybackPlan, SyncRequest, SyncResponse};
+use minidsp_protocol::playback::{
+    PlayRequest, PlaybackPlan, SyncRequest, SyncResponse, ToneBurstParams,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -153,6 +154,12 @@ struct WsQueryParams {
     poll: Option<bool>,
     #[serde(default)]
     levels: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PlayQueryParams {
+    #[serde(default)]
+    test: Option<String>,
 }
 
 /// GET /devices/{id} — returns JSON status OR upgrades to WebSocket for state/levels.
@@ -406,19 +413,16 @@ async fn set_device_status(
 }
 
 async fn sync_clock(Json(body): Json<SyncRequest>) -> impl IntoResponse {
-    let server_time_us = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or_default();
     Json(SyncResponse {
         client_time_us: body.client_time_us,
-        server_time_us,
+        server_time_us: playback::server_time_us(),
     })
 }
 
 async fn play_device(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
+    Query(params): Query<PlayQueryParams>,
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     let client = get_device_or_404(&state, id).await?;
@@ -439,9 +443,29 @@ async fn play_device(
         PlayRequest::default()
     } else {
         serde_json::from_slice::<PlayRequest>(&body)
-            .map_err(|_| ApiError::bad_request("invalid JSON"))?
+            .map_err(|e| ApiError::bad_request(format!("invalid play request: {e}")))?
     };
-    let plan = PlaybackPlan::build(request).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let plan = match params.test.as_deref() {
+        Some("marker") | Some("tail-marker") => {
+            let tone = ToneBurstParams {
+                frequency: request.marker_frequency_hz,
+                cycles: request.marker_cycles,
+            };
+            PlaybackPlan::diagnostic_tail_marker(
+                tone,
+                request.sample_rate,
+                request.bit_depth,
+                request.decay_sec,
+            )
+            .map_err(|e| ApiError::bad_request(e.to_string()))?
+        }
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown play test mode: {other}"
+            )));
+        }
+        None => PlaybackPlan::build(request).map_err(|e| ApiError::bad_request(e.to_string()))?,
+    };
     let current_source = client
         .get_master_status()
         .await
@@ -466,7 +490,7 @@ async fn play_device(
             .await
             .map_err(|e| ApiError::internal(format!("set_source: {e}")))?;
         source_changed = true;
-        previous_source = Some(current_source.to_string());
+        previous_source = Some(current_source.pascal_case().to_string());
         restore_source = Some(current_source);
     }
 
@@ -1582,6 +1606,63 @@ async fn openapi() -> impl IntoResponse {
                     "summary": "Switch preset (0-3)",
                     "operationId": "setPreset",
                     "responses": { "200": { "description": "Updated status" } }
+                }
+            },
+            "/devices/{id}/play": {
+                "post": {
+                    "summary": "Play the shared measurement sweep and optional acoustic markers",
+                    "operationId": "playDevice",
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } },
+                        { "name": "test", "in": "query", "required": false, "schema": { "type": "string", "enum": ["marker", "tail-marker"] } }
+                    ],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "description": "Canonical playback request. The signal always includes the fixed 2 s low-level preamble. By default it also includes one 80 Hz marker before the sweep, a 50 ms gap, the sweep, another 50 ms gap, one 80 Hz marker after the sweep, and 2 s of post-silence. Setting markerCycles to 0 disables both marker sections and removes their gaps.",
+                                    "properties": {
+                                        "sweepDurationSec": { "type": "number", "default": 5.46, "exclusiveMinimum": 0.0 },
+                                        "sweepStartHz": { "type": "number", "default": 5.0, "exclusiveMinimum": 0.0 },
+                                        "sweepEndHz": { "type": "number", "default": 400.0, "exclusiveMinimum": 0.0 },
+                                        "sweepFadeSec": { "type": "number", "default": 0.02, "minimum": 0.0 },
+                                        "markerBefore": { "type": "boolean", "default": true },
+                                        "markerAfter": { "type": "boolean", "default": true },
+                                        "markerGapMs": { "type": "integer", "default": 50, "minimum": 0, "maximum": 2000 },
+                                        "markerFrequencyHz": { "type": "number", "default": 80.0, "exclusiveMinimum": 0.0 },
+                                        "markerCycles": { "type": "number", "default": 1.0, "minimum": 0.0 },
+                                        "decaySec": { "type": "number", "default": 2.0, "minimum": 0.0 },
+                                        "sampleRate": { "type": "integer", "default": 48000, "minimum": 1 },
+                                        "bitDepth": { "type": "string", "enum": ["16", "24"], "default": "16" }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "description": "Playback started; response includes startedAtUs, offsets, and source-switch metadata" },
+                        "400": { "description": "Invalid playback request" },
+                        "404": { "description": "Device not found" },
+                        "409": { "description": "Playback already in progress" }
+                    }
+                }
+            },
+            "/sync": {
+                "post": {
+                    "summary": "Read the platform playback clock used by /play.startedAtUs",
+                    "operationId": "syncClock",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": { "type": "object", "description": "Body: { clientTimeUs: i64 }" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "description": "Echoed clientTimeUs plus serverTimeUs from the same clock basis as /play.startedAtUs" }
+                    }
                 }
             },
             "/devices/{id}/display": {
