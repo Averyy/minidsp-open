@@ -8,6 +8,7 @@ Current planning note:
 - the project now uses the physical 2x4 HD as the live regression case for shared behavior
 - broader all-device coverage must come from a repeatable importer/enumerator based on `app/app-extracted` and `app/apk-extracted`
 - use this checklist for compatibility verification, and use `PROGRESS.md`, `docs/ref-device-coverage.md`, `docs/ref-devices.md`, and `docs/ref-legacy-devices.md` to track importer-driven support expansion
+- the default executable regression harness now lives at `tools/run-live-validation.py`, with operator notes in `docs/ref-live-validation.md`
 - if imported matrix assumptions conflict with live 2x4 HD behavior, treat the 2x4 HD result as authoritative until the conflict is explained
 - keep `/play` audio-quality investigation separate from routing/control verification so audible sweep bugs do not get misdiagnosed as HID/config bugs
 - when judging `/play` audio quality, use the current shared REW/MSO-style default (`5-400 Hz` hybrid sweep with `2 s` low-level dither pre-silence and `2 s` post-silence), not the retired `BRAP`-bundle default
