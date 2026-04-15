@@ -29,15 +29,19 @@ import gzip
 import json
 import math
 import os
+import re
 import struct
+import subprocess
 import sys
 import tempfile
 import urllib.request
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 CATALOGUE_URL = "https://raw.githubusercontent.com/3ll3d00d/beqcatalogue/master/docs/database.json"
 VERSION_URL = "https://raw.githubusercontent.com/3ll3d00d/beqcatalogue/master/docs/version.txt"
+CATALOGUE_COMMIT_API_URL = "https://api.github.com/repos/3ll3d00d/beqcatalogue/commits/{sha}"
 PYPI_JSON_URL = "https://pypi.org/pypi/ezbeq/json"
 
 # Binary format constants (v2: digest-keyed)
@@ -48,6 +52,56 @@ COEFFS_PER_FILTER = 5  # b0, b1, b2, a1, a2
 DIGEST_PREFIX_SIZE = 8  # First 8 bytes of SHA256
 # Per-entry record: 8 bytes digest_prefix + 1 byte filter_count + 4 bytes mv_adjust + 10*5*4 bytes coefficients
 RECORD_SIZE = DIGEST_PREFIX_SIZE + 1 + 4 + MAX_FILTERS * COEFFS_PER_FILTER * 4  # 213 bytes
+
+
+def fetch_bytes(url: str, timeout: int = 15) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "minidsp-open build-catalogue"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def fetch_json(url: str, timeout: int = 15) -> dict:
+    return json.loads(fetch_bytes(url, timeout=timeout))
+
+
+def iso_to_build_stamp(value: str) -> str:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    return dt.strftime("%Y%m%dT%H%M%SZ")
+
+
+def current_build_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def repo_build_stamp() -> str:
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if dirty:
+            return current_build_stamp()
+        head_iso = subprocess.run(
+            ["git", "log", "-1", "--format=%cI", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if head_iso:
+            return iso_to_build_stamp(head_iso)
+    except Exception:
+        pass
+    return current_build_stamp()
+
+
+def catalogue_build_stamp(version: str) -> str:
+    commit = fetch_json(CATALOGUE_COMMIT_API_URL.format(sha=version), timeout=15)
+    return iso_to_build_stamp(commit["commit"]["committer"]["date"])
 
 def compute_biquad_coefficients(filt: dict, fs: int) -> list[float]:
     """Compute biquad coefficients from parametric filter description.
@@ -164,6 +218,45 @@ def build_browser_catalogue(entries: list[dict]) -> bytes:
     return json.dumps(processed, separators=(",", ":")).encode("utf-8")
 
 
+def unique_sorted_strings(values) -> list[str]:
+    seen: dict[str, str] = {}
+    for value in values:
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        if not value:
+            continue
+        seen.setdefault(value.casefold(), value)
+    return [seen[key] for key in sorted(seen)]
+
+
+def build_filter_metadata(entries: list[dict]) -> dict[str, list[str]]:
+    authors = unique_sorted_strings(entry.get("author") for entry in entries)
+    years = [
+        year
+        for year in unique_sorted_strings(entry.get("year") for entry in entries)
+        if re.fullmatch(r"\d{4}", year)
+    ]
+    audio_types = unique_sorted_strings(
+        audio_type
+        for entry in entries
+        for audio_type in (entry.get("audioTypes") or [])
+    )
+    content_types = unique_sorted_strings(
+        (entry.get("content_type") or entry.get("contentType")) for entry in entries
+    )
+    languages = unique_sorted_strings(entry.get("language") for entry in entries)
+    return {
+        "authors": authors,
+        "years": years,
+        "audiotypes": audio_types,
+        "contenttypes": content_types,
+        "languages": languages,
+    }
+
+
 def build_binary_record(entry: dict, fs: int) -> bytes:
     """Build a fixed-size binary record for one entry's biquad data.
 
@@ -188,25 +281,30 @@ def build_binary_record(entry: dict, fs: int) -> bytes:
     return data
 
 
-def download_ui(output_dir: Path) -> tuple[str, dict[str, dict]]:
+def download_ui(output_dir: Path) -> tuple[str, str, dict[str, dict]]:
     """Download the ezBEQ React UI from the PyPI wheel.
 
-    Returns (ui_version, {relative_path: {size, sha256}}).
+    Returns (ui_version, ui_build_stamp, {relative_path: {size, sha256}}).
     """
     # Find latest wheel URL from PyPI
     print("Fetching ezBEQ UI from PyPI...")
-    with urllib.request.urlopen(PYPI_JSON_URL, timeout=15) as resp:
-        pypi = json.loads(resp.read())
+    pypi = fetch_json(PYPI_JSON_URL, timeout=15)
     ui_version = pypi["info"]["version"]
 
     # Find the .whl URL (wheels are zip files)
     whl_url = None
+    ui_build_stamp = None
     for url_info in pypi["urls"]:
         if url_info["filename"].endswith(".whl"):
             whl_url = url_info["url"]
+            upload_iso = url_info.get("upload_time_iso_8601") or url_info.get("upload_time")
+            if upload_iso:
+                ui_build_stamp = iso_to_build_stamp(upload_iso)
             break
     if not whl_url:
         raise RuntimeError("No wheel found on PyPI for ezbeq")
+    if not ui_build_stamp:
+        raise RuntimeError("No upload timestamp found on PyPI for ezbeq wheel")
 
     print(f"  version: {ui_version}")
     print(f"  wheel: {whl_url.split('/')[-1]}")
@@ -216,8 +314,7 @@ def download_ui(output_dir: Path) -> tuple[str, dict[str, dict]]:
     ui_dir.mkdir(exist_ok=True)
 
     with tempfile.NamedTemporaryFile(suffix=".whl") as tmp:
-        with urllib.request.urlopen(whl_url, timeout=60) as resp:
-            tmp.write(resp.read())
+        tmp.write(fetch_bytes(whl_url, timeout=60))
         tmp.flush()
 
         with zipfile.ZipFile(tmp.name) as zf:
@@ -253,7 +350,7 @@ def download_ui(output_dir: Path) -> tuple[str, dict[str, dict]]:
             ui_total += size
 
     print(f"  {len(files)} files, {ui_total:,} bytes ({ui_total/1024:.0f}KB)")
-    return ui_version, files
+    return ui_version, ui_build_stamp, files
 
 
 def inject_shim(ui_dir: Path):
@@ -532,8 +629,7 @@ def main():
 
     # Download catalogue
     print(f"Downloading catalogue from {CATALOGUE_URL}...")
-    with urllib.request.urlopen(CATALOGUE_URL, timeout=60) as resp:
-        raw = resp.read()
+    raw = fetch_bytes(CATALOGUE_URL, timeout=60)
     db = json.loads(raw)
     print(f"  {len(db)} entries")
 
@@ -552,6 +648,16 @@ def main():
         f"{browser_catalogue_path.stat().st_size:,} bytes "
         f"({len(browser_catalogue):,} bytes uncompressed)"
     )
+
+    metadata_files: dict[str, dict[str, str | int]] = {}
+    for name, values in build_filter_metadata(db).items():
+        metadata_path = output_dir / f"{name}.json"
+        metadata_path.write_text(json.dumps(values, separators=(",", ":")) + "\n")
+        metadata_files[f"{name}.json"] = {
+            "size": metadata_path.stat().st_size,
+            "sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
+        }
+    print(f"  metadata files: {len(metadata_files)}")
 
     # Download version
     try:
@@ -592,7 +698,9 @@ def main():
         print(f"  ({skipped} entries skipped due to errors)")
 
     # Download ezBEQ React UI from PyPI
-    ui_version, ui_files = download_ui(output_dir)
+    catalogue_stamp = catalogue_build_stamp(version)
+    repo_stamp = repo_build_stamp()
+    ui_version, ui_stamp, ui_files = download_ui(output_dir)
 
     # Build manifest — catalogue.bin + UI files
     files = {
@@ -605,11 +713,13 @@ def main():
             "sha256": hashlib.sha256(browser_catalogue_path.read_bytes()).hexdigest(),
         },
     }
+    files.update(metadata_files)
     files.update(ui_files)
     site_hash = hashlib.sha256(
         json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:12]
-    site_version = f"{version}+ui{ui_version}+site{site_hash}"
+    site_build_stamp = max(catalogue_stamp, ui_stamp, repo_stamp)
+    site_version = f"{site_build_stamp}+cat{version[:12]}+ui{ui_version}+site{site_hash}"
 
     # version.txt is consumed by the browser-side cache layer, so it needs to
     # change when the site payload changes, not only when the upstream BEQ
@@ -623,8 +733,12 @@ def main():
 
     manifest = {
         "version": site_version,
+        "site_build_stamp": site_build_stamp,
         "catalogue_version": version,
+        "catalogue_build_stamp": catalogue_stamp,
         "ui_version": ui_version,
+        "ui_build_stamp": ui_stamp,
+        "repo_build_stamp": repo_stamp,
         "entry_count": len(records),
         "files": files,
     }

@@ -461,6 +461,12 @@ fn device_state_json_plain(device: &DeviceState, beq_state: &EzBeqState) -> Stri
     serde_json::to_string(&device_state_value(device, beq_state)).unwrap_or_default()
 }
 
+fn storage_json_or_default(path: &str, default: &str) -> String {
+    storage::read_file(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_else(|| default.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // HTTP route registration
 // ---------------------------------------------------------------------------
@@ -483,15 +489,18 @@ pub fn register_routes(
         send_json(req, 200, &body)
     })?;
 
-    // Catalogue filter endpoints — return empty arrays (catalogue is loaded by the browser directly)
-    for path in &[
-        "/api/1/authors",
-        "/api/1/years",
-        "/api/1/audiotypes",
-        "/api/1/contenttypes",
-        "/api/1/languages",
+    // Catalogue filter metadata endpoints — served from the flashed/updater-managed bundle.
+    for (path, storage_path) in [
+        ("/api/1/authors", "authors.json"),
+        ("/api/1/years", "years.json"),
+        ("/api/1/audiotypes", "audiotypes.json"),
+        ("/api/1/contenttypes", "contenttypes.json"),
+        ("/api/1/languages", "languages.json"),
     ] {
-        server.fn_handler(path, Method::Get, |req| send_json(req, 200, "[]"))?;
+        server.fn_handler(path, Method::Get, move |req| {
+            let body = storage_json_or_default(storage_path, "[]");
+            send_json(req, 200, &body)
+        })?;
     }
 
     // GET /api/2/devices — device list with ezBEQ state

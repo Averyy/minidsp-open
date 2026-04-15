@@ -284,6 +284,33 @@ On every boot:
 
 **The ESP32 keeps itself current without any firmware updates from us.** New BEQ titles appear within 15 minutes of community submission. New ezBEQ UI versions appear within hours of release. The user does nothing. We do nothing.
 
+#### Local dev workflow while the published site is stale
+
+The production intent is still "flash firmware once, then let the board update itself from the published site." But while the published `minidsp-open` site is behind or unavailable, a freshly flashed board can only serve whatever ezBEQ bundle is already present in its data partition. That means:
+
+- if the board already has a previously installed bundle, it will boot and serve that stale bundle immediately
+- if the data partition is empty, the board still serves the MiniDSP control API, but hosted ezBEQ remains unavailable until a bundle is installed
+
+To make local development deterministic, use the canonical flash wrapper:
+
+```bash
+tools/flash-esp32.sh --board-url http://BOARD:5380
+```
+
+That wrapper:
+
+1. flashes the current ESP32 firmware with the same `esptool.py` flow documented in `CLAUDE.md`
+2. builds the latest local ezBEQ bundle via `uv run tools/build-catalogue.py`
+3. creates a LittleFS image for the `storage` partition from that bundle
+4. flashes the `storage` partition image at the partition-table offset
+5. optionally verifies the board's `/version.txt` matches the flashed bundle after boot
+
+This keeps the board usable immediately after flash even when the published site is still stale, without baking catalogue/UI artifacts into the firmware image itself.
+
+The runtime updater still matters. After boot, the board should continue checking the configured remote site and self-updating when a newer published bundle exists. The local flash seed is only the initial stored baseline.
+
+`tools/flash-esp32-with-site.sh` is kept as the explicit updater-path fallback when you want to test `/debug/updater` itself against a temporary local site instead of flashing the storage partition directly.
+
 #### How it all fits together
 
 ```

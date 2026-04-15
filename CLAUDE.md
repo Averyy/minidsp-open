@@ -19,7 +19,11 @@ esp cargo build
 
 ### ESP32 Flashing (project-specific)
 
-Flash with `esptool.py` (not espflash — it panics on our CH340 boards). The build produces an ELF that must be converted first:
+Use `tools/flash-esp32.sh` as the default local flashing workflow. It builds the current ezBEQ bundle locally, turns it into a LittleFS image for the `storage` partition, flashes that image alongside the firmware, and can optionally verify the board's `/version.txt` after boot via `--board-url http://BOARD:5380`.
+
+This is the correct dev workflow even while the published ezBEQ site is stale because the board comes up with a real stored bundle immediately after flash instead of depending on an immediate post-boot download.
+
+If you need the low-level primitive directly, flash with `esptool.py` (not espflash — it panics on our CH340 boards). The build produces an ELF that must be converted first:
 
 ```bash
 # 1. Close serial-mcp session
@@ -34,6 +38,8 @@ esp esptool.py --chip esp32s3 -p /dev/ttyUSB0 -b 460800 write_flash \
 ```
 
 Bootloader/partition-table binaries are in `app-esp32/target/xtensa-esp32s3-espidf/debug/`. If the port is stuck (Resource busy), `lsof` and `kill` the holding process — you have permission.
+
+`tools/flash-esp32-with-site.sh` remains available as the explicit updater-path fallback for testing `/debug/updater` against a temporary local site.
 
 ## ESP32 Dev Boards
 

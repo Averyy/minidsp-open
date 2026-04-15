@@ -119,7 +119,16 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
     }
 
     let base_url = base_url(nvs);
-    let installed = read_nvs_version(nvs);
+    let storage_installed = read_storage_version();
+    let nvs_installed = read_nvs_version(nvs);
+    if let Some(version) = storage_installed.as_deref() {
+        if nvs_installed.as_deref() != Some(version) {
+            if let Err(e) = write_nvs_version(nvs, version) {
+                warn!("failed to sync installed version from storage to NVS: {e}");
+            }
+        }
+    }
+    let installed = storage_installed.or(nvs_installed);
     let has_catalogue = has_catalogue_data();
 
     let remote_version = match fetch_remote_version(&base_url) {
@@ -136,8 +145,16 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
         }
     };
 
-    if installed.as_deref() == Some(remote_version.as_str()) {
-        info!("catalogue up to date ({remote_version})");
+    if !remote_version_requires_update(installed.as_deref(), &remote_version) {
+        if installed.as_deref() == Some(remote_version.as_str()) {
+            info!("catalogue up to date ({remote_version})");
+        } else {
+            info!(
+                "keeping installed {} over remote {}",
+                installed.as_deref().unwrap_or("(none)"),
+                remote_version
+            );
+        }
         return UpdateResult::Current;
     }
 
@@ -148,8 +165,16 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
 
     // Check installed version (combined catalogue + UI)
     let new_version = manifest.combined_version();
-    if installed.as_deref() == Some(new_version.as_str()) {
-        info!("catalogue up to date ({new_version})");
+    if !remote_version_requires_update(installed.as_deref(), &new_version) {
+        if installed.as_deref() == Some(new_version.as_str()) {
+            info!("catalogue up to date ({new_version})");
+        } else {
+            info!(
+                "keeping installed {} over manifest {}",
+                installed.as_deref().unwrap_or("(none)"),
+                new_version
+            );
+        }
         return UpdateResult::Current;
     }
 
@@ -480,6 +505,53 @@ fn read_nvs_version(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<St
     val.map(|s| s.to_string())
 }
 
+fn read_storage_version() -> Option<String> {
+    crate::storage::read_file("version.txt")
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn version_sort_key(version: &str) -> Option<&str> {
+    let bytes = version.as_bytes();
+    if bytes.len() < 16 {
+        return None;
+    }
+    if bytes[8] != b'T' || bytes[15] != b'Z' {
+        return None;
+    }
+    let digit_positions = [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14];
+    if digit_positions
+        .iter()
+        .any(|&idx| !bytes[idx].is_ascii_digit())
+    {
+        return None;
+    }
+    Some(&version[..16])
+}
+
+fn remote_version_requires_update(installed: Option<&str>, remote: &str) -> bool {
+    let Some(installed) = installed else {
+        return true;
+    };
+    if installed == remote {
+        return false;
+    }
+
+    match (version_sort_key(installed), version_sort_key(remote)) {
+        (Some(installed_key), Some(remote_key)) => {
+            if remote_key != installed_key {
+                remote_key > installed_key
+            } else {
+                true
+            }
+        }
+        (Some(_), None) => false,
+        (None, Some(_)) => true,
+        (None, None) => true,
+    }
+}
+
 fn read_nvs_base_url(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
     use esp_idf_svc::nvs::EspNvs;
 
@@ -514,7 +586,7 @@ fn write_nvs_base_url(
 
 /// Get the currently installed catalogue version (if any).
 pub fn installed_version(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
-    read_nvs_version(nvs)
+    read_storage_version().or_else(|| read_nvs_version(nvs))
 }
 
 #[cfg(test)]
@@ -550,6 +622,47 @@ mod tests {
         assert!(should_keep_installed_data(Some("2026.04.13"), true));
         assert!(!should_keep_installed_data(Some("2026.04.13"), false));
         assert!(!should_keep_installed_data(None, true));
+    }
+
+    #[test]
+    fn version_sort_key_parses_timestamped_versions() {
+        assert_eq!(
+            version_sort_key("20260415T124249Z+cat1b47227beded+ui2.6.1+site123456789abc"),
+            Some("20260415T124249Z")
+        );
+        assert_eq!(version_sort_key("1b47227beded4115"), None);
+    }
+
+    #[test]
+    fn remote_version_requires_update_uses_timestamped_ordering() {
+        assert!(remote_version_requires_update(
+            Some("20260415T124249Z+catold+ui2.6.0+siteaaaa"),
+            "20260415T124300Z+catnew+ui2.6.1+sitebbbb"
+        ));
+        assert!(!remote_version_requires_update(
+            Some("20260415T124300Z+catnew+ui2.6.1+sitebbbb"),
+            "20260415T124249Z+catold+ui2.6.0+siteaaaa"
+        ));
+    }
+
+    #[test]
+    fn remote_version_requires_update_rejects_legacy_downgrade() {
+        assert!(!remote_version_requires_update(
+            Some("20260415T124300Z+catnew+ui2.6.1+sitebbbb"),
+            "1b47227beded4115d1b14fbe3185f795a82d95bb+ui2.6.1+siteaaaa"
+        ));
+        assert!(remote_version_requires_update(
+            Some("1b47227beded4115d1b14fbe3185f795a82d95bb+ui2.6.1+siteaaaa"),
+            "20260415T124300Z+catnew+ui2.6.1+sitebbbb"
+        ));
+    }
+
+    #[test]
+    fn remote_version_requires_update_updates_same_stamp_different_payload() {
+        assert!(remote_version_requires_update(
+            Some("20260415T124300Z+catnew+ui2.6.1+siteaaaa"),
+            "20260415T124300Z+catnew+ui2.6.1+sitebbbb"
+        ));
     }
 }
 
