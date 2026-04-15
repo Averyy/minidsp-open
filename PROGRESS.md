@@ -438,6 +438,9 @@ and TEST-04 after P1.
   - sample-rate switch between plays
   - HID-only-device clear error path
   - live 2026-04-14 busy-guard verification is now complete on the attached ESP32 + 2x4 HD: during an active default `/play`, plain `GET /devices/0` and `GET /api/2/devices` both returned `409 {"error":"device busy during playback"}`, the raw TCP bridge on port `5333` returned `0x00` busy/error for a framed `0x31` request, and the device remained healthy after playback finished
+  - post-push bridge parity follow-up on 2026-04-14 is also clean on the same hardware: raw TCP `CMD_SET_SOURCE` (`0x34`) now reuses the same source-recovery path as HTTP, repeated live `Toslink <-> Usb` cycles over port `5333` returned clean `0x01` acks and left the device healthy, and the raw WebSocket bridge at `/devices/0/ws` now does the same on framed binary requests
+  - embedded ezBEQ `/ws` playback gating was rechecked live after that follow-up: connecting and subscribing during an active sweep now yields only the normal `Catalogue` envelope during the busy window instead of injecting HTTP-style `{"error":...}` payloads into the ezBEQ stream
+  - the same follow-up also tightened the playback pre-generation yield cadence on the ESP32 after an 8 s sweep reproduced a CPU0 `task_wdt` warning; reflashing and rerunning the same 8 s `Toslink -> /play -> Toslink` hardware check completed cleanly with no fresh `task_wdt` output in the UART log while source restore still succeeded
 - [x] Prove on hardware that the current shared `0x13` route-enable write path restores audible USB playback on DSP100 / 2x4 HD without relying on the official app
   - confirmed live on 2026-04-09: after the shared HID echo-decoder fix, ESP32 route writes made `/play` audible on physical output `3`
 - [x] Make DSP100 / 2x4 HD routing-state read-back survive fresh desktop daemon reconnects via persisted verified shadow keyed by device serial

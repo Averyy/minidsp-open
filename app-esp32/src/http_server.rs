@@ -3063,55 +3063,22 @@ fn raw_source_from_payload(
 }
 
 pub(crate) fn raw_bridge_command_with_audio_coordination(
-    _state: &SharedDeviceState,
+    state: &SharedDeviceState,
     audio: &usb_audio::SharedAudioState,
     dev: &Arc<DeviceState>,
     payload: &[u8],
 ) -> Result<Vec<u8>, UsbHidError> {
     if let Some(target) = raw_source_from_payload(dev, payload)? {
-        let source_index = payload[1];
-        let current = {
-            let _op = dev.begin_operation();
-            dev.current_source()?
-                .ok_or_else(|| UsbHidError::Protocol("current source unavailable".to_string()))?
-        };
-
-        let switching_away_from_usb = current == Source::Usb && target != Source::Usb;
-        if switching_away_from_usb {
-            audio.pause_and_close_current("raw source change");
-            if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
-                let recovery_reason = "raw source change audio close timeout";
-                audio.resume_opening(recovery_reason);
-                let _ = audio.reopen_last_known(recovery_reason);
-                return Err(UsbHidError::Protocol(format!(
-                    "timed out waiting for USB audio teardown before switching source to {}",
-                    target.pascal_case()
-                )));
-            }
-        }
-
-        let result = {
-            let _op = dev.begin_operation();
-            dev.set_source(source_index)
-        };
-        let result = match result {
-            Ok(()) if target == Source::Usb => {
-                ensure_audio_device_available(audio, "raw source change").map_err(|err| {
-                    UsbHidError::Protocol(format!(
-                        "source switched to Usb but audio interface did not recover: {err}"
-                    ))
-                })?;
-                Ok(())
-            }
-            Err(err) if switching_away_from_usb => {
-                let recovery_reason = "raw source change failed";
-                audio.resume_opening(recovery_reason);
-                let _ = audio.reopen_last_known(recovery_reason);
-                Err(err)
-            }
-            other => other,
-        };
-        return result.map(|()| payload[..2.min(payload.len())].to_vec());
+        set_source_with_audio_coordination(
+            state,
+            audio,
+            dev,
+            target,
+            SOURCE_SWITCH_RECOVERY_TIMEOUT,
+            "raw source change",
+        )
+        .map_err(UsbHidError::Protocol)?;
+        return Ok(payload[..2.min(payload.len())].to_vec());
     }
 
     let _op = dev.begin_operation();
@@ -3309,6 +3276,8 @@ fn run_playback_thread(
     // higher priority tasks so IDLE never runs — sleep(10ms) crosses a
     // FreeRTOS tick boundary and calls vTaskDelay, letting IDLE reset
     // the watchdog.
+    const PREGEN_YIELD_INTERVAL_CHUNKS: u32 = 10;
+    const PREGEN_YIELD_DURATION_MS: u64 = 10;
     let gen_chunk_bytes = (plan.request.sample_rate as usize / 100) * plan.layout().frame_bytes();
     let mut yield_counter = 0u32;
     while !generator.is_finished() && offset < pcm_data.len() {
@@ -3319,10 +3288,10 @@ fn run_playback_thread(
         }
         offset += written;
         yield_counter += 1;
-        if yield_counter % 50 == 0 {
+        if yield_counter % PREGEN_YIELD_INTERVAL_CHUNKS == 0 {
             // 10ms minimum to cross one FreeRTOS tick boundary and
             // actually call vTaskDelay — sub-tick sleeps busy-wait.
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(PREGEN_YIELD_DURATION_MS));
         }
     }
     let pcm_data = &pcm_data[..offset];
@@ -4245,8 +4214,7 @@ fn register_ezbeq_ws(
 
             // Send initial DeviceState
             if audio.is_playing() {
-                let json = playback_busy_json();
-                ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), json.as_bytes())?;
+                log::info!("ezBEQ WS: deferring initial DeviceState while playback is active");
             } else if let Some(dev) = get_device(&st) {
                 let _op = dev.begin_operation();
                 let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
@@ -4430,36 +4398,36 @@ fn push_levels(
             break;
         }
 
-        let json = if audio_state.is_playing() {
-            playback_busy_json()
-        } else {
-            match get_device(&state) {
-                Some(dev) => {
-                    let _op = dev.begin_operation();
-                    match dev.get_status_summary() {
-                        Ok(status) => {
-                            let mut levels = serde_json::Map::new();
-                            for (i, &v) in status.input_levels.iter().enumerate() {
-                                levels.insert(format!("I{i}"), serde_json::Value::from(v));
-                            }
-                            for (i, &v) in status.output_levels.iter().enumerate() {
-                                levels.insert(format!("O{i}"), serde_json::Value::from(v));
-                            }
-                            serde_json::to_string(&serde_json::json!({
-                                "message": "Levels",
-                                "data": {
-                                    "name": "master",
-                                    "ts": 0,
-                                    "levels": levels,
-                                }
-                            }))
-                            .unwrap_or_default()
+        if audio_state.is_playing() {
+            continue;
+        }
+
+        let json = match get_device(&state) {
+            Some(dev) => {
+                let _op = dev.begin_operation();
+                match dev.get_status_summary() {
+                    Ok(status) => {
+                        let mut levels = serde_json::Map::new();
+                        for (i, &v) in status.input_levels.iter().enumerate() {
+                            levels.insert(format!("I{i}"), serde_json::Value::from(v));
                         }
-                        Err(_) => continue,
+                        for (i, &v) in status.output_levels.iter().enumerate() {
+                            levels.insert(format!("O{i}"), serde_json::Value::from(v));
+                        }
+                        serde_json::to_string(&serde_json::json!({
+                            "message": "Levels",
+                            "data": {
+                                "name": "master",
+                                "ts": 0,
+                                "levels": levels,
+                            }
+                        }))
+                        .unwrap_or_default()
                     }
+                    Err(_) => continue,
                 }
-                None => continue,
             }
+            None => continue,
         };
 
         if sender
