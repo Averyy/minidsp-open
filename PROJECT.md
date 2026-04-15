@@ -557,7 +557,7 @@ From comprehensive GitHub issue review (34 open, 10 dependabot PRs, last release
 | #625 | Negative PEQ coefficients parsed as CLI flags | Low | Trivial |
 | #571 | No CORS headers for REST API | Medium | Trivial |
 | #569 | nanoAVR HDA (hw_id 8) partially broken | Low | 1 day |
-| #245 | PWR-ICE125/250 — deferred, see `docs/FUTURE-pwr-ice.md` | — | Transport (70-byte frames) included; full support needs user packet captures |
+| #245 | PWR-ICE125/250 — deferred, see `docs/TODO4-pwr-ice-compatibility.md` | — | Transport (70-byte frames) included; full support needs user packet captures |
 | #229 | MiniDSP 2x4 non-HD (legacy dialect, VID 0x04D8) | Medium | 2 days |
 
 Also: minidsp-rs serves ReDoc at `/api` and OpenAPI schema at `/openapi.json`. We serve the same plus `llms.txt` at webapp root for AI/LLM discoverability.

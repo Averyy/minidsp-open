@@ -508,7 +508,7 @@ This section must be completed after the technical tests.
 - Result:
   Physical attach, probe, EEPROM reads, master status, tokens, and basic write routes all work on real hardware after fixing real-device `ReadFlash`/`ReadFloats` response-shape handling.
 - Notes / follow-up:
-  `GET /devices/0/config` now exists on ESP32 but is still failing compatibility verification on real hardware. It first returned garbage PEQ/gain values, and after widening the parser search it times out instead of returning verified config data. Keep this open under Section 6.2 and `PROGRESS.md`.
+  This early baseline note is now superseded by the later 2026-04-11 and 2026-04-12 ESP32 `/config` verification in Sections 6.2 and 9.2. Keep this block only as historical context for the bring-up sequence, not as the current `/config` status.
 
 ### Section 1 config-read retest
 
@@ -522,7 +522,7 @@ This section must be completed after the technical tests.
 - Result:
   `GET /devices/0` still returns live status and level data. `GET /devices/0/config` now returns empty PEQ arrays and `null` scalar fields instead of fabricated garbage values.
 - Notes / follow-up:
-  Desktop direct-USB investigation resolved the model on the same physical 2x4 HD: scalar config slots are typed 32-bit values, modern-device write commands use the official app’s 2-byte address shape on `0x13` / `0x19` / `0x30`, and live PEQ `0x14` reads still return the all-zero placeholder so the daemon now uses a PEQ shadow/default model. ESP32 still needs that corrected behavior ported and verified.
+  This retest note is also historical only now. The shared model discovered here did later land on ESP32, and the live compatibility status for `/devices/0/config` is the verified state recorded in Section 6.2 rather than this earlier pre-fix snapshot.
 
 ### 10.4 `docs/ref-ezbeq.md`
 

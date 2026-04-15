@@ -531,6 +531,31 @@ and TEST-04 after P1.
 - [ ] Multi-device live verification
 - [ ] CI for desktop targets
 - [ ] CI for ESP32 cross-build
+- [ ] ESP32 updater pthread allocation failure on STA boot
+  - current live boot logs still show `failed to spawn update thread: Not enough space (os error 12)` after WiFi monitor startup on the STA path in `app-esp32/src/main.rs`
+  - this is a thread-creation failure, not an updater HTTP/TLS failure: `app-esp32/src/updater.rs::start_background_updater()` spawns `beq_update` with a `16 KiB` stack and the thread would only sleep for `30 s` before doing any network work
+  - likely root cause: ESP-IDF pthread stacks default to `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`, so the updater is competing for scarce internal-capability heap even though total free heap still looks healthy in `/debug/info`
+  - follow-up fix to try first: move both updater spawns (`beq_update` and `beq_refresh`) onto a scoped `ThreadSpawnConfiguration` with `stack_alloc_caps = MallocCap::Spiram | MallocCap::Cap8bit`, keep the current `16 KiB` stack initially, then retest `GET /debug/updater` + `POST /debug/updater/check` on a cold STA boot
+- [ ] ESP32 amber-to-green delay after MiniDSP plug-in
+  - current behavior is intentionally slow: after `NEW_DEV`, `app-esp32/src/usb_hid.rs::wait_for_attach_settle()` waits a fixed `20 s` before opening the device, so the LED stays amber until that gate plus the subsequent protocol probe complete
+  - this was added as a conservative reconnect-stability guard while fixing the source-switch / re-enumeration wedge, not because the healthy device normally needs a full `20 s`
+  - follow-up pass: replace the blind `20 s` sleep with earlier readiness polling and a bounded fallback deadline, so healthy attaches can turn green quickly while still preserving the current long-settle recovery path for flaky attaches
+- [ ] ESP32 non-default playback format verification
+  - the current `/play` parity pass proved the shared 48 kHz sweep/marker path on the physical 2x4 HD, but we have not yet bench-tested alternate generated playback formats or device-side format transitions on the real board
+  - follow-up pass: explicitly exercise the non-default playback-format combinations we intend to claim, and capture whether any UAC2 format/rate renegotiation path regresses sweep quality or marker timing
+- [ ] ESP32 cold-boot `Toslink -> /play -> Toslink` smoke test
+  - we verified source switching and restore repeatedly on a warm, already-attached board, but we should still keep one cold-boot non-USB playback smoke test on the list so the first attach path and the playback source-restore path are proven together
+- [ ] ESP32 unplug-mid-play / replug robustness
+  - current reconnect validation covers unplug/replug and power cycling in general, but not the specific case where the MiniDSP disappears while `/play` is actively streaming
+  - follow-up pass: interrupt playback mid-sweep, confirm cleanup is bounded, and verify the board returns to a healthy attach/reconnect state after the MiniDSP is replugged
+- [ ] ESP32 sample-rate switch between plays
+  - the live `/play` validation focused on the now-stable sweep/marker path at the current shared defaults; we should still explicitly test back-to-back plays that force a sample-rate transition and confirm UAC2 reopen / packet pacing stays clean
+- [ ] Final ezBEQ + minidsp-rs backward-compatibility audit
+  - most core surfaces are now live-verified, but the remaining compatibility closure pass should still rerun the unchecked edges in `docs/todo-checker.md`, especially actual ezBEQ-process end-to-end checks, Device Console coexistence, probe-style USB URLs, deprecated force flags, and any remaining doc-claim cleanup
+- [ ] Official-app product-matrix completion for unresolved USB-only alias families
+  - the exact modern Device Console HW/DSP matrix is already fully represented in `protocol/src/device/probe.rs`; the remaining “support everything the real app does” gap is the unresolved alias families that still lack exact runtime identity
+  - current unresolved families: `HA-DSP`, `DDRC-22`, `DDRC-88`, `CDSP-8x12/DL`, `Harmony DSP`
+  - follow-up pass: either resolve those aliases to exact runtime profiles using stronger official evidence than the current extracted corpus, or lock in and document them as intentional non-exact alias coverage boundaries
 - [ ] ezBEQ expansion after core device-matrix work is stable
 - [ ] ESP32 VBUS GPIO drive — not needed on DevKitC boards (both boards powered via UART); only needed for custom PCB where ESP32-S3 must supply 5V to the MiniDSP over the OTG port (GPIO19 high before `usb_host_install`)
 

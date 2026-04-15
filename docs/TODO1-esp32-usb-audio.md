@@ -1,5 +1,13 @@
 # USB Audio: Measurement Sweep Playback
 
+The stable public contract for `POST /devices/{id}/play` and `POST /sync` now
+lives in [docs/ref-playback.md](./docs/ref-playback.md).
+
+This file remains the detailed ESP32 bring-up and investigation log for the
+playback feature. Use `PROGRESS.md` and `docs/todo-checker.md` for current
+remaining validation items rather than treating this file as the live status
+board.
+
 ## Goal
 
 Add `POST /devices/{id}/play` and `POST /sync` endpoints. The device generates a measurement sweep mathematically, plays it through the miniDSP's USB audio input via the UAC2 driver, and returns the exact playback start timestamp so the caller can align their recording.

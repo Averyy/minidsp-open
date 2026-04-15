@@ -90,7 +90,7 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 |-------|--------|---------|-------|
 | 1 | 4x10 HD | SPDIF, TOSLINK, AES-EBU (or "Not Installed" if AN-FP module) | |
 | 2 | miniDSP 2x4 (non-HD) / NanoDigi 2x8 | TOSLINK, SPDIF | Legacy VID 0x04D8 |
-| 3 | PWR-ICE125/250 | LAN-only, see `FUTURE-pwr-ice.md` | dsp_version=51 |
+| 3 | PWR-ICE125/250 | LAN-only, see `docs/TODO4-pwr-ice-compatibility.md` | dsp_version=51 |
 | 4 | miniSHARC 4x8 / 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | APK groups hw_id 4 with 1 and 5 for sources; minidsp-rs maps `(4, _) -> MSharc4x8`. Likely shared hw_id. |
 | 5 | 10x10 HD (variant) | SPDIF, TOSLINK, AES-EBU | |
 | 6 | DDRC-88BM | TOSLINK, SPDIF | dsp_version=95, new dialect (SHARC). Not in APK or Device Console. minidsp-rs maps `(6, 95) -> DDRC88BM`. |

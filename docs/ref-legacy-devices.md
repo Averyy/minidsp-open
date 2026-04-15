@@ -112,7 +112,7 @@ This is already fully implemented in minidsp-rs `dev` and works correctly for al
 
 | Device | hw_id | Status |
 |--------|-------|--------|
-| **PWR-ICE125/250** | 3 (dsp 51) | Deferred per `FUTURE-pwr-ice.md`. LAN-only, no config.xml, no address tables. |
+| **PWR-ICE125/250** | 3 (dsp 51) | Deferred per `docs/TODO4-pwr-ice-compatibility.md`. LAN-only, no config.xml, no address tables. |
 
 ## Legacy vs SHARC: Complexity Comparison
 
@@ -209,7 +209,7 @@ Our additions:
 
 ### Still deferred or incomplete
 
-- **PWR-ICE125/250** (hw_id 3) -- already deferred per FUTURE-pwr-ice.md
+- **PWR-ICE125/250** (hw_id 3) -- already deferred per `docs/TODO4-pwr-ice-compatibility.md`
 - **CDSP 8x12DL / CDSP-8x12-DL** -- still only a USB product hint from official app assets; exact probe/runtime mapping still needed
 - **hw_id 5** (10x10HD variant) -- probably shares address table with hw_id 1/dsp 51, but unconfirmed
 - **HA-DSP** -- public product family is confirmed, and the public manual shows a dedicated `HA-DSP-CF` software family, but the extracted app assets still expose only the USB-product hint; native `minidsp_dirac` does not probe `PID 0x0013`, so exact probe/runtime mapping is still missing
