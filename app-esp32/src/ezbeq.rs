@@ -468,10 +468,11 @@ fn device_state_json_plain(device: &DeviceState, beq_state: &EzBeqState) -> Stri
 pub fn register_routes(
     server: &mut esp_idf_svc::http::server::EspHttpServer<'static>,
     device_state: SharedDeviceState,
+    audio_state: crate::usb_audio::SharedAudioState,
     beq_state: SharedEzBeqState,
     nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
-    use crate::http_server::{get_device, send_error, send_json};
+    use crate::http_server::{get_device, reject_hid_during_playback, send_error, send_json};
     use esp_idf_svc::http::Method;
 
     // GET /api/1/version
@@ -495,8 +496,13 @@ pub fn register_routes(
     // GET /api/2/devices — device list with ezBEQ state
     {
         let st = device_state.clone();
+        let audio = audio_state.clone();
         let beq = beq_state.clone();
         server.fn_handler("/api/2/devices", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 200, "{}"),
@@ -511,10 +517,15 @@ pub fn register_routes(
     // PUT /api/1/devices/master/filter/{slot} — load a BEQ filter by digest
     for slot_idx in 0..NUM_SLOTS {
         let st = device_state.clone();
+        let audio = audio_state.clone();
         let beq = beq_state.clone();
         let nvs = nvs.clone();
         let path = format!("/api/1/devices/master/filter/{}", slot_idx + 1);
         server.fn_handler(&path, Method::Put, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -609,10 +620,15 @@ pub fn register_routes(
     // DELETE /api/1/devices/master/filter/{slot} — clear a BEQ filter
     for slot_idx in 0..NUM_SLOTS {
         let st = device_state.clone();
+        let audio = audio_state.clone();
         let beq = beq_state.clone();
         let nvs = nvs.clone();
         let path = format!("/api/1/devices/master/filter/{}", slot_idx + 1);
         server.fn_handler(&path, Method::Delete, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -659,9 +675,14 @@ pub fn register_routes(
     // PATCH /api/3/devices/master — device control (volume, mute)
     {
         let st = device_state.clone();
+        let audio = audio_state.clone();
         let beq = beq_state.clone();
         let nvs = nvs.clone();
         server.fn_handler("/api/3/devices/master", Method::Patch, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -777,10 +798,15 @@ pub fn register_routes(
     // PUT /api/1/devices/master/commands — preset save/overwrite (used by React UI)
     {
         let st = device_state.clone();
+        let audio = audio_state.clone();
         server.fn_handler(
             "/api/1/devices/master/commands",
             Method::Put,
             move |mut req| {
+                req = match reject_hid_during_playback(req, &audio)? {
+                    Some(req) => req,
+                    None => return Ok(()),
+                };
                 let dev = match get_device(&st) {
                     Some(d) => d,
                     None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -812,9 +838,14 @@ pub fn register_routes(
     // PUT /api/1/devices/master/config/{slot}/active — activate a slot
     for slot_idx in 0..NUM_SLOTS {
         let st = device_state.clone();
+        let audio = audio_state.clone();
         let beq = beq_state.clone();
         let path = format!("/api/1/devices/master/config/{}/active", slot_idx + 1);
         server.fn_handler(&path, Method::Put, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),

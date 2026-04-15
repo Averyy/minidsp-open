@@ -684,6 +684,10 @@ pub fn parse_response(data: &[u8], dialect: &Dialect) -> Response {
 /// responses (`[0x05, addr_hi, addr_lo, data...]`), while the simulator and
 /// older assumptions use `[0x05, data...]`. This helper accepts both forms.
 pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect) -> Response {
+    if is_source_changed_notification_for_request(request, data) {
+        return Response::Ack;
+    }
+
     if request.first() == Some(&CMD_SET_CONFIG)
         && data.first() == Some(&RESP_EVENT)
         && request.len() >= 3
@@ -817,6 +821,18 @@ pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect
     }
 
     parse_response(data, dialect)
+}
+
+/// Returns true when `data` is the official `AudioSrcChanged` flash
+/// notification that confirms a `set_source` request completed.
+pub fn is_source_changed_notification_for_request(request: &[u8], data: &[u8]) -> bool {
+    request.first() == Some(&CMD_SET_SOURCE)
+        && request.len() >= 2
+        && data.first() == Some(&CMD_READ_FLASH)
+        && data.len() >= 4
+        && data[1] == crate::eeprom::AUDIO_SRC_CHANGED_NOTIFICATION_ADDR.0
+        && data[2] == crate::eeprom::AUDIO_SRC_CHANGED_NOTIFICATION_ADDR.1
+        && data[3] == request[1]
 }
 
 /// Parse a ReadFloats response into float values.
@@ -1461,6 +1477,23 @@ mod tests {
         let data = [0x05, 0xFF, 0xA9, 0x00];
         let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
         assert!(matches!(resp, Response::Unknown(_)));
+    }
+
+    #[test]
+    fn parse_set_source_accepts_audio_src_changed_notification() {
+        let req = set_source(0x02);
+        let data = [0x05, 0xFF, 0xA9, 0x02];
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert!(matches!(resp, Response::Ack));
+    }
+
+    #[test]
+    fn parse_set_source_rejects_audio_src_changed_for_wrong_target() {
+        let req = set_source(0x02);
+        let data = [0x05, 0xFF, 0xA9, 0x01];
+        assert!(!is_source_changed_notification_for_request(&req, &data));
+        let resp = parse_response_for_request(&req, &data, &Dialect::NEW);
+        assert!(!matches!(resp, Response::Ack));
     }
 
     #[test]

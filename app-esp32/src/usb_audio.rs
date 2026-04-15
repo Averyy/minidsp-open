@@ -12,12 +12,14 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 pub type SharedAudioState = Arc<AudioState>;
 static TX_NEED_DATA_COUNT: AtomicU32 = AtomicU32::new(0);
 
 pub struct AudioState {
     device: Mutex<Option<Arc<Uac2Device>>>,
+    last_tx_interface: Mutex<Option<(u8, u8)>>,
     connected_flag: Mutex<bool>,
     pub connected: Condvar,
     pub playing: AtomicBool,
@@ -59,6 +61,7 @@ impl AudioState {
 
             Self {
                 device: Mutex::new(None),
+                last_tx_interface: Mutex::new(None),
                 connected_flag: Mutex::new(false),
                 connected: Condvar::new(),
                 playing: AtomicBool::new(false),
@@ -136,6 +139,7 @@ impl AudioState {
     }
 
     pub fn queue_open(&self, addr: u8, iface_num: u8) {
+        *self.last_tx_interface.lock().unwrap() = Some((addr, iface_num));
         if let Err(err) = self.open_tx.send((addr, iface_num)) {
             error!("UAC2 open queue send failed: {err}");
         }
@@ -149,6 +153,10 @@ impl AudioState {
 
     pub fn finish_playback(&self) {
         self.playing.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::SeqCst)
     }
 
     pub fn pause_opening(&self, reason: &str) {
@@ -166,6 +174,87 @@ impl AudioState {
         }
         gate.enabled = true;
         self.open_gate_changed.notify_all();
+    }
+
+    pub fn pause_and_close_current(&self, reason: &str) {
+        self.pause_opening(reason);
+
+        let Some(device) = self.current_device() else {
+            return;
+        };
+        let handle = device.handle_ptr();
+        if handle.is_null() {
+            return;
+        }
+
+        info!("UAC2 closing TX interface ({reason})");
+        if let Some(device) = self.clear_device_by_handle(handle) {
+            self.defer_device_cleanup(device);
+        }
+    }
+
+    pub fn reopen_last_known(&self, reason: &str) -> bool {
+        if self.current_device().is_some() {
+            return true;
+        }
+
+        let Some((addr, iface_num)) = *self.last_tx_interface.lock().unwrap() else {
+            warn!("UAC2 reopen requested without a remembered TX interface ({reason})");
+            return false;
+        };
+
+        info!("UAC2 requesting TX reopen ({reason})");
+        if let Err(err) = self.open_tx.send((addr, iface_num)) {
+            error!("UAC2 reopen queue send failed: {err}");
+            return false;
+        }
+        true
+    }
+
+    pub fn wait_for_current_device(&self, timeout: Duration) -> Option<Arc<Uac2Device>> {
+        if let Some(device) = self.current_device() {
+            return Some(device);
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut connected = self.connected_flag.lock().unwrap();
+        while !*connected {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let result = self
+                .connected
+                .wait_timeout(connected, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            connected = result.0;
+            if result.1.timed_out() {
+                break;
+            }
+        }
+        drop(connected);
+        self.current_device()
+    }
+
+    pub fn wait_for_cleanup_complete(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut gate = self.open_gate.lock().unwrap();
+        while gate.cleanup_inflight != 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+
+            let result = self
+                .open_gate_changed
+                .wait_timeout(gate, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            gate = result.0;
+            if result.1.timed_out() && gate.cleanup_inflight != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     fn wait_until_open_allowed(&self) {
@@ -195,7 +284,9 @@ impl AudioState {
 pub fn install(state: SharedAudioState) -> Result<(), UsbAudioError> {
     let config = uac2_host_driver_config_t {
         create_background_task: true,
-        task_priority: 3,
+        // Keep the UAC2 event/submit task above default pthread priority so
+        // USB transfer callbacks are not delayed by normal app threads.
+        task_priority: UAC2_TASK_PRIORITY,
         stack_size: 6 * 1024,
         core_id: UAC2_TASK_CORE,
         callback: Some(driver_event_cb),
@@ -650,4 +741,39 @@ unsafe extern "C" {
     fn uac2_host_device_get_feedback(dev: uac2_host_device_handle_t) -> u32;
 }
 const UAC2_TASK_CORE: BaseType_t = 1;
-pub const TX_RING_BUFFER_BYTES: usize = 48 * 1024;
+const UAC2_TASK_PRIORITY: usize = 20;
+// Keep the playback ring buffer aligned to the chunk sizes we use in practice.
+// 46,080 bytes is an exact multiple of both the older 10 ms writes and the
+// current shorter 2 ms cadence, so steady-state writes never straddle the
+// internal BYTEBUF wrap point.
+pub const TX_RING_BUFFER_BYTES: usize = 46_080;
+
+#[cfg(test)]
+mod tests {
+    use super::AudioState;
+    use std::time::Duration;
+
+    #[test]
+    fn wait_for_cleanup_complete_returns_after_cleanup_finishes() {
+        let state = AudioState::new();
+        state.begin_cleanup();
+
+        let state_for_thread = state.clone();
+        let join = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            state_for_thread.finish_cleanup();
+        });
+
+        assert!(state.wait_for_cleanup_complete(Duration::from_millis(500)));
+        join.join().expect("cleanup thread should finish");
+    }
+
+    #[test]
+    fn wait_for_cleanup_complete_times_out_when_cleanup_never_finishes() {
+        let state = AudioState::new();
+        state.begin_cleanup();
+
+        assert!(!state.wait_for_cleanup_complete(Duration::from_millis(50)));
+        state.finish_cleanup();
+    }
+}

@@ -508,7 +508,7 @@ impl DeviceState {
         let status = self.get_master_status()?;
         Ok(self.profile.sources.source_for_index(status.source))
     }
-    fn dialect(&self) -> &Dialect {
+    pub(crate) fn dialect(&self) -> &Dialect {
         &self.profile.dialect
     }
 
@@ -1223,6 +1223,18 @@ impl DeviceState {
     }
 
     pub fn set_source(&self, source: u8) -> Result<(), UsbHidError> {
+        if self.profile.sources.source_for_index(source).is_none() {
+            return Err(UsbHidError::Protocol(format!(
+                "source {source} not available on this device"
+            )));
+        }
+
+        if let Ok(before) = self.read_master_status_once() {
+            if before.source == source {
+                return Ok(());
+            }
+        }
+
         self.expect_write_ok(&commands::set_source(source), "set source")
     }
 
@@ -2234,18 +2246,6 @@ impl DeviceState {
         Ok(resp)
     }
 
-    /// Execute a raw TCP-bridge command and encode the reply the way the
-    /// official Device Console network parser expects:
-    ///
-    /// - `0x01` for OK
-    /// - `0x00` for Error
-    /// - `0x02 <event>` for preset/reset completion
-    /// - `[len][cmd ...]` for read-style replies
-    pub fn tcp_bridge_command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
-        let resp = self.raw_command(payload)?;
-        Ok(encode_tcp_bridge_response(payload, &resp, self.dialect()))
-    }
-
     /// Parse a raw write payload and update in-memory shadow state for
     /// successful bridge / WebSocket writes.
     fn mirror_raw_to_shadow(&self, payload: &[u8]) {
@@ -2307,13 +2307,14 @@ impl DeviceState {
     }
 }
 
+#[cfg(test)]
 fn encode_tcp_bridge_response(request: &[u8], raw_resp: &[u8], dialect: &Dialect) -> Vec<u8> {
     minidsp_protocol::packet::encode_device_console_tcp_response(request, raw_resp, dialect)
 }
 
 #[cfg(test)]
 mod tcp_bridge_tests {
-    use super::encode_tcp_bridge_response;
+    use super::{encode_tcp_bridge_response, raw_bridge_timeout_for_payload, SLOW_COMMAND_TIMEOUT};
     use minidsp_protocol::commands;
     use minidsp_protocol::dialect::Dialect;
 
@@ -2642,14 +2643,14 @@ mod peq_shadow_tests {
     #[test]
     fn parse_raw_selector_write_extracts_selector_value() {
         let payload = commands::write_dsp_u32_le_with_ctrl(0x1234, 2, 0x80);
-        let parsed = parse_raw_selector_write(&payload, &Dialect::FLOAT32LE);
+        let parsed = parse_raw_selector_write(&payload, &Dialect::NEW);
         assert_eq!(parsed, Some((0x1234, 2)));
     }
 
     #[test]
     fn parse_raw_linked_selector_write_extracts_primary_value() {
         let payload = commands::write_dsp_linked_u32(0x1234, 3, &[0x2000, 0x2001]);
-        let parsed = parse_raw_linked_selector_write(&payload, &Dialect::FLOAT32LE);
+        let parsed = parse_raw_linked_selector_write(&payload, &Dialect::NEW);
         assert_eq!(parsed, Some((0x1234, 3)));
     }
 }

@@ -11,14 +11,17 @@
 use crate::device::DeviceState;
 use crate::diagnostics;
 use crate::usb_audio;
+use crate::usb_hid::UsbHidError;
+use esp_idf_hal::task::thread::{MallocCap, ThreadSpawnConfiguration};
 use esp_idf_svc::http::client::{Configuration as HttpClientConfiguration, EspHttpConnection};
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::io::Write;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{debug, info, warn};
+use minidsp_protocol::commands;
 use minidsp_protocol::playback::{
-    BitDepth, PlayRequest, PlayResponse, PlaybackPlan, SyncRequest, SyncResponse,
+    BitDepth, PlayRequest, PlayResponse, PlaybackPlan, SyncRequest, SyncResponse, ToneBurstParams,
 };
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::{BmChannelPatch, BmMixerCellPatch, DeviceConfig, StatusSummary};
@@ -28,6 +31,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const REBOOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(50);
+const SOURCE_SWITCH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(35);
+const AUDIO_REOPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const AUDIO_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PLAYBACK_BYTES: usize = 4 * 1024 * 1024;
+const PLAYBACK_THREAD_STACK_BYTES: usize = 18 * 1024;
+const PLAYBACK_STREAM_TARGET_CHUNK_MS: usize = 2;
+const PLAYBACK_PROGRESS_LOG_EVERY_WRITES: usize = 500;
+pub(crate) const HID_BUSY_DURING_PLAYBACK: &str = "device busy during playback";
+static PLAYBACK_STREAM_BUF: Mutex<[u8; 2880]> = Mutex::new([0u8; 2880]);
 
 /// Shared device state — None when USB disconnected, Some when connected.
 pub type SharedDeviceState = Arc<Mutex<Option<Arc<DeviceState>>>>;
@@ -96,7 +108,12 @@ pub fn start(
     #[cfg(not(esp_idf_httpd_ws_support))]
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -112,7 +129,12 @@ pub fn start(
     // POST /devices/0 — set master status
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0", Method::Post, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -125,15 +147,21 @@ pub fn start(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
-            let _op = dev.begin_operation();
-
             if let Some(vol) = json.get("volume").and_then(|v| v.as_f64()) {
-                if let Err(e) = dev.set_volume_db(vol as f32) {
+                let result = {
+                    let _op = dev.begin_operation();
+                    dev.set_volume_db(vol as f32)
+                };
+                if let Err(e) = result {
                     return send_error(req, 500, &format!("set_volume: {e}"));
                 }
             }
             if let Some(mute) = json.get("mute").and_then(|v| v.as_bool()) {
-                if let Err(e) = dev.set_mute(mute) {
+                let result = {
+                    let _op = dev.begin_operation();
+                    dev.set_mute(mute)
+                };
+                if let Err(e) = result {
                     return send_error(req, 500, &format!("set_mute: {e}"));
                 }
             }
@@ -144,32 +172,46 @@ pub fn start(
                     Some(s) => s,
                     None => return send_error(req, 400, &format!("unknown source '{source}'")),
                 };
-                match dev.profile().sources.index_for_source(src) {
-                    Some(idx) => {
-                        if let Err(e) = dev.set_source(idx) {
-                            return send_error(req, 500, &format!("set_source: {e}"));
-                        }
-                    }
-                    None => return send_error(req, 400, "source not available on this device"),
+                if let Err(e) = set_source_with_audio_coordination(
+                    &st,
+                    &audio,
+                    &dev,
+                    src,
+                    SOURCE_SWITCH_RECOVERY_TIMEOUT,
+                    "master status update",
+                ) {
+                    return send_error(req, 500, &e);
                 }
             }
             if let Some(preset) = json.get("preset").and_then(|v| v.as_u64()) {
                 if preset > u8::MAX as u64 {
                     return send_error(req, 400, "preset out of range");
                 }
-                if let Err(e) = dev.set_preset(preset as u8) {
+                let result = {
+                    let _op = dev.begin_operation();
+                    dev.set_preset(preset as u8)
+                };
+                if let Err(e) = result {
                     return send_error(req, 500, &format!("set_preset: {e}"));
                 }
             }
             if let Some(dirac) = json.get("dirac").and_then(|v| v.as_bool()) {
-                match dev.set_dirac_bypass(!dirac) {
+                let result = {
+                    let _op = dev.begin_operation();
+                    dev.set_dirac_bypass(!dirac)
+                };
+                match result {
                     Ok(()) => {}
                     Err(e) if e.to_string().contains("unsupported") => {}
                     Err(e) => return send_error(req, 500, &format!("set_dirac: {e}")),
                 }
             }
 
-            match dev.get_status_summary() {
+            let status = {
+                let _op = dev.begin_operation();
+                dev.get_status_summary()
+            };
+            match status {
                 Ok(status) => send_json(req, 200, &master_status_json(&status)),
                 Err(e) => send_error(req, 500, &e.to_string()),
             }
@@ -177,11 +219,11 @@ pub fn start(
     }
 
     // Compatibility routes: volume direction
-    register_volume_routes(&mut server, state.clone())?;
+    register_volume_routes(&mut server, state.clone(), audio_state.clone())?;
 
     // Source and preset routes
-    register_source_routes(&mut server, state.clone())?;
-    register_preset_routes(&mut server, state.clone())?;
+    register_source_routes(&mut server, state.clone(), audio_state.clone())?;
+    register_preset_routes(&mut server, state.clone(), audio_state.clone())?;
 
     {
         server.fn_handler("/sync", Method::Post, move |mut req| {
@@ -208,6 +250,14 @@ pub fn start(
         let st = state.clone();
         let audio = audio_state.clone();
         server.fn_handler("/devices/0/play", Method::Post, move |mut req| {
+            let uri = req.uri().to_string();
+            let Some(device_id) = parse_play_path(&uri) else {
+                return send_error(req, 404, "not found");
+            };
+            if device_id != 0 {
+                return send_error(req, 404, "not found");
+            }
+
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -215,87 +265,16 @@ pub fn start(
             if !dev.profile().has_usb_audio {
                 return send_error(req, 400, "device does not support USB audio playback");
             }
-            let audio_device = match audio.current_device() {
-                Some(device) => device,
-                None => return send_error(req, 503, "USB audio interface not connected"),
-            };
+            let audio_device =
+                match ensure_audio_device_available(&audio, "play request needs USB audio") {
+                    Ok(device) => device,
+                    Err(message) => return send_error(req, 503, &message),
+                };
             if !audio.try_begin_playback() {
                 return send_error(req, 409, "playback already in progress");
             }
 
-            // Check for diagnostic test modes via query parameter
-            let uri = req.uri().to_string();
-            let test_mode = uri
-                .split_once('?')
-                .map(|(_, q)| q)
-                .unwrap_or("")
-                .split('&')
-                .find_map(|p| {
-                    let (k, v) = p.split_once('=').unwrap_or((p, ""));
-                    if k == "test" { Some(v.to_string()) } else { None }
-                });
-
-            if test_mode.as_deref() == Some("sine") {
-                // Inline sine test: bypass PlaybackGenerator and PSRAM entirely.
-                // Generates sin(2πft) into a stack buffer in a tight write loop,
-                // identical to the standalone driver test harness.
-                let (source_changed, previous_source, restore_source) =
-                    match switch_to_usb_source(&dev) {
-                        Ok(result) => result,
-                        Err((code, msg)) => {
-                            audio.finish_playback();
-                            return send_error(req, code, &msg);
-                        }
-                    };
-
-                let (tx, rx) = mpsc::sync_channel(1);
-                let dev_for_thread = dev.clone();
-                let audio_for_thread = audio.clone();
-                if let Err(err) = std::thread::Builder::new()
-                    .name("sine_test".into())
-                    .stack_size(16 * 1024)
-                    .spawn(move || {
-                        run_inline_sine_test(
-                            dev_for_thread,
-                            audio_for_thread,
-                            audio_device,
-                            source_changed,
-                            previous_source,
-                            restore_source,
-                            tx,
-                        );
-                    })
-                {
-                    if let Some(source) = restore_source {
-                        if let Some(index) = dev.profile().sources.index_for_source(source) {
-                            let _op = dev.begin_operation();
-                            if let Err(restore_err) = dev.set_source(index) {
-                                warn!(
-                                    "failed to restore source after sine spawn failure to {}: {}",
-                                    source, restore_err
-                                );
-                            }
-                        }
-                    }
-                    audio.finish_playback();
-                    return send_error(req, 500, &format!("spawn sine test: {err}"));
-                }
-
-                return match rx.recv() {
-                    Ok(Ok(response)) => match serde_json::to_string(&response) {
-                        Ok(json) => send_json(req, 200, &json),
-                        Err(_) => send_error(req, 500, "failed to serialize response"),
-                    },
-                    Ok(Err(message)) => {
-                        audio.finish_playback();
-                        send_error(req, 500, &message)
-                    }
-                    Err(_) => {
-                        audio.finish_playback();
-                        send_error(req, 500, "sine test thread ended unexpectedly")
-                    }
-                };
-            }
+            let test_mode = parse_query_param(&uri, "test");
 
             let body = match read_request_body(&mut req, 4096) {
                 Ok(body) => body,
@@ -309,23 +288,47 @@ pub fn start(
             } else {
                 match serde_json::from_slice::<PlayRequest>(&body) {
                     Ok(value) => value,
-                    Err(_) => {
+                    Err(err) => {
                         audio.finish_playback();
-                        return send_error(req, 400, "invalid JSON");
+                        return send_error(req, 400, &format!("invalid play request: {err}"));
                     }
                 }
             };
 
-            let plan = match PlaybackPlan::build(play_request) {
+            let plan = match test_mode.as_deref() {
+                Some("marker") | Some("tail-marker") => {
+                    let tone = ToneBurstParams {
+                        frequency: play_request.marker_frequency_hz,
+                        cycles: play_request.marker_cycles,
+                    };
+                    PlaybackPlan::diagnostic_tail_marker(
+                        tone,
+                        play_request.sample_rate,
+                        play_request.bit_depth,
+                        play_request.decay_sec,
+                    )
+                    .map_err(|err| err.to_string())
+                }
+                Some(other) => Err(format!("unknown play test mode: {other}")),
+                None => PlaybackPlan::build(play_request).map_err(|err| err.to_string()),
+            };
+            let plan = match plan {
                 Ok(plan) => plan,
-                Err(err) => {
+                Err(message) => {
                     audio.finish_playback();
-                    return send_error(req, 400, &err.to_string());
+                    return send_error(req, 400, &message);
+                }
+            };
+            let total_bytes = match validate_esp32_playback_size(&plan) {
+                Ok(total_bytes) => total_bytes,
+                Err(message) => {
+                    audio.finish_playback();
+                    return send_error(req, 413, &message);
                 }
             };
 
-            let (source_changed, previous_source, restore_source) =
-                match switch_to_usb_source(&dev) {
+            let (dev_for_thread, source_changed, previous_source, restore_source) =
+                match switch_to_usb_source(&st, &dev) {
                     Ok(result) => result,
                     Err((code, msg)) => {
                         audio.finish_playback();
@@ -334,33 +337,28 @@ pub fn start(
                 };
 
             let (tx, rx) = mpsc::sync_channel(1);
-            let dev_for_thread = dev.clone();
             let audio_for_thread = audio.clone();
-            if let Err(err) = std::thread::Builder::new()
-                .name("playback".into())
-                .stack_size(24 * 1024)
-                .spawn(move || {
-                    run_playback_thread(
-                        dev_for_thread,
-                        audio_for_thread,
-                        audio_device,
-                        plan,
-                        source_changed,
-                        previous_source,
-                        restore_source,
-                        tx,
-                    );
-                })
-            {
-                if let Some(source) = restore_source {
-                    if let Some(index) = dev.profile().sources.index_for_source(source) {
-                        let _op = dev.begin_operation();
-                        if let Err(restore_err) = dev.set_source(index) {
-                            warn!(
-                                "failed to restore source after playback spawn failure: {restore_err}"
-                            );
-                        }
-                    }
+            let restore_source_for_error = restore_source;
+            if let Err(err) = spawn_playback_thread(
+                st.clone(),
+                dev_for_thread.clone(),
+                audio_for_thread,
+                audio_device,
+                Box::new(plan),
+                total_bytes,
+                source_changed,
+                previous_source,
+                restore_source,
+                tx,
+            ) {
+                if let Err(restore_err) = restore_source_after_playback(
+                    &st,
+                    &audio,
+                    &dev_for_thread,
+                    restore_source_for_error,
+                    "playback spawn failure",
+                ) {
+                    warn!("{restore_err}");
                 }
                 audio.finish_playback();
                 return send_error(req, 500, &format!("spawn playback thread: {err}"));
@@ -386,7 +384,12 @@ pub fn start(
     // GET /devices/0/config — full config read-back
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/config", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -408,8 +411,13 @@ pub fn start(
     // POST /devices/0/config — full config write (PEQ, gain, mute, delay, polarity, master)
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         let nvs_clone = nvs.clone();
         server.fn_handler("/devices/0/config", Method::Post, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -427,6 +435,35 @@ pub fn start(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
+
+            let requested_source = if let Some(source) = json
+                .get("master_status")
+                .and_then(|ms| ms.get("source"))
+                .and_then(|v| v.as_str())
+            {
+                match minidsp_protocol::source::Source::from_str_pascal(source)
+                    .or_else(|| minidsp_protocol::source::Source::from_str_lowercase(source))
+                {
+                    Some(src) => Some(src),
+                    None => return send_error(req, 400, &format!("unknown source '{source}'")),
+                }
+            } else {
+                None
+            };
+
+            if let Some(source) = requested_source {
+                if let Err(err) = set_source_with_audio_coordination(
+                    &st,
+                    &audio,
+                    &dev,
+                    source,
+                    SOURCE_SWITCH_RECOVERY_TIMEOUT,
+                    "config master_status update",
+                ) {
+                    return send_error(req, 500, &err);
+                }
+            }
+
             let _op = dev.begin_operation();
 
             // master_status: {preset, volume, mute, source, dirac}
@@ -444,22 +481,6 @@ pub fn start(
                 if let Some(mute) = ms.get("mute").and_then(|v| v.as_bool()) {
                     if let Err(e) = dev.set_mute(mute) {
                         return send_error(req, 500, &format!("set_mute: {e}"));
-                    }
-                }
-                if let Some(source) = ms.get("source").and_then(|v| v.as_str()) {
-                    let src = match minidsp_protocol::source::Source::from_str_pascal(source)
-                        .or_else(|| minidsp_protocol::source::Source::from_str_lowercase(source))
-                    {
-                        Some(s) => s,
-                        None => return send_error(req, 400, &format!("unknown source '{source}'")),
-                    };
-                    match dev.profile().sources.index_for_source(src) {
-                        Some(idx) => {
-                            if let Err(e) = dev.set_source(idx) {
-                                return send_error(req, 500, &format!("set_source: {e}"));
-                            }
-                        }
-                        None => return send_error(req, 400, "source not available on this device"),
                     }
                 }
                 if let Some(dirac) = ms.get("dirac").and_then(|v| v.as_bool()) {
@@ -845,20 +866,32 @@ pub fn start(
     }
 
     // Display, DRE, tokens, preset copy, measurement-mode
-    register_device_feature_routes(&mut server, state.clone(), nvs.clone(), beq_state.clone())?;
+    register_device_feature_routes(
+        &mut server,
+        state.clone(),
+        audio_state.clone(),
+        nvs.clone(),
+        beq_state.clone(),
+    )?;
 
     // Debug / diagnostics endpoints
-    register_debug_routes(&mut server, state.clone(), nvs.clone())?;
+    register_debug_routes(&mut server, state.clone(), audio_state.clone(), nvs.clone())?;
 
     // WebSocket for status streaming (gated on ESP-IDF httpd WS support)
     #[cfg(esp_idf_httpd_ws_support)]
-    register_ws_routes(&mut server, state.clone())?;
+    register_ws_routes(&mut server, state.clone(), audio_state.clone())?;
 
     // ezBEQ REST API + WebSocket (only in STA mode with beq_state)
     if let Some(ref beq) = beq_state {
-        crate::ezbeq::register_routes(&mut server, state.clone(), beq.clone(), nvs.clone())?;
+        crate::ezbeq::register_routes(
+            &mut server,
+            state.clone(),
+            audio_state.clone(),
+            beq.clone(),
+            nvs.clone(),
+        )?;
         #[cfg(esp_idf_httpd_ws_support)]
-        register_ezbeq_ws(&mut server, state.clone(), beq.clone())?;
+        register_ezbeq_ws(&mut server, state.clone(), audio_state.clone(), beq.clone())?;
     }
 
     // JSON fallback for unsupported /devices/* mutations. Register after all
@@ -1089,6 +1122,7 @@ fn get_sta_ip_string() -> Option<String> {
 fn register_debug_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
     nvs: EspDefaultNvsPartition,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     // GET /debug/info — JSON system diagnostics
@@ -1111,7 +1145,12 @@ fn register_debug_routes(
     // GET /debug/dsp?addr=0x20&count=4&format=floats|words
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/debug/dsp", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1338,9 +1377,15 @@ fn register_debug_routes(
 fn register_volume_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     let st = state.clone();
+    let audio = audio_state.clone();
     server.fn_handler("/devices/0/volume/*", Method::Post, move |req| {
+        let req = match reject_hid_during_playback(req, &audio)? {
+            Some(req) => req,
+            None => return Ok(()),
+        };
         let dev = match get_device(&st) {
             Some(d) => d,
             None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1378,9 +1423,15 @@ fn register_volume_routes(
 fn register_source_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     let st = state.clone();
+    let audio = audio_state.clone();
     server.fn_handler("/devices/0/source/*", Method::Post, move |req| {
+        let req = match reject_hid_during_playback(req, &audio)? {
+            Some(req) => req,
+            None => return Ok(()),
+        };
         let dev = match get_device(&st) {
             Some(d) => d,
             None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1389,23 +1440,22 @@ fn register_source_routes(
         let Some(source_name) = parse_source_path(&uri) else {
             return send_error(req, 400, "invalid source path");
         };
-        let _op = dev.begin_operation();
         let src = match Source::from_str_lowercase(&source_name)
             .or_else(|| Source::from_str_pascal(&source_name))
         {
             Some(s) => s,
             None => return send_error(req, 400, "unknown source"),
         };
-        let idx = match dev.profile().sources.index_for_source(src) {
-            Some(i) => i,
-            None => return send_error(req, 400, "source not available on this device"),
-        };
-        if let Err(e) = dev.set_source(idx) {
-            return send_error(req, 500, &e.to_string());
-        }
-        match dev.get_status_summary() {
-            Ok(status) => send_json(req, 200, &master_status_json(&status)),
-            Err(e) => send_error(req, 500, &e.to_string()),
+        match set_source_with_audio_coordination(
+            &st,
+            &audio,
+            &dev,
+            src,
+            SOURCE_SWITCH_RECOVERY_TIMEOUT,
+            "manual source change",
+        ) {
+            Ok((_, status)) => send_json(req, 200, &master_status_json(&status)),
+            Err(err) => send_error(req, 500, &err),
         }
     })?;
     Ok(())
@@ -1414,11 +1464,17 @@ fn register_source_routes(
 fn register_preset_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     for preset in 0..=3u8 {
         let st = state.clone();
+        let audio = audio_state.clone();
         let path = format!("/devices/0/preset/{preset}");
         server.fn_handler(&path, Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1439,13 +1495,19 @@ fn register_preset_routes(
 fn register_device_feature_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
     nvs: EspDefaultNvsPartition,
     beq_state: Option<crate::ezbeq::SharedEzBeqState>,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     // GET /devices/0/display
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/display", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 Some(d) if !d.profile().has_display => {
@@ -1467,7 +1529,12 @@ fn register_device_feature_routes(
     // POST /devices/0/display
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/display", Method::Post, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 Some(d) if !d.profile().has_display => {
@@ -1507,7 +1574,12 @@ fn register_device_feature_routes(
     // GET /devices/0/dre
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/dre", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 Some(d) if !d.profile().has_dre => {
@@ -1529,7 +1601,12 @@ fn register_device_feature_routes(
     // POST /devices/0/dre
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/dre", Method::Post, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 Some(d) if !d.profile().has_dre => {
@@ -1558,7 +1635,12 @@ fn register_device_feature_routes(
     // GET /devices/0/tokens
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/tokens", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1578,7 +1660,12 @@ fn register_device_feature_routes(
     // GET /devices/0/verify-program
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/verify-program", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1603,7 +1690,12 @@ fn register_device_feature_routes(
     // POST /devices/0/preset/copy
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/preset/copy", Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1619,7 +1711,12 @@ fn register_device_feature_routes(
     // POST /devices/0/preset/reset
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/preset/reset", Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1644,10 +1741,15 @@ fn register_device_feature_routes(
     // POST /devices/0/preset/{preset}/reset
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         // Safe because the handler captures only owned `Arc` state and the
         // server owns the closure for the same lifetime as `state`.
         unsafe {
             server.fn_handler_nonstatic("/devices/0/preset/*/reset", Method::Post, move |req| {
+                let req = match reject_hid_during_playback(req, &audio)? {
+                    Some(req) => req,
+                    None => return Ok(()),
+                };
                 let dev = match get_device(&st) {
                     Some(d) => d,
                     None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1681,7 +1783,12 @@ fn register_device_feature_routes(
     // POST /devices/0/preset/reset-all
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/preset/reset-all", Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1706,7 +1813,12 @@ fn register_device_feature_routes(
     // POST /devices/0/reboot
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/reboot", Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1725,8 +1837,13 @@ fn register_device_feature_routes(
     // band so a REW sweep hits the device unfiltered.
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         let nvs = nvs.clone();
         server.fn_handler("/devices/0/measurement-mode", Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1746,11 +1863,16 @@ fn register_device_feature_routes(
     // snapshot taken by the last POST /measurement-mode.
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         let nvs = nvs.clone();
         server.fn_handler(
             "/devices/0/measurement-mode/restore",
             Method::Post,
             move |req| {
+                let req = match reject_hid_during_playback(req, &audio)? {
+                    Some(req) => req,
+                    None => return Ok(()),
+                };
                 let dev = match get_device(&st) {
                     Some(d) => d,
                     None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1770,9 +1892,14 @@ fn register_device_feature_routes(
     // POST /devices/0/peq/reset
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         let nvs = nvs.clone();
         let beq = beq_state.clone();
         server.fn_handler("/devices/0/peq/reset", Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1829,7 +1956,12 @@ fn register_device_feature_routes(
     // GET /devices/0/bm
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/bm", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1851,7 +1983,12 @@ fn register_device_feature_routes(
     // POST /devices/0/bm/channel/{ch}
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/bm/channel/*", Method::Post, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -1888,7 +2025,12 @@ fn register_device_feature_routes(
     // POST /devices/0/bm/mixer/{row}/{col}
     {
         let st = state.clone();
+        let audio = audio_state.clone();
         server.fn_handler("/devices/0/bm/mixer/*", Method::Post, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
             let dev = match get_device(&st) {
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
@@ -2076,12 +2218,29 @@ fn parse_source_path(uri: &str) -> Option<String> {
     }
 }
 
+fn parse_play_path(uri: &str) -> Option<usize> {
+    let parts = path_segments(uri);
+    match parts.as_slice() {
+        ["devices", idx, "play"] => idx.parse().ok(),
+        _ => None,
+    }
+}
+
 fn parse_volume_path(uri: &str) -> Option<String> {
     let parts = path_segments(uri);
     match parts.as_slice() {
         ["devices", "0", "volume", direction] => Some((*direction).to_string()),
         _ => None,
     }
+}
+
+fn parse_query_param(uri: &str, key: &str) -> Option<String> {
+    uri.split_once('?').and_then(|(_, query)| {
+        query.split('&').find_map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (name == key).then(|| urldecode(value))
+        })
+    })
 }
 
 fn config_json(dev: &DeviceState, config: DeviceConfig) -> String {
@@ -2357,12 +2516,8 @@ fn openapi_json() -> String {
             "/devices/0/bm/mixer/{row}/{col}": {
                 "post": { "summary": "Patch one bass-management mixer cell" }
             },
-            "/devices/0/play": {
-                "post": { "summary": "Play a diagnostic or measurement signal" }
-            },
-            "/sync": {
-                "post": { "summary": "Clock sync helper" }
-            },
+            "/devices/{id}/play": openapi_play_path(),
+            "/sync": openapi_sync_path(),
             "/openapi.json": {
                 "get": { "summary": "This OpenAPI specification" }
             },
@@ -2372,6 +2527,70 @@ fn openapi_json() -> String {
         }
     }))
     .unwrap_or_else(|_| "{}".into())
+}
+
+fn openapi_play_path() -> serde_json::Value {
+    json!({
+        "post": {
+            "summary": "Play the shared measurement sweep and optional acoustic markers",
+            "operationId": "playDevice",
+            "parameters": [
+                { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } },
+                { "name": "test", "in": "query", "required": false, "schema": { "type": "string", "enum": ["marker", "tail-marker"] } }
+            ],
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "description": "Canonical playback request. The signal always includes the fixed 2 s low-level preamble. By default it also includes one 80 Hz marker before the sweep, a 50 ms gap, the sweep, another 50 ms gap, one 80 Hz marker after the sweep, and 2 s of post-silence. Setting markerCycles to 0 disables both marker sections and removes their gaps.",
+                            "properties": {
+                                "sweepDurationSec": { "type": "number", "default": 5.46, "exclusiveMinimum": 0.0 },
+                                "sweepStartHz": { "type": "number", "default": 5.0, "exclusiveMinimum": 0.0 },
+                                "sweepEndHz": { "type": "number", "default": 400.0, "exclusiveMinimum": 0.0 },
+                                "sweepFadeSec": { "type": "number", "default": 0.02, "minimum": 0.0 },
+                                "markerBefore": { "type": "boolean", "default": true },
+                                "markerAfter": { "type": "boolean", "default": true },
+                                "markerGapMs": { "type": "integer", "default": 50, "minimum": 0, "maximum": 2000 },
+                                "markerFrequencyHz": { "type": "number", "default": 80.0, "exclusiveMinimum": 0.0 },
+                                "markerCycles": { "type": "number", "default": 1.0, "minimum": 0.0 },
+                                "decaySec": { "type": "number", "default": 2.0, "minimum": 0.0 },
+                                "sampleRate": { "type": "integer", "default": 48000, "minimum": 1 },
+                                "bitDepth": { "type": "string", "enum": ["16", "24"], "default": "16" }
+                            },
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            },
+            "responses": {
+                "200": { "description": "Playback started; response includes startedAtUs, offsets, and source-switch metadata" },
+                "400": { "description": "Invalid playback request" },
+                "404": { "description": "Device not found" },
+                "409": { "description": "Playback already in progress" },
+                "413": { "description": "Playback request exceeds the ESP32 pre-generation buffer limit" }
+            }
+        }
+    })
+}
+
+fn openapi_sync_path() -> serde_json::Value {
+    json!({
+        "post": {
+            "summary": "Read the platform playback clock used by /play.startedAtUs",
+            "operationId": "syncClock",
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": { "type": "object", "description": "Body: { clientTimeUs: i64 }" }
+                    }
+                }
+            },
+            "responses": {
+                "200": { "description": "Echoed clientTimeUs plus serverTimeUs from the same clock basis as /play.startedAtUs" }
+            }
+        }
+    })
 }
 
 pub fn send_json<C: esp_idf_svc::http::server::Connection>(
@@ -2387,6 +2606,22 @@ pub fn send_json<C: esp_idf_svc::http::server::Connection>(
     let mut resp = req.into_response(status, None, &headers)?;
     resp.write_all(body.as_bytes())?;
     Ok(())
+}
+
+pub(crate) fn reject_hid_during_playback<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    audio: &usb_audio::SharedAudioState,
+) -> Result<Option<esp_idf_svc::http::server::Request<C>>, C::Error> {
+    if audio.is_playing() {
+        send_error(req, 409, HID_BUSY_DURING_PLAYBACK)?;
+        Ok(None)
+    } else {
+        Ok(Some(req))
+    }
+}
+
+fn playback_busy_json() -> String {
+    format!(r#"{{"error":"{HID_BUSY_DURING_PLAYBACK}"}}"#)
 }
 
 fn send_text<C: esp_idf_svc::http::server::Connection>(
@@ -2596,29 +2831,358 @@ fn master_status_json(status: &StatusSummary) -> String {
 /// Switch the device source to USB for playback, returning the previous source
 /// info needed to restore it after playback completes.
 fn switch_to_usb_source(
+    state: &SharedDeviceState,
     dev: &Arc<DeviceState>,
-) -> Result<(bool, Option<String>, Option<Source>), (u16, String)> {
+) -> Result<(Arc<DeviceState>, bool, Option<String>, Option<Source>), (u16, String)> {
     let usb_index = dev
         .profile()
         .sources
         .index_for_source(Source::Usb)
         .ok_or((500, "USB source missing from device profile".to_string()))?;
 
-    let _op = dev.begin_operation();
-    let current_source = dev
-        .current_source()
-        .ok()
-        .flatten()
-        .ok_or((500, "current source unavailable".to_string()))?;
+    let current_source = {
+        let _op = dev.begin_operation();
+        dev.current_source()
+            .ok()
+            .flatten()
+            .ok_or((500, "current source unavailable".to_string()))?
+    };
 
     if current_source == Source::Usb {
-        return Ok((false, None, None));
+        return Ok((dev.clone(), false, None, None));
     }
 
-    dev.set_source(usb_index)
-        .map_err(|err| (500, format!("set_source: {err}")))?;
+    let (recovered, _) = set_source_index_with_recovery(
+        state,
+        dev,
+        usb_index,
+        Source::Usb,
+        SOURCE_SWITCH_RECOVERY_TIMEOUT,
+    )
+    .map_err(|err| (500, err))?;
 
-    Ok((true, Some(current_source.to_string()), Some(current_source)))
+    Ok((
+        recovered,
+        true,
+        Some(format_previous_source(current_source)),
+        Some(current_source),
+    ))
+}
+
+fn source_switch_error_is_recoverable(err: &UsbHidError) -> bool {
+    match err {
+        UsbHidError::Timeout | UsbHidError::Disconnected | UsbHidError::Transfer(_) => true,
+        UsbHidError::Protocol(message) => message.starts_with("set source did not persist"),
+        _ => false,
+    }
+}
+
+fn same_device_identity(current: &Arc<DeviceState>, previous: &Arc<DeviceState>) -> bool {
+    current.hw_id().hw_id == previous.hw_id().hw_id
+        && current.dsp_version() == previous.dsp_version()
+        && (previous.serial() == 0 || current.serial() == previous.serial())
+}
+
+fn wait_for_source_state(
+    state: &SharedDeviceState,
+    previous: &Arc<DeviceState>,
+    target: Source,
+    timeout: Duration,
+) -> Result<(Arc<DeviceState>, StatusSummary), String> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(current) = get_device(state) {
+            if same_device_identity(&current, previous) {
+                let status = {
+                    let _op = current.begin_operation();
+                    match current.current_source() {
+                        Ok(Some(source)) if source == target => current.get_status_summary().ok(),
+                        _ => None,
+                    }
+                };
+                if let Some(status) = status {
+                    return Ok((current, status));
+                }
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "source did not settle to {} after {:?}",
+                target.pascal_case(),
+                timeout
+            ));
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn set_source_index_with_recovery(
+    state: &SharedDeviceState,
+    dev: &Arc<DeviceState>,
+    target_index: u8,
+    target: Source,
+    timeout: Duration,
+) -> Result<(Arc<DeviceState>, StatusSummary), String> {
+    {
+        let _op = dev.begin_operation();
+        match dev.set_source(target_index) {
+            Ok(()) => {}
+            Err(err) if source_switch_error_is_recoverable(&err) => {
+                warn!(
+                    "source switch to {} dropped transport ({}); waiting for recovery",
+                    target.pascal_case(),
+                    err
+                );
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    wait_for_source_state(state, dev, target, timeout)
+}
+
+fn set_source_with_recovery(
+    state: &SharedDeviceState,
+    dev: &Arc<DeviceState>,
+    target: Source,
+    timeout: Duration,
+) -> Result<(Arc<DeviceState>, StatusSummary), String> {
+    let current = {
+        let _op = dev.begin_operation();
+        dev.current_source()
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "current source unavailable".to_string())?
+    };
+
+    if current == target {
+        let status = {
+            let _op = dev.begin_operation();
+            dev.get_status_summary().map_err(|err| err.to_string())?
+        };
+        return Ok((dev.clone(), status));
+    }
+
+    let target_index = dev
+        .profile()
+        .sources
+        .index_for_source(target)
+        .ok_or_else(|| "source not available on this device".to_string())?;
+    set_source_index_with_recovery(state, dev, target_index, target, timeout)
+}
+
+fn ensure_audio_device_available(
+    audio: &usb_audio::SharedAudioState,
+    reason: &str,
+) -> Result<Arc<usb_audio::Uac2Device>, String> {
+    if let Some(device) = audio.current_device() {
+        return Ok(device);
+    }
+
+    audio.resume_opening(reason);
+    let _ = audio.reopen_last_known(reason);
+    audio
+        .wait_for_current_device(AUDIO_REOPEN_TIMEOUT)
+        .ok_or_else(|| "USB audio interface not connected".to_string())
+}
+
+fn set_source_with_audio_coordination(
+    state: &SharedDeviceState,
+    audio: &usb_audio::SharedAudioState,
+    dev: &Arc<DeviceState>,
+    target: Source,
+    timeout: Duration,
+    context: &str,
+) -> Result<(Arc<DeviceState>, StatusSummary), String> {
+    let current = {
+        let _op = dev.begin_operation();
+        dev.current_source()
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "current source unavailable".to_string())?
+    };
+
+    let switching_away_from_usb = current == Source::Usb && target != Source::Usb;
+    if switching_away_from_usb {
+        audio.pause_and_close_current(context);
+        if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
+            let recovery_reason = format!("{context} audio close timeout");
+            audio.resume_opening(&recovery_reason);
+            let _ = audio.reopen_last_known(&recovery_reason);
+            return Err(format!(
+                "timed out waiting for USB audio teardown before switching source to {}",
+                target.pascal_case()
+            ));
+        }
+    }
+
+    let result = set_source_with_recovery(state, dev, target, timeout);
+    let result = match result {
+        Ok(ok) if target == Source::Usb => {
+            ensure_audio_device_available(audio, context).map_err(|err| {
+                format!("source switched to Usb but audio interface did not recover: {err}")
+            })?;
+            Ok(ok)
+        }
+        Err(err) if switching_away_from_usb => {
+            let recovery_reason = format!("{context} failed");
+            audio.resume_opening(&recovery_reason);
+            let _ = audio.reopen_last_known(&recovery_reason);
+            Err(err)
+        }
+        other => other,
+    };
+    result
+}
+
+fn raw_source_from_payload(
+    dev: &Arc<DeviceState>,
+    payload: &[u8],
+) -> Result<Option<Source>, UsbHidError> {
+    if payload.first().copied() != Some(commands::CMD_SET_SOURCE) {
+        return Ok(None);
+    }
+
+    let Some(&source_index) = payload.get(1) else {
+        return Err(UsbHidError::Protocol(
+            "set source: missing source index".to_string(),
+        ));
+    };
+
+    dev.profile()
+        .sources
+        .source_for_index(source_index)
+        .ok_or_else(|| {
+            UsbHidError::Protocol(format!(
+                "source {source_index} not available on this device"
+            ))
+        })
+        .map(Some)
+}
+
+pub(crate) fn raw_bridge_command_with_audio_coordination(
+    _state: &SharedDeviceState,
+    audio: &usb_audio::SharedAudioState,
+    dev: &Arc<DeviceState>,
+    payload: &[u8],
+) -> Result<Vec<u8>, UsbHidError> {
+    if let Some(target) = raw_source_from_payload(dev, payload)? {
+        let source_index = payload[1];
+        let current = {
+            let _op = dev.begin_operation();
+            dev.current_source()?
+                .ok_or_else(|| UsbHidError::Protocol("current source unavailable".to_string()))?
+        };
+
+        let switching_away_from_usb = current == Source::Usb && target != Source::Usb;
+        if switching_away_from_usb {
+            audio.pause_and_close_current("raw source change");
+            if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
+                let recovery_reason = "raw source change audio close timeout";
+                audio.resume_opening(recovery_reason);
+                let _ = audio.reopen_last_known(recovery_reason);
+                return Err(UsbHidError::Protocol(format!(
+                    "timed out waiting for USB audio teardown before switching source to {}",
+                    target.pascal_case()
+                )));
+            }
+        }
+
+        let result = {
+            let _op = dev.begin_operation();
+            dev.set_source(source_index)
+        };
+        let result = match result {
+            Ok(()) if target == Source::Usb => {
+                ensure_audio_device_available(audio, "raw source change").map_err(|err| {
+                    UsbHidError::Protocol(format!(
+                        "source switched to Usb but audio interface did not recover: {err}"
+                    ))
+                })?;
+                Ok(())
+            }
+            Err(err) if switching_away_from_usb => {
+                let recovery_reason = "raw source change failed";
+                audio.resume_opening(recovery_reason);
+                let _ = audio.reopen_last_known(recovery_reason);
+                Err(err)
+            }
+            other => other,
+        };
+        return result.map(|()| payload[..2.min(payload.len())].to_vec());
+    }
+
+    let _op = dev.begin_operation();
+    dev.raw_command(payload)
+}
+
+pub(crate) fn tcp_bridge_command_with_audio_coordination(
+    state: &SharedDeviceState,
+    audio: &usb_audio::SharedAudioState,
+    dev: &Arc<DeviceState>,
+    payload: &[u8],
+) -> Result<Vec<u8>, UsbHidError> {
+    let raw_resp = raw_bridge_command_with_audio_coordination(state, audio, dev, payload)?;
+    Ok(
+        minidsp_protocol::packet::encode_device_console_tcp_response(
+            payload,
+            &raw_resp,
+            dev.dialect(),
+        ),
+    )
+}
+
+fn restore_source_after_playback(
+    state: &SharedDeviceState,
+    audio: &usb_audio::SharedAudioState,
+    dev: &Arc<DeviceState>,
+    source: Option<Source>,
+    context: &str,
+) -> Result<(), String> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+
+    match set_source_with_audio_coordination(
+        state,
+        audio,
+        dev,
+        source,
+        SOURCE_SWITCH_RECOVERY_TIMEOUT,
+        context,
+    ) {
+        Ok(_) => {
+            info!(
+                "restored source after {context} to {}",
+                source.pascal_case()
+            );
+            Ok(())
+        }
+        Err(err) => Err(format!("failed to restore source after {context}: {err}")),
+    }
+}
+
+fn format_previous_source(source: Source) -> String {
+    source.pascal_case().to_string()
+}
+
+fn playback_total_bytes(plan: &PlaybackPlan) -> Result<usize, &'static str> {
+    plan.offsets()
+        .total_samples
+        .checked_mul(plan.layout().frame_bytes())
+        .ok_or("playback request exceeds addressable buffer size")
+}
+
+fn validate_esp32_playback_size(plan: &PlaybackPlan) -> Result<usize, String> {
+    let total_bytes = playback_total_bytes(plan).map_err(str::to_string)?;
+    if total_bytes > MAX_PLAYBACK_BYTES {
+        return Err(format!(
+            "playback request exceeds ESP32 buffer limit ({total_bytes} bytes > {MAX_PLAYBACK_BYTES} bytes)"
+        ));
+    }
+    Ok(total_bytes)
 }
 
 /// RAII guard that disables WiFi power save on creation and restores it on drop.
@@ -2642,11 +3206,77 @@ impl Drop for WifiPsGuard {
     }
 }
 
-fn run_playback_thread(
+fn copy_thread_spawn_configuration(conf: &ThreadSpawnConfiguration) -> ThreadSpawnConfiguration {
+    ThreadSpawnConfiguration {
+        name: conf.name,
+        stack_size: conf.stack_size,
+        priority: conf.priority,
+        inherit: conf.inherit,
+        pin_to_core: conf.pin_to_core,
+        stack_alloc_caps: conf.stack_alloc_caps,
+    }
+}
+
+fn spawn_playback_thread(
+    state: SharedDeviceState,
     dev: Arc<DeviceState>,
     audio_state: usb_audio::SharedAudioState,
     audio_device: Arc<usb_audio::Uac2Device>,
-    plan: PlaybackPlan,
+    plan: Box<PlaybackPlan>,
+    total_bytes: usize,
+    source_changed: bool,
+    previous_source: Option<String>,
+    restore_source: Option<Source>,
+    started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
+) -> Result<(), String> {
+    let previous_conf = ThreadSpawnConfiguration::get();
+    let mut playback_conf = previous_conf
+        .as_ref()
+        .map(copy_thread_spawn_configuration)
+        .unwrap_or_default();
+    playback_conf.name = Some(c"playback");
+    playback_conf.stack_size = PLAYBACK_THREAD_STACK_BYTES;
+    playback_conf.stack_alloc_caps = MallocCap::Spiram | MallocCap::Cap8bit;
+    playback_conf
+        .set()
+        .map_err(|err| format!("set playback thread config: {err}"))?;
+
+    let spawn_result = std::thread::Builder::new()
+        .name("playback".into())
+        .stack_size(PLAYBACK_THREAD_STACK_BYTES)
+        .spawn(move || {
+            run_playback_thread(
+                state,
+                dev,
+                audio_state,
+                audio_device,
+                plan,
+                total_bytes,
+                source_changed,
+                previous_source,
+                restore_source,
+                started_tx,
+            );
+        });
+
+    let restore_result = previous_conf
+        .as_ref()
+        .map(ThreadSpawnConfiguration::set)
+        .unwrap_or_else(|| ThreadSpawnConfiguration::default().set());
+    if let Err(err) = restore_result {
+        warn!("failed to restore pthread config after playback spawn: {err}");
+    }
+
+    spawn_result.map(|_| ()).map_err(|err| err.to_string())
+}
+
+fn run_playback_thread(
+    state: SharedDeviceState,
+    dev: Arc<DeviceState>,
+    audio_state: usb_audio::SharedAudioState,
+    audio_device: Arc<usb_audio::Uac2Device>,
+    plan: Box<PlaybackPlan>,
+    total_bytes: usize,
     source_changed: bool,
     previous_source: Option<String>,
     restore_source: Option<Source>,
@@ -2661,7 +3291,6 @@ fn run_playback_thread(
     // with real-time 48 kHz playback, so we generate everything upfront
     // into PSRAM (~1.8 MB for a 9.5 s sweep) and then just blast bytes
     // to the ring buffer during playback.
-    let total_bytes = plan.offsets().total_samples * plan.layout().frame_bytes();
     info!(
         "pre-generating {} samples ({} bytes) at {} Hz {}-bit",
         plan.offsets().total_samples,
@@ -2671,7 +3300,7 @@ fn run_playback_thread(
     );
     let gen_started_us = usb_audio::server_time_us();
     let mut pcm_data = vec![0u8; total_bytes];
-    let mut generator = plan.generator();
+    let mut generator = Box::new(plan.generator());
     let mut offset = 0;
     // Generate in 10ms slices so fill_pcm_bytes returns after each chunk
     // instead of consuming the entire remaining buffer in one call.
@@ -2729,12 +3358,17 @@ fn run_playback_thread(
 
             // Stream remaining pre-generated data in chunks
             let chunk_bytes = start.chunk_bytes;
-            // Copy each chunk from PSRAM to a stack buffer (internal SRAM)
+            // Copy each chunk from PSRAM to a fixed internal-SRAM buffer
             // before writing to the ring buffer. xRingbufferSend holds a
             // critical section during memcpy — PSRAM SPI latency inside
-            // that section can block the USB host task.
-            // Max 10ms chunk: 480 frames × 2ch × 3 bytes (24-bit) = 2880.
-            let mut sram_buf = [0u8; 2880];
+            // that section can block the USB host task. This buffer stays
+            // off the playback thread stack so the thread can run with a
+            // smaller stack budget on the constrained ESP32 pthread pool.
+            // Keep the shared SRAM scratch buffer larger than the current
+            // streaming chunk so future 24-bit or higher-rate paths still fit.
+            let mut sram_buf = PLAYBACK_STREAM_BUF
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut pos = start.first_write_bytes;
             let mut stream_failed = false;
             while pos < pcm_data.len() {
@@ -2755,7 +3389,7 @@ fn run_playback_thread(
                 last_write_bytes = written;
                 last_write_return_us = usb_audio::server_time_us();
                 pos = end;
-                if write_latencies_us.len() % 100 == 0 {
+                if write_latencies_us.len() % PLAYBACK_PROGRESS_LOG_EVERY_WRITES == 0 {
                     info!(
                         "playback progress: {} / {} bytes, write={} ms",
                         total_bytes_written,
@@ -2806,15 +3440,10 @@ fn run_playback_thread(
     }
 
     if allow_source_restore {
-        if let Some(source) = restore_source {
-            if let Some(index) = dev.profile().sources.index_for_source(source) {
-                let _op = dev.begin_operation();
-                if let Err(err) = dev.set_source(index) {
-                    warn!("failed to restore source after playback: {err}");
-                } else {
-                    info!("restored source after playback to {}", source);
-                }
-            }
+        if let Err(err) =
+            restore_source_after_playback(&state, &audio_state, &dev, restore_source, "playback")
+        {
+            warn!("{err}");
         }
     } else if restore_source.is_some() {
         warn!("skipping source restore after interrupted or disconnected playback");
@@ -2851,7 +3480,9 @@ fn stop_audio_stream_if_connected(audio_device: &usb_audio::Uac2Device, context:
 /// in a tight loop, identical to the standalone driver test harness.
 /// No PSRAM, no PlaybackGenerator, no pre-generation — isolates whether
 /// blips come from the data pipeline or the system environment.
+#[allow(dead_code)]
 fn run_inline_sine_test(
+    state: SharedDeviceState,
     dev: Arc<DeviceState>,
     audio_state: usb_audio::SharedAudioState,
     audio_device: Arc<usb_audio::Uac2Device>,
@@ -2861,15 +3492,15 @@ fn run_inline_sine_test(
     started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
 ) {
     const SAMPLE_RATE: u32 = 48_000;
-    const CHUNK_MS: u32 = 10;
-    const FRAMES_PER_CHUNK: usize = (SAMPLE_RATE / (1000 / CHUNK_MS)) as usize; // 480
+    const CHUNK_MS: u32 = PLAYBACK_STREAM_TARGET_CHUNK_MS as u32;
+    const FRAMES_PER_CHUNK: usize = 96; // 2 ms at 48 kHz, matching basic_playback.
     const FRAME_BYTES: usize = 4; // 2ch × 16-bit
-    const CHUNK_BYTES: usize = FRAMES_PER_CHUNK * FRAME_BYTES; // 1920
+    const CHUNK_BYTES: usize = FRAMES_PER_CHUNK * FRAME_BYTES; // 384
     const FREQUENCY_HZ: f32 = 50.0;
     const AMPLITUDE: f32 = 0.5;
     const DURATION_SEC: u32 = 5;
     const TOTAL_CHUNKS: u32 = DURATION_SEC * (1000 / CHUNK_MS);
-    const PREFILL_CHUNKS: u32 = 5; // 50ms
+    const PREFILL_CHUNKS: u32 = 50 / CHUNK_MS; // 50 ms
     const PREFILL_WRITE_TIMEOUT_MS: u32 = 500;
     const STREAM_WRITE_TIMEOUT_MS: u32 = 250;
     const STREAM_WRITE_MAX_ATTEMPTS: usize = 4;
@@ -2969,15 +3600,10 @@ fn run_inline_sine_test(
     stop_audio_stream_if_connected(&audio_device, "inline sine");
 
     if allow_source_restore {
-        if let Some(source) = restore_source {
-            if let Some(index) = dev.profile().sources.index_for_source(source) {
-                let _op = dev.begin_operation();
-                if let Err(err) = dev.set_source(index) {
-                    warn!("failed to restore source after sine test: {err}");
-                } else {
-                    info!("restored source after sine test to {}", source);
-                }
-            }
+        if let Err(err) =
+            restore_source_after_playback(&state, &audio_state, &dev, restore_source, "sine test")
+        {
+            warn!("{err}");
         }
     } else if restore_source.is_some() {
         warn!("skipping source restore after interrupted or disconnected sine test");
@@ -2989,6 +3615,7 @@ fn run_inline_sine_test(
 
 /// Fill a buffer with 16-bit stereo sine samples (same algorithm as
 /// the standalone driver test's `tone_gen_fill`).
+#[allow(dead_code)]
 fn fill_sine_16bit_stereo(buf: &mut [u8], phase: &mut f32, phase_inc: f32, amplitude: f32) {
     let frames = buf.len() / 4; // 2ch × 2 bytes
     for i in 0..frames {
@@ -3007,6 +3634,7 @@ fn fill_sine_16bit_stereo(buf: &mut [u8], phase: &mut f32, phase_inc: f32, ampli
     }
 }
 
+#[allow(dead_code)]
 fn write_audio_chunk_with_retry(
     audio_device: &usb_audio::Uac2Device,
     data: &[u8],
@@ -3046,19 +3674,24 @@ fn start_playback_pregenerated(
     plan: &PlaybackPlan,
     pcm_data: &[u8],
 ) -> Result<PlaybackStart, String> {
+    const PREFILL_MS: usize = 150;
+
     usb_audio::reset_tx_need_data_count();
     audio_device
         .start_stream(plan.request.sample_rate, plan.request.bit_depth)
         .map_err(|e| e.to_string())?;
 
-    // Write 10ms chunks (~1920 bytes at 48kHz/16-bit stereo), matching
-    // the standalone driver test harness's write pattern.
-    let frames_per_10ms = (plan.request.sample_rate as usize) / 100;
-    let chunk_bytes = frames_per_10ms * plan.layout().frame_bytes();
+    // Stream in ~2 ms chunks (96 frames at 48 kHz), matching the cadence
+    // used by the standalone UAC2 playback harness when it sounds clean.
+    let frames_per_chunk = playback_stream_chunk_frames(plan.request.sample_rate);
+    let chunk_bytes = frames_per_chunk * plan.layout().frame_bytes();
 
-    // Pre-fill 50ms of audio into the ring buffer before the streaming
-    // loop starts, matching the standalone driver test harness.
-    let prefill_end = (chunk_bytes * 5).min(pcm_data.len());
+    // Pre-fill well past the ring buffer's half-full low-watermark so
+    // playback starts with enough slack to absorb WiFi/USB jitter across
+    // repeated runs. At 48 KiB this keeps the buffer comfortably above the
+    // default threshold while still leaving headroom for immediate writes.
+    let prefill_chunks = PREFILL_MS.div_ceil(PLAYBACK_STREAM_TARGET_CHUNK_MS).max(1);
+    let prefill_end = (chunk_bytes * prefill_chunks).min(pcm_data.len());
     let mut prefill_pos = 0;
     let mut prefill_sram = [0u8; 2880];
     let first_write_started_us = usb_audio::server_time_us();
@@ -3109,6 +3742,10 @@ fn start_playback_pregenerated(
     })
 }
 
+fn playback_stream_chunk_frames(sample_rate: u32) -> usize {
+    ((sample_rate as usize) * PLAYBACK_STREAM_TARGET_CHUNK_MS / 1000).max(1)
+}
+
 fn summarize_write_latencies(samples: &[i64]) -> (i64, i64, i64, i64, i64, i64) {
     if samples.is_empty() {
         return (0, 0, 0, 0, 0, 0);
@@ -3140,6 +3777,7 @@ fn summarize_write_latencies(samples: &[i64]) -> (i64, i64, i64, i64, i64, i64) 
 fn register_ws_routes(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     use esp_idf_svc::http::server::ws::EspHttpWsConnection;
     use esp_idf_svc::ws::FrameType;
@@ -3156,6 +3794,7 @@ fn register_ws_routes(
         let active_ws: Arc<Mutex<Option<ActiveWs>>> = Arc::new(Mutex::new(None));
 
         let st = state.clone();
+        let audio = audio_state.clone();
         let ws_ref = active_ws.clone();
 
         server.ws_handler("/devices/0", None, move |ws| {
@@ -3170,21 +3809,25 @@ fn register_ws_routes(
                 // ESP-IDF httpd calls our handler for BOTH — with handshake (WS) or without (GET).
                 if !unsafe { ws_is_upgrade(raw_req) } {
                     // Regular GET — send JSON status response via raw httpd API
-                    let (status, json) = match get_device(&st) {
-                        Some(dev) => {
-                            let _op = dev.begin_operation();
-                            match dev.get_status_summary() {
-                                Ok(s) => (200, status_json(&s)),
-                                Err(e) => (
-                                    500,
-                                    format!(
-                                        r#"{{"error":"{}"}}"#,
-                                        e.to_string().replace('"', "\\\"")
+                    let (status, json) = if audio.is_playing() {
+                        (409, playback_busy_json())
+                    } else {
+                        match get_device(&st) {
+                            Some(dev) => {
+                                let _op = dev.begin_operation();
+                                match dev.get_status_summary() {
+                                    Ok(s) => (200, status_json(&s)),
+                                    Err(e) => (
+                                        500,
+                                        format!(
+                                            r#"{{"error":"{}"}}"#,
+                                            e.to_string().replace('"', "\\\"")
+                                        ),
                                     ),
-                                ),
+                                }
                             }
+                            None => (503, r#"{"error":"no device"}"#.to_string()),
                         }
-                        None => (503, r#"{"error":"no device"}"#.to_string()),
                     };
                     unsafe { ws_send_http_json(raw_req, status, &json) };
                     return Ok(());
@@ -3221,11 +3864,12 @@ fn register_ws_routes(
                             }
 
                             let dev_state = st.clone();
+                            let audio_state = audio.clone();
                             if let Err(e) = std::thread::Builder::new()
                                 .name("ws_compat".into())
                                 .stack_size(8192)
                                 .spawn(move || {
-                                    ws_poll_loop(sender, dev_state, stop, interval_ms);
+                                    ws_poll_loop(sender, dev_state, audio_state, stop, interval_ms);
                                 })
                             {
                                 log::warn!("WebSocket compat: failed to spawn poll thread: {e}");
@@ -3253,15 +3897,19 @@ fn register_ws_routes(
             // Handle incoming WebSocket frames
             match ws_recv_frame(ws, "WebSocket compat", 512)? {
                 Some((FrameType::Text(_), _)) | Some((FrameType::Binary(_), _)) => {
-                    let json = match get_device(&st) {
-                        Some(dev) => {
-                            let _op = dev.begin_operation();
-                            match dev.get_status_summary() {
-                                Ok(status) => status_json(&status),
-                                Err(_) => r#"{"error":"device read failed"}"#.to_string(),
+                    let json = if audio.is_playing() {
+                        playback_busy_json()
+                    } else {
+                        match get_device(&st) {
+                            Some(dev) => {
+                                let _op = dev.begin_operation();
+                                match dev.get_status_summary() {
+                                    Ok(status) => status_json(&status),
+                                    Err(_) => r#"{"error":"device read failed"}"#.to_string(),
+                                }
                             }
+                            None => r#"{"error":"no device"}"#.to_string(),
                         }
-                        None => r#"{"error":"no device"}"#.to_string(),
                     };
                     ws_send_logged(
                         ws,
@@ -3290,6 +3938,7 @@ fn register_ws_routes(
     // -- Raw frame bridge: /devices/0/ws --
     {
         let st = state.clone();
+        let audio = audio_state.clone();
 
         server.ws_handler("/devices/0/ws", None, move |ws| {
             // Raw frame bridge — NO status polling thread. Only responds to binary frames.
@@ -3305,13 +3954,20 @@ fn register_ws_routes(
 
             match ws_recv_frame(ws, "WS raw bridge", 512)? {
                 Some((FrameType::Binary(_), frame)) => {
+                    if audio.is_playing() {
+                        log::warn!("WS raw bridge: rejecting command during playback");
+                        let busy = minidsp_protocol::packet::encode_frame(&[
+                            minidsp_protocol::commands::RESP_ERROR,
+                        ]);
+                        ws_send_logged(ws, "WS raw bridge", FrameType::Binary(false), &busy)?;
+                        return Ok(());
+                    }
                     // Raw frame bridge: decode framed packet, forward payload to device
                     if let Some(payload) = minidsp_protocol::packet::decode_frame(&frame) {
                         match get_device(&st) {
-                            Some(dev) => match {
-                                let _op = dev.begin_operation();
-                                dev.raw_command(&payload)
-                            } {
+                            Some(dev) => match raw_bridge_command_with_audio_coordination(
+                                &st, &audio, &dev, &payload,
+                            ) {
                                 Ok(resp) => {
                                     let frame = minidsp_protocol::packet::encode_frame(&resp);
                                     ws_send_logged(
@@ -3393,11 +4049,18 @@ unsafe fn ws_send_http_json(raw_req: *mut esp_idf_svc::sys::httpd_req_t, status:
         b"*\0".as_ptr(),
     );
 
-    if status == 503 {
-        httpd_resp_set_status(raw_req, b"503 Service Unavailable\0".as_ptr());
-    } else if status == 500 {
-        httpd_resp_set_status(raw_req, b"500 Internal Server Error\0".as_ptr());
-    }
+    let status_text = match status {
+        200 => b"200 OK\0".as_slice(),
+        400 => b"400 Bad Request\0".as_slice(),
+        404 => b"404 Not Found\0".as_slice(),
+        409 => b"409 Conflict\0".as_slice(),
+        500 => b"500 Internal Server Error\0".as_slice(),
+        503 => b"503 Service Unavailable\0".as_slice(),
+        _ if status >= 500 => b"500 Internal Server Error\0".as_slice(),
+        _ if status >= 400 => b"400 Bad Request\0".as_slice(),
+        _ => b"200 OK\0".as_slice(),
+    };
+    httpd_resp_set_status(raw_req, status_text.as_ptr());
 
     let ret = httpd_resp_send(raw_req, json.as_ptr(), json.len() as isize);
     if ret != ESP_OK {
@@ -3465,6 +4128,7 @@ fn ws_send_logged(
 fn ws_poll_loop(
     mut sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
     stop: Arc<std::sync::atomic::AtomicBool>,
     interval_ms: u64,
 ) {
@@ -3474,7 +4138,15 @@ fn ws_poll_loop(
     log::info!("WebSocket poll thread started (interval={interval_ms}ms)");
 
     // Send initial status immediately so clients don't wait for first tick
-    if let Some(dev) = get_device(&state) {
+    if audio_state.is_playing() {
+        let json = playback_busy_json();
+        if sender
+            .send(FrameType::Text(false), json.as_bytes())
+            .is_err()
+        {
+            return;
+        }
+    } else if let Some(dev) = get_device(&state) {
         let _op = dev.begin_operation();
         if let Ok(status) = dev.get_status_summary() {
             let json = status_json(&status);
@@ -3499,15 +4171,19 @@ fn ws_poll_loop(
             break;
         }
 
-        let json = match get_device(&state) {
-            Some(dev) => {
-                let _op = dev.begin_operation();
-                match dev.get_status_summary() {
-                    Ok(status) => status_json(&status),
-                    Err(_) => continue,
+        let json = if audio_state.is_playing() {
+            playback_busy_json()
+        } else {
+            match get_device(&state) {
+                Some(dev) => {
+                    let _op = dev.begin_operation();
+                    match dev.get_status_summary() {
+                        Ok(status) => status_json(&status),
+                        Err(_) => continue,
+                    }
                 }
+                None => r#"{"error":"no device"}"#.to_string(),
             }
-            None => r#"{"error":"no device"}"#.to_string(),
         };
 
         if sender
@@ -3536,6 +4212,7 @@ fn ws_poll_loop(
 fn register_ezbeq_ws(
     server: &mut EspHttpServer<'static>,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
     beq_state: crate::ezbeq::SharedEzBeqState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     use esp_idf_svc::ws::FrameType;
@@ -3544,6 +4221,7 @@ fn register_ezbeq_ws(
     let active_ws: Arc<Mutex<Option<ActiveWsBeq>>> = Arc::new(Mutex::new(None));
 
     let st = state.clone();
+    let audio = audio_state.clone();
     let beq = beq_state.clone();
     let ws_ref = active_ws.clone();
 
@@ -3566,7 +4244,10 @@ fn register_ezbeq_ws(
             )?;
 
             // Send initial DeviceState
-            if let Some(dev) = get_device(&st) {
+            if audio.is_playing() {
+                let json = playback_busy_json();
+                ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), json.as_bytes())?;
+            } else if let Some(dev) = get_device(&st) {
                 let _op = dev.begin_operation();
                 let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
                 let state_json = crate::ezbeq::device_state_json(&dev, &beq_guard);
@@ -3644,6 +4325,7 @@ fn register_ezbeq_ws(
                             }
 
                             let dev_state = st.clone();
+                            let audio_state = audio.clone();
                             let beq_clone = beq.clone();
                             let ws_ref_clone = ws_ref.clone();
                             if let Err(e) = std::thread::Builder::new()
@@ -3653,6 +4335,7 @@ fn register_ezbeq_ws(
                                     push_levels(
                                         sender,
                                         dev_state,
+                                        audio_state,
                                         stop,
                                         beq_clone,
                                         fd,
@@ -3729,6 +4412,7 @@ struct ActiveWsBeq {
 fn push_levels(
     mut sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
     state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
     stop: Arc<std::sync::atomic::AtomicBool>,
     beq_state: crate::ezbeq::SharedEzBeqState,
     session_fd: i32,
@@ -3746,32 +4430,36 @@ fn push_levels(
             break;
         }
 
-        let json = match get_device(&state) {
-            Some(dev) => {
-                let _op = dev.begin_operation();
-                match dev.get_status_summary() {
-                    Ok(status) => {
-                        let mut levels = serde_json::Map::new();
-                        for (i, &v) in status.input_levels.iter().enumerate() {
-                            levels.insert(format!("I{i}"), serde_json::Value::from(v));
-                        }
-                        for (i, &v) in status.output_levels.iter().enumerate() {
-                            levels.insert(format!("O{i}"), serde_json::Value::from(v));
-                        }
-                        serde_json::to_string(&serde_json::json!({
-                            "message": "Levels",
-                            "data": {
-                                "name": "master",
-                                "ts": 0,
-                                "levels": levels,
+        let json = if audio_state.is_playing() {
+            playback_busy_json()
+        } else {
+            match get_device(&state) {
+                Some(dev) => {
+                    let _op = dev.begin_operation();
+                    match dev.get_status_summary() {
+                        Ok(status) => {
+                            let mut levels = serde_json::Map::new();
+                            for (i, &v) in status.input_levels.iter().enumerate() {
+                                levels.insert(format!("I{i}"), serde_json::Value::from(v));
                             }
-                        }))
-                        .unwrap_or_default()
+                            for (i, &v) in status.output_levels.iter().enumerate() {
+                                levels.insert(format!("O{i}"), serde_json::Value::from(v));
+                            }
+                            serde_json::to_string(&serde_json::json!({
+                                "message": "Levels",
+                                "data": {
+                                    "name": "master",
+                                    "ts": 0,
+                                    "levels": levels,
+                                }
+                            }))
+                            .unwrap_or_default()
+                        }
+                        Err(_) => continue,
                     }
-                    Err(_) => continue,
                 }
+                None => continue,
             }
-            None => continue,
         };
 
         if sender
@@ -3961,9 +4649,12 @@ fn urldecode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        openapi_json, parse_bm_channel_path, parse_bm_mixer_path, parse_device_index,
-        parse_source_path, parse_volume_path,
+        format_previous_source, openapi_json, parse_bm_channel_path, parse_bm_mixer_path,
+        parse_device_index, parse_play_path, parse_query_param, parse_source_path,
+        parse_volume_path, validate_esp32_playback_size,
     };
+    use minidsp_protocol::playback::{PlayRequest, PlaybackPlan};
+    use minidsp_protocol::source::Source;
 
     #[test]
     fn parses_bm_channel_path() {
@@ -4007,6 +4698,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_play_path() {
+        assert_eq!(parse_play_path("/devices/0/play"), Some(0));
+        assert_eq!(parse_play_path("/devices/17/play?test=marker"), Some(17));
+        assert_eq!(parse_play_path("/devices/0/play/extra"), None);
+    }
+
+    #[test]
+    fn parses_play_query_param() {
+        assert_eq!(
+            parse_query_param("/devices/0/play?test=tail-marker&x=1", "test"),
+            Some("tail-marker".into())
+        );
+        assert_eq!(parse_query_param("/devices/0/play?x=1", "test"), None);
+    }
+
+    #[test]
     fn parses_volume_path() {
         assert_eq!(
             parse_volume_path("/devices/0/volume/toggle_mute?x=1"),
@@ -4023,5 +4730,27 @@ mod tests {
         assert!(spec.contains("/devices/0/bm"));
         assert!(spec.contains("/devices/0/peq/reset"));
         assert!(spec.contains("/devices/0/peq/default-frequencies"));
+        assert!(spec.contains("/devices/{id}/play"));
+        assert!(spec.contains("\"tail-marker\""));
+        assert!(spec.contains("/play.startedAtUs"));
+    }
+
+    #[test]
+    fn previous_source_stays_pascal_case() {
+        assert_eq!(format_previous_source(Source::Toslink), "Toslink");
+        assert_eq!(format_previous_source(Source::Usb), "Usb");
+    }
+
+    #[test]
+    fn rejects_oversized_playback_requests() {
+        let plan = PlaybackPlan::build(PlayRequest {
+            sweep_duration_sec: 20.0,
+            ..PlayRequest::default()
+        })
+        .expect("oversize request should still be a valid shared playback plan");
+
+        let err = validate_esp32_playback_size(&plan)
+            .expect_err("ESP32 should reject oversize playback buffers");
+        assert!(err.contains("ESP32 buffer limit"));
     }
 }

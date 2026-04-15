@@ -38,6 +38,8 @@ const EP_DIR_IN: u8 = 0x80;
 const USB_REPORT_SIZE: usize = 64;
 /// Transfer timeout.
 const XFER_TIMEOUT: Duration = Duration::from_secs(5);
+const ROOT_PORT_POWER_OFF_SETTLE: Duration = Duration::from_millis(250);
+const ROOT_PORT_POWER_ON_SETTLE: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum UsbHidError {
@@ -215,6 +217,13 @@ unsafe impl Send for UsbHidBus {}
 unsafe impl Sync for UsbHidBus {}
 
 impl UsbHidBus {
+    fn preserve_session_on_response_timeout(payload: &[u8]) -> bool {
+        matches!(
+            payload.first().copied(),
+            Some(minidsp_protocol::commands::CMD_SET_SOURCE)
+        )
+    }
+
     fn begin_new_session(&self) -> u8 {
         let cb = cb_state();
         let generation = cb
@@ -633,6 +642,34 @@ impl UsbHidBus {
         }
     }
 
+    pub fn recycle_root_port(&self, reason: &str) -> Result<(), UsbHidError> {
+        let _lock = self.lock.lock().unwrap();
+
+        if let Err(err) = self.cleanup_device() {
+            warn!("USB cleanup before root-port recycle failed ({reason}): {err}");
+        }
+
+        info!("USB: powering root port off ({reason})");
+        unsafe {
+            let err = usb_host_lib_set_root_port_power(false);
+            if err != ESP_OK as i32 && err != ESP_ERR_INVALID_STATE as i32 {
+                return Err(UsbHidError::Transfer(format!(
+                    "root-port power off failed during {reason}: 0x{err:04x}"
+                )));
+            }
+        }
+        std::thread::sleep(ROOT_PORT_POWER_OFF_SETTLE);
+
+        info!("USB: powering root port on ({reason})");
+        unsafe {
+            esp_ok(usb_host_lib_set_root_port_power(true)).map_err(|e| {
+                UsbHidError::Transfer(format!("root-port power on failed during {reason}: {e}"))
+            })?;
+        }
+        std::thread::sleep(ROOT_PORT_POWER_ON_SETTLE);
+        Ok(())
+    }
+
     /// True if the USB device is currently connected.
     pub fn is_connected(&self) -> bool {
         cb_state().device_present.load(Ordering::SeqCst) && !self.dev_hdl.lock().unwrap().is_null()
@@ -755,7 +792,14 @@ impl UsbHidBus {
                         .unwrap_or_else(|| "n/a".into())
                 );
                 debug!("USB IN wait failed for {:02x?}: {}", payload, e);
-                if let Err(cleanup_err) = self.cleanup_device() {
+                if matches!(e, UsbHidError::Timeout)
+                    && Self::preserve_session_on_response_timeout(payload)
+                {
+                    warn!(
+                        "USB preserving session after response timeout for payload {:02x?}; caller will verify command outcome",
+                        payload
+                    );
+                } else if let Err(cleanup_err) = self.cleanup_device() {
                     warn!("USB cleanup after IN timeout failed: {cleanup_err}");
                 }
                 e
@@ -789,6 +833,16 @@ impl UsbHidBus {
             // Try to decode the HID response frame
             if let Some(decoded) = minidsp_protocol::packet::decode_hid_response(&resp_buf) {
                 debug!("USB command decoded response: {:02x?}", decoded);
+
+                if minidsp_protocol::commands::is_source_changed_notification_for_request(
+                    payload, &decoded,
+                ) {
+                    debug!(
+                        "USB HID: accepting AudioSrcChanged notification as set_source completion: {:02x?}",
+                        decoded
+                    );
+                    return Ok(decoded);
+                }
 
                 // Skip stale frames whose opcode doesn't match the request. The
                 // 2x4 HD emits AudioSrcChanged / flash-notification frames that

@@ -419,21 +419,25 @@ and TEST-04 after P1.
   - **Most likely prior test failure cause**: default threshold `-30 dBFS` is too quiet to trigger audible compression on typical test signals
   - **Remaining item (methodology, not protocol)**: audible retest on loud material with compressor enabled and threshold set to trigger. Open as audio-verification item below.
 - [ ] Capture or otherwise verify the physical output duration of ESP32 `/play` on the real 2x4 HD now that software timing and repeated-play stability are characterized.
-- [ ] Validate the new shared `/play` default signal on the real sub and keep iterating until it sounds like a normal smooth low-frequency sweep:
+- [x] Validate the new shared `/play` default signal on the real sub and keep iterating until it sounds like a normal smooth low-frequency sweep:
   - the previous measurement-bundle default (`5-500 Hz`, `24-bit`, `2 s` preamble, `80 Hz` tone burst, `0.2 s` gap, `2 s` decay, hidden guard-band expansion) was retired after it produced repeated `BRAP` bursts on hardware
   - the current shared default is now a REW/MSO-style `5-400 Hz`, `5.46 s`, `16-bit` hybrid sweep with `2 s` low-level dither pre-silence, `2 s` post-silence, and `20 ms` raised-cosine fade-in/out
   - below `10 Hz`, the current default intentionally uses a linear `5-10 Hz` section before switching to logarithmic `10-400 Hz`
   - a 2026-04-10 qualitative listening check on the physical 2x4 HD after the ESP32 core-1 + pre-gen watchdog fixes described that same default as "actually sounded pretty good", which is a positive partial signal but not a full audible validation
-  - the remaining work here is a proper audible comparison against a known-good measurement rig (for example REW direct), not further ESP32 transport investigation
-  - if the new default is still wrong after that, the next suspect is PCM/sample-format behavior rather than routing or HID transport
-- [ ] Validate non-USB-source `/play` source auto-switch + restore on real hardware:
+  - the ESP32 sweep-only collapse is now audibly signed off on the physical 2x4 HD via `POST /devices/0/play {"markerCycles":0}`; the current driver/app combination that cleared the last random pops includes the committed TX ringbuffer wrap fix in `esp-uac2-host`, a higher-priority UAC2 background task, and shorter `~2 ms` playback writes
+  - follow-up audible checks on the same ESP32 path then confirmed marker-only playback via `POST /devices/0/play?test=marker`, the combined default marker+sweep bundle via `POST /devices/0/play {}`, and the longer-gap variant via `POST /devices/0/play {"markerGapMs":1000}`; the user signed those off as sounding clean/perfect on the attached 2x4 HD
+- [x] Validate non-USB-source `/play` source auto-switch + restore on real hardware:
   - desktop path is now complete on the physical 2x4 HD: forcing `Toslink`, starting `/play`, and waiting for completion restored `Toslink`, with the response reporting `sourceChanged=true` and `previousSource="Toslink"`
-  - ESP32 path to a real MiniDSP USB-audio device
-  - the real sub path has now audibly signed off on sweep-only, marker-only, and combined default marker+sweep playback
+  - direct desktop source-switch recheck on 2026-04-14 also stayed healthy on the same physical 2x4 HD: both the direct USB CLI path and the desktop HTTP daemon cleanly switched `Usb <-> Toslink` and `Usb <-> Analog`, and the device remained probeable afterward once the owning desktop process released the HID handle
+  - the remaining wedge was ESP32-specific rather than a shared `0x34` source-opcode problem: the attached 2x4 HD stayed healthy on the direct desktop CLI / daemon path and on the official app, while the ESP32 path could still wedge it during `Toslink -> Usb`
+  - the final ESP32 fix was to stop treating the official `AudioSrcChanged` flash notification (`ReadFlash 0xFFA9 <new_source>`) as stale noise and to stop the ESP32-only `set_source` timeout/reopen verification loop from hammering master-status reads after a dropped ack
+  - live re-verification on 2026-04-14 is now clean on the attached 2x4 HD: repeated HTTP `Usb -> Toslink -> Usb` cycles stayed healthy, `GET /devices/0` remained probeable after every leg, and UART no longer showed HID reopen churn or device-loss after `set_source(Usb)`
+  - live ESP32 `/play` re-verification on the same hardware is also complete: forcing `Toslink`, starting the canonical default `/devices/0/play {}`, and waiting for completion restored `Toslink`, with the response reporting `sourceChanged=true` and `previousSource="Toslink"`; the same source-restore path also stayed correct for both `?test=marker` and `?test=tail-marker`
 - [ ] Verify remaining `/play` compatibility edges on hardware where possible:
   - malformed request handling
   - sample-rate switch between plays
   - HID-only-device clear error path
+  - live 2026-04-14 busy-guard verification is now complete on the attached ESP32 + 2x4 HD: during an active default `/play`, plain `GET /devices/0` and `GET /api/2/devices` both returned `409 {"error":"device busy during playback"}`, the raw TCP bridge on port `5333` returned `0x00` busy/error for a framed `0x31` request, and the device remained healthy after playback finished
 - [x] Prove on hardware that the current shared `0x13` route-enable write path restores audible USB playback on DSP100 / 2x4 HD without relying on the official app
   - confirmed live on 2026-04-09: after the shared HID echo-decoder fix, ESP32 route writes made `/play` audible on physical output `3`
 - [x] Make DSP100 / 2x4 HD routing-state read-back survive fresh desktop daemon reconnects via persisted verified shadow keyed by device serial

@@ -35,6 +35,28 @@ enum UsbState {
     ProtocolReady,
 }
 
+fn reset_reason_label(reason: sys::esp_reset_reason_t) -> &'static str {
+    match reason {
+        sys::esp_reset_reason_t_ESP_RST_UNKNOWN => "unknown",
+        sys::esp_reset_reason_t_ESP_RST_POWERON => "power-on",
+        sys::esp_reset_reason_t_ESP_RST_EXT => "external-pin",
+        sys::esp_reset_reason_t_ESP_RST_SW => "software",
+        sys::esp_reset_reason_t_ESP_RST_PANIC => "panic",
+        sys::esp_reset_reason_t_ESP_RST_INT_WDT => "interrupt-watchdog",
+        sys::esp_reset_reason_t_ESP_RST_TASK_WDT => "task-watchdog",
+        sys::esp_reset_reason_t_ESP_RST_WDT => "watchdog",
+        sys::esp_reset_reason_t_ESP_RST_DEEPSLEEP => "deep-sleep",
+        sys::esp_reset_reason_t_ESP_RST_BROWNOUT => "brownout",
+        sys::esp_reset_reason_t_ESP_RST_SDIO => "sdio",
+        sys::esp_reset_reason_t_ESP_RST_USB => "usb",
+        sys::esp_reset_reason_t_ESP_RST_JTAG => "jtag",
+        sys::esp_reset_reason_t_ESP_RST_EFUSE => "efuse",
+        sys::esp_reset_reason_t_ESP_RST_PWR_GLITCH => "power-glitch",
+        sys::esp_reset_reason_t_ESP_RST_CPU_LOCKUP => "cpu-lockup",
+        _ => "other",
+    }
+}
+
 fn main() {
     sys::link_patches();
 
@@ -49,7 +71,13 @@ fn main() {
         Err(e) => warn!("LED init failed: {e}"),
     }
 
-    info!("minidsp-open v{} starting", env!("CARGO_PKG_VERSION"));
+    let reset_reason = unsafe { sys::esp_reset_reason() };
+    info!(
+        "minidsp-open v{} starting (reset reason: {} / {})",
+        env!("CARGO_PKG_VERSION"),
+        reset_reason as i32,
+        reset_reason_label(reset_reason)
+    );
 
     // Initialize NVS (required for WiFi credentials)
     let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take().expect("failed to initialize NVS");
@@ -190,11 +218,12 @@ fn main() {
     // Step 7: TCP bridge (port 5333) — Device Console compatibility
     if wifi_is_sta {
         let tcp_state = device_state.clone();
+        let tcp_audio = audio_state.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("tcp_brg".into())
             .stack_size(16384)
             .spawn(move || {
-                tcp_bridge(tcp_state);
+                tcp_bridge(tcp_state, tcp_audio);
             })
         {
             error!("failed to spawn TCP bridge: {e}");
@@ -326,7 +355,31 @@ fn discover_and_activate_device(
             std::thread::sleep(wait);
         }
     }
-    probe_device_with_retries(bus.clone(), Duration::from_secs(20))
+
+    match probe_device_with_retries(bus.clone(), Duration::from_secs(20)) {
+        Ok(state) => Ok(state),
+        Err(err @ (usb_hid::UsbHidError::Timeout | usb_hid::UsbHidError::Transfer(_)))
+            if bus.has_present_device().unwrap_or(false) =>
+        {
+            warn!(
+                "USB state: probe failed while a device is still present ({err}); recycling root port"
+            );
+            bus.recycle_root_port("probe recovery")?;
+            info!("USB state: waiting for HID attach after root-port recycle");
+            bus.wait_for_device(timeout)?;
+            if let Some(age) = bus.last_attach_age() {
+                if age < ATTACH_SETTLE {
+                    let wait = ATTACH_SETTLE - age;
+                    info!(
+                        "USB state: waiting {wait:?} for device firmware warmup after root-port recycle"
+                    );
+                    std::thread::sleep(wait);
+                }
+            }
+            probe_device_with_retries(bus.clone(), Duration::from_secs(20))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn probe_device_with_retries(
@@ -484,9 +537,11 @@ fn start_mdns(device_state: &http_server::SharedDeviceState) -> Option<esp_idf_s
 /// TCP bridge server on port 5333 — Device Console compatibility.
 /// Accepts one connection at a time, forwards length-prefixed frames to/from the device.
 /// Wire format: client sends [len][payload][checksum], server responds [len][payload] (no checksum).
-fn tcp_bridge(state: http_server::SharedDeviceState) {
+fn tcp_bridge(state: http_server::SharedDeviceState, audio_state: usb_audio::SharedAudioState) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    const TCP_BRIDGE_BUSY_FRAME: [u8; 1] = [minidsp_protocol::commands::RESP_ERROR];
 
     let listener = match TcpListener::bind("0.0.0.0:5333") {
         Ok(l) => l,
@@ -520,6 +575,14 @@ fn tcp_bridge(state: http_server::SharedDeviceState) {
             {
                 read_buf.drain(..consumed);
 
+                if audio_state.is_playing() {
+                    log::warn!("TCP bridge: rejecting command during playback");
+                    if stream.write_all(&TCP_BRIDGE_BUSY_FRAME).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
                 // Forward to device
                 let dev = match http_server::get_device(&state) {
                     Some(d) => d,
@@ -529,10 +592,12 @@ fn tcp_bridge(state: http_server::SharedDeviceState) {
                         continue;
                     }
                 };
-                let response = {
-                    let _op = dev.begin_operation();
-                    dev.tcp_bridge_command(&payload)
-                };
+                let response = http_server::tcp_bridge_command_with_audio_coordination(
+                    &state,
+                    &audio_state,
+                    &dev,
+                    &payload,
+                );
 
                 match response {
                     Ok(resp_frame) => {

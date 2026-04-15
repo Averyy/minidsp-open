@@ -267,25 +267,25 @@ impl PlaybackPlan {
         // f1 to 10 Hz, then logarithmic from 10 Hz to f2. The linear section
         // gets a proportional share of the total sweep duration based on the
         // frequency span it covers relative to the log section's octave span.
-        let (linear_section_samples, log_start_hz) =
-            if sweep_f1 < LINEAR_LOG_CROSSOVER_HZ && sweep_f2 > LINEAR_LOG_CROSSOVER_HZ {
-                let linear_span = LINEAR_LOG_CROSSOVER_HZ - sweep_f1;
-                let log_octaves = (sweep_f2 / LINEAR_LOG_CROSSOVER_HZ).log2();
-                // Weight: 1 octave of log ≈ same perceptual time as the linear span
-                let linear_weight = linear_span / LINEAR_LOG_CROSSOVER_HZ;
-                let total_weight = linear_weight + log_octaves;
-                let linear_fraction = linear_weight / total_weight;
-                let linear_samples =
-                    (request.resolved_sweep.duration * linear_fraction
-                        * request.sample_rate as f32)
-                        .round() as usize;
-                (linear_samples, LINEAR_LOG_CROSSOVER_HZ)
-            } else {
-                (0, sweep_f1)
-            };
+        let (linear_section_samples, log_start_hz) = if sweep_f1 < LINEAR_LOG_CROSSOVER_HZ
+            && sweep_f2 > LINEAR_LOG_CROSSOVER_HZ
+        {
+            let linear_span = LINEAR_LOG_CROSSOVER_HZ - sweep_f1;
+            let log_octaves = (sweep_f2 / LINEAR_LOG_CROSSOVER_HZ).log2();
+            // Weight: 1 octave of log ≈ same perceptual time as the linear span
+            let linear_weight = linear_span / LINEAR_LOG_CROSSOVER_HZ;
+            let total_weight = linear_weight + log_octaves;
+            let linear_fraction = linear_weight / total_weight;
+            let linear_samples =
+                (request.resolved_sweep.duration * linear_fraction * request.sample_rate as f32)
+                    .round() as usize;
+            (linear_samples, LINEAR_LOG_CROSSOVER_HZ)
+        } else {
+            (0, sweep_f1)
+        };
 
-        let log_duration =
-            request.resolved_sweep.duration - linear_section_samples as f32 / request.sample_rate as f32;
+        let log_duration = request.resolved_sweep.duration
+            - linear_section_samples as f32 / request.sample_rate as f32;
         let raw_sweep_samples =
             seconds_to_samples(request.resolved_sweep.duration, request.sample_rate);
 
@@ -314,8 +314,14 @@ impl PlaybackPlan {
             raw_sweep_samples,
             sweep_phase_scale,
             sweep_ratio_step,
-            preamble_samples: seconds_to_samples(request.resolved_preamble_sec, request.sample_rate),
-            tone_burst_samples: tone_burst_samples(request.resolved_tone_burst, request.sample_rate),
+            preamble_samples: seconds_to_samples(
+                request.resolved_preamble_sec,
+                request.sample_rate,
+            ),
+            tone_burst_samples: tone_burst_samples(
+                request.resolved_tone_burst,
+                request.sample_rate,
+            ),
             gap_samples: seconds_to_samples(request.resolved_gap_sec, request.sample_rate),
             tail_marker_gap_samples: seconds_to_samples(
                 resolved.tail_marker_gap_sec,
@@ -485,9 +491,7 @@ fn resolve_play_request(mut request: PlayRequest) -> Result<ResolvedPlayRequest,
     request.resolved_tail_tone_burst = None;
 
     if request.marker_gap_ms > 2_000 {
-        return Err(PlaybackError::InvalidRequest(
-            "markerGapMs must be <= 2000",
-        ));
+        return Err(PlaybackError::InvalidRequest("markerGapMs must be <= 2000"));
     }
 
     let marker_gap_sec = request.marker_gap_ms as f32 / 1000.0;
@@ -861,12 +865,12 @@ fn validate_request(request: &PlayRequest) -> Result<(), PlaybackError> {
         ));
     }
     if request.resolved_sweep.duration <= 0.0 {
-        return Err(PlaybackError::InvalidRequest("sweepDurationSec must be > 0"));
+        return Err(PlaybackError::InvalidRequest(
+            "sweepDurationSec must be > 0",
+        ));
     }
     if request.resolved_sweep.fade_duration < 0.0 {
-        return Err(PlaybackError::InvalidRequest(
-            "sweepFadeSec must be >= 0",
-        ));
+        return Err(PlaybackError::InvalidRequest("sweepFadeSec must be >= 0"));
     }
     validate_tone_burst(
         request.resolved_tone_burst,
@@ -1050,12 +1054,11 @@ fn hybrid_sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
 
 fn sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
     let mut sample = hybrid_sweep_sample(index, plan);
-    let fade_samples =
-        seconds_to_samples(
-            plan.request.resolved_sweep.fade_duration,
-            plan.request.sample_rate,
-        )
-            .min(plan.sweep_samples / 2);
+    let fade_samples = seconds_to_samples(
+        plan.request.resolved_sweep.fade_duration,
+        plan.request.sample_rate,
+    )
+    .min(plan.sweep_samples / 2);
     if fade_samples > 0 {
         // Fade-in
         if index < fade_samples {
@@ -1331,9 +1334,7 @@ mod tests {
         let err = PlaybackPlan::build(request).unwrap_err();
         assert_eq!(
             err,
-            PlaybackError::InvalidRequest(
-                "markerFrequencyHz must be > 0 when markerCycles > 0"
-            )
+            PlaybackError::InvalidRequest("markerFrequencyHz must be > 0 when markerCycles > 0")
         );
     }
 
@@ -1349,7 +1350,9 @@ mod tests {
         let err = PlaybackPlan::build(request).unwrap_err();
         assert_eq!(
             err,
-            PlaybackError::InvalidRequest("marker signal is too short for the requested sampleRate")
+            PlaybackError::InvalidRequest(
+                "marker signal is too short for the requested sampleRate"
+            )
         );
     }
 
@@ -1451,7 +1454,10 @@ mod tests {
             ..PlayRequest::default()
         })
         .unwrap_err();
-        assert_eq!(err, PlaybackError::InvalidRequest("markerGapMs must be <= 2000"));
+        assert_eq!(
+            err,
+            PlaybackError::InvalidRequest("markerGapMs must be <= 2000")
+        );
     }
 
     #[test]
@@ -1517,7 +1523,10 @@ mod tests {
         assert_eq!(offsets.sweep_offset_samples, 0);
         assert_eq!(offsets.tone_burst_offset_samples, 0);
         assert_eq!(offsets.tail_tone_burst_offset_samples, Some(0));
-        assert_eq!(offsets.total_samples, plan.tail_tone_burst_samples + plan.decay_samples);
+        assert_eq!(
+            offsets.total_samples,
+            plan.tail_tone_burst_samples + plan.decay_samples
+        );
         assert_ne!(plan.sample_at(1), 0.0);
     }
 }
