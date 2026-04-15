@@ -3403,7 +3403,10 @@ fn run_playback_thread(
             );
         }
         Err(err) => {
-            allow_source_restore = false;
+            // Playback never started, but we may already have switched the
+            // MiniDSP to USB in preparation for it. Try to restore the
+            // previous source on the same cleanup path before returning 500.
+            allow_source_restore = true;
             let _ = started_tx.send(Err(err));
         }
     }
