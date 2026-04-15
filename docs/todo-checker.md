@@ -371,7 +371,7 @@ This section is mandatory before deleting the compatibility todo.
 - [x] `GET /devices/0/config` exists and is tested, or the gap is explicitly fixed before claiming parity.
   Re-verified on 2026-04-11 on the physical 2x4 HD: `GET /devices/0/config` returned a 5744-byte JSON body covering the full input/output PEQ tree.
 - [x] `POST /devices/0/config` applies master status fields correctly.
-  Re-verified on 2026-04-11 on the physical 2x4 HD: bare-compat bodies `{"volume":-22.5}` and `{"volume":-20.0}` round-tripped cleanly through `/devices/0` and `/devices/0/config`.
+  Re-verified on 2026-04-14 on the physical 2x4 HD: bare compatibility master-status bodies such as `{"volume":-22.5}` belong on `POST /devices/0`, while `POST /devices/0/config` applies the same fields through the structured `{"master_status":{...}}` shape. Both paths updated live master state correctly on the board.
 - [x] `POST /devices/0/config` applies input PEQ/gain/mute correctly.
   Covered by the real-device ESP32 retest recorded in `PROGRESS.md`: config read/write for PEQ/gains/routing/delay/polarity/mute was live-verified on the physical 2x4 HD.
 - [x] `POST /devices/0/config` applies output PEQ/gain/mute/delay/invert correctly.
