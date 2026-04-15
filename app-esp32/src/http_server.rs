@@ -36,10 +36,13 @@ const AUDIO_REOPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const AUDIO_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PLAYBACK_BYTES: usize = 4 * 1024 * 1024;
 const PLAYBACK_THREAD_STACK_BYTES: usize = 18 * 1024;
+const WS_COMPAT_THREAD_STACK_BYTES: usize = 8 * 1024;
+const EZBEQ_LEVELS_THREAD_STACK_BYTES: usize = 12 * 1024;
 const PLAYBACK_STREAM_TARGET_CHUNK_MS: usize = 2;
 const PLAYBACK_PROGRESS_LOG_EVERY_WRITES: usize = 500;
 pub(crate) const HID_BUSY_DURING_PLAYBACK: &str = "device busy during playback";
 static PLAYBACK_STREAM_BUF: Mutex<[u8; 2880]> = Mutex::new([0u8; 2880]);
+const EZBEQ_SHIM_JS: &str = include_str!("../static/ezbeq-shim.js");
 
 /// Shared device state — None when USB disconnected, Some when connected.
 pub type SharedDeviceState = Arc<Mutex<Option<Arc<DeviceState>>>>;
@@ -912,14 +915,23 @@ pub fn start(
         )
     })?;
 
-    // GET /database.json — same-origin proxy for the full ezBEQ catalogue JSON.
-    // The board stores only the compact biquad index locally; proxy the larger
-    // browser catalogue from the configured upstream so the UI avoids CORS issues
-    // and still talks to the board origin only.
+    server.fn_handler("/ezbeq-shim.js", Method::Get, |req| {
+        send_javascript(req, EZBEQ_SHIM_JS)
+    })?;
+
+    // GET /database.json — same-origin browser catalogue for the hosted ezBEQ UI.
+    // Newer bundles store a gzipped metadata snapshot locally so fresh browsers
+    // do not depend on the upstream site being reachable. Older bundles fall
+    // back to the proxy path below.
     {
         let nvs_catalogue = nvs.clone();
         server.fn_handler("/database.json", Method::Get, move |req| {
-            proxy_catalogue_file(req, &nvs_catalogue, "database.json", "application/json")
+            let local_catalogue = crate::storage::full_path("database.json.gz");
+            if std::path::Path::new(&local_catalogue).exists() {
+                send_gzip_file(req, &local_catalogue, "application/json")
+            } else {
+                proxy_catalogue_file(req, &nvs_catalogue, "database.json", "application/json")
+            }
         })?;
     }
 
@@ -1282,7 +1294,7 @@ fn register_debug_routes(
         let nvs = nvs.clone();
         server.fn_handler("/debug/updater", Method::Get, move |req| {
             let body = serde_json::to_string(&serde_json::json!({
-                "baseUrl": crate::updater::base_url(&nvs),
+                "updaterBaseUrl": crate::updater::base_url(&nvs),
                 "installedVersion": crate::updater::installed_version(&nvs),
                 "hasCatalogueData": crate::updater::has_catalogue_data(),
                 "isUpdating": crate::updater::is_updating(),
@@ -1315,7 +1327,7 @@ fn register_debug_routes(
                 Ok(active_url) => {
                     let body = serde_json::to_string(&serde_json::json!({
                         "status": "ok",
-                        "baseUrl": active_url,
+                        "updaterBaseUrl": active_url,
                     }))
                     .unwrap_or_default();
                     send_json(req, 200, &body)
@@ -1333,7 +1345,7 @@ fn register_debug_routes(
                 crate::updater::UpdateAttempt::Busy => {
                     let body = serde_json::json!({
                         "status": "busy",
-                        "baseUrl": crate::updater::base_url(&nvs),
+                        "updaterBaseUrl": crate::updater::base_url(&nvs),
                     });
                     send_json(req, 409, &serde_json::to_string(&body).unwrap_or_default())
                 }
@@ -1341,23 +1353,23 @@ fn register_debug_routes(
                     let body = match result {
                         crate::updater::UpdateResult::Current => serde_json::json!({
                             "status": "current",
-                            "baseUrl": crate::updater::base_url(&nvs),
+                            "updaterBaseUrl": crate::updater::base_url(&nvs),
                         }),
                         crate::updater::UpdateResult::Updated { version, files } => {
                             serde_json::json!({
                                 "status": "updated",
-                                "baseUrl": crate::updater::base_url(&nvs),
+                                "updaterBaseUrl": crate::updater::base_url(&nvs),
                                 "version": version,
                                 "files": files,
                             })
                         }
                         crate::updater::UpdateResult::NoStorage => serde_json::json!({
                             "status": "no_storage",
-                            "baseUrl": crate::updater::base_url(&nvs),
+                            "updaterBaseUrl": crate::updater::base_url(&nvs),
                         }),
                         crate::updater::UpdateResult::Error(error) => serde_json::json!({
                             "status": "error",
-                            "baseUrl": crate::updater::base_url(&nvs),
+                            "updaterBaseUrl": crate::updater::base_url(&nvs),
                             "error": error,
                         }),
                     };
@@ -2638,6 +2650,49 @@ fn send_text<C: esp_idf_svc::http::server::Connection>(
     Ok(())
 }
 
+fn send_javascript<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    text: &str,
+) -> Result<(), C::Error> {
+    let headers = [
+        ("Server", "miniDSP-Open"),
+        ("Content-Type", "application/javascript"),
+        ("Access-Control-Allow-Origin", "*"),
+        ("Cache-Control", "no-store"),
+    ];
+    let mut resp = req.into_response(200, None, &headers)?;
+    resp.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+fn send_gzip_file<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    path: &str,
+    content_type: &str,
+) -> Result<(), C::Error> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return send_json(req, 404, r#"{"error":"not found"}"#),
+    };
+    let headers = [
+        ("Server", "miniDSP-Open"),
+        ("Content-Type", content_type),
+        ("Content-Encoding", "gzip"),
+        ("Access-Control-Allow-Origin", "*"),
+        ("Cache-Control", "no-store"),
+    ];
+    let mut resp = req.into_response(200, None, &headers)?;
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        resp.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
 fn send_html<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
     html: &str,
@@ -3182,6 +3237,43 @@ fn copy_thread_spawn_configuration(conf: &ThreadSpawnConfiguration) -> ThreadSpa
         pin_to_core: conf.pin_to_core,
         stack_alloc_caps: conf.stack_alloc_caps,
     }
+}
+
+fn spawn_psram_thread<F>(
+    conf_name: &'static std::ffi::CStr,
+    builder_name: &str,
+    stack_size: usize,
+    f: F,
+) -> Result<std::thread::JoinHandle<()>, String>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let previous_conf = ThreadSpawnConfiguration::get();
+    let mut spawn_conf = previous_conf
+        .as_ref()
+        .map(copy_thread_spawn_configuration)
+        .unwrap_or_default();
+    spawn_conf.name = Some(conf_name);
+    spawn_conf.stack_size = stack_size;
+    spawn_conf.stack_alloc_caps = MallocCap::Spiram | MallocCap::Cap8bit;
+    spawn_conf
+        .set()
+        .map_err(|err| format!("set {builder_name} thread config: {err}"))?;
+
+    let spawn_result = std::thread::Builder::new()
+        .name(builder_name.into())
+        .stack_size(stack_size)
+        .spawn(f);
+
+    let restore_result = previous_conf
+        .as_ref()
+        .map(ThreadSpawnConfiguration::set)
+        .unwrap_or_else(|| ThreadSpawnConfiguration::default().set());
+    if let Err(err) = restore_result {
+        warn!("failed to restore pthread config after {builder_name} spawn: {err}");
+    }
+
+    spawn_result.map_err(|err| err.to_string())
 }
 
 fn spawn_playback_thread(
@@ -3837,13 +3929,14 @@ fn register_ws_routes(
 
                             let dev_state = st.clone();
                             let audio_state = audio.clone();
-                            if let Err(e) = std::thread::Builder::new()
-                                .name("ws_compat".into())
-                                .stack_size(8192)
-                                .spawn(move || {
+                            if let Err(e) = spawn_psram_thread(
+                                c"ws_compat",
+                                "ws_compat",
+                                WS_COMPAT_THREAD_STACK_BYTES,
+                                move || {
                                     ws_poll_loop(sender, dev_state, audio_state, stop, interval_ms);
-                                })
-                            {
+                                },
+                            ) {
                                 log::warn!("WebSocket compat: failed to spawn poll thread: {e}");
                             }
                         }
@@ -4188,7 +4281,7 @@ fn register_ezbeq_ws(
     beq_state: crate::ezbeq::SharedEzBeqState,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     use esp_idf_svc::ws::FrameType;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
 
     let active_ws: Arc<Mutex<Option<ActiveWsBeq>>> = Arc::new(Mutex::new(None));
 
@@ -4234,15 +4327,17 @@ fn register_ezbeq_ws(
             let fd = ws.session();
             match ws.create_detached_sender() {
                 Ok(sender) => {
+                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     log::info!("ezBEQ WS: detached sender created (fd={fd})");
                     if let Ok(mut beq_guard) = beq.lock() {
-                        beq_guard.ws_sender = Some(sender);
+                        beq_guard.ws_sender = Some(sender.clone());
                     }
                     // Record fd so is_closed() can match and clean up even without subscribe
                     if let Ok(mut guard) = ws_ref.lock() {
                         *guard = Some(ActiveWsBeq {
-                            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            stop,
                             fd,
+                            levels_running: false,
                         });
                     }
                 }
@@ -4284,25 +4379,56 @@ fn register_ezbeq_ws(
                     let empty = r#"{"message":"CatalogueEntries","data":[]}"#;
                     ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), empty.as_bytes())?;
                 } else if msg.starts_with("subscribe levels") {
-                    if let Ok(mut beq_guard) = beq.lock() {
-                        if let Some(sender) = beq_guard.ws_sender.take() {
-                            let stop = Arc::new(AtomicBool::new(false));
-                            let fd = ws.session();
-                            if let Ok(mut guard) = ws_ref.lock() {
-                                *guard = Some(ActiveWsBeq {
-                                    stop: stop.clone(),
-                                    fd,
-                                });
+                    let fd = ws.session();
+                    let stop = match ws_ref.lock() {
+                        Ok(mut guard) => match guard.as_mut() {
+                            Some(active) if active.fd == fd => {
+                                if active.levels_running {
+                                    log::debug!(
+                                        "ezBEQ WS: duplicate levels subscribe ignored for fd={fd}"
+                                    );
+                                    None
+                                } else {
+                                    active.levels_running = true;
+                                    Some(active.stop.clone())
+                                }
                             }
+                            Some(active) => {
+                                log::warn!(
+                                    "ezBEQ WS: ignoring levels subscribe for stale fd={} active_fd={}",
+                                    fd,
+                                    active.fd
+                                );
+                                None
+                            }
+                            None => {
+                                log::warn!(
+                                    "ezBEQ WS: levels subscribe received without active session"
+                                );
+                                None
+                            }
+                        },
+                        Err(err) => {
+                            log::warn!("ezBEQ WS: levels subscribe lock poisoned: {err}");
+                            None
+                        }
+                    };
 
+                    if let Some(stop) = stop {
+                        let sender = beq
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.ws_sender.as_ref().cloned());
+                        if let Some(sender) = sender {
                             let dev_state = st.clone();
                             let audio_state = audio.clone();
                             let beq_clone = beq.clone();
                             let ws_ref_clone = ws_ref.clone();
-                            if let Err(e) = std::thread::Builder::new()
-                                .name("beq_lvl".into())
-                                .stack_size(8192)
-                                .spawn(move || {
+                            if let Err(e) = spawn_psram_thread(
+                                c"beq_lvl",
+                                "beq_lvl",
+                                EZBEQ_LEVELS_THREAD_STACK_BYTES,
+                                move || {
                                     push_levels(
                                         sender,
                                         dev_state,
@@ -4312,10 +4438,26 @@ fn register_ezbeq_ws(
                                         fd,
                                         ws_ref_clone,
                                     );
-                                })
-                            {
+                                },
+                            ) {
+                                if let Ok(mut guard) = ws_ref.lock() {
+                                    if guard.as_ref().is_some_and(|active| active.fd == fd) {
+                                        if let Some(active) = guard.as_mut() {
+                                            active.levels_running = false;
+                                        }
+                                    }
+                                }
                                 log::warn!("failed to spawn levels thread: {e}");
                             }
+                        } else {
+                            if let Ok(mut guard) = ws_ref.lock() {
+                                if guard.as_ref().is_some_and(|active| active.fd == fd) {
+                                    if let Some(active) = guard.as_mut() {
+                                        active.levels_running = false;
+                                    }
+                                }
+                            }
+                            log::warn!("ezBEQ WS: no detached sender available for levels");
                         }
                     }
                 }
@@ -4374,11 +4516,10 @@ fn build_catalogue_meta() -> String {
 struct ActiveWsBeq {
     stop: Arc<std::sync::atomic::AtomicBool>,
     fd: i32,
+    levels_running: bool,
 }
 
-/// Push level meter data over WebSocket at ~4Hz.
-/// Returns the sender to beq_state when done ONLY if the session fd still matches
-/// (prevents overwriting a new client's sender).
+/// Push level meter data over WebSocket at ~4Hz for the active ezBEQ session.
 #[cfg(esp_idf_httpd_ws_support)]
 fn push_levels(
     mut sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
@@ -4393,6 +4534,7 @@ fn push_levels(
     use std::sync::atomic::Ordering;
 
     log::info!("levels push thread started");
+    let mut connection_lost = false;
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -4417,11 +4559,13 @@ fn push_levels(
                         for (i, &v) in status.output_levels.iter().enumerate() {
                             levels.insert(format!("O{i}"), serde_json::Value::from(v));
                         }
+                        let ts =
+                            (unsafe { esp_idf_sys::esp_timer_get_time() } as f64) / 1_000_000.0;
                         serde_json::to_string(&serde_json::json!({
                             "message": "Levels",
                             "data": {
                                 "name": "master",
-                                "ts": 0,
+                                "ts": ts,
                                 "levels": levels,
                             }
                         }))
@@ -4437,24 +4581,36 @@ fn push_levels(
             .send(FrameType::Text(false), json.as_bytes())
             .is_err()
         {
+            connection_lost = true;
             break;
         }
     }
 
     log::info!("levels push thread stopped");
 
-    // Only return sender if the session is still the same (no new client replaced us)
-    let still_active = active_ws
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|a| a.fd == session_fd))
-        .unwrap_or(false);
-    if still_active {
-        if let Ok(mut beq_guard) = beq_state.lock() {
-            beq_guard.ws_sender = Some(sender);
+    let still_active = if let Ok(mut guard) = active_ws.lock() {
+        if let Some(active) = guard.as_mut() {
+            if active.fd == session_fd {
+                active.levels_running = false;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
     } else {
-        log::info!("levels: session replaced, not restoring sender");
+        false
+    };
+
+    if connection_lost && still_active {
+        if let Ok(mut beq_guard) = beq_state.lock() {
+            if beq_guard.ws_sender.as_ref().map(|active| active.session()) == Some(session_fd) {
+                beq_guard.ws_sender = None;
+            }
+        }
+    } else {
+        let _ = sender;
     }
 }
 

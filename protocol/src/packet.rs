@@ -274,6 +274,11 @@ pub fn encode_device_console_tcp_response(
 ///
 /// Returns `(payload, bytes_consumed)` or None if insufficient data.
 pub fn decode_tcp_response(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    // RESP_ERROR is zero-valued, so an exact single-byte error must be
+    // recognized before we strip WI-DG-style leading zero padding.
+    if data == [crate::commands::RESP_ERROR] {
+        return Some((vec![crate::commands::RESP_ERROR], 1));
+    }
     // Skip zero-byte padding
     let mut offset = 0;
     while offset < data.len() && data[offset] == 0 {
@@ -281,6 +286,14 @@ pub fn decode_tcp_response(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     }
     if offset >= data.len() {
         return None;
+    }
+    match data[offset] {
+        crate::commands::RESP_OK
+        | crate::commands::RESP_ERROR
+        | crate::commands::RESP_OVERFLOW => {
+            return Some((vec![data[offset]], offset + 1));
+        }
+        _ => {}
     }
     let (payload, consumed) = decode_response_frame(&data[offset..])?;
     Some((payload, offset + consumed))
@@ -299,6 +312,24 @@ mod tests {
         assert_eq!(frame[2], checksum);
         let decoded = decode_frame(&frame).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn tcp_response_accepts_single_byte_ok_frame() {
+        let decoded = decode_tcp_response(&[crate::commands::RESP_OK]).unwrap();
+        assert_eq!(decoded, (vec![crate::commands::RESP_OK], 1));
+    }
+
+    #[test]
+    fn tcp_response_accepts_single_byte_error_frame() {
+        let decoded = decode_tcp_response(&[crate::commands::RESP_ERROR]).unwrap();
+        assert_eq!(decoded, (vec![crate::commands::RESP_ERROR], 1));
+    }
+
+    #[test]
+    fn tcp_response_accepts_padded_single_byte_ok_frame() {
+        let decoded = decode_tcp_response(&[0x00, 0x00, crate::commands::RESP_OK]).unwrap();
+        assert_eq!(decoded, (vec![crate::commands::RESP_OK], 3));
     }
 
     #[test]

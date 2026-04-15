@@ -27,7 +27,7 @@ const NVS_BASE_URL_KEY: &str = "base_url";
 
 /// Chunk size for streaming downloads to flash (4KB).
 const DOWNLOAD_CHUNK: usize = 4096;
-const UPDATER_THREAD_STACK_BYTES: usize = 16 * 1024;
+const UPDATER_THREAD_STACK_BYTES: usize = 12 * 1024;
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Cooldown between user-triggered refreshes so repeated 404s on a missing
@@ -92,11 +92,13 @@ struct Manifest {
 impl Manifest {
     /// Combined version string for NVS tracking (detects changes in either component).
     fn combined_version(&self) -> String {
-        match (&self.version, &self.ui_version) {
-            (Some(version), Some(ui)) => format!("{version}+ui{ui}"),
-            (Some(version), None) => version.clone(),
-            (None, Some(ui)) => format!("{}+ui{}", self.catalogue_version, ui),
-            (None, None) => self.catalogue_version.clone(),
+        if let Some(version) = &self.version {
+            return version.clone();
+        }
+
+        match &self.ui_version {
+            Some(ui) => format!("{}+ui{}", self.catalogue_version, ui),
+            None => self.catalogue_version.clone(),
         }
     }
 }
@@ -116,8 +118,29 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
         return UpdateResult::NoStorage;
     }
 
-    // Fetch manifest
     let base_url = base_url(nvs);
+    let installed = read_nvs_version(nvs);
+    let has_catalogue = has_catalogue_data();
+
+    let remote_version = match fetch_remote_version(&base_url) {
+        Ok(version) => version,
+        Err(err) => {
+            if should_keep_installed_data(installed.as_deref(), has_catalogue) {
+                info!(
+                    "catalogue update unavailable at {base_url}: {err}; keeping installed {}",
+                    installed.as_deref().unwrap_or("(unknown)")
+                );
+                return UpdateResult::Current;
+            }
+            return UpdateResult::Error(format!("version fetch: {err}"));
+        }
+    };
+
+    if installed.as_deref() == Some(remote_version.as_str()) {
+        info!("catalogue up to date ({remote_version})");
+        return UpdateResult::Current;
+    }
+
     let manifest = match fetch_manifest(&base_url) {
         Ok(m) => m,
         Err(e) => return UpdateResult::Error(format!("manifest fetch: {e}")),
@@ -125,7 +148,6 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
 
     // Check installed version (combined catalogue + UI)
     let new_version = manifest.combined_version();
-    let installed = read_nvs_version(nvs);
     if installed.as_deref() == Some(new_version.as_str()) {
         info!("catalogue up to date ({new_version})");
         return UpdateResult::Current;
@@ -272,6 +294,10 @@ fn run_scheduled_check(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) {
     }
 }
 
+fn should_keep_installed_data(installed: Option<&str>, has_catalogue_data: bool) -> bool {
+    installed.is_some() && has_catalogue_data
+}
+
 fn log_update_result(result: UpdateResult) {
     match result {
         UpdateResult::Current => {}
@@ -321,6 +347,17 @@ fn fetch_manifest(base_url: &str) -> Result<Manifest, Box<dyn std::error::Error>
     let body = fetch_to_memory(&url, 8192)?;
     let manifest: Manifest = serde_json::from_slice(&body)?;
     Ok(manifest)
+}
+
+fn fetch_remote_version(base_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("{base_url}/version.txt");
+    let body = fetch_to_memory(&url, 256)?;
+    let version = String::from_utf8(body)?;
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        return Err("empty version.txt".into());
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Download a file from the catalogue server directly to LittleFS in chunks.
@@ -493,7 +530,7 @@ mod tests {
             files: std::collections::HashMap::new(),
         };
 
-        assert_eq!(manifest.combined_version(), "2026.04.13+ui42");
+        assert_eq!(manifest.combined_version(), "2026.04.13");
     }
 
     #[test]
@@ -506,6 +543,13 @@ mod tests {
         };
 
         assert_eq!(manifest.combined_version(), "2026.04.13");
+    }
+
+    #[test]
+    fn keep_installed_data_requires_version_and_catalogue() {
+        assert!(should_keep_installed_data(Some("2026.04.13"), true));
+        assert!(!should_keep_installed_data(Some("2026.04.13"), false));
+        assert!(!should_keep_installed_data(None, true));
     }
 }
 

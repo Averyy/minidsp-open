@@ -79,7 +79,7 @@ Parses JSON output for: master volume, mute, source, active preset, input/output
 
 ### Live monitoring
 
-Connects to minidsp-rs compatibility WebSocket at `ws://{wsIp}/devices/{wsDeviceId}?levels=true&poll=true` for real-time level data and state change notifications. The `wsIp` config value includes the port (default `127.0.0.1:5380`), and `wsDeviceId` specifies the device index. Uses Autobahn Twisted WebSocket client with reconnecting factory.
+Connects to minidsp-rs compatibility WebSocket at `ws://{wsIp}/devices/{wsDeviceId}?levels=true&poll=true` for real-time level data and state change notifications. The `wsIp` config value includes the port (default `127.0.0.1:5380`), and `wsDeviceId` specifies the zero-based device index. For a single-device daemon, that means `wsDeviceId: 0`. Uses Autobahn Twisted WebSocket client with reconnecting factory.
 
 ## ezBEQ's Tech Stack
 
@@ -104,7 +104,7 @@ devices:
     ignoreRetcode: true
     options: ''
     type: minidsp
-    wsDeviceId: 1
+    wsDeviceId: 0
     descriptor:
       name: 2x4
       fs: 96000
@@ -187,8 +187,8 @@ Verified against ezBEQ source (2026-04-03). Not needed for Phase 1 compatibility
 - **`device_type` config key:** Maps to built-in descriptors: `24HD`, `DDRC24`, `DDRC88`, `HTx`, `4x10`, `10x10`, `SHD`, `8x12CDSP`. Default is `Minidsp24HD`. SHD and DDRC24 share the same PEQ layout internally.
 - **Slot switching:** ezBEQ prepends `config {n}` to batch files when the target slot differs from the active one. `slotChangeDelay` config option adds a delay after slot change for Flex devices.
 - **`sw_channels`:** Config key that overrides which output channels receive BEQ filters (used for DDRC88/HTx).
-- **ezBEQ REST API surface:** Beyond filter load/clear, the frontend calls: `/api/1/devices/{name}/config/{slot}/active`, `/api/1/devices/{name}/mute`, `/api/1/devices/{name}/gain`, `/api/1/devices/{name}/levels`, `/api/2/devices` (all devices with refresh), `/api/3/devices/{name}` (PATCH with MV adjust), `/api/1/search`, `/api/1/catalogue/{id}/details`, `/api/1/authors`, `/api/1/audiotypes`, `/api/1/years`, `/api/1/contenttypes`, `/api/1/version`. All must be implemented on ESP32 for the React UI.
-- **ezBEQ WebSocket protocol:** Server sends JSON `{"message": "DeviceState"|"Catalogue"|"CatalogueEntries"|"Levels"|"Error", "data": ...}`. Client sends `"load catalogue"` and `"subscribe levels {device_name}"`. Catalogue entries are sent in chunks.
+- **ezBEQ REST API surface:** Upstream Python exposes `/api/1/devices/{name}/config/{slot}/active`, `/api/1/devices/{name}/mute`, `/api/1/devices/{name}/gain`, `/api/1/devices/{name}/levels`, `/api/2/devices` (all devices with refresh), `/api/3/devices/{name}` (PATCH with MV adjust), `/api/1/search`, `/api/1/catalogue/{id}/details`, `/api/1/authors`, `/api/1/audiotypes`, `/api/1/years`, `/api/1/contenttypes`, and `/api/1/version`. The hosted React levels page actually uses the WebSocket `subscribe levels {device_name}` flow rather than the REST `levels` helper, but keeping `/api/1/devices/{name}/levels` on ESP32 is still useful for broader API parity and non-browser consumers.
+- **ezBEQ WebSocket protocol:** Server sends JSON `{"message": "DeviceState"|"Catalogue"|"CatalogueEntries"|"Levels"|"Error", "data": ...}`. Client sends `"load catalogue"` and `"subscribe levels {device_name}"`. `Levels` messages must include `data.name`, `data.levels`, and a real monotonic `data.ts` in seconds; the hosted React levels plot uses that timestamp as the x-axis. Catalogue entries are sent in chunks.
 - **`ignoreRetcode`:** Config flag that suppresses exit code checking from minidsp CLI.
 
 ## ESP32 Strategy: Replace the Entire Stack

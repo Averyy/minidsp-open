@@ -12,6 +12,7 @@ use crate::device::DeviceState;
 use crate::http_server::SharedDeviceState;
 use crate::storage;
 use log::info;
+use minidsp_protocol::status::StatusSummary;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
@@ -514,6 +515,27 @@ pub fn register_routes(
         })?;
     }
 
+    // GET /api/1/devices/master/levels — direct level snapshot in upstream ezBEQ shape
+    {
+        let st = device_state.clone();
+        let audio = audio_state.clone();
+        server.fn_handler("/api/1/devices/master/levels", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            let _op = dev.begin_operation();
+            match dev.get_status_summary() {
+                Ok(status) => send_json(req, 200, &levels_json("master", &status)),
+                Err(e) => send_error(req, 500, &format!("read_levels: {e}")),
+            }
+        })?;
+    }
+
     // PUT /api/1/devices/master/filter/{slot} — load a BEQ filter by digest
     for slot_idx in 0..NUM_SLOTS {
         let st = device_state.clone();
@@ -887,6 +909,24 @@ pub fn register_routes(
 fn device_state_json_rest(device: &DeviceState, beq_state: &EzBeqState) -> String {
     serde_json::to_string(&serde_json::json!({
         "master": device_state_value(device, beq_state)
+    }))
+    .unwrap_or_default()
+}
+
+fn levels_json(name: &str, status: &StatusSummary) -> String {
+    let mut levels = serde_json::Map::new();
+    for (i, &v) in status.input_levels.iter().enumerate() {
+        levels.insert(format!("I{i}"), serde_json::Value::from(v));
+    }
+    for (i, &v) in status.output_levels.iter().enumerate() {
+        levels.insert(format!("O{i}"), serde_json::Value::from(v));
+    }
+
+    let ts = (unsafe { esp_idf_sys::esp_timer_get_time() } as f64) / 1_000_000.0;
+    serde_json::to_string(&serde_json::json!({
+        "name": name,
+        "ts": ts,
+        "levels": levels,
     }))
     .unwrap_or_default()
 }
