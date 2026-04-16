@@ -42,6 +42,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -87,6 +88,18 @@ class HttpResponse:
 
     def json(self) -> Any:
         return json.loads(self.text)
+
+
+@dataclasses.dataclass(slots=True)
+class SnapshotArtifacts:
+    root: Path
+    snapshot_before: Path
+    snapshot_after: Path
+    device_before: Path
+    config_before: Path
+    device_after: Path
+    config_after: Path
+    restore_result: Path
 
 
 @dataclasses.dataclass(slots=True)
@@ -161,7 +174,14 @@ class Harness:
         self.results: list[StepResult] = []
         self.failures = 0
 
-    def run_step(self, section: str, name: str, fn: Callable[[], str | None]) -> bool:
+    def run_step(
+        self,
+        section: str,
+        name: str,
+        fn: Callable[[], str | None],
+        *,
+        abort_on_fail: bool = True,
+    ) -> bool:
         start = time.perf_counter()
         try:
             detail = fn() or "ok"
@@ -181,7 +201,7 @@ class Harness:
         )
         if not ok:
             self.failures += 1
-            if not self.args.continue_on_fail:
+            if abort_on_fail and not self.args.continue_on_fail:
                 raise SystemExit(1)
         return ok
 
@@ -213,6 +233,24 @@ class Harness:
     def write_report(self, path: Path) -> None:
         lines = ["# Live Validation Report", "", *self.summary_lines(), ""]
         path.write_text("\n".join(lines))
+
+    def summary_payload(self) -> dict[str, Any]:
+        total = len(self.results)
+        passed = sum(1 for r in self.results if r.status == "PASS")
+        skipped = sum(1 for r in self.results if r.status == "SKIP")
+        failed = sum(1 for r in self.results if r.status == "FAIL")
+        return {
+            "results": [dataclasses.asdict(result) for result in self.results],
+            "summary": {
+                "passed": passed,
+                "skipped": skipped,
+                "failed": failed,
+                "total": total,
+            },
+        }
+
+    def write_json_report(self, path: Path) -> None:
+        path.write_text(json.dumps(self.summary_payload(), indent=2) + "\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -297,6 +335,12 @@ def parse_args() -> argparse.Namespace:
         "--report",
         type=Path,
         help="Optional path to write a markdown report.",
+    )
+    parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        default=ROOT / ".scratch" / "live-validation-runs",
+        help="Root directory for destructive-run artifacts (default: %(default)s).",
     )
     parser.add_argument(
         "--continue-on-fail",
@@ -606,13 +650,21 @@ def make_target(label: str, kind: str, base_url: str, args: argparse.Namespace, 
 
 def run_static_checks(harness: Harness, args: argparse.Namespace) -> None:
     section = "static"
-    harness.run_step(section, "cargo test -p minidsp-protocol", lambda: command_detail(["cargo", "test", "-p", "minidsp-protocol"]))
-    harness.run_step(section, "cargo test", lambda: command_detail(["cargo", "test"]))
+    harness.run_step(
+        section,
+        "cargo +stable test -p minidsp-protocol",
+        lambda: command_detail(["cargo", "+stable", "test", "-p", "minidsp-protocol"]),
+    )
+    harness.run_step(
+        section,
+        "cargo +stable test",
+        lambda: command_detail(["cargo", "+stable", "test"]),
+    )
     if args.cli_bin:
         harness.run_step(
             section,
-            "cargo build -p minidsp-app",
-            lambda: command_detail(["cargo", "build", "-p", "minidsp-app"]),
+            "cargo +stable build -p minidsp-app",
+            lambda: command_detail(["cargo", "+stable", "build", "-p", "minidsp-app"]),
         )
     if args.esp32_url:
         harness.run_step(
@@ -649,6 +701,200 @@ def build_catalogue_artifacts() -> str:
         for rel in required:
             assert_true((Path(tmp) / rel).exists(), f"missing catalogue artifact {rel}")
         return "bundle + metadata artifacts built"
+
+
+def timestamp_slug() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def prepare_run_artifact_dir(root: Path) -> Path:
+    path = root / timestamp_slug()
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def json_dump(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def snapshot_cli_prefix(target: Target) -> list[str]:
+    assert target.cli_bin is not None
+    if target.cli_transport:
+        return [str(target.cli_bin), *shlex.split(target.cli_transport)]
+    return [
+        str(target.cli_bin),
+        "--daemon-url",
+        target.base_url,
+        "--device-index",
+        str(target.device_id),
+    ]
+
+
+def create_snapshot_artifacts(run_dir: Path, target: Target) -> SnapshotArtifacts:
+    root = run_dir / target.label
+    root.mkdir(parents=True, exist_ok=True)
+    return SnapshotArtifacts(
+        root=root,
+        snapshot_before=root / "snapshot-before.json",
+        snapshot_after=root / "snapshot-after.json",
+        device_before=root / "device-before.json",
+        config_before=root / "config-before.json",
+        device_after=root / "device-after.json",
+        config_after=root / "config-after.json",
+        restore_result=root / "restore-result.json",
+    )
+
+
+def normalize_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(snapshot))
+    normalized.pop("capturedAt", None)
+    normalized.pop("tool", None)
+    normalized.pop("notes", None)
+    return normalized
+
+
+def compare_snapshot_documents(expected: dict[str, Any], actual: dict[str, Any]) -> list[str]:
+    mismatches: list[str] = []
+    keys = sorted(set(expected) | set(actual))
+    for key in keys:
+        if expected.get(key) != actual.get(key):
+            mismatches.append(key)
+    return mismatches
+
+
+def start_destructive_snapshot_guard(
+    harness: Harness,
+    target: Target,
+    run_dir: Path | None,
+) -> SnapshotArtifacts | None:
+    if not harness.args.allow_destructive or target.kind != "desktop":
+        return None
+    section = f"{target.label}-snapshot"
+    if target.cli_bin is None:
+        harness.skip(section, "snapshot guard", "CLI binary unavailable")
+        return None
+    assert run_dir is not None
+    ensure_cli_available(target.cli_bin)
+    artifacts = create_snapshot_artifacts(run_dir, target)
+
+    def export_baseline_step() -> str:
+        run_command(
+            [
+                *snapshot_cli_prefix(target),
+                "snapshot",
+                "export",
+                str(artifacts.snapshot_before),
+            ],
+            cwd=ROOT,
+            timeout=max(120.0, harness.args.timeout),
+        )
+        return str(artifacts.snapshot_before.relative_to(ROOT))
+
+    harness.run_step(section, "strict snapshot baseline export", export_baseline_step)
+
+    def capture_baseline_http_step() -> str:
+        json_dump(artifacts.device_before, read_status(target))
+        json_dump(artifacts.config_before, read_config(target))
+        return str(artifacts.root.relative_to(ROOT))
+
+    harness.run_step(section, "capture baseline HTTP state", capture_baseline_http_step)
+    return artifacts
+
+
+def finish_destructive_snapshot_guard(
+    harness: Harness,
+    target: Target,
+    artifacts: SnapshotArtifacts | None,
+) -> None:
+    if artifacts is None:
+        return
+    section = f"{target.label}-snapshot"
+
+    restore_ok = harness.run_step(
+        section,
+        "snapshot restore",
+        lambda: restore_snapshot(target, artifacts.snapshot_before, artifacts.restore_result),
+        abort_on_fail=False,
+    )
+
+    if restore_ok:
+        harness.run_step(
+            section,
+            "post-restore snapshot verify",
+            lambda: verify_snapshot_restore(target, artifacts),
+            abort_on_fail=False,
+        )
+        harness.run_step(
+            section,
+            "capture post-restore HTTP state",
+            lambda: capture_post_restore_http_state(target, artifacts),
+            abort_on_fail=False,
+        )
+
+
+def restore_snapshot(target: Target, snapshot_path: Path, restore_result_path: Path) -> str:
+    proc = run_command(
+        [
+            *snapshot_cli_prefix(target),
+            "snapshot",
+            "import",
+            str(snapshot_path),
+        ],
+        cwd=ROOT,
+        timeout=300.0,
+    )
+    detail = (proc.stdout.strip() or proc.stderr.strip() or "restored snapshot").splitlines()[-1]
+    json_dump(
+        restore_result_path,
+        {
+            "restored": True,
+            "snapshot": str(snapshot_path),
+            "detail": detail,
+        },
+    )
+    return detail
+
+
+def verify_snapshot_restore(target: Target, artifacts: SnapshotArtifacts) -> str:
+    run_command(
+        [
+            *snapshot_cli_prefix(target),
+            "snapshot",
+            "export",
+            str(artifacts.snapshot_after),
+        ],
+        cwd=ROOT,
+        timeout=max(120.0, DEFAULT_TIMEOUT),
+    )
+    before = normalize_snapshot(json.loads(artifacts.snapshot_before.read_text()))
+    after = normalize_snapshot(json.loads(artifacts.snapshot_after.read_text()))
+    if before != after:
+        mismatches = compare_snapshot_documents(before, after)
+        raise StepFailed(
+            "post-restore snapshot did not match the baseline"
+            + (f" (top-level mismatches: {', '.join(mismatches[:8])})" if mismatches else "")
+        )
+
+    restore_data = json.loads(artifacts.restore_result.read_text())
+    restore_data["equalWithoutMetadata"] = True
+    restore_data["snapshotAfter"] = str(artifacts.snapshot_after)
+    json_dump(artifacts.restore_result, restore_data)
+    return "snapshot-after matched baseline"
+
+
+def capture_post_restore_http_state(target: Target, artifacts: SnapshotArtifacts) -> str:
+    json_dump(artifacts.device_after, read_status(target))
+    json_dump(artifacts.config_after, read_config(target))
+    return str(artifacts.root.relative_to(ROOT))
+
+
+def wait_for_playback_completion(play_result: dict[str, Any], *, padding_sec: float = 0.5) -> None:
+    total_samples = play_result.get("totalSamples")
+    sample_rate = play_result.get("sampleRate")
+    if not isinstance(total_samples, int) or not isinstance(sample_rate, int) or sample_rate <= 0:
+        return
+    time.sleep(total_samples / sample_rate + padding_sec)
 
 
 def run_common_http_suite(harness: Harness, target: Target) -> None:
@@ -936,6 +1182,7 @@ def run_playback_suite(harness: Harness, target: Target) -> None:
         for key in ["startedAtUs", "sweepOffsetSamples", "totalSamples", "sampleRate"]:
             assert_true(key in data, f"{target.label}: /play response missing {key}")
         assert_true(before["serverTimeUs"] <= data["startedAtUs"] <= after["serverTimeUs"], f"{target.label}: /play startedAtUs not bracketed by /sync")
+        wait_for_playback_completion(data)
         return f"startedAtUs={data['startedAtUs']} totalSamples={data['totalSamples']}"
 
     harness.run_step(section, "sweep-only /play", sweep_only_step)
@@ -949,6 +1196,7 @@ def run_playback_suite(harness: Harness, target: Target) -> None:
         )
         assert_true(resp.status == 200 and isinstance(data, dict), f"{target.label}: marker test returned {resp.status}")
         assert_true(int(data.get("toneBurstOffsetSamples", -1)) == 0, f"{target.label}: marker test expected toneBurstOffsetSamples=0")
+        wait_for_playback_completion(data)
         return f"sampleRate={data['sampleRate']} totalSamples={data['totalSamples']}"
 
     harness.run_step(section, "?test=marker", marker_test_step)
@@ -1542,16 +1790,11 @@ def build_targets(args: argparse.Namespace) -> list[Target]:
     return targets
 
 
-def main() -> int:
-    args = parse_args()
-    harness = Harness(args)
-
-    if not args.skip_static:
-        run_static_checks(harness, args)
-    else:
-        harness.skip("static", "static repo checks", "--skip-static set")
-
-    for target in build_targets(args):
+def run_target_suite(harness: Harness, target: Target, run_dir: Path | None) -> None:
+    guard = None
+    deferred_exit: SystemExit | None = None
+    try:
+        guard = start_destructive_snapshot_guard(harness, target, run_dir)
         run_common_http_suite(harness, target)
         run_transport_suite(harness, target)
         run_cli_suite(harness, target)
@@ -1561,14 +1804,41 @@ def main() -> int:
             run_esp32_specific_suite(harness, target)
         else:
             harness.skip(f"{target.label}-ezbeq", "embedded ezBEQ suite", "embedded ezBEQ routes are ESP32-only")
-        if args.run_upstream_ezbeq:
+        if harness.args.run_upstream_ezbeq:
             run_upstream_ezbeq_suite(harness, target)
+    except SystemExit as exc:
+        deferred_exit = exc
+    finally:
+        finish_destructive_snapshot_guard(harness, target, guard)
+        if deferred_exit is not None:
+            raise deferred_exit
+
+
+def main() -> int:
+    args = parse_args()
+    harness = Harness(args)
+    run_dir = prepare_run_artifact_dir(args.artifact_root) if args.allow_destructive else None
+
+    if not args.skip_static:
+        run_static_checks(harness, args)
+    else:
+        harness.skip("static", "static repo checks", "--skip-static set")
+
+    for target in build_targets(args):
+        run_target_suite(harness, target, run_dir)
 
     summary = "\n".join(harness.summary_lines())
     print(summary)
     if args.report:
         harness.write_report(args.report)
         print(f"Report written to {args.report}")
+    if run_dir is not None:
+        markdown_report = run_dir / "report.md"
+        json_report = run_dir / "report.json"
+        harness.write_report(markdown_report)
+        harness.write_json_report(json_report)
+        print(f"Artifact report written to {markdown_report}")
+        print(f"Artifact JSON written to {json_report}")
     return 1 if harness.failures else 0
 
 

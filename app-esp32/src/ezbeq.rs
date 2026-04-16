@@ -517,7 +517,10 @@ pub fn register_routes(
                 Some(d) => d,
                 None => return send_json(req, 200, "{}"),
             };
-            let _op = dev.begin_operation();
+            let _op = match dev.try_begin_operation() {
+                Some(op) => op,
+                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+            };
             let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
             let json = device_state_json_rest(&dev, &beq_guard);
             send_json(req, 200, &json)
@@ -537,7 +540,10 @@ pub fn register_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = match dev.try_begin_operation() {
+                Some(op) => op,
+                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+            };
             match dev.get_status_summary() {
                 Ok(status) => send_json(req, 200, &levels_json("master", &status)),
                 Err(e) => send_error(req, 500, &format!("read_levels: {e}")),
@@ -594,7 +600,10 @@ pub fn register_routes(
             } else {
                 raw_author
             };
-            let _op = dev.begin_operation();
+            let _op = match dev.try_begin_operation() {
+                Some(op) => op,
+                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+            };
             if let Err(e) = dev.set_preset(slot_idx as u8) {
                 return send_error(req, 500, &format!("set_preset: {e}"));
             }
@@ -664,7 +673,10 @@ pub fn register_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = match dev.try_begin_operation() {
+                Some(op) => op,
+                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+            };
             if let Err(e) = dev.set_preset(slot_idx as u8) {
                 return send_error(req, 500, &format!("set_preset: {e}"));
             }
@@ -724,7 +736,10 @@ pub fn register_routes(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
-            let _op = dev.begin_operation();
+            let _op = match dev.try_begin_operation() {
+                Some(op) => op,
+                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+            };
             let mut beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Some(vol) = json.get("masterVolume").and_then(|v| v.as_f64()) {
@@ -848,7 +863,10 @@ pub fn register_routes(
                     Ok(v) => v,
                     Err(_) => return send_error(req, 400, "invalid JSON"),
                 };
-                let _op = dev.begin_operation();
+                let _op = match dev.try_begin_operation() {
+                    Some(op) => op,
+                    None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+                };
 
                 // Handle "overwrite" command (copy current preset to flash)
                 if json
@@ -881,7 +899,10 @@ pub fn register_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = match dev.try_begin_operation() {
+                Some(op) => op,
+                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+            };
             if let Err(e) = dev.set_preset(slot_idx as u8) {
                 return send_error(req, 500, &format!("set_preset: {e}"));
             }

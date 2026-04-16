@@ -24,7 +24,7 @@ usage() {
   cat <<'EOF'
 Usage: tools/flash-esp32.sh [options]
 
-Builds the current ESP32 firmware, builds the latest ezBEQ site bundle,
+Builds the current ESP32 firmware in release mode, builds the latest ezBEQ site bundle,
 creates a LittleFS image for the `storage` partition, flashes both app and
 storage images, then optionally verifies the board's /version.txt after boot.
 
@@ -213,8 +213,8 @@ main() {
   storage_size=$((storage_size_raw))
 
   if [[ "$SKIP_BUILD" -eq 0 && "$SKIP_APP_FLASH" -eq 0 ]]; then
-    echo "==> Building ESP32 firmware"
-    (cd "$APP_DIR" && esp cargo build)
+    echo "==> Building ESP32 firmware (release)"
+    (cd "$APP_DIR" && esp cargo build --release)
   fi
 
   if [[ -z "$SITE_DIR" ]]; then
@@ -298,11 +298,11 @@ for relative_path in manifest["files"]:
     echo "==> Flashing ESP32 on $PORT"
     if [[ "$SKIP_APP_FLASH" -eq 0 ]]; then
       esp esptool.py --chip esp32s3 elf2image \
-        "$APP_DIR/target/xtensa-esp32s3-espidf/debug/minidsp-esp32" \
+        "$APP_DIR/target/xtensa-esp32s3-espidf/release/minidsp-esp32" \
         -o /tmp/app.bin
       esp esptool.py --chip esp32s3 -p "$PORT" -b "$BAUD" write_flash --flash_size 16MB \
-        0x0 "$APP_DIR/target/xtensa-esp32s3-espidf/debug/bootloader.bin" \
-        0x8000 "$APP_DIR/target/xtensa-esp32s3-espidf/debug/partition-table.bin" \
+        0x0 "$APP_DIR/target/xtensa-esp32s3-espidf/release/bootloader.bin" \
+        0x8000 "$APP_DIR/target/xtensa-esp32s3-espidf/release/partition-table.bin" \
         0x10000 /tmp/app.bin
     fi
 

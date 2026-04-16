@@ -97,6 +97,19 @@ pub(super) async fn apply_peq_shadow_bypass(
     }
 }
 
+fn merge_trusted_snapshot(
+    mut existing: PresetShadowState,
+    captured: PresetShadowState,
+) -> PresetShadowState {
+    for (addr, entry) in captured.peq {
+        existing.peq.entry(addr).or_insert(entry);
+    }
+    existing.selector.extend(captured.selector);
+    existing.scalar.extend(captured.scalar);
+    existing.fir_blocks.extend(captured.fir_blocks);
+    existing
+}
+
 fn parse_raw_write_biquad(
     payload: &[u8],
     dialect: &minidsp_protocol::dialect::Dialect,
@@ -236,10 +249,12 @@ impl MiniDspClient {
             .collect();
         let selector = self.selector_shadow.lock().await.clone();
         let scalar = self.scalar_shadow.lock().await.clone();
+        let fir_blocks = self.fir_shadow.lock().await.clone();
         PresetShadowState {
             peq,
             selector,
             scalar,
+            fir_blocks,
         }
     }
 
@@ -278,6 +293,18 @@ impl MiniDspClient {
                 scalar_shadow.extend(snapshot.scalar.iter().map(|(&addr, &value)| (addr, value)));
             }
         }
+        {
+            let mut fir_shadow = self.fir_shadow.lock().await;
+            fir_shadow.clear();
+            if let Some(snapshot) = &snapshot {
+                fir_shadow.extend(
+                    snapshot
+                        .fir_blocks
+                        .iter()
+                        .map(|(&addr, coeffs)| (addr, coeffs.clone())),
+                );
+            }
+        }
     }
 
     pub(super) async fn update_active_preset(&self, preset: u8) {
@@ -292,15 +319,39 @@ impl MiniDspClient {
         };
 
         if let Some(previous) = previous {
-            let snapshot = self.capture_active_shadow().await;
-            self.preset_shadows.lock().await.insert(previous, snapshot);
+            let skip_capture = {
+                self.skip_trusted_shadow_capture_once
+                    .lock()
+                    .await
+                    .remove(&previous)
+            };
+            if !skip_capture {
+                let snapshot = self.capture_active_shadow().await;
+                let trusted = self
+                    .trusted_snapshot_presets
+                    .lock()
+                    .await
+                    .contains(&previous);
+                let snapshot = if trusted {
+                    self.preset_shadows
+                        .lock()
+                        .await
+                        .get(&previous)
+                        .cloned()
+                        .map(|existing| merge_trusted_snapshot(existing, snapshot.clone()))
+                        .unwrap_or(snapshot)
+                } else {
+                    snapshot
+                };
+                self.preset_shadows.lock().await.insert(previous, snapshot);
+            }
         }
 
         let snapshot = self.preset_shadows.lock().await.get(&preset).cloned();
         self.apply_active_shadow_snapshot(snapshot).await;
     }
 
-    pub(super) async fn store_preset_shadow_snapshot(
+    pub(crate) async fn store_preset_shadow_snapshot(
         &self,
         preset: u8,
         snapshot: PresetShadowState,
@@ -316,6 +367,16 @@ impl MiniDspClient {
 
     pub(super) async fn set_preset_token(&self, preset: u8, token: [u8; 4]) {
         self.preset_tokens.lock().await.insert(preset, token);
+    }
+
+    pub(crate) async fn mark_snapshot_trusted(&self, preset: u8) {
+        self.trusted_snapshot_presets.lock().await.insert(preset);
+        if *self.active_preset.lock().await == Some(preset) {
+            self.skip_trusted_shadow_capture_once
+                .lock()
+                .await
+                .insert(preset);
+        }
     }
 
     /// Mirror the side effects of a successful raw-bridge write into the
@@ -346,12 +407,14 @@ impl MiniDspClient {
             presets.insert(active_preset, active_shadow.clone());
         }
         let preset_tokens = self.preset_tokens.lock().await.clone();
+        let trusted_snapshot_presets = self.trusted_snapshot_presets.lock().await.clone();
         DeviceShadowState {
             presets,
             peq: active_shadow.peq,
             selector: active_shadow.selector,
             scalar: active_shadow.scalar,
             preset_tokens,
+            trusted_snapshot_presets,
         }
     }
 
@@ -364,6 +427,7 @@ impl MiniDspClient {
             peq: state.peq.clone(),
             selector: state.selector.clone(),
             scalar: state.scalar.clone(),
+            fir_blocks: HashMap::new(),
         });
 
         {
@@ -379,6 +443,13 @@ impl MiniDspClient {
         {
             let mut preset_tokens = self.preset_tokens.lock().await;
             *preset_tokens = state.preset_tokens.clone();
+        }
+        {
+            let mut trusted_snapshot_presets = self.trusted_snapshot_presets.lock().await;
+            *trusted_snapshot_presets = state.trusted_snapshot_presets.clone();
+        }
+        {
+            self.skip_trusted_shadow_capture_once.lock().await.clear();
         }
 
         let snapshot = if let Some(active_preset) = active_preset {
@@ -484,5 +555,28 @@ impl MiniDspClient {
         .await?;
         self.preset_tokens.lock().await.insert(preset, token);
         Ok((preset, token))
+    }
+
+    pub async fn write_preset_token_exact(
+        &self,
+        preset: u8,
+        token: [u8; 4],
+    ) -> Result<(), ClientError> {
+        if preset >= self.profile.presets {
+            return Err(ClientError::Protocol(format!(
+                "preset {} out of range (max {})",
+                preset,
+                self.profile.presets.saturating_sub(1)
+            )));
+        }
+        let addr_lo = eeprom::TOKENS_ADDR.1 + preset.saturating_mul(4);
+        self.execute_write(
+            commands::write_flash(eeprom::TOKENS_ADDR.0, addr_lo, &token),
+            Priority::High,
+            "restore modification token",
+        )
+        .await?;
+        self.preset_tokens.lock().await.insert(preset, token);
+        Ok(())
     }
 }

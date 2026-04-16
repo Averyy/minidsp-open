@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! MiniDSP daemon — HTTP API, TCP bridge, UDP discovery, WebSocket.
 
 pub mod bridge;

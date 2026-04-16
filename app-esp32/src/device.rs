@@ -14,7 +14,7 @@ use minidsp_protocol::dialect::{Dialect, ValueFormat};
 use minidsp_protocol::eeprom;
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -25,17 +25,19 @@ struct PeqShadow {
     bypass: bool,
 }
 
-#[derive(Debug, Clone)]
-struct CachedPeqShadow {
-    coeffs: [f32; 5],
-    bypass: bool,
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CachedPeqShadow {
+    pub(crate) coeffs: [f32; 5],
+    pub(crate) bypass: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-struct PresetShadowState {
-    peq: HashMap<u16, CachedPeqShadow>,
-    selector: HashMap<u16, u16>,
-    scalar: HashMap<u16, u32>,
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PresetShadowState {
+    pub(crate) peq: HashMap<u16, CachedPeqShadow>,
+    pub(crate) selector: HashMap<u16, u16>,
+    pub(crate) scalar: HashMap<u16, u32>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub(crate) fir_blocks: HashMap<u16, Vec<f32>>,
 }
 
 /// Snapshot of all PEQ bands captured when entering measurement mode.
@@ -61,8 +63,10 @@ pub struct DeviceState {
     peq_shadow: Mutex<HashMap<u16, PeqShadow>>,
     selector_shadow: Mutex<HashMap<u16, u16>>,
     scalar_shadow: Mutex<HashMap<u16, u32>>,
+    fir_shadow: Mutex<HashMap<u16, Vec<f32>>>,
     preset_shadows: Mutex<HashMap<u8, PresetShadowState>>,
     active_preset: Mutex<Option<u8>>,
+    trusted_snapshot_presets: Mutex<HashSet<u8>>,
     /// Measurement-mode snapshot — `Some` while PEQ bypass is in effect,
     /// `None` once the client has explicitly restored state.
     saved_peq: Mutex<Option<SavedPeqState>>,
@@ -181,7 +185,10 @@ fn default_param_coeffs(image: &DefaultPresetImage, addr: u16) -> Option<[f32; 5
     Some(coeffs)
 }
 
-fn default_preset_shadow(profile: &DeviceProfile, image: &DefaultPresetImage) -> PresetShadowState {
+pub(crate) fn default_preset_shadow(
+    profile: &DeviceProfile,
+    image: &DefaultPresetImage,
+) -> PresetShadowState {
     let mut snapshot = PresetShadowState::default();
     let bypass = default_bypass_map(image);
     let Some(table) = profile.dsp_table else {
@@ -257,6 +264,11 @@ fn default_preset_shadow(profile: &DeviceProfile, image: &DefaultPresetImage) ->
             if let Some(value) = default_param_word(image, fir.taps_count) {
                 snapshot.selector.insert(fir.taps_count, value as u16);
             }
+            if let Some(block) = default_fir_block(image, &snapshot, fir) {
+                snapshot
+                    .fir_blocks
+                    .insert(block.data_start, block.coefficients);
+            }
         }
         if let Some(crossover) = output.crossover {
             for base in [crossover.lpf_addr, crossover.hpf_addr] {
@@ -312,6 +324,29 @@ fn default_preset_shadow(profile: &DeviceProfile, image: &DefaultPresetImage) ->
     }
 
     snapshot
+}
+
+fn default_fir_block(
+    image: &DefaultPresetImage,
+    shadow: &PresetShadowState,
+    fir: minidsp_protocol::device::dsp::FirFilter,
+) -> Option<crate::snapshot::SnapshotFirBlock> {
+    let taps = shadow.selector.get(&fir.taps_count).copied().unwrap_or(0) as usize;
+    if taps == 0 {
+        return None;
+    }
+
+    let mut coefficients = Vec::with_capacity(taps);
+    for offset in 0..taps {
+        coefficients.push(f32::from_bits(default_param_word(
+            image,
+            fir.data_start + offset as u16,
+        )?));
+    }
+    Some(crate::snapshot::SnapshotFirBlock {
+        data_start: fir.data_start,
+        coefficients,
+    })
 }
 
 fn random_token_bytes() -> Result<[u8; 4], UsbHidError> {
@@ -466,8 +501,10 @@ impl DeviceState {
             peq_shadow: Mutex::new(peq_shadow),
             selector_shadow: Mutex::new(HashMap::new()),
             scalar_shadow: Mutex::new(HashMap::new()),
+            fir_shadow: Mutex::new(HashMap::new()),
             preset_shadows: Mutex::new(HashMap::new()),
             active_preset: Mutex::new(None),
+            trusted_snapshot_presets: Mutex::new(HashSet::new()),
             saved_peq: Mutex::new(None),
         };
 
@@ -478,12 +515,12 @@ impl DeviceState {
         Ok(state)
     }
 
-    /// Serialize whole logical operations so multi-command reads/writes cannot
-    /// interleave with background polling or bridge traffic.
-    pub fn begin_operation(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.operation_lock
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+    pub fn try_begin_operation(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.operation_lock.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(err)) => Some(err.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     // -- Accessors --
@@ -538,10 +575,16 @@ impl DeviceState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let fir_blocks = self
+            .fir_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         PresetShadowState {
             peq,
             selector,
             scalar,
+            fir_blocks,
         }
     }
 
@@ -583,6 +626,18 @@ impl DeviceState {
                 scalar_shadow.extend(snapshot.scalar.iter().map(|(&addr, &value)| (addr, value)));
             }
         }
+        {
+            let mut fir_shadow = self.fir_shadow.lock().unwrap_or_else(|e| e.into_inner());
+            fir_shadow.clear();
+            if let Some(snapshot) = &snapshot {
+                fir_shadow.extend(
+                    snapshot
+                        .fir_blocks
+                        .iter()
+                        .map(|(&data_start, coeffs)| (data_start, coeffs.clone())),
+                );
+            }
+        }
     }
 
     fn update_active_preset(&self, preset: u8) {
@@ -598,10 +653,22 @@ impl DeviceState {
 
         if let Some(previous) = previous {
             let snapshot = self.capture_active_shadow();
-            self.preset_shadows
+            let mut preset_shadows = self.preset_shadows.lock().unwrap_or_else(|e| e.into_inner());
+            let trusted = self
+                .trusted_snapshot_presets
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(previous, snapshot);
+                .contains(&previous);
+            let snapshot = if trusted {
+                preset_shadows
+                    .get(&previous)
+                    .cloned()
+                    .map(|existing| merge_trusted_snapshot(existing, snapshot.clone()))
+                    .unwrap_or(snapshot)
+            } else {
+                snapshot
+            };
+            preset_shadows.insert(previous, snapshot);
         }
 
         let snapshot = self
@@ -613,7 +680,7 @@ impl DeviceState {
         self.apply_active_shadow_snapshot(snapshot);
     }
 
-    fn store_preset_shadow_snapshot(&self, preset: u8, snapshot: PresetShadowState) {
+    pub(crate) fn store_preset_shadow_snapshot(&self, preset: u8, snapshot: PresetShadowState) {
         self.preset_shadows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -621,6 +688,35 @@ impl DeviceState {
         if *self.active_preset.lock().unwrap_or_else(|e| e.into_inner()) == Some(preset) {
             self.apply_active_shadow_snapshot(Some(snapshot));
         }
+    }
+
+    pub(crate) fn mark_snapshot_trusted(&self, preset: u8) {
+        self.trusted_snapshot_presets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(preset);
+    }
+
+    pub(crate) fn trusted_snapshot_slots(&self) -> HashSet<u8> {
+        self.trusted_snapshot_presets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn export_shadow_snapshots(&self) -> HashMap<u8, PresetShadowState> {
+        let active_preset = *self.active_preset.lock().unwrap_or_else(|e| e.into_inner());
+        let mut presets = self
+            .preset_shadows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(active_preset) = active_preset {
+            presets
+                .entry(active_preset)
+                .or_insert_with(|| self.capture_active_shadow());
+        }
+        presets
     }
 
     fn prefers_scalar_shadow_for_addr(&self, addr: u16) -> bool {
@@ -1339,7 +1435,9 @@ impl DeviceState {
     }
 
     pub fn reset_active_preset_to_defaults(&self) -> Result<u8, UsbHidError> {
-        let _guard = self.begin_operation();
+        let _guard = self
+            .try_begin_operation()
+            .ok_or_else(|| UsbHidError::Protocol("device busy".into()))?;
         let preset = self.get_master_status()?.preset;
         self.write_preset_defaults_locked()?;
         let token = random_token_bytes()?;
@@ -1347,11 +1445,14 @@ impl DeviceState {
         self.set_config_with_verify(preset, commands::PRESET_CHANGE_RELOAD_SAME_SLOT)?;
         let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
         self.store_preset_shadow_snapshot(preset, snapshot);
+        self.mark_snapshot_trusted(preset);
         Ok(preset)
     }
 
     pub fn reset_preset_to_defaults(&self, preset: u8) -> Result<(), UsbHidError> {
-        let _guard = self.begin_operation();
+        let _guard = self
+            .try_begin_operation()
+            .ok_or_else(|| UsbHidError::Protocol("device busy".into()))?;
         self.set_config_with_verify(preset, commands::PRESET_CHANGE_WITHOUT_RESET)?;
         self.write_preset_defaults_locked()?;
         let token = random_token_bytes()?;
@@ -1359,11 +1460,14 @@ impl DeviceState {
         self.set_config_with_verify(preset, commands::PRESET_CHANGE_RELOAD_SAME_SLOT)?;
         let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
         self.store_preset_shadow_snapshot(preset, snapshot);
+        self.mark_snapshot_trusted(preset);
         Ok(())
     }
 
     pub fn initialize_all_presets_to_defaults(&self, reboot: bool) -> Result<(), UsbHidError> {
-        let _guard = self.begin_operation();
+        let _guard = self
+            .try_begin_operation()
+            .ok_or_else(|| UsbHidError::Protocol("device busy".into()))?;
         self.set_config_with_verify(0, commands::PRESET_CHANGE_WITHOUT_RESET)?;
         self.write_preset_defaults_locked()?;
         self.save_preset_token_locked(0, RECOVERY_MODIFICATION_TOKEN)?;
@@ -1382,6 +1486,7 @@ impl DeviceState {
         let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
         for preset in 0..self.profile.presets {
             self.store_preset_shadow_snapshot(preset, snapshot.clone());
+            self.mark_snapshot_trusted(preset);
         }
 
         if reboot {
@@ -1874,6 +1979,20 @@ impl DeviceState {
         self.expect_write_ok(&commands::write_dsp_u32(addr, value, save), "write dsp u32")
     }
 
+    pub(crate) fn write_dsp_int_verified(
+        &self,
+        addr: u16,
+        value: u16,
+        context: &str,
+    ) -> Result<(), UsbHidError> {
+        self.expect_write_ok(&commands::write_dsp_int(addr, value), context)?;
+        self.selector_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(addr, value);
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn write_dsp_delay(&self, addr: u16, samples: u32, save: bool) -> Result<(), UsbHidError> {
         self.expect_write_ok(
@@ -1943,6 +2062,13 @@ impl DeviceState {
         Ok(())
     }
 
+    pub fn set_channel_gain_persisted(&self, addr: u16, db: f32) -> Result<(), UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => self.write_dsp_verified(addr, db, true, "set channel gain"),
+            ValueFormat::FixedPoint => self.set_channel_gain(addr, db),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn set_routing(
         &self,
@@ -1972,6 +2098,41 @@ impl DeviceState {
             ValueFormat::Float32 => {
                 // Mixer status: 2=enabled, 1=disabled (matches minidsp-rs WriteInt).
                 // Uses 0x13 with LE u32 value — audio-verified on 2x4 HD.
+                let val = if enabled { 2u32 } else { 1u32 };
+                self.write_dsp_selector_u32(status_addr, val)
+            }
+            ValueFormat::FixedPoint => {
+                self.write_dsp(status_addr, if enabled { 1.0 } else { 0.0 }, true)
+            }
+        }
+    }
+
+    pub fn set_routing_persisted(
+        &self,
+        input: u8,
+        output: u8,
+        enabled: bool,
+        gain_db: f32,
+    ) -> Result<(), UsbHidError> {
+        let table = self
+            .profile
+            .dsp_table
+            .ok_or_else(|| UsbHidError::Protocol("routing unsupported".into()))?;
+        let routing = table.routing;
+        if input >= routing.rows || output >= routing.cols {
+            return Err(UsbHidError::Protocol(format!(
+                "routing index ({input}, {output}) out of range (max {}x{})",
+                routing.rows, routing.cols
+            )));
+        }
+
+        let flat_idx = input as u16 * routing.cols as u16 + output as u16;
+        let status_addr = routing.status_base + flat_idx;
+        let gain_addr = routing.gain_base + flat_idx;
+
+        self.set_channel_gain_persisted(gain_addr, gain_db)?;
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
                 let val = if enabled { 2u32 } else { 1u32 };
                 self.write_dsp_selector_u32(status_addr, val)
             }
@@ -2060,6 +2221,34 @@ impl DeviceState {
         Ok(())
     }
 
+    pub fn set_channel_delay_samples_persisted(
+        &self,
+        addr: u16,
+        samples: u32,
+    ) -> Result<(), UsbHidError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
+                let before = self.read_param_scalar_u32(addr)?;
+                let expected = samples.min(u16::MAX as u32);
+                self.write_dsp_delay(addr, samples, true)?;
+                let after = self.read_param_scalar_u32(addr)?;
+                if after != expected {
+                    if self.prefers_scalar_shadow_for_addr(addr) {
+                        info!(
+                            "accepting shadow-backed delay write at addr {addr} despite non-authoritative live readback (before={before}, expected={expected}, after={after})"
+                        );
+                        return Ok(());
+                    }
+                    return Err(UsbHidError::Protocol(format!(
+                        "set channel delay at addr {addr} did not persist (before={before}, expected={expected}, after={after})"
+                    )));
+                }
+                Ok(())
+            }
+            ValueFormat::FixedPoint => self.set_channel_delay_samples(addr, samples),
+        }
+    }
+
     pub fn load_fir_coefficients(
         &self,
         fir: minidsp_protocol::device::dsp::FirFilter,
@@ -2111,6 +2300,10 @@ impl DeviceState {
             FIR_LOAD_END_TIMEOUT,
             "fir load end",
         )?;
+        self.fir_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(fir.data_start, coeffs.to_vec());
         self.selector_shadow
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2191,6 +2384,30 @@ impl DeviceState {
     pub fn read_tokens(&self) -> Result<Vec<u8>, UsbHidError> {
         let (hi, lo) = eeprom::TOKENS_ADDR;
         self.read_flash_data(hi, lo, 16)
+    }
+
+    pub(crate) fn read_modification_tokens(&self) -> Result<HashMap<u8, [u8; 4]>, UsbHidError> {
+        let bytes = self.read_tokens()?;
+        let mut tokens = HashMap::new();
+        for (preset, chunk) in bytes.chunks_exact(4).enumerate() {
+            tokens.insert(preset as u8, [chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        Ok(tokens)
+    }
+
+    pub(crate) fn write_preset_token_exact(
+        &self,
+        preset: u8,
+        token: [u8; 4],
+    ) -> Result<(), UsbHidError> {
+        if preset >= self.profile.presets {
+            return Err(UsbHidError::Protocol(format!(
+                "preset {} out of range (max {})",
+                preset,
+                self.profile.presets.saturating_sub(1)
+            )));
+        }
+        self.save_preset_token_locked(preset, token)
     }
 
     // -- Raw command --
@@ -2305,6 +2522,24 @@ impl DeviceState {
             product_name: self.product_name().to_string(),
         }
     }
+}
+
+fn merge_trusted_snapshot(
+    mut existing: PresetShadowState,
+    captured: PresetShadowState,
+) -> PresetShadowState {
+    for (addr, entry) in captured.peq {
+        if existing.peq.contains_key(&addr)
+            || entry.coeffs != minidsp_protocol::biquad::BYPASS
+            || entry.bypass
+        {
+            existing.peq.insert(addr, entry);
+        }
+    }
+    existing.selector.extend(captured.selector);
+    existing.scalar.extend(captured.scalar);
+    existing.fir_blocks.extend(captured.fir_blocks);
+    existing
 }
 
 #[cfg(test)]

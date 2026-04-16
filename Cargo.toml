@@ -28,6 +28,7 @@ axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
+time = { version = "0.3", features = ["formatting"] }
 
 # Internal crates
 minidsp-protocol = { path = "protocol" }

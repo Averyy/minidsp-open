@@ -288,9 +288,7 @@ pub fn decode_tcp_response(data: &[u8]) -> Option<(Vec<u8>, usize)> {
         return None;
     }
     match data[offset] {
-        crate::commands::RESP_OK
-        | crate::commands::RESP_ERROR
-        | crate::commands::RESP_OVERFLOW => {
+        crate::commands::RESP_OK | crate::commands::RESP_ERROR | crate::commands::RESP_OVERFLOW => {
             return Some((vec![data[offset]], offset + 1));
         }
         _ => {}

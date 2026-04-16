@@ -16,7 +16,7 @@ use minidsp_protocol::status::{
     FirConfig, IndexedBiquadConfig, InputChannelConfig, MasterStatusView, OutputChannelConfig,
     PeqBandConfig, RoutingConfig, StatusSummary,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -58,20 +58,22 @@ struct PeqShadow {
     bypass: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CachedPeqShadow {
     pub coeffs: [f32; 5],
     pub bypass: bool,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PresetShadowState {
     pub peq: HashMap<u16, CachedPeqShadow>,
     pub selector: HashMap<u16, u16>,
     pub scalar: HashMap<u16, u32>,
+    #[serde(default)]
+    pub fir_blocks: HashMap<u16, Vec<f32>>,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceShadowState {
     #[serde(default)]
     pub presets: HashMap<u8, PresetShadowState>,
@@ -83,6 +85,8 @@ pub struct DeviceShadowState {
     pub scalar: HashMap<u16, u32>,
     #[serde(default)]
     pub preset_tokens: HashMap<u8, [u8; 4]>,
+    #[serde(default)]
+    pub trusted_snapshot_presets: HashSet<u8>,
 }
 
 const MASTER_STATUS_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -201,6 +205,14 @@ fn default_preset_shadow(profile: &DeviceProfile, image: &DefaultPresetImage) ->
             && let Some(value) = default_param_word(image, fir.taps_count)
         {
             snapshot.selector.insert(fir.taps_count, value as u16);
+            if let Some(bypass) = default_param_word(image, fir.bypass) {
+                snapshot.selector.insert(fir.bypass, bypass as u16);
+            }
+            if let Some(block) = default_fir_block(image, &snapshot, fir) {
+                snapshot
+                    .fir_blocks
+                    .insert(block.data_start, block.coefficients);
+            }
         }
     }
 
@@ -238,6 +250,11 @@ fn default_preset_shadow(profile: &DeviceProfile, image: &DefaultPresetImage) ->
             }
             if let Some(value) = default_param_word(image, fir.taps_count) {
                 snapshot.selector.insert(fir.taps_count, value as u16);
+            }
+            if let Some(block) = default_fir_block(image, &snapshot, fir) {
+                snapshot
+                    .fir_blocks
+                    .insert(block.data_start, block.coefficients);
             }
         }
         if let Some(crossover) = output.crossover {
@@ -296,6 +313,29 @@ fn default_preset_shadow(profile: &DeviceProfile, image: &DefaultPresetImage) ->
     snapshot
 }
 
+fn default_fir_block(
+    image: &DefaultPresetImage,
+    shadow: &PresetShadowState,
+    fir: FirFilter,
+) -> Option<crate::snapshot::SnapshotFirBlock> {
+    let taps = shadow.selector.get(&fir.taps_count).copied().unwrap_or(0) as usize;
+    if taps == 0 {
+        return None;
+    }
+
+    let mut coefficients = Vec::with_capacity(taps);
+    for offset in 0..taps {
+        coefficients.push(f32::from_bits(default_param_word(
+            image,
+            fir.data_start + offset as u16,
+        )?));
+    }
+    Some(crate::snapshot::SnapshotFirBlock {
+        data_start: fir.data_start,
+        coefficients,
+    })
+}
+
 /// Connected MiniDSP device client.
 pub struct MiniDspClient {
     queue: Arc<CommandQueue>,
@@ -316,11 +356,18 @@ pub struct MiniDspClient {
     /// Shadow state for scalar float32 config writes on paths where live
     /// DSP100 readback is not authoritative.
     scalar_shadow: Arc<Mutex<HashMap<u16, u32>>>,
+    /// Shadowed FIR coefficient blocks keyed by the block start address.
+    fir_shadow: Arc<Mutex<HashMap<u16, Vec<f32>>>>,
     /// Shadow state snapshots keyed by preset slot so non-authoritative DSP100
     /// values do not leak across preset switches.
     preset_shadows: Arc<Mutex<HashMap<u8, PresetShadowState>>>,
     /// Last observed raw modification-token bytes per preset slot.
     preset_tokens: Arc<Mutex<HashMap<u8, [u8; 4]>>>,
+    /// Preset snapshots known to be complete and trustworthy for strict export.
+    trusted_snapshot_presets: Arc<Mutex<HashSet<u8>>>,
+    /// Presets whose freshly stored trusted snapshot should survive the next
+    /// preset switch without being re-captured from the active shadow.
+    skip_trusted_shadow_capture_once: Arc<Mutex<HashSet<u8>>>,
     /// Last observed active preset slot.
     active_preset: Mutex<Option<u8>>,
     /// Serializes state transitions so overlapping preset/reset calls cannot
@@ -464,8 +511,11 @@ impl MiniDspClient {
         let pending_write = Arc::new(Mutex::new(None));
         let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
         let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let fir_shadow = Arc::new(Mutex::new(HashMap::new()));
         let preset_shadows = Arc::new(Mutex::new(HashMap::new()));
         let preset_tokens = Arc::new(Mutex::new(HashMap::new()));
+        let trusted_snapshot_presets = Arc::new(Mutex::new(HashSet::new()));
+        let skip_trusted_shadow_capture_once = Arc::new(Mutex::new(HashSet::new()));
 
         let client = Self {
             queue,
@@ -479,8 +529,11 @@ impl MiniDspClient {
             peq_shadow,
             selector_shadow,
             scalar_shadow,
+            fir_shadow,
             preset_shadows,
             preset_tokens,
+            trusted_snapshot_presets,
+            skip_trusted_shadow_capture_once,
             active_preset: Mutex::new(None),
             state_transition_lock: Mutex::new(()),
         };
@@ -1057,6 +1110,18 @@ impl MiniDspClient {
         Ok(())
     }
 
+    /// Set channel gain and request persistence to preset storage on float32
+    /// families instead of the lighter RAM-only interactive path.
+    pub async fn set_channel_gain_persisted(&self, addr: u16, db: f32) -> Result<(), ClientError> {
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
+                self.write_dsp_verified(addr, db, true, "set channel gain")
+                    .await
+            }
+            ValueFormat::FixedPoint => self.set_channel_gain(addr, db).await,
+        }
+    }
+
     /// Set one input->output routing entry.
     pub async fn set_routing(
         &self,
@@ -1084,6 +1149,69 @@ impl MiniDspClient {
                 let before = self.read_param_word(status_addr).await? as u16;
                 let previous_shadow = self.selector_shadow_value(status_addr).await;
                 // Mixer status: 2=enabled, 1=disabled (matches minidsp-rs WriteInt).
+                self.write_selector_int(
+                    status_addr,
+                    if enabled { 2 } else { 1 },
+                    "set routing status",
+                )
+                .await?;
+                let after = self.read_param_word(status_addr).await? as u16;
+                if after == 0 {
+                    self.restore_selector_shadow(status_addr, previous_shadow)
+                        .await;
+                    return Err(ClientError::Protocol(format!(
+                        "set routing status at addr {status_addr} did not persist (before={before}, expected={}, after={after})",
+                        if enabled {
+                            "non-zero / enabled"
+                        } else {
+                            "1 / disabled"
+                        }
+                    )));
+                }
+            }
+            ValueFormat::FixedPoint => {
+                let before = self.read_param_scalar_u32(status_addr).await?;
+                self.write_dsp(status_addr, if enabled { 1.0 } else { 0.0 }, true)
+                    .await?;
+                let after = self.read_param_scalar_u32(status_addr).await?;
+                let expected = if enabled { 1 } else { 0 };
+                if after != expected {
+                    return Err(ClientError::Protocol(format!(
+                        "set routing status at addr {status_addr} did not persist (before={before}, expected={expected}, after={after})"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set one input->output routing entry while persisting the gain word for
+    /// float32 families.
+    pub async fn set_routing_persisted(
+        &self,
+        input: u8,
+        output: u8,
+        enabled: bool,
+        gain_db: f32,
+    ) -> Result<(), ClientError> {
+        let table = self.profile.dsp_table.ok_or(ClientError::Unsupported)?;
+        let routing = table.routing;
+        if input >= routing.rows || output >= routing.cols {
+            return Err(ClientError::Protocol(format!(
+                "routing index ({input}, {output}) out of range (max {}x{})",
+                routing.rows, routing.cols
+            )));
+        }
+
+        let flat_idx = input as u16 * routing.cols as u16 + output as u16;
+        let status_addr = routing.status_base + flat_idx;
+        let gain_addr = routing.gain_base + flat_idx;
+
+        self.set_channel_gain_persisted(gain_addr, gain_db).await?;
+        match self.profile.dialect.value_format {
+            ValueFormat::Float32 => {
+                let before = self.read_param_word(status_addr).await? as u16;
+                let previous_shadow = self.selector_shadow_value(status_addr).await;
                 self.write_selector_int(
                     status_addr,
                     if enabled { 2 } else { 1 },
@@ -1795,6 +1923,7 @@ impl MiniDspClient {
             .await?;
         let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
         self.store_preset_shadow_snapshot(preset, snapshot).await;
+        self.mark_snapshot_trusted(preset).await;
         Ok(preset)
     }
 
@@ -1811,6 +1940,7 @@ impl MiniDspClient {
             .await?;
         let snapshot = default_preset_shadow(self.profile(), self.default_preset_image()?);
         self.store_preset_shadow_snapshot(preset, snapshot).await;
+        self.mark_snapshot_trusted(preset).await;
         Ok(())
     }
 
@@ -1849,6 +1979,7 @@ impl MiniDspClient {
             self.store_preset_shadow_snapshot(preset, snapshot.clone())
                 .await;
             self.set_preset_token(preset, token_bytes).await;
+            self.mark_snapshot_trusted(preset).await;
         }
 
         if reboot {
@@ -1897,6 +2028,42 @@ impl MiniDspClient {
                 self.profile.dialect.value_format == ValueFormat::FixedPoint,
                 &self.profile.dialect,
             ),
+            Priority::High,
+            "write dsp delay",
+        )
+        .await?;
+        if self.profile.dialect.value_format == ValueFormat::Float32 {
+            self.scalar_shadow.lock().await.insert(addr, expected);
+        }
+        let after = self.read_param_scalar_u32(addr).await?;
+        if after != expected {
+            if self.prefers_scalar_shadow_for_addr(addr) {
+                tracing::info!(
+                    "accepting shadow-backed delay write at addr {addr} despite non-authoritative live readback (before={before}, expected={expected}, after={after})"
+                );
+                return Ok(());
+            }
+            return Err(ClientError::Protocol(format!(
+                "set channel delay at addr {addr} did not persist (before={before}, expected={expected}, after={after})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set channel delay and request persistence to preset storage on float32
+    /// families instead of the lighter RAM-only interactive path.
+    pub async fn set_channel_delay_samples_persisted(
+        &self,
+        addr: u16,
+        samples: u32,
+    ) -> Result<(), ClientError> {
+        let before = self.read_param_scalar_u32(addr).await?;
+        let expected = match self.profile.dialect.value_format {
+            ValueFormat::Float32 => samples.min(u16::MAX as u32),
+            ValueFormat::FixedPoint => samples,
+        };
+        self.execute_write(
+            commands::write_dsp_delay(addr, samples, true, &self.profile.dialect),
             Priority::High,
             "write dsp delay",
         )
@@ -2117,6 +2284,10 @@ impl MiniDspClient {
             .lock()
             .await
             .insert(fir.taps_count, coeffs.len() as u16);
+        self.fir_shadow
+            .lock()
+            .await
+            .insert(fir.data_start, coeffs.to_vec());
         self.set_mute(master.is_muted()).await?;
         Ok(())
     }
@@ -3323,8 +3494,11 @@ mod tests {
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
             active_preset: Mutex::new(Some(0)),
             state_transition_lock: Mutex::new(()),
         };
@@ -3342,6 +3516,7 @@ mod tests {
                     )]),
                     selector: HashMap::from([(8, 1), (4182, 6)]),
                     scalar: HashMap::from([(42, 9.9f32.to_bits())]),
+                    fir_blocks: HashMap::new(),
                 },
             )]),
             peq: HashMap::from([(
@@ -3354,6 +3529,7 @@ mod tests {
             selector: HashMap::from([(8, 1), (4182, 6)]),
             scalar: HashMap::from([(42, 9.9f32.to_bits())]),
             preset_tokens: HashMap::from([(0, [0x80, 0x97, 0x81, 0xc9])]),
+            trusted_snapshot_presets: HashSet::new(),
         };
 
         client.apply_shadow_state(&state).await;
@@ -3398,8 +3574,11 @@ mod tests {
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
             active_preset: Mutex::new(Some(0)),
             state_transition_lock: Mutex::new(()),
         };
@@ -3455,6 +3634,76 @@ mod tests {
         assert_eq!(client.selector_shadow.lock().await.get(&6), Some(&1));
     }
 
+    #[tokio::test]
+    async fn trusted_snapshot_preserves_exact_restore_on_next_switch_only() {
+        let client = MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(DummyTransport))),
+            transport_url: "mock://trusted-snapshot".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(HashMap::new())),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
+            active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
+        };
+
+        let exact_snapshot = PresetShadowState {
+            selector: HashMap::from([(6, 1)]),
+            scalar: HashMap::from([(42, 9.5f32.to_bits())]),
+            ..PresetShadowState::default()
+        };
+        client
+            .store_preset_shadow_snapshot(0, exact_snapshot.clone())
+            .await;
+        client.mark_snapshot_trusted(0).await;
+
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(42, 3.5f32.to_bits());
+        client.selector_shadow.lock().await.insert(6, 2);
+
+        client.update_active_preset(1).await;
+        assert_eq!(
+            client.preset_shadows.lock().await.get(&0),
+            Some(&exact_snapshot)
+        );
+
+        client.update_active_preset(0).await;
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(42, 4.5f32.to_bits());
+        client.selector_shadow.lock().await.insert(6, 3);
+
+        client.update_active_preset(1).await;
+        let stored = client
+            .preset_shadows
+            .lock()
+            .await
+            .get(&0)
+            .cloned()
+            .expect("preset 0 snapshot should still exist");
+        assert_eq!(stored.scalar.get(&42), Some(&4.5f32.to_bits()));
+        assert_eq!(stored.selector.get(&6), Some(&3));
+    }
+
     #[test]
     fn prefers_scalar_shadow_for_non_authoritative_dsp100_scalar_fields() {
         let client = MiniDspClient {
@@ -3473,8 +3722,11 @@ mod tests {
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
             active_preset: Mutex::new(Some(0)),
             state_transition_lock: Mutex::new(()),
         };
@@ -3518,8 +3770,11 @@ mod tests {
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
             active_preset: Mutex::new(Some(3)),
             state_transition_lock: Mutex::new(()),
         };
@@ -3556,8 +3811,11 @@ mod tests {
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
             active_preset: Mutex::new(Some(0)),
             state_transition_lock: Mutex::new(()),
         });
@@ -3590,8 +3848,11 @@ mod tests {
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
             active_preset: Mutex::new(Some(0)),
             state_transition_lock: Mutex::new(()),
         };
@@ -3623,8 +3884,11 @@ mod tests {
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
             preset_shadows: Arc::new(Mutex::new(HashMap::new())),
             preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
             active_preset: Mutex::new(Some(0)),
             state_transition_lock: Mutex::new(()),
         };

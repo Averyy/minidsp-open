@@ -538,6 +538,14 @@ These are allowed, but they are not part of the compatibility contract unless la
 
 - `GET /devices/{id}/config` full config read-back
 - extended `/devices/{id}/config` fields beyond the compatibility request body documented above (including the optional `polarity_inverted` per routing entry on families whose `RoutingMatrix.polarity_base` is populated — DSP_110 Flex Eight, DSP_113 / DSP_115 Flex HT/HTx, legacy DDRC-88BM)
+- controller-side snapshot backup / restore routes:
+  - `GET /devices/{id}/snapshot` — export a strict `DeviceSnapshot` when every preset is complete, otherwise return `409` with the incomplete snapshot body
+  - `POST /devices/{id}/snapshot` — restore a previously exported snapshot, verify it immediately with a follow-up export, and return the verified snapshot body
+  - `POST /devices/{id}/snapshot/learn` — sweep presets, seed the controller's trusted snapshot cache, and return the learned snapshot (`200` when strict, `409` when incomplete)
+- controller-side snapshot CLI:
+  - `minidsp snapshot export <file>`
+  - `minidsp snapshot import <file>`
+  - `snapshot export --allow-partial` writes an explicitly incomplete artifact instead of refusing it
 - measurement-mode endpoints
 - measurement playback endpoints:
   - `POST /sync` echoes `clientTimeUs` and returns `serverTimeUs` from the same platform clock basis used by `/play.startedAtUs`
@@ -572,6 +580,9 @@ Current verification note:
 - Desktop config read-back is implemented, but on DSP100 / 2x4 HD some fields still rely on verified shadow state rather than authoritative live hardware readback. Fresh-daemon `/devices/{id}/config` now clamps bogus low-address DSP100 scalar/tap reads to verified shadow or conservative zero instead of surfacing garbage values.
 - Desktop daemon preset-content writes now also mirror the official app's explicit modification-token save model on the physical 2x4 HD, so `/devices/{id}/config` shadow restore is keyed by a real active-preset freshness marker rather than by raw runtime writes that never touched `0xFFC8`.
 - Desktop daemon can also import missing preset shadow from the official Device Console `setting*.xml` cache when the XML timestamp matches the live device token for that slot and the XML `dspversion` matches the connected DSP family. That is part of the controller-side recovery model for DSP100, not a claim of stronger live hardware readback.
+- Controller-side snapshot backup / restore is now live-verified on the physical 2x4 HD `912345` on both desktop paths:
+  - raw USB CLI export -> destructive mutate -> import -> export matches baseline once metadata fields are ignored
+  - daemon-backed destructive harness run `20260415T234640Z` completed with `44` passed, `3` skipped, `0` failed and a matching post-restore strict snapshot
 - Desktop WebSocket compatibility surfaces are live-verified on the physical 2x4 HD: `/devices/{id}?poll=true` sends an immediate status frame, `/devices/{id}?levels=true&poll=true` keeps source writes fast and still allows preset writes to complete, and `/devices/{id}/ws` ignores text frames without breaking framed binary commands.
 - ESP32 `/devices/0/config` is now verified on the physical 2x4 HD for typed scalar read/write behavior and PEQ write/readback through the same PEQ shadow/default model used on desktop when live PEQ `0x14` reads return the all-zero placeholder.
 

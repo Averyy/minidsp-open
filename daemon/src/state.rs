@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 
@@ -24,6 +25,7 @@ pub struct DaemonState {
     shadow_cache: RwLock<HashMap<u32, DeviceShadowState>>,
     shadow_cache_path: PathBuf,
     playback_active: AtomicBool,
+    busy_devices: StdMutex<HashSet<usize>>,
 }
 
 impl DaemonState {
@@ -36,6 +38,7 @@ impl DaemonState {
             shadow_cache: RwLock::new(shadow_cache),
             shadow_cache_path,
             playback_active: AtomicBool::new(false),
+            busy_devices: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -115,6 +118,30 @@ impl DaemonState {
 
     pub fn finish_playback(&self) {
         self.playback_active.store(false, Ordering::SeqCst);
+    }
+
+    pub fn try_begin_device_operation(&self, id: usize) -> bool {
+        let mut busy = self.busy_devices.lock().unwrap_or_else(|e| e.into_inner());
+        if busy.contains(&id) {
+            false
+        } else {
+            busy.insert(id);
+            true
+        }
+    }
+
+    pub fn finish_device_operation(&self, id: usize) {
+        self.busy_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+
+    pub fn device_operation_active(&self, id: usize) -> bool {
+        self.busy_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&id)
     }
 
     async fn prepare_restore_shadow(
@@ -211,6 +238,9 @@ fn filter_shadow_state_by_tokens(
     filtered
         .presets
         .retain(|slot, _| state.preset_tokens.get(slot) == current_tokens.get(slot));
+    filtered
+        .trusted_snapshot_presets
+        .retain(|slot| state.preset_tokens.get(slot) == current_tokens.get(slot));
     filtered.preset_tokens = current_tokens.clone();
     filtered
 }
@@ -297,6 +327,7 @@ fn import_official_app_presets(
         if state.presets.insert(slot, preset).is_none() {
             imported += 1;
         }
+        state.trusted_snapshot_presets.insert(slot);
     }
 
     if imported > 0 {
@@ -542,6 +573,7 @@ fn parse_official_setting_xml(
             peq,
             selector,
             scalar,
+            fir_blocks: HashMap::new(),
         },
     ))
 }

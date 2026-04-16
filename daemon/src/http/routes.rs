@@ -41,10 +41,40 @@ impl ApiError {
     fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
         Self::new(StatusCode::BAD_REQUEST, msg)
     }
+    fn conflict(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
+        Self::new(StatusCode::CONFLICT, msg)
+    }
 }
 
 /// Result type alias for handlers returning JSON errors.
 type ApiResult<T> = Result<T, (StatusCode, Json<ApiError>)>;
+
+struct DeviceOperationGuard {
+    state: Arc<DaemonState>,
+    id: usize,
+    active: bool,
+}
+
+impl DeviceOperationGuard {
+    fn begin(state: Arc<DaemonState>, id: usize) -> ApiResult<Self> {
+        if !state.try_begin_device_operation(id) {
+            return Err(ApiError::conflict("device busy"));
+        }
+        Ok(Self {
+            state,
+            id,
+            active: true,
+        })
+    }
+}
+
+impl Drop for DeviceOperationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.state.finish_device_operation(self.id);
+        }
+    }
+}
 
 struct PlaybackGuard {
     state: Arc<DaemonState>,
@@ -83,6 +113,26 @@ async fn get_device_or_404(
         .ok_or_else(|| ApiError::not_found())
 }
 
+async fn get_ready_device_or_404(
+    state: &DaemonState,
+    id: usize,
+) -> ApiResult<Arc<minidsp::client::MiniDspClient>> {
+    if state.device_operation_active(id) {
+        return Err(ApiError::conflict("device busy"));
+    }
+    get_device_or_404(state, id).await
+}
+
+async fn get_ready_device_or_status(
+    state: &DaemonState,
+    id: usize,
+) -> Result<Arc<minidsp::client::MiniDspClient>, StatusCode> {
+    if state.device_operation_active(id) {
+        return Err(StatusCode::CONFLICT);
+    }
+    state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)
+}
+
 pub fn router(state: Arc<DaemonState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -96,6 +146,11 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             get(device_get_or_ws).post(set_device_status),
         )
         .route("/devices/{id}/config", post(write_config).get(read_config))
+        .route(
+            "/devices/{id}/snapshot",
+            get(export_snapshot).post(import_snapshot),
+        )
+        .route("/devices/{id}/snapshot/learn", post(learn_snapshot))
         .route("/devices/{id}/volume/{direction}", post(volume_direction))
         .route("/devices/{id}/source/{source}", post(set_source))
         .route("/devices/{id}/preset/{preset}", post(set_preset))
@@ -170,7 +225,7 @@ async fn device_get_or_ws(
     Query(params): Query<WsQueryParams>,
     req: axum::extract::Request,
 ) -> Result<axum::response::Response, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
 
     // Check if this is a WebSocket upgrade request
     let is_ws = req
@@ -266,7 +321,7 @@ async fn ws_raw_bridge(
     Path(id): Path<usize>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     Ok(ws.on_upgrade(move |socket| ws_raw_handler(socket, client, state)))
 }
 
@@ -351,7 +406,7 @@ async fn set_device_status(
     Path(id): Path<usize>,
     Json(body): Json<MasterStatusPostJson>,
 ) -> ApiResult<impl IntoResponse> {
-    let client = get_device_or_404(&state, id).await?;
+    let client = get_ready_device_or_404(&state, id).await?;
 
     if let Some(volume) = body.volume {
         client
@@ -425,7 +480,7 @@ async fn play_device(
     Query(params): Query<PlayQueryParams>,
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let client = get_device_or_404(&state, id).await?;
+    let client = get_ready_device_or_404(&state, id).await?;
     if !client.profile().has_usb_audio {
         return Err(ApiError::bad_request(
             "device does not support USB audio playback",
@@ -532,11 +587,69 @@ async fn play_device(
     Ok(Json(value))
 }
 
+async fn export_snapshot(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> ApiResult<impl IntoResponse> {
+    let client = get_device_or_404(&state, id).await?;
+    let _operation = DeviceOperationGuard::begin(state.clone(), id)?;
+    let snapshot = client
+        .capture_device_snapshot()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let status = if snapshot.is_strict_complete() {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    Ok((status, Json(snapshot)))
+}
+
+async fn import_snapshot(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+    body: Bytes,
+) -> ApiResult<impl IntoResponse> {
+    let client = get_device_or_404(&state, id).await?;
+    let _operation = DeviceOperationGuard::begin(state.clone(), id)?;
+    let snapshot: minidsp::snapshot::DeviceSnapshot = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("invalid snapshot JSON"))?;
+    client
+        .restore_device_snapshot(&snapshot)
+        .await
+        .map_err(|e| ApiError::internal(format!("snapshot restore failed: {e}")))?;
+    state.persist_device_shadow(&client).await;
+    let verified = client
+        .capture_device_snapshot()
+        .await
+        .map_err(|e| ApiError::internal(format!("snapshot verification export failed: {e}")))?;
+    Ok((StatusCode::OK, Json(verified)))
+}
+
+async fn learn_snapshot(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> ApiResult<impl IntoResponse> {
+    let client = get_device_or_404(&state, id).await?;
+    let _operation = DeviceOperationGuard::begin(state.clone(), id)?;
+    let snapshot = client
+        .learn_device_snapshot()
+        .await
+        .map_err(|e| ApiError::internal(format!("snapshot learn failed: {e}")))?;
+    state.persist_device_shadow(&client).await;
+    let status = if snapshot.is_strict_complete() {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    Ok((status, Json(snapshot)))
+}
+
 async fn volume_direction(
     State(state): State<Arc<DaemonState>>,
     Path((id, direction)): Path<(usize, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let master = client
         .get_master_status()
         .await
@@ -589,7 +702,7 @@ async fn set_source(
     State(state): State<Arc<DaemonState>>,
     Path((id, source)): Path<(usize, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let src = minidsp_protocol::source::Source::from_str_lowercase(&source)
         .or_else(|| minidsp_protocol::source::Source::from_str_pascal(&source))
         .ok_or(StatusCode::BAD_REQUEST)?;
@@ -626,7 +739,7 @@ async fn set_preset(
     State(state): State<Arc<DaemonState>>,
     Path((id, preset)): Path<(usize, u8)>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let master = client
         .set_config(preset)
         .await
@@ -651,7 +764,7 @@ async fn write_config(
     Path(id): Path<usize>,
     Json(body): Json<ConfigWriteJson>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
 
     if let Some(ms) = body.master_status {
         if let Some(preset) = ms.preset {
@@ -954,7 +1067,7 @@ async fn read_config(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let table = client
         .profile()
         .dsp_table
@@ -1101,7 +1214,7 @@ async fn get_display(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     if !client.profile().has_display {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -1130,7 +1243,7 @@ async fn set_display(
     Path(id): Path<usize>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     if !client.profile().has_display {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -1159,7 +1272,7 @@ async fn get_dre(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     if !client.profile().has_dre {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -1183,7 +1296,7 @@ async fn set_dre(
     Path(id): Path<usize>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     if !client.profile().has_dre {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -1203,7 +1316,7 @@ async fn get_tokens(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let resp = client
         .raw_command(
             minidsp_protocol::commands::read_flash(0xFF, 0xC8, 16),
@@ -1229,7 +1342,7 @@ async fn get_verify_program(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let resp = client
         .raw_command(
             minidsp_protocol::commands::read_flash(0xFF, 0xA3, 9),
@@ -1260,7 +1373,7 @@ async fn reset_peq_to_defaults(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let touched = client
         .reset_all_peq_to_defaults()
         .await
@@ -1283,7 +1396,7 @@ async fn get_default_peq_frequencies(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     Ok(Json(serde_json::json!({
         "frequencies_hz": client.default_peq_frequencies(),
     })))
@@ -1293,7 +1406,7 @@ async fn get_bm_state(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> ApiResult<Json<minidsp_protocol::status::BmStateConfig>> {
-    let client = get_device_or_404(&state, id).await?;
+    let client = get_ready_device_or_404(&state, id).await?;
     if !client.supports_bass_management() {
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
@@ -1312,7 +1425,7 @@ async fn set_bm_channel_route(
     Path((id, ch)): Path<(usize, u8)>,
     Json(patch): Json<minidsp_protocol::status::BmChannelPatch>,
 ) -> ApiResult<Json<minidsp_protocol::status::BmChannelConfig>> {
-    let client = get_device_or_404(&state, id).await?;
+    let client = get_ready_device_or_404(&state, id).await?;
     if !client.supports_bass_management() {
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
@@ -1343,7 +1456,7 @@ async fn set_bm_mixer_cell_route(
     Path((id, row, col)): Path<(usize, u8, u8)>,
     Json(patch): Json<minidsp_protocol::status::BmMixerCellPatch>,
 ) -> ApiResult<Json<minidsp_protocol::status::BmMixerCellConfig>> {
-    let client = get_device_or_404(&state, id).await?;
+    let client = get_ready_device_or_404(&state, id).await?;
     if !client.supports_bass_management() {
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
@@ -1373,7 +1486,7 @@ async fn copy_preset(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     // CopyPreset is followed by a verifyProgram read at 0xFFA3 to confirm the
     // device persisted the copied preset slots cleanly. A status byte > 0x0D
     // means the flash write failed and the cached preset is corrupt — bail
@@ -1398,7 +1511,7 @@ async fn reset_active_preset_to_defaults(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let preset = client
         .reset_active_preset_to_defaults()
         .await
@@ -1414,7 +1527,7 @@ async fn reset_preset_to_defaults_route(
     State(state): State<Arc<DaemonState>>,
     Path((id, preset)): Path<(usize, u8)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     client
         .reset_preset_to_defaults(preset)
         .await
@@ -1430,7 +1543,7 @@ async fn initialize_all_presets_to_defaults(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     client
         .initialize_all_presets_to_defaults(true)
         .await
@@ -1446,7 +1559,7 @@ async fn reboot_device_route(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     client
         .reboot_device()
         .await
@@ -1460,7 +1573,7 @@ async fn enter_measurement_mode(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     client
         .enter_measurement_mode()
         .await
@@ -1482,7 +1595,7 @@ async fn restore_measurement_mode(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let client = state.get_device(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let client = get_ready_device_or_status(&state, id).await?;
     let saved = state.get_saved_peq(id).await.ok_or(StatusCode::NOT_FOUND)?;
     client
         .restore_measurement_mode_with(&saved)
@@ -1581,6 +1694,31 @@ async fn openapi() -> impl IntoResponse {
                     "summary": "Write device config (PEQ, gains)",
                     "operationId": "writeConfig",
                     "responses": { "200": { "description": "Config applied" } }
+                }
+            },
+            "/devices/{id}/snapshot": {
+                "get": {
+                    "summary": "Export a strict controller-side snapshot when complete",
+                    "operationId": "exportSnapshot",
+                    "responses": {
+                        "200": { "description": "Strict snapshot export" },
+                        "409": { "description": "Incomplete snapshot export with detail body" }
+                    }
+                },
+                "post": {
+                    "summary": "Restore a previously exported snapshot",
+                    "operationId": "importSnapshot",
+                    "responses": { "200": { "description": "Verified restored snapshot" } }
+                }
+            },
+            "/devices/{id}/snapshot/learn": {
+                "post": {
+                    "summary": "Learn a snapshot directly from the live device and seed future exports",
+                    "operationId": "learnSnapshot",
+                    "responses": {
+                        "200": { "description": "Strict learned snapshot" },
+                        "409": { "description": "Incomplete learned snapshot with detail body" }
+                    }
                 }
             },
             "/devices/{id}/volume/{direction}": {

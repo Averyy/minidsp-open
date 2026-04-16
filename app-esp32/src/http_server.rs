@@ -10,6 +10,7 @@
 
 use crate::device::DeviceState;
 use crate::diagnostics;
+use crate::snapshot::DeviceSnapshot;
 use crate::usb_audio;
 use crate::usb_hid::UsbHidError;
 use esp_idf_hal::task::thread::{MallocCap, ThreadSpawnConfiguration};
@@ -40,9 +41,19 @@ const WS_COMPAT_THREAD_STACK_BYTES: usize = 8 * 1024;
 const EZBEQ_LEVELS_THREAD_STACK_BYTES: usize = 12 * 1024;
 const PLAYBACK_STREAM_TARGET_CHUNK_MS: usize = 2;
 const PLAYBACK_PROGRESS_LOG_EVERY_WRITES: usize = 500;
+pub(crate) const DEVICE_BUSY: &str = "device busy";
 pub(crate) const HID_BUSY_DURING_PLAYBACK: &str = "device busy during playback";
 static PLAYBACK_STREAM_BUF: Mutex<[u8; 2880]> = Mutex::new([0u8; 2880]);
 const EZBEQ_SHIM_JS: &str = include_str!("../static/ezbeq-shim.js");
+
+macro_rules! try_device_operation_or_409 {
+    ($req:expr, $dev:expr) => {
+        match $dev.try_begin_operation() {
+            Some(op) => op,
+            None => return send_error($req, 409, DEVICE_BUSY),
+        }
+    };
+}
 
 /// Shared device state — None when USB disconnected, Some when connected.
 pub type SharedDeviceState = Arc<Mutex<Option<Arc<DeviceState>>>>;
@@ -121,7 +132,7 @@ pub fn start(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.get_status_summary() {
                 Ok(status) => send_json(req, 200, &status_json(&status)),
                 Err(e) => send_error(req, 500, &e.to_string()),
@@ -152,7 +163,7 @@ pub fn start(
             };
             if let Some(vol) = json.get("volume").and_then(|v| v.as_f64()) {
                 let result = {
-                    let _op = dev.begin_operation();
+                    let _op = try_device_operation_or_409!(req, dev);
                     dev.set_volume_db(vol as f32)
                 };
                 if let Err(e) = result {
@@ -161,7 +172,7 @@ pub fn start(
             }
             if let Some(mute) = json.get("mute").and_then(|v| v.as_bool()) {
                 let result = {
-                    let _op = dev.begin_operation();
+                    let _op = try_device_operation_or_409!(req, dev);
                     dev.set_mute(mute)
                 };
                 if let Err(e) = result {
@@ -191,7 +202,7 @@ pub fn start(
                     return send_error(req, 400, "preset out of range");
                 }
                 let result = {
-                    let _op = dev.begin_operation();
+                    let _op = try_device_operation_or_409!(req, dev);
                     dev.set_preset(preset as u8)
                 };
                 if let Err(e) = result {
@@ -200,7 +211,7 @@ pub fn start(
             }
             if let Some(dirac) = json.get("dirac").and_then(|v| v.as_bool()) {
                 let result = {
-                    let _op = dev.begin_operation();
+                    let _op = try_device_operation_or_409!(req, dev);
                     dev.set_dirac_bypass(!dirac)
                 };
                 match result {
@@ -211,7 +222,7 @@ pub fn start(
             }
 
             let status = {
-                let _op = dev.begin_operation();
+                let _op = try_device_operation_or_409!(req, dev);
                 dev.get_status_summary()
             };
             match status {
@@ -397,7 +408,7 @@ pub fn start(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.read_device_config() {
                 Ok(config) => {
                     let body = config_json(&dev, config);
@@ -467,7 +478,7 @@ pub fn start(
                 }
             }
 
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
 
             // master_status: {preset, volume, mute, source, dirac}
             if let Some(ms) = json.get("master_status") {
@@ -868,6 +879,110 @@ pub fn start(
         })?;
     }
 
+    // GET /devices/0/snapshot — strict controller-side backup export
+    {
+        let st = state.clone();
+        let audio = audio_state.clone();
+        server.fn_handler("/devices/0/snapshot", Method::Get, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            match dev.capture_device_snapshot() {
+                Ok(snapshot) => match serde_json::to_string_pretty(&snapshot) {
+                    Ok(body) => send_json(
+                        req,
+                        if snapshot.is_strict_complete() {
+                            200
+                        } else {
+                            409
+                        },
+                        &body,
+                    ),
+                    Err(_) => send_error(req, 500, "failed to serialize snapshot"),
+                },
+                Err(err) if is_device_busy_error(&err) => send_error(req, 409, DEVICE_BUSY),
+                Err(err) => send_error(req, 500, &format!("snapshot export failed: {err}")),
+            }
+        })?;
+    }
+
+    // POST /devices/0/snapshot — restore a previously exported snapshot
+    {
+        let st = state.clone();
+        let audio = audio_state.clone();
+        server.fn_handler("/devices/0/snapshot", Method::Post, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            let body = match read_request_body(&mut req, 128 * 1024) {
+                Ok(body) => body,
+                Err("request body too large") => {
+                    return send_error(req, 413, "request body too large");
+                }
+                Err(_) => return send_error(req, 400, "failed to read request body"),
+            };
+            let snapshot: DeviceSnapshot = match serde_json::from_slice(&body) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return send_error(req, 400, "invalid snapshot JSON"),
+            };
+            if let Err(err) = dev.restore_device_snapshot(&snapshot) {
+                if is_device_busy_error(&err) {
+                    return send_error(req, 409, DEVICE_BUSY);
+                }
+                return send_error(req, 500, &format!("snapshot restore failed: {err}"));
+            }
+            match dev.capture_device_snapshot() {
+                Ok(snapshot) => match serde_json::to_string_pretty(&snapshot) {
+                    Ok(body) => send_json(req, 200, &body),
+                    Err(_) => send_error(req, 500, "failed to serialize snapshot"),
+                },
+                Err(err) if is_device_busy_error(&err) => send_error(req, 409, DEVICE_BUSY),
+                Err(err) => send_error(
+                    req,
+                    500,
+                    &format!("snapshot verification export failed: {err}"),
+                ),
+            }
+        })?;
+    }
+
+    // POST /devices/0/snapshot/learn — sweep presets and seed a strict snapshot cache
+    {
+        let st = state.clone();
+        let audio = audio_state.clone();
+        server.fn_handler("/devices/0/snapshot/learn", Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_json(req, 503, r#"{"error":"no device"}"#),
+            };
+            match dev.learn_device_snapshot() {
+                Ok(snapshot) => match serde_json::to_string_pretty(&snapshot) {
+                    Ok(body) => {
+                        let status = if snapshot.is_strict_complete() { 200 } else { 409 };
+                        send_json(req, status, &body)
+                    }
+                    Err(_) => send_error(req, 500, "failed to serialize snapshot"),
+                },
+                Err(err) if is_device_busy_error(&err) => send_error(req, 409, DEVICE_BUSY),
+                Err(err) => send_error(req, 500, &format!("snapshot learn failed: {err}")),
+            }
+        })?;
+    }
+
     // Display, DRE, tokens, preset copy, measurement-mode
     register_device_feature_routes(
         &mut server,
@@ -1204,7 +1319,7 @@ fn register_debug_routes(
             let Some(addr) = addr else {
                 return send_error(req, 400, "missing addr query parameter");
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
 
             let body = match format {
                 Some("words") => match dev.read_dsp_words(addr, count) {
@@ -1406,7 +1521,7 @@ fn register_volume_routes(
         let Some(direction) = parse_volume_path(&uri) else {
             return send_error(req, 400, "invalid volume path");
         };
-        let _op = dev.begin_operation();
+        let _op = try_device_operation_or_409!(req, dev);
         let ms = match dev.get_master_status() {
             Ok(ms) => ms,
             Err(e) => return send_error(req, 500, &e.to_string()),
@@ -1491,7 +1606,7 @@ fn register_preset_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             if let Err(e) = dev.set_preset(preset) {
                 return send_error(req, 500, &e.to_string());
             }
@@ -1527,7 +1642,7 @@ fn register_device_feature_routes(
                 }
                 Some(d) => d,
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.read_display() {
                 Ok((idle_time, brightness)) => {
                     let body = format!(r#"{{"idle_time":{idle_time},"brightness":{brightness}}}"#);
@@ -1562,7 +1677,7 @@ fn register_device_feature_routes(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             if let Some(b) = json.get("brightness").and_then(|v| v.as_u64()) {
                 if b > u8::MAX as u64 {
                     return send_error(req, 400, "brightness out of range (0-255)");
@@ -1599,7 +1714,7 @@ fn register_device_feature_routes(
                 }
                 Some(d) => d,
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.read_dre() {
                 Ok(enabled) => {
                     let body = format!(r#"{{"enabled":{enabled}}}"#);
@@ -1634,7 +1749,7 @@ fn register_device_feature_routes(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             if let Some(enabled) = json.get("enabled").and_then(|v| v.as_bool()) {
                 if let Err(e) = dev.set_dre(enabled) {
                     return send_error(req, 500, &format!("set_dre: {e}"));
@@ -1657,7 +1772,7 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.read_tokens() {
                 Ok(tokens) => {
                     let body = serde_json::to_string(&serde_json::json!({"tokens": tokens}))
@@ -1682,7 +1797,7 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.read_flash_data(0xFF, 0xA3, 9) {
                 Ok(bytes) => {
                     let status = bytes.first().copied().unwrap_or(0);
@@ -1712,7 +1827,7 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.copy_preset() {
                 Ok(()) => send_empty_200(req),
                 Err(e) => send_error(req, 500, &e.to_string()),
@@ -1745,7 +1860,7 @@ fn register_device_feature_routes(
                     .unwrap_or_default();
                     send_json(req, 200, &body)
                 }
-                Err(e) => send_error(req, 500, &e.to_string()),
+                Err(e) => send_usb_error(req, &e),
             }
         })?;
     }
@@ -1786,7 +1901,7 @@ fn register_device_feature_routes(
                         .unwrap_or_default();
                         send_json(req, 200, &body)
                     }
-                    Err(e) => send_error(req, 500, &e.to_string()),
+                    Err(e) => send_usb_error(req, &e),
                 }
             })?;
         }
@@ -1817,7 +1932,7 @@ fn register_device_feature_routes(
                     ),
                     Err(e) => send_error(req, 500, &e),
                 },
-                Err(e) => send_error(req, 500, &e.to_string()),
+                Err(e) => send_usb_error(req, &e),
             }
         })?;
     }
@@ -1835,7 +1950,11 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            match dev.reboot_device() {
+            let reset = {
+                let _op = try_device_operation_or_409!(req, dev);
+                dev.reboot_device()
+            };
+            match reset {
                 Ok(()) => match wait_for_rebooted_device(&st, &dev, REBOOT_RECOVERY_TIMEOUT) {
                     Ok(()) => send_json(req, 200, r#"{"status":"rebooted"}"#),
                     Err(e) => send_error(req, 500, &e),
@@ -1860,7 +1979,7 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.enter_measurement_mode() {
                 Ok(()) => {
                     dev.save_peq_shadow_to_nvs(&nvs);
@@ -1889,7 +2008,7 @@ fn register_device_feature_routes(
                     Some(d) => d,
                     None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 };
-                let _op = dev.begin_operation();
+                let _op = try_device_operation_or_409!(req, dev);
                 match dev.restore_measurement_mode() {
                     Ok(()) => {
                         dev.save_peq_shadow_to_nvs(&nvs);
@@ -1916,7 +2035,7 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.reset_all_peq_to_defaults() {
                 Ok(touched) => {
                     dev.save_peq_shadow_to_nvs(&nvs);
@@ -1981,7 +2100,7 @@ fn register_device_feature_routes(
             if !dev.supports_bass_management() {
                 return send_error(req, 501, "device does not support bass management");
             }
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev.read_bass_management_state() {
                 Ok(state) => {
                     let body = serde_json::to_string(&state).unwrap_or_default();
@@ -2020,7 +2139,7 @@ fn register_device_feature_routes(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev
                 .set_bm_channel(ch, patch)
                 .and_then(|()| dev.read_bm_channel(ch))
@@ -2062,7 +2181,7 @@ fn register_device_feature_routes(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
-            let _op = dev.begin_operation();
+            let _op = try_device_operation_or_409!(req, dev);
             match dev
                 .set_bm_mixer_cell(row, col, patch)
                 .and_then(|()| dev.read_bm_mixer_cell(row, col))
@@ -2469,6 +2588,13 @@ fn openapi_json() -> String {
                 "get": { "summary": "Read full device config" },
                 "post": { "summary": "Write device config" }
             },
+            "/devices/0/snapshot": {
+                "get": { "summary": "Export a strict controller-side snapshot when complete" },
+                "post": { "summary": "Restore a previously exported snapshot" }
+            },
+            "/devices/0/snapshot/learn": {
+                "post": { "summary": "Learn a snapshot directly from the live device and seed future exports" }
+            },
             "/devices/0/volume/{direction}": {
                 "post": { "summary": "Volume up/down/toggle_mute" }
             },
@@ -2636,6 +2762,21 @@ fn playback_busy_json() -> String {
     format!(r#"{{"error":"{HID_BUSY_DURING_PLAYBACK}"}}"#)
 }
 
+fn device_busy_json() -> String {
+    format!(r#"{{"error":"{DEVICE_BUSY}"}}"#)
+}
+
+pub(crate) fn is_device_busy_error(err: &UsbHidError) -> bool {
+    matches!(err, UsbHidError::Protocol(message) if message == DEVICE_BUSY)
+}
+
+fn try_begin_operation_or_busy<'a>(
+    dev: &'a Arc<DeviceState>,
+) -> Result<std::sync::MutexGuard<'a, ()>, String> {
+    dev.try_begin_operation()
+        .ok_or_else(|| DEVICE_BUSY.to_string())
+}
+
 fn send_text<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
     text: &str,
@@ -2648,6 +2789,17 @@ fn send_text<C: esp_idf_svc::http::server::Connection>(
     let mut resp = req.into_response(200, None, &headers)?;
     resp.write_all(text.as_bytes())?;
     Ok(())
+}
+
+fn send_usb_error<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    err: &UsbHidError,
+) -> Result<(), C::Error> {
+    if is_device_busy_error(err) {
+        send_error(req, 409, DEVICE_BUSY)
+    } else {
+        send_error(req, 500, &err.to_string())
+    }
 }
 
 fn send_javascript<C: esp_idf_svc::http::server::Connection>(
@@ -2896,7 +3048,7 @@ fn switch_to_usb_source(
         .ok_or((500, "USB source missing from device profile".to_string()))?;
 
     let current_source = {
-        let _op = dev.begin_operation();
+        let _op = try_begin_operation_or_busy(dev).map_err(|err| (409, err))?;
         dev.current_source()
             .ok()
             .flatten()
@@ -2951,7 +3103,10 @@ fn wait_for_source_state(
         if let Some(current) = get_device(state) {
             if same_device_identity(&current, previous) {
                 let status = {
-                    let _op = current.begin_operation();
+                    let Ok(_op) = try_begin_operation_or_busy(&current) else {
+                        std::thread::sleep(POLL_INTERVAL);
+                        continue;
+                    };
                     match current.current_source() {
                         Ok(Some(source)) if source == target => current.get_status_summary().ok(),
                         _ => None,
@@ -2983,7 +3138,7 @@ fn set_source_index_with_recovery(
     timeout: Duration,
 ) -> Result<(Arc<DeviceState>, StatusSummary), String> {
     {
-        let _op = dev.begin_operation();
+        let _op = try_begin_operation_or_busy(dev)?;
         match dev.set_source(target_index) {
             Ok(()) => {}
             Err(err) if source_switch_error_is_recoverable(&err) => {
@@ -3007,7 +3162,7 @@ fn set_source_with_recovery(
     timeout: Duration,
 ) -> Result<(Arc<DeviceState>, StatusSummary), String> {
     let current = {
-        let _op = dev.begin_operation();
+        let _op = try_begin_operation_or_busy(dev)?;
         dev.current_source()
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "current source unavailable".to_string())?
@@ -3015,7 +3170,7 @@ fn set_source_with_recovery(
 
     if current == target {
         let status = {
-            let _op = dev.begin_operation();
+            let _op = try_begin_operation_or_busy(dev)?;
             dev.get_status_summary().map_err(|err| err.to_string())?
         };
         return Ok((dev.clone(), status));
@@ -3053,7 +3208,7 @@ fn set_source_with_audio_coordination(
     context: &str,
 ) -> Result<(Arc<DeviceState>, StatusSummary), String> {
     let current = {
-        let _op = dev.begin_operation();
+        let _op = try_begin_operation_or_busy(dev)?;
         dev.current_source()
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "current source unavailable".to_string())?
@@ -3136,7 +3291,9 @@ pub(crate) fn raw_bridge_command_with_audio_coordination(
         return Ok(payload[..2.min(payload.len())].to_vec());
     }
 
-    let _op = dev.begin_operation();
+    let _op = dev
+        .try_begin_operation()
+        .ok_or_else(|| UsbHidError::Protocol(DEVICE_BUSY.to_string()))?;
     dev.raw_command(payload)
 }
 
@@ -3878,16 +4035,19 @@ fn register_ws_routes(
                     } else {
                         match get_device(&st) {
                             Some(dev) => {
-                                let _op = dev.begin_operation();
-                                match dev.get_status_summary() {
-                                    Ok(s) => (200, status_json(&s)),
-                                    Err(e) => (
-                                        500,
-                                        format!(
-                                            r#"{{"error":"{}"}}"#,
-                                            e.to_string().replace('"', "\\\"")
+                                if let Some(_op) = dev.try_begin_operation() {
+                                    match dev.get_status_summary() {
+                                        Ok(s) => (200, status_json(&s)),
+                                        Err(e) => (
+                                            500,
+                                            format!(
+                                                r#"{{"error":"{}"}}"#,
+                                                e.to_string().replace('"', "\\\"")
+                                            ),
                                         ),
-                                    ),
+                                    }
+                                } else {
+                                    (409, device_busy_json())
                                 }
                             }
                             None => (503, r#"{"error":"no device"}"#.to_string()),
@@ -3967,10 +4127,13 @@ fn register_ws_routes(
                     } else {
                         match get_device(&st) {
                             Some(dev) => {
-                                let _op = dev.begin_operation();
-                                match dev.get_status_summary() {
-                                    Ok(status) => status_json(&status),
-                                    Err(_) => r#"{"error":"device read failed"}"#.to_string(),
+                                if let Some(_op) = dev.try_begin_operation() {
+                                    match dev.get_status_summary() {
+                                        Ok(status) => status_json(&status),
+                                        Err(_) => r#"{"error":"device read failed"}"#.to_string(),
+                                    }
+                                } else {
+                                    device_busy_json()
                                 }
                             }
                             None => r#"{"error":"no device"}"#.to_string(),
@@ -4043,7 +4206,19 @@ fn register_ws_routes(
                                     )?;
                                 }
                                 Err(e) => {
-                                    log::warn!("WS raw bridge: device error: {e}");
+                                    if is_device_busy_error(&e) {
+                                        let busy = minidsp_protocol::packet::encode_frame(&[
+                                            minidsp_protocol::commands::RESP_ERROR,
+                                        ]);
+                                        ws_send_logged(
+                                            ws,
+                                            "WS raw bridge",
+                                            FrameType::Binary(false),
+                                            &busy,
+                                        )?;
+                                    } else {
+                                        log::warn!("WS raw bridge: device error: {e}");
+                                    }
                                 }
                             },
                             None => {
@@ -4212,9 +4387,18 @@ fn ws_poll_loop(
             return;
         }
     } else if let Some(dev) = get_device(&state) {
-        let _op = dev.begin_operation();
-        if let Ok(status) = dev.get_status_summary() {
-            let json = status_json(&status);
+        if let Some(_op) = dev.try_begin_operation() {
+            if let Ok(status) = dev.get_status_summary() {
+                let json = status_json(&status);
+                if sender
+                    .send(FrameType::Text(false), json.as_bytes())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        } else {
+            let json = device_busy_json();
             if sender
                 .send(FrameType::Text(false), json.as_bytes())
                 .is_err()
@@ -4241,10 +4425,13 @@ fn ws_poll_loop(
         } else {
             match get_device(&state) {
                 Some(dev) => {
-                    let _op = dev.begin_operation();
-                    match dev.get_status_summary() {
-                        Ok(status) => status_json(&status),
-                        Err(_) => continue,
+                    if let Some(_op) = dev.try_begin_operation() {
+                        match dev.get_status_summary() {
+                            Ok(status) => status_json(&status),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        device_busy_json()
                     }
                 }
                 None => r#"{"error":"no device"}"#.to_string(),
@@ -4312,9 +4499,18 @@ fn register_ezbeq_ws(
             if audio.is_playing() {
                 log::info!("ezBEQ WS: deferring initial DeviceState while playback is active");
             } else if let Some(dev) = get_device(&st) {
-                let _op = dev.begin_operation();
-                let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
-                let state_json = crate::ezbeq::device_state_json(&dev, &beq_guard);
+                let state_json = if let Some(_op) = dev.try_begin_operation() {
+                    let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::ezbeq::device_state_json(&dev, &beq_guard)
+                } else {
+                    serde_json::to_string(&json!({
+                        "message": "DeviceState",
+                        "data": {
+                            "error": DEVICE_BUSY,
+                        }
+                    }))
+                    .unwrap_or_default()
+                };
                 ws_send_logged(
                     ws,
                     "ezBEQ WS",
@@ -4549,29 +4745,32 @@ fn push_levels(
 
         let json = match get_device(&state) {
             Some(dev) => {
-                let _op = dev.begin_operation();
-                match dev.get_status_summary() {
-                    Ok(status) => {
-                        let mut levels = serde_json::Map::new();
-                        for (i, &v) in status.input_levels.iter().enumerate() {
-                            levels.insert(format!("I{i}"), serde_json::Value::from(v));
-                        }
-                        for (i, &v) in status.output_levels.iter().enumerate() {
-                            levels.insert(format!("O{i}"), serde_json::Value::from(v));
-                        }
-                        let ts =
-                            (unsafe { esp_idf_sys::esp_timer_get_time() } as f64) / 1_000_000.0;
-                        serde_json::to_string(&serde_json::json!({
-                            "message": "Levels",
-                            "data": {
-                                "name": "master",
-                                "ts": ts,
-                                "levels": levels,
+                if let Some(_op) = dev.try_begin_operation() {
+                    match dev.get_status_summary() {
+                        Ok(status) => {
+                            let mut levels = serde_json::Map::new();
+                            for (i, &v) in status.input_levels.iter().enumerate() {
+                                levels.insert(format!("I{i}"), serde_json::Value::from(v));
                             }
-                        }))
-                        .unwrap_or_default()
+                            for (i, &v) in status.output_levels.iter().enumerate() {
+                                levels.insert(format!("O{i}"), serde_json::Value::from(v));
+                            }
+                            let ts =
+                                (unsafe { esp_idf_sys::esp_timer_get_time() } as f64) / 1_000_000.0;
+                            serde_json::to_string(&serde_json::json!({
+                                "message": "Levels",
+                                "data": {
+                                    "name": "master",
+                                    "ts": ts,
+                                    "levels": levels,
+                                }
+                            }))
+                            .unwrap_or_default()
+                        }
+                        Err(_) => continue,
                     }
-                    Err(_) => continue,
+                } else {
+                    continue;
                 }
             }
             None => continue,

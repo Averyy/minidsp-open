@@ -26,6 +26,9 @@ It intentionally separates the risky paths:
 
 - `--allow-audio` enables `/play` tests and playback-busy checks
 - `--allow-destructive` enables preset-copy and overwrite-style mutations
+- on desktop targets, `--allow-destructive` now captures a strict snapshot
+  baseline first, restores it at the end of the run, and writes an artifact
+  bundle under `.scratch/live-validation-runs/<timestamp>/`
 
 ## What Stays Manual
 
@@ -71,6 +74,15 @@ Desktop + ESP32 combined run:
   --report .scratch/live-validation-full.md
 ```
 
+Desktop destructive run with automatic snapshot baseline / restore artifacts:
+
+```bash
+./tools/run-live-validation.py \
+  --desktop-url http://127.0.0.1:5380 \
+  --allow-destructive \
+  --continue-on-fail
+```
+
 Full ESP32 run with a real upstream ezBEQ process in front of our bridge:
 
 ```bash
@@ -94,8 +106,15 @@ If you already know the repo is built and only want live checks:
 - Keep the MiniDSP attached and idle before starting.
 - Keep the official Device Console closed during routine harness runs.
 - Use low speaker volume before `--allow-audio`.
+- On desktop, `--allow-destructive` now restores the full device from a strict
+  snapshot at the end of the run, but it still performs real live mutations in
+  between, so keep the unit idle until the run finishes.
 - Use `--allow-destructive` only when overwriting inactive presets or ezBEQ slot state is acceptable.
 - Prefer `--report` so the result can be attached to a commit, PR, or progress note.
+- The desktop destructive artifact bundle currently includes
+  `snapshot-before.json`, `snapshot-after.json`, `device-before.json`,
+  `device-after.json`, `config-before.json`, `config-after.json`,
+  `restore-result.json`, plus top-level `report.md` / `report.json`.
 
 ## Manual Checklist
 

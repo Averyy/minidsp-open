@@ -19,3 +19,4 @@ urlencoding = "2"
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 getrandom = "0.2"
+time = { workspace = true }

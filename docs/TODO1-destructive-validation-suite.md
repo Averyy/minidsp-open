@@ -1,5 +1,34 @@
 # Full Destructive Validation Suite Plan
 
+## Status
+
+### Completed first-pass scope
+
+The harness is no longer just a plan for the verified desktop path.
+Today it already does all of this:
+
+- captures a strict snapshot baseline before destructive desktop runs
+- restores that snapshot automatically at the end of the run
+- writes durable artifact directories under `.scratch/live-validation-runs/<timestamp>/`
+- verifies post-restore snapshot equality
+- covers desktop HTTP / WS / TCP / CLI compatibility checks
+- covers desktop `/play` sweep-only, marker-only, and legacy-field rejection checks
+- has a live-verified one-command desktop run on the attached 2x4 HD `912345`
+
+That means the "snapshot-backed destructive desktop first pass" is complete.
+
+### Remaining scope
+
+This doc is still not fully complete as written.
+The remaining work is:
+
+- structured manual checkpoint recording for audio / reconnect / Device Console
+- a truly explicit "full destructive profile" with its proposed flags and hard stops
+- integrated reboot / reconnect coverage in the same destructive workflow
+- clearer direct-USB desktop lane requirements alongside the daemon-backed lane
+- stronger concurrency / busy-behavior assertions during snapshot export / restore
+- broader ESP32 and multi-profile rollout beyond the already verified paths
+
 ## Goal
 
 Extend the existing live validation harness into a full destructive regression
@@ -34,21 +63,24 @@ That means this plan should extend the existing harness, not replace it.
 
 Also note the current ceiling:
 
-- the harness already does useful narrow restore-by-hand for volume, mute,
-  source, preset, and measurement-mode
-- it does not yet prove full-device return-to-baseline after arbitrary
-  destructive mutations
+- the harness now proves full-device return-to-baseline for the verified
+  desktop path through shared snapshot export/import
+- it still does not yet implement every later-stage idea in this document,
+  especially manual checkpoint capture and the explicit "full profile" controls
 
 ## Why The Current Harness Is Not Enough
 
-The current harness is intentionally conservative:
+The current harness is no longer just a conservative smoke test, but it is not
+yet the final shape described below:
 
-- it avoids full-device destructive coverage by default
-- it restores individual settings opportunistically, not from a formal backup
-- it does not yet prove "run everything, then put the box back exactly where it
-  started"
+- it still relies on `--allow-destructive` / `--allow-audio` rather than the
+  stronger explicit profile and manual-gate flags proposed later
+- it does not yet record manual approvals inside the artifact bundle
+- reboot / reconnect and Device Console gates are still separate operator work
+- the direct-USB desktop lane is verified, but not yet called out as a first-
+  class lane in the harness plan below
 
-That is the missing capability the project now needs.
+Those are the remaining gaps this plan should close.
 
 ## Dependency
 
@@ -173,6 +205,8 @@ Keep the current safe checks:
 
 - HTTP route existence and schema expectations
 - CLI compatibility
+- direct-USB desktop CLI snapshot round-trip for desktop targets, not only the
+  daemon-backed path
 - TCP bridge round-trips
 - raw WebSocket bridge round-trips
 - env-var and flag compatibility
@@ -213,6 +247,9 @@ The machine-checkable portion should verify:
 - source auto-switch and restore
 - oversize request rejection
 - legacy field rejection
+- snapshot import/export refuses or fails loudly when another command tries to
+  mutate the device concurrently; no silent race is acceptable during the
+  destructive restore window
 
 The manual portion should still separately record human approval for:
 
@@ -250,6 +287,8 @@ Also keep scope honest:
 ## Phase 3: operator checkpoints
 
 The suite should support explicit manual checkpoints with artifact logging.
+
+This is still an open item today and should remain explicit until it exists.
 
 ### Audio approval
 
@@ -452,6 +491,28 @@ The harness itself needs staged proof:
   workflow once it is implemented
 - the suite refuses to run a "full" destructive profile on hardware where the
   snapshot model is still incomplete
+
+## First-Pass Exit Criteria Already Met
+
+These are now done for the verified desktop path:
+
+- one command runs the machine-checkable destructive desktop surface and
+  restores the original state automatically
+- durable artifacts are emitted for every destructive run
+- the run fails when restore fails
+- the suite now depends on the shared snapshot export/import path rather than
+  ad-hoc end-of-run hand restoration
+
+## Next Honest Steps
+
+If we keep extending this plan, the right next items are:
+
+1. add structured manual checkpoint recording to the artifact report
+2. make the direct-USB desktop lane an explicit required matrix item
+3. add snapshot concurrency / busy-behavior assertions during restore
+4. integrate reboot / reconnect into the same destructive workflow where safe
+5. only then promote the harness to the stronger "full destructive profile"
+   shape described here
 
 ## Recommended Implementation Order
 

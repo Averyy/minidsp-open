@@ -3,4 +3,5 @@
 pub mod client;
 pub mod queue;
 pub mod reconnect;
+pub mod snapshot;
 pub mod transport;

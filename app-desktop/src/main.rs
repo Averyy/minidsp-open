@@ -180,6 +180,11 @@ enum Command {
         #[command(subcommand)]
         cmd: DebugCommand,
     },
+    /// Export controller-side device snapshots
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCommand,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -248,6 +253,23 @@ enum DebugCommand {
         /// Number of bytes to read (max 58)
         #[arg(default_value = "1")]
         count: u8,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum SnapshotCommand {
+    /// Export a controller-side snapshot to JSON
+    Export {
+        /// Output path for the snapshot JSON file
+        file: String,
+        /// Allow writing an explicitly incomplete snapshot
+        #[arg(long)]
+        allow_partial: bool,
+    },
+    /// Import a controller-side snapshot from JSON and restore it to hardware
+    Import {
+        /// Path to the snapshot JSON file
+        file: String,
     },
 }
 
@@ -674,6 +696,73 @@ async fn execute_command(
                         .join(" ");
                     println!("{line_addr:06x}: {bytes}");
                 }
+            }
+        },
+        Some(Command::Snapshot { cmd }) => match cmd {
+            SnapshotCommand::Export {
+                file,
+                allow_partial,
+            } => {
+                let snapshot = client.capture_device_snapshot().await?;
+                if !snapshot.is_strict_complete() && !allow_partial {
+                    let detail = snapshot
+                        .completeness
+                        .issues
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let suffix = if snapshot.completeness.issues.len() > 3 {
+                        format!(
+                            " (plus {} more issue{})",
+                            snapshot.completeness.issues.len() - 3,
+                            if snapshot.completeness.issues.len() == 4 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )
+                    } else {
+                        String::new()
+                    };
+                    return Err(format!(
+                        "strict snapshot export refused: {detail}{suffix}. Re-run with `snapshot export --allow-partial` to write the artifact anyway."
+                    )
+                    .into());
+                }
+
+                let path = PathBuf::from(file);
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, serde_json::to_vec_pretty(&snapshot)?)?;
+
+                if snapshot.is_strict_complete() {
+                    println!("wrote strict snapshot to {}", path.display());
+                } else {
+                    println!(
+                        "wrote partial snapshot to {} ({} issue{})",
+                        path.display(),
+                        snapshot.completeness.issues.len(),
+                        if snapshot.completeness.issues.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    );
+                }
+            }
+            SnapshotCommand::Import { file } => {
+                let payload = std::fs::read_to_string(file)?;
+                let snapshot: minidsp::snapshot::DeviceSnapshot = serde_json::from_str(&payload)?;
+                client.restore_device_snapshot(&snapshot).await?;
+                println!(
+                    "restored snapshot for serial {} from {}",
+                    snapshot.device.serial, file
+                );
             }
         },
         Some(Command::Probe { .. }) | Some(Command::Server { .. }) => unreachable!(),

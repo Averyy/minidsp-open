@@ -23,6 +23,7 @@ mod diagnostics;
 mod ezbeq;
 mod http_server;
 mod led;
+mod snapshot;
 mod storage;
 mod updater;
 mod usb_audio;
@@ -606,7 +607,13 @@ fn tcp_bridge(state: http_server::SharedDeviceState, audio_state: usb_audio::Sha
                         }
                     }
                     Err(e) => {
-                        log::warn!("TCP bridge: device error: {e}");
+                        if http_server::is_device_busy_error(&e) {
+                            if stream.write_all(&TCP_BRIDGE_BUSY_FRAME).is_err() {
+                                break;
+                            }
+                        } else {
+                            log::warn!("TCP bridge: device error: {e}");
+                        }
                         // Don't break — keep connection alive
                     }
                 }
