@@ -3,6 +3,8 @@ app/
 .playwright-mcp/
 target/
 .scratch/
+__pycache__/
+*.pyc
 
 .codex-dobby/
 .claude/
