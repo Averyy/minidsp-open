@@ -33,14 +33,19 @@ use std::time::{Duration, Instant};
 
 const REBOOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(50);
 const SOURCE_SWITCH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(35);
+const RAW_BRIDGE_OPERATION_WAIT: Duration = Duration::from_millis(500);
 const AUDIO_REOPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const AUDIO_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const AUDIO_RECOVERY_SETTLE: Duration = Duration::from_millis(250);
 const MAX_PLAYBACK_BYTES: usize = 4 * 1024 * 1024;
 const PLAYBACK_THREAD_STACK_BYTES: usize = 18 * 1024;
 const WS_COMPAT_THREAD_STACK_BYTES: usize = 8 * 1024;
 const EZBEQ_LEVELS_THREAD_STACK_BYTES: usize = 12 * 1024;
 const PLAYBACK_STREAM_TARGET_CHUNK_MS: usize = 2;
 const PLAYBACK_PROGRESS_LOG_EVERY_WRITES: usize = 500;
+const LARGE_RESPONSE_STREAM_CHUNK_BYTES: usize = 1024;
+const LARGE_RESPONSE_STREAM_YIELD_EVERY_CHUNKS: usize = 16;
+const LARGE_RESPONSE_STREAM_YIELD_MS: u64 = 10;
 pub(crate) const DEVICE_BUSY: &str = "device busy";
 pub(crate) const HID_BUSY_DURING_PLAYBACK: &str = "device busy during playback";
 static PLAYBACK_STREAM_BUF: Mutex<[u8; 2880]> = Mutex::new([0u8; 2880]);
@@ -1012,10 +1017,6 @@ pub fn start(
         register_ezbeq_ws(&mut server, state.clone(), audio_state.clone(), beq.clone())?;
     }
 
-    // JSON fallback for unsupported /devices/* mutations. Register after all
-    // concrete device routes so exact handlers and WS endpoints always win.
-    register_device_api_fallbacks(&mut server)?;
-
     // GET /openapi.json
     server.fn_handler("/openapi.json", Method::Get, |req| {
         let spec = openapi_json();
@@ -1204,6 +1205,11 @@ pub fn start(
             }
         })?;
     }
+
+    // JSON fallback for unsupported /devices/* mutations. Register after all
+    // concrete device routes so exact handlers and more-specific wildcard
+    // routes win before the generic catch-all does.
+    register_device_api_fallbacks(&mut server)?;
 
     info!("HTTP routes registered");
     Ok(server)
@@ -1848,31 +1854,17 @@ fn register_device_feature_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            if !dev.supports_default_preset_reset() {
-                return send_error(req, 501, "default preset reset not supported");
-            }
-            match dev.reset_active_preset_to_defaults() {
-                Ok(preset) => {
-                    let body = serde_json::to_string(&json!({
-                        "status": "preset_reset",
-                        "preset": preset,
-                    }))
-                    .unwrap_or_default();
-                    send_json(req, 200, &body)
-                }
-                Err(e) => send_usb_error(req, &e),
-            }
+            reset_preset_to_defaults_response(req, &dev, None)
         })?;
     }
 
     // POST /devices/0/preset/{preset}/reset
     {
-        let st = state.clone();
-        let audio = audio_state.clone();
-        // Safe because the handler captures only owned `Arc` state and the
-        // server owns the closure for the same lifetime as `state`.
-        unsafe {
-            server.fn_handler_nonstatic("/devices/0/preset/*/reset", Method::Post, move |req| {
+        for preset in 0u8..4 {
+            let st = state.clone();
+            let audio = audio_state.clone();
+            let path = format!("/devices/0/preset/{preset}/reset");
+            server.fn_handler(&path, Method::Post, move |req| {
                 let req = match reject_hid_during_playback(req, &audio)? {
                     Some(req) => req,
                     None => return Ok(()),
@@ -1881,28 +1873,7 @@ fn register_device_feature_routes(
                     Some(d) => d,
                     None => return send_json(req, 503, r#"{"error":"no device"}"#),
                 };
-                if !dev.supports_default_preset_reset() {
-                    return send_error(req, 501, "default preset reset not supported");
-                }
-                let path = req.uri().trim_matches('/');
-                let parts: Vec<_> = path.split('/').collect();
-                let Some(&preset_text) = parts.get(3) else {
-                    return send_error(req, 400, "missing preset");
-                };
-                let Ok(preset) = preset_text.parse::<u8>() else {
-                    return send_error(req, 400, "invalid preset");
-                };
-                match dev.reset_preset_to_defaults(preset) {
-                    Ok(()) => {
-                        let body = serde_json::to_string(&json!({
-                            "status": "preset_reset",
-                            "preset": preset,
-                        }))
-                        .unwrap_or_default();
-                        send_json(req, 200, &body)
-                    }
-                    Err(e) => send_usb_error(req, &e),
-                }
+                reset_preset_to_defaults_response(req, &dev, Some(preset))
             })?;
         }
     }
@@ -2766,6 +2737,14 @@ fn device_busy_json() -> String {
     format!(r#"{{"error":"{DEVICE_BUSY}"}}"#)
 }
 
+fn maybe_yield_large_response(chunks_written: usize) {
+    if chunks_written % LARGE_RESPONSE_STREAM_YIELD_EVERY_CHUNKS == 0 {
+        // Cross a FreeRTOS tick so large streamed responses yield often enough
+        // for the WiFi stack and IDLE task to run on the ESP32.
+        std::thread::sleep(Duration::from_millis(LARGE_RESPONSE_STREAM_YIELD_MS));
+    }
+}
+
 pub(crate) fn is_device_busy_error(err: &UsbHidError) -> bool {
     matches!(err, UsbHidError::Protocol(message) if message == DEVICE_BUSY)
 }
@@ -2802,6 +2781,33 @@ fn send_usb_error<C: esp_idf_svc::http::server::Connection>(
     }
 }
 
+fn reset_preset_to_defaults_response<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    dev: &Arc<DeviceState>,
+    preset: Option<u8>,
+) -> Result<(), C::Error> {
+    if !dev.supports_default_preset_reset() {
+        return send_error(req, 501, "default preset reset not supported");
+    }
+
+    let reset_result = match preset {
+        Some(preset) => dev.reset_preset_to_defaults(preset).map(|()| preset),
+        None => dev.reset_active_preset_to_defaults(),
+    };
+
+    match reset_result {
+        Ok(preset) => {
+            let body = serde_json::to_string(&json!({
+                "status": "preset_reset",
+                "preset": preset,
+            }))
+            .unwrap_or_default();
+            send_json(req, 200, &body)
+        }
+        Err(e) => send_usb_error(req, &e),
+    }
+}
+
 fn send_javascript<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
     text: &str,
@@ -2822,25 +2828,25 @@ fn send_gzip_file<C: esp_idf_svc::http::server::Connection>(
     path: &str,
     content_type: &str,
 ) -> Result<(), C::Error> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
+    let body = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(_) => return send_json(req, 404, r#"{"error":"not found"}"#),
     };
+    let content_length = body.len().to_string();
     let headers = [
         ("Server", "miniDSP-Open"),
         ("Content-Type", content_type),
         ("Content-Encoding", "gzip"),
         ("Access-Control-Allow-Origin", "*"),
         ("Cache-Control", "no-store"),
+        ("Content-Length", content_length.as_str()),
     ];
     let mut resp = req.into_response(200, None, &headers)?;
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = std::io::Read::read(&mut file, &mut buf).unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        resp.write_all(&buf[..n])?;
+    if let Err(err) = resp.write_all(&body) {
+        warn!(
+            "gzip file write failed for {path} ({} bytes): {err}",
+            body.len()
+        );
     }
     Ok(())
 }
@@ -3199,6 +3205,85 @@ fn ensure_audio_device_available(
         .ok_or_else(|| "USB audio interface not connected".to_string())
 }
 
+fn settle_audio_device_after_recovery(reason: &str) {
+    // The UAC2 driver can report the interface opened a little before the
+    // controller has fully quiesced after close/reopen or root-port recovery.
+    // Give the host stack one short settle window before the next start attempt.
+    debug!("waiting {:?} after audio recovery ({reason})", AUDIO_RECOVERY_SETTLE);
+    std::thread::sleep(AUDIO_RECOVERY_SETTLE);
+}
+
+fn refresh_audio_device_for_playback(
+    audio: &usb_audio::SharedAudioState,
+    current_device: &mut Option<Arc<usb_audio::Uac2Device>>,
+    reason: &str,
+) -> Result<Arc<usb_audio::Uac2Device>, String> {
+    audio.pause_and_close_current(reason);
+    // The playback thread keeps its own Arc to the UAC2 handle. Drop that
+    // local reference before waiting/reopening so the deferred cleanup can
+    // actually close the interface instead of leaving it "already open".
+    drop(current_device.take());
+    if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
+        return Err(format!(
+            "timed out waiting for USB audio teardown before {reason}"
+        ));
+    }
+
+    audio.resume_opening(reason);
+    let _ = audio.reopen_last_known(reason);
+    let device = audio
+        .wait_for_current_device(AUDIO_REOPEN_TIMEOUT)
+        .ok_or_else(|| format!("USB audio interface did not recover after {reason}"))?;
+    settle_audio_device_after_recovery(reason);
+    Ok(device)
+}
+
+fn restart_audio_driver_for_playback(
+    audio: &usb_audio::SharedAudioState,
+    current_device: &mut Option<Arc<usb_audio::Uac2Device>>,
+    reason: &str,
+) -> Result<Arc<usb_audio::Uac2Device>, String> {
+    audio.pause_and_close_current(reason);
+    drop(current_device.take());
+    if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
+        return Err(format!(
+            "timed out waiting for USB audio teardown before {reason}"
+        ));
+    }
+
+    usb_audio::restart(audio.clone(), reason).map_err(|err| err.to_string())?;
+    audio.resume_opening(reason);
+    let _ = audio.reopen_last_known(reason);
+    let device = audio
+        .wait_for_current_device(AUDIO_REOPEN_TIMEOUT)
+        .ok_or_else(|| format!("USB audio interface did not recover after {reason}"))?;
+    settle_audio_device_after_recovery(reason);
+    Ok(device)
+}
+
+fn recycle_root_port_for_playback(
+    state: &SharedDeviceState,
+    audio: &usb_audio::SharedAudioState,
+    dev: &Arc<DeviceState>,
+    current_device: &mut Option<Arc<usb_audio::Uac2Device>>,
+    reason: &str,
+) -> Result<Arc<usb_audio::Uac2Device>, String> {
+    audio.pause_and_close_current(reason);
+    drop(current_device.take());
+    if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
+        return Err(format!(
+            "timed out waiting for USB audio teardown before {reason}"
+        ));
+    }
+
+    crate::usb_hid::recycle_root_port_global(reason).map_err(|err| err.to_string())?;
+    wait_for_rebooted_device(state, dev, REBOOT_RECOVERY_TIMEOUT)?;
+    usb_audio::restart(audio.clone(), reason).map_err(|err| err.to_string())?;
+    let device = ensure_audio_device_available(audio, reason)?;
+    settle_audio_device_after_recovery(reason);
+    Ok(device)
+}
+
 fn set_source_with_audio_coordination(
     state: &SharedDeviceState,
     audio: &usb_audio::SharedAudioState,
@@ -3292,7 +3377,7 @@ pub(crate) fn raw_bridge_command_with_audio_coordination(
     }
 
     let _op = dev
-        .try_begin_operation()
+        .begin_operation_with_wait(RAW_BRIDGE_OPERATION_WAIT)
         .ok_or_else(|| UsbHidError::Protocol(DEVICE_BUSY.to_string()))?;
     dev.raw_command(payload)
 }
@@ -3498,6 +3583,8 @@ fn run_playback_thread(
     restore_source: Option<Source>,
     started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
 ) {
+    let mut audio_device = Some(audio_device);
+
     // Disable WiFi power save during playback — beacon wakeups cause
     // ~1-2 ms CPU stalls that can disrupt USB isochronous timing.
     let _wifi_ps = WifiPsGuard::disable_ps();
@@ -3551,17 +3638,102 @@ fn run_playback_thread(
         gen_elapsed_ms
     );
 
-    // Start the USB audio stream and write the pre-generated data
-    let start_result =
-        start_playback_pregenerated(&audio_device, &plan, pcm_data).map(|mut start| {
-            start.response.source_changed = source_changed;
-            start.response.previous_source = previous_source.clone();
-            start
-        });
+    // Start the USB audio stream and write the pre-generated data.
+    let start_result = match start_playback_pregenerated(
+        audio_device
+            .as_ref()
+            .expect("playback thread should hold an audio device"),
+        &plan,
+        pcm_data,
+    ) {
+        Ok(start) => Ok(start),
+        Err(err) if err.contains("ESP_ERR_NO_MEM") => {
+            warn!("playback start hit {err}; refreshing UAC2 device and retrying");
+            match refresh_audio_device_for_playback(
+                &audio_state,
+                &mut audio_device,
+                "playback start no-mem recovery",
+            ) {
+                Ok(device) => {
+                    audio_device = Some(device);
+                    match start_playback_pregenerated(
+                        audio_device
+                            .as_ref()
+                            .expect("recovered playback device should be present"),
+                        &plan,
+                        pcm_data,
+                    ) {
+                        Ok(start) => Ok(start),
+                        Err(retry_err) if retry_err.contains("ESP_ERR_NO_MEM") => {
+                            warn!(
+                                "playback retry after UAC2 reopen still hit {retry_err}; restarting UAC2 driver"
+                            );
+                            match restart_audio_driver_for_playback(
+                                &audio_state,
+                                &mut audio_device,
+                                "playback start driver restart recovery",
+                            ) {
+                                Ok(device) => {
+                                    audio_device = Some(device);
+                                    start_playback_pregenerated(
+                                        audio_device
+                                            .as_ref()
+                                            .expect("driver-restarted playback device should be present"),
+                                        &plan,
+                                        pcm_data,
+                                    )
+                                }
+                                Err(restart_err) => Err(format!(
+                                    "{retry_err}; driver restart recovery failed: {restart_err}"
+                                )),
+                            }
+                        }
+                        Err(retry_err) => Err(retry_err),
+                    }
+                }
+                Err(recover_err) => Err(format!("{err}; recovery failed: {recover_err}")),
+            }
+        }
+        Err(err) => Err(err),
+    }
+    .or_else(|err| {
+        if !err.contains("ESP_ERR_NO_MEM") {
+            return Err(err);
+        }
+
+        warn!("playback start still hit {err}; recycling USB root port");
+        match recycle_root_port_for_playback(
+            &state,
+            &audio_state,
+            &dev,
+            &mut audio_device,
+            "playback start root-port recovery",
+        ) {
+            Ok(device) => {
+                audio_device = Some(device);
+                start_playback_pregenerated(
+                    audio_device
+                        .as_ref()
+                        .expect("root-port-recovered playback device should be present"),
+                    &plan,
+                    pcm_data,
+                )
+            }
+            Err(recover_err) => Err(format!("{err}; root-port recovery failed: {recover_err}")),
+        }
+    })
+    .map(|mut start| {
+        start.response.source_changed = source_changed;
+        start.response.previous_source = previous_source.clone();
+        start
+    });
     let allow_source_restore;
 
     match start_result {
         Ok(start) => {
+            let audio_device = audio_device
+                .as_ref()
+                .expect("playback device should remain available after start");
             let playback_started_us = usb_audio::server_time_us();
             info!(
                 "playback streaming started: {} bytes pre-generated",
@@ -3660,6 +3832,13 @@ fn run_playback_thread(
         }
     }
 
+    if allow_source_restore && restore_source.is_some() {
+        // Source restoration may switch away from USB and tear down the UAC2
+        // interface. Release the playback thread's Arc first so that close
+        // completion really means the interface is gone.
+        drop(audio_device.take());
+    }
+
     if allow_source_restore {
         if let Err(err) =
             restore_source_after_playback(&state, &audio_state, &dev, restore_source, "playback")
@@ -3712,6 +3891,7 @@ fn run_inline_sine_test(
     restore_source: Option<Source>,
     started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
 ) {
+    let mut audio_device = Some(audio_device);
     const SAMPLE_RATE: u32 = 48_000;
     const CHUNK_MS: u32 = PLAYBACK_STREAM_TARGET_CHUNK_MS as u32;
     const FRAMES_PER_CHUNK: usize = 96; // 2 ms at 48 kHz, matching basic_playback.
@@ -3735,7 +3915,11 @@ fn run_inline_sine_test(
     );
 
     usb_audio::reset_tx_need_data_count();
-    if let Err(err) = audio_device.start_stream(SAMPLE_RATE, BitDepth::Pcm16) {
+    if let Err(err) = audio_device
+        .as_ref()
+        .expect("inline sine test should hold an audio device")
+        .start_stream(SAMPLE_RATE, BitDepth::Pcm16)
+    {
         let _ = started_tx.send(Err(err.to_string()));
         audio_state.finish_playback();
         return;
@@ -3748,8 +3932,17 @@ fn run_inline_sine_test(
     // Pre-fill 50ms into the ring buffer, matching standalone
     for _ in 0..PREFILL_CHUNKS {
         fill_sine_16bit_stereo(&mut buf, &mut phase, phase_inc, AMPLITUDE);
-        if let Err(err) = audio_device.write(&buf, PREFILL_WRITE_TIMEOUT_MS) {
-            stop_audio_stream_if_connected(&audio_device, "inline sine prefill");
+        if let Err(err) = audio_device
+            .as_ref()
+            .expect("inline sine prefill should hold an audio device")
+            .write(&buf, PREFILL_WRITE_TIMEOUT_MS)
+        {
+            stop_audio_stream_if_connected(
+                audio_device
+                    .as_ref()
+                    .expect("inline sine prefill should hold an audio device"),
+                "inline sine prefill",
+            );
             let _ = started_tx.send(Err(format!("prefill write: {err}")));
             audio_state.finish_playback();
             return;
@@ -3757,17 +3950,32 @@ fn run_inline_sine_test(
     }
 
     // Wait for stream to actually start (first SOF)
-    let mut started_at_us = if audio_device.is_connected() {
-        audio_device.start_time_us()
+    let mut started_at_us = if audio_device
+        .as_ref()
+        .expect("inline sine start should hold an audio device")
+        .is_connected()
+    {
+        audio_device
+            .as_ref()
+            .expect("inline sine start should hold an audio device")
+            .start_time_us()
     } else {
         0
     };
     for _ in 0..20 {
-        if started_at_us != 0 || !audio_device.is_connected() {
+        if started_at_us != 0
+            || !audio_device
+                .as_ref()
+                .expect("inline sine start wait should hold an audio device")
+                .is_connected()
+        {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
-        started_at_us = audio_device.start_time_us();
+        started_at_us = audio_device
+            .as_ref()
+            .expect("inline sine start wait should hold an audio device")
+            .start_time_us();
     }
     if started_at_us == 0 {
         started_at_us = usb_audio::server_time_us();
@@ -3791,7 +3999,9 @@ fn run_inline_sine_test(
     for _ in 0..TOTAL_CHUNKS {
         fill_sine_16bit_stereo(&mut buf, &mut phase, phase_inc, AMPLITUDE);
         match write_audio_chunk_with_retry(
-            &audio_device,
+            audio_device
+                .as_ref()
+                .expect("inline sine stream should hold an audio device"),
             &buf,
             STREAM_WRITE_TIMEOUT_MS,
             STREAM_WRITE_MAX_ATTEMPTS,
@@ -3808,9 +4018,17 @@ fn run_inline_sine_test(
     }
     let stream_elapsed_ms = (usb_audio::server_time_us() - stream_start_us) / 1000;
 
-    let stream_connected = audio_device.is_connected();
+    let stream_connected = audio_device
+        .as_ref()
+        .expect("inline sine completion should hold an audio device")
+        .is_connected();
     let allow_source_restore = !stream_failed && stream_connected;
-    log_audio_feedback_if_connected(&audio_device, "inline sine");
+    log_audio_feedback_if_connected(
+        audio_device
+            .as_ref()
+            .expect("inline sine completion should hold an audio device"),
+        "inline sine",
+    );
     info!(
         "inline sine test complete: {} writes in {} ms, tx_need_data={}",
         writes,
@@ -3818,7 +4036,16 @@ fn run_inline_sine_test(
         usb_audio::tx_need_data_count()
     );
 
-    stop_audio_stream_if_connected(&audio_device, "inline sine");
+    stop_audio_stream_if_connected(
+        audio_device
+            .as_ref()
+            .expect("inline sine completion should hold an audio device"),
+        "inline sine",
+    );
+
+    if allow_source_restore && restore_source.is_some() {
+        drop(audio_device.take());
+    }
 
     if allow_source_restore {
         if let Err(err) =
@@ -4858,13 +5085,23 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
         ("Cache-Control", cache_control),
     ];
     let mut resp = req.into_response(200, None, &headers)?;
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; LARGE_RESPONSE_STREAM_CHUNK_BYTES];
+    let mut chunks_written = 0usize;
     loop {
-        let n = std::io::Read::read(&mut file, &mut buf).unwrap_or(0);
-        if n == 0 {
+        let n = match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => {
+                warn!("static file read failed for {path}: {err}");
+                break;
+            }
+        };
+        if let Err(err) = resp.write_all(&buf[..n]) {
+            warn!("static file write failed for {path}: {err}");
             break;
         }
-        resp.write_all(&buf[..n])?;
+        chunks_written += 1;
+        maybe_yield_large_response(chunks_written);
     }
     Ok(())
 }
@@ -4926,8 +5163,9 @@ fn proxy_catalogue_file<C: esp_idf_svc::http::server::Connection>(
         ];
         req.into_response(200, None, &headers)?
     };
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; LARGE_RESPONSE_STREAM_CHUNK_BYTES];
     let mut total_sent = 0usize;
+    let mut chunks_written = 0usize;
     let expected_len = content_length
         .as_deref()
         .and_then(|len| len.parse::<usize>().ok());
@@ -4945,6 +5183,8 @@ fn proxy_catalogue_file<C: esp_idf_svc::http::server::Connection>(
             warn!("catalogue proxy: downstream write failed for {url}: {e}");
             break;
         }
+        chunks_written += 1;
+        maybe_yield_large_response(chunks_written);
         if expected_len.is_some_and(|len| total_sent >= len) {
             break;
         }

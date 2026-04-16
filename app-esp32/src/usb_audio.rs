@@ -301,6 +301,15 @@ pub fn install(state: SharedAudioState) -> Result<(), UsbAudioError> {
     Ok(())
 }
 
+pub fn restart(state: SharedAudioState, reason: &str) -> Result<(), UsbAudioError> {
+    info!("restarting UAC2 host driver ({reason})");
+    unsafe {
+        esp_ok(uac2_host_uninstall())
+            .map_err(|e| UsbAudioError::Install(format!("uac2_host_uninstall: {e}")))?;
+    }
+    install(state)
+}
+
 pub fn server_time_us() -> i64 {
     unsafe { esp_timer_get_time() }
 }
@@ -711,6 +720,7 @@ struct uac2_host_dev_alt_param_t {
 
 unsafe extern "C" {
     fn uac2_host_install(config: *const uac2_host_driver_config_t) -> esp_err_t;
+    fn uac2_host_uninstall() -> esp_err_t;
     fn uac2_host_device_open(
         config: *const uac2_host_device_config_t,
         out_handle: *mut uac2_host_device_handle_t,

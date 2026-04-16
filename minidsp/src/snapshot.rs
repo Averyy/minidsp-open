@@ -155,6 +155,41 @@ impl DeviceSnapshot {
     }
 }
 
+fn preset_payload_matches(expected: &PresetSnapshot, actual: &PresetSnapshot) -> bool {
+    if expected.shadow != actual.shadow {
+        return false;
+    }
+
+    if expected.fir_blocks.len() != actual.fir_blocks.len() {
+        return false;
+    }
+
+    for expected_block in &expected.fir_blocks {
+        let Some(actual_block) = actual
+            .fir_blocks
+            .iter()
+            .find(|block| block.data_start == expected_block.data_start)
+        else {
+            return false;
+        };
+
+        if expected_block.coefficients.len() != actual_block.coefficients.len() {
+            return false;
+        }
+
+        if expected_block
+            .coefficients
+            .iter()
+            .zip(&actual_block.coefficients)
+            .any(|(left, right)| !approx_equal(*left, *right, 1e-6))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotTool {
@@ -417,10 +452,12 @@ impl MiniDspClient {
             ));
         }
 
+        let current = self.capture_device_snapshot().await?;
         let mut presets = snapshot.presets.clone();
         presets.sort_by_key(|preset| preset.slot);
         for preset in &presets {
-            self.restore_preset_snapshot(preset).await?;
+            let current_preset = current.preset_by_slot(preset.slot);
+            self.restore_preset_snapshot(preset, current_preset).await?;
         }
 
         self.restore_master_state(&snapshot.master).await?;
@@ -435,7 +472,11 @@ impl MiniDspClient {
         }
     }
 
-    async fn restore_preset_snapshot(&self, preset: &PresetSnapshot) -> Result<(), ClientError> {
+    async fn restore_preset_snapshot(
+        &self,
+        preset: &PresetSnapshot,
+        current: Option<&PresetSnapshot>,
+    ) -> Result<(), ClientError> {
         let shadow = preset.shadow.as_ref().ok_or_else(|| {
             ClientError::Protocol(format!(
                 "preset {} has no restorable shadow payload",
@@ -443,11 +484,22 @@ impl MiniDspClient {
             ))
         })?;
 
-        self.set_config_with_mode(preset.slot, commands::PRESET_CHANGE_WITHOUT_RESET)
-            .await?;
-        apply_shadow_to_active_preset(self, shadow, &preset.fir_blocks).await?;
+        let payload_matches = current.is_some_and(|current| preset_payload_matches(preset, current));
+        if payload_matches {
+            tracing::info!(
+                "snapshot restore: skipping preset {} payload rewrite; current state already matches",
+                preset.slot
+            );
+        } else {
+            self.set_config_with_mode(preset.slot, commands::PRESET_CHANGE_WITHOUT_RESET)
+                .await?;
+            apply_shadow_to_active_preset(self, shadow, &preset.fir_blocks).await?;
+        }
 
-        if let Some(token) = preset.token.as_deref() {
+        let token_matches = current.is_some_and(|current| current.token == preset.token);
+        if let Some(token) = preset.token.as_deref()
+            && !token_matches
+        {
             self.write_preset_token_exact(preset.slot, parse_hex_token(token)?)
                 .await?;
         }
@@ -1816,5 +1868,66 @@ mod tests {
         let source = build_default_preset_source(&profile, default_preset_image_for_dsp(100));
         assert!(source.shadow.is_some());
         assert!(source.issues.is_empty());
+    }
+
+    #[test]
+    fn preset_payload_matches_ignores_token_and_matches_same_shadow() {
+        let shadow = PresetShadowState::default();
+        let expected = PresetSnapshot {
+            slot: 0,
+            token: Some("aaaaaaaa".into()),
+            complete: true,
+            provenance: vec![SnapshotProvenance::ControllerShadow],
+            completeness: SnapshotCompleteness {
+                strict: true,
+                issues: Vec::new(),
+            },
+            shadow: Some(shadow.clone()),
+            fir_blocks: vec![SnapshotFirBlock {
+                data_start: 10,
+                coefficients: vec![1.0, 0.0, 0.0],
+            }],
+        };
+        let actual = PresetSnapshot {
+            token: Some("bbbbbbbb".into()),
+            ..expected.clone()
+        };
+
+        assert!(preset_payload_matches(&expected, &actual));
+    }
+
+    #[test]
+    fn preset_payload_matches_rejects_different_shadow_or_fir() {
+        let expected = PresetSnapshot {
+            slot: 0,
+            token: Some("aaaaaaaa".into()),
+            complete: true,
+            provenance: vec![SnapshotProvenance::ControllerShadow],
+            completeness: SnapshotCompleteness {
+                strict: true,
+                issues: Vec::new(),
+            },
+            shadow: Some(PresetShadowState::default()),
+            fir_blocks: vec![SnapshotFirBlock {
+                data_start: 10,
+                coefficients: vec![1.0, 0.0, 0.0],
+            }],
+        };
+        let mut different_shadow = PresetShadowState::default();
+        different_shadow.scalar.insert(42, 123);
+        let actual_shadow = PresetSnapshot {
+            shadow: Some(different_shadow),
+            ..expected.clone()
+        };
+        let actual_fir = PresetSnapshot {
+            fir_blocks: vec![SnapshotFirBlock {
+                data_start: 10,
+                coefficients: vec![0.5, 0.0, 0.0],
+            }],
+            ..expected.clone()
+        };
+
+        assert!(!preset_payload_matches(&expected, &actual_shadow));
+        assert!(!preset_payload_matches(&expected, &actual_fir));
     }
 }

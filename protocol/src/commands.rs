@@ -1730,7 +1730,8 @@ mod tests {
     /// — if this test fails, the on-wire encoding has drifted from the
     /// official format and live writes against real hardware will be wrong.
     ///
-    /// XML defaults from `app/Audio Firmware/100/DSP_default_parameters.xml`:
+    /// XML defaults from
+    /// `protocol/assets/audio_firmware/100/DSP_default_parameters.xml`:
     ///   threshold C1F00000 = -30.0
     ///   gain      00000000 =  0.0
     ///   ratio     40800000 =  4.0

@@ -1,0 +1,1618 @@
+<XML>
+	<DSP_ID>113</DSP_ID>
+	<plugin>
+        <!-- Allow user to rename Input Channels as LFE might not be input channel 4-->
+		<label name="Input1" text="L-Front" immutable="false"/>
+        <label name="Input2" text="R-Front" immutable="false"/>
+        <label name="Input3" text="LFE" immutable="false"/>
+        <label name="Input4" text="Center" immutable="false"/>
+        <label name="Input5" text="L-Surround" immutable="false"/>
+        <label name="Input6" text="R-Surround" immutable="false"/>
+        <label name="Input7" text="L-Back" immutable="false"/>
+        <label name="Input8" text="R-Back" immutable="false"/>
+		<label name="Output1" text="Output 1"/>
+		<label name="Output2" text="Output 2"/>
+		<label name="Output3" text="Output 3"/>
+		<label name="Output4" text="Output 4"/>
+        <label name="Output5" text="Output 5"/>
+		<label name="Output6" text="Output 6"/>
+		<label name="Output7" text="Output 7"/>
+		<label name="Output8" text="Output 8"/>
+	</plugin>
+	<dirac addr="6624" size="3332" chns="8">
+        <digital_gains cnt="2">
+            <status idx="0">2</status>
+            <db idx="2">0</db>
+            <polarity idx="7">0</polarity>
+        </digital_gains>
+        <!-- the order in memory: polarity is after both meter and delay-->
+        <meters cnt="2" idx="4">
+            <meter>0</meter>
+        </meters>
+        <delay idx="6">0</delay>
+        <mux_bypass idx="9">1</mux_bypass>
+        <dirac_delay idx="10">640</dirac_delay>
+        <mixer_fir idx="11">0</mixer_fir>
+        <mixer_iir size="30" idx="12">0</mixer_iir>
+        <fir>
+            <ctrl idx="42">640</ctrl>
+            <taps size="640" iirFraction="0x3d042108" iirFractionLocation="end" idx="43">0</taps>
+        </fir>
+        <iir fraction="0x3d042108">
+            <taps size="30" dimension="5" iirFractionDim="0" idx="683">0</taps>
+        </iir>
+    </dirac>
+	 <!-- The param_range definitions has an identifier. It will be referred by
+         the items that chooses to use it. -->
+    <params_range>
+        <gain unit="dB">
+            <min>-72</min>
+            <max>12</max>
+            <step>0.1</step>
+        </gain>
+        <delay unit="ms">
+            <min>0</min>
+            <max>30</max>
+            <step>0.02</step>
+        </delay>
+		<compressor>
+			<threshold unit="dBFS">
+				<min>-90</min>
+				<max>0</max>
+				<step>1</step>
+			</threshold>
+			<ratio>
+				<min>1</min>
+				<max>50</max>
+				<step>0.1</step>
+			</ratio>
+			<atime unit="ms">
+				<min>15</min>
+				<max>100</max>
+				<step>1</step>
+			</atime>
+			<rtime unit="ms">
+				<min>15</min>
+				<max>1000</max>
+				<step>1</step>
+			</rtime>
+		</compressor>
+		<bpf>
+			<frequency unit="Hz">
+				<min>10</min>
+				<max>20000</max>
+				<step>1</step>
+			</frequency>
+		</bpf>
+		<peq>
+			<frequency unit="Hz">
+				<min>10</min>
+				<max>20000</max>
+				<step>1</step>
+			</frequency>
+			<gain unit="dB">
+				<min>-16</min>
+				<max>16</max>
+				<step>0.1</step>
+			</gain>
+			<q>
+				<min>0.5</min>
+				<max>50</max>
+				<step>0.1</step>
+			</q>
+		</peq>
+        <bmbpf>
+			<frequency unit="Hz">
+				<min>10</min>
+				<max>1000</max>
+				<step>1</step>
+			</frequency>
+		</bmbpf>
+    </params_range>
+    <compat_params_remap>
+        <!-- Device Console parameters that is renamed -->
+        <rename from="BM_DGain_1_0" to="BM_DGain_1"/>
+        <rename from="BM_DGain_2_0" to="BM_DGain_2"/>
+        <rename from="BM_DGain_3_0" to="BM_DGain_3"/>
+        <rename from="BM_DGain_4_0" to="BM_DGain_4"/>
+        <rename from="BM_DGain_5_0" to="BM_DGain_5"/>
+        <rename from="BM_DGain_6_0" to="BM_DGain_6"/>
+        <rename from="BM_DGain_7_0" to="BM_DGain_7"/>
+        <rename from="BM_DGain_8_0" to="BM_DGain_8"/>
+    </compat_params_remap>
+	<params addr="0" size="6624">
+        <!-- These two filter is to set all the below BM filter at once -->
+		<!-- When bypassing the LPF filter, the BM mixer will have a 1 to 1 crosspoint enable, when un-bypassing, the LFE of the mixer will disable and BM will replace it -->
+		<!-- Bypassing the HPF filter will not cause the BM mixer to change -->
+		<filter type="BM_BPF_ALL" band="1" idx="0">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF_ALL" band="5" idx="20">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <item name="BM_DGain_1_status" rep="integer" idx="40">00000001</item>
+		<item name="BM_DGain_2_status" rep="integer" idx="41">00000001</item>
+		<item name="BM_DGain_3_status" rep="integer" idx="42">00000001</item>
+		<item name="BM_DGain_4_status" rep="integer" idx="43">00000001</item>
+        <item name="BM_DGain_5_status" rep="integer" idx="44">00000001</item>
+		<item name="BM_DGain_6_status" rep="integer" idx="45">00000001</item>
+		<item name="BM_DGain_7_status" rep="integer" idx="46">00000001</item>
+		<item name="BM_DGain_8_status" rep="integer" idx="47">00000001</item>
+        <item name="BM_DGain_1" rep="float" range="gain" idx="48">00000000</item>
+        <item name="BM_DGain_2" rep="float" range="gain" idx="49">00000000</item>
+        <item name="BM_DGain_3" rep="float" range="gain" idx="50">00000000</item>
+        <item name="BM_DGain_4" rep="float" range="gain" idx="51">00000000</item>
+        <item name="BM_DGain_5" rep="float" range="gain" idx="52">00000000</item>
+        <item name="BM_DGain_6" rep="float" range="gain" idx="53">00000000</item>
+        <item name="BM_DGain_7" rep="float" range="gain" idx="54">00000000</item>
+        <item name="BM_DGain_8" rep="float" range="gain" idx="55">00000000</item>	
+        <item name="BM_Mixer_1_1_status" rep="integer" idx="56">00000002</item>
+		<item name="BM_Mixer_1_2_status" rep="integer" idx="57">00000001</item>
+		<item name="BM_Mixer_1_3_status" rep="integer" idx="58">00000001</item>
+		<item name="BM_Mixer_1_4_status" rep="integer" idx="59">00000001</item>
+        <item name="BM_Mixer_1_5_status" rep="integer" idx="60">00000001</item>
+		<item name="BM_Mixer_1_6_status" rep="integer" idx="61">00000001</item>
+		<item name="BM_Mixer_1_7_status" rep="integer" idx="62">00000001</item>
+		<item name="BM_Mixer_1_8_status" rep="integer" idx="63">00000001</item>
+		<item name="BM_Mixer_2_1_status" rep="integer" idx="64">00000001</item>
+		<item name="BM_Mixer_2_2_status" rep="integer" idx="65">00000002</item>
+		<item name="BM_Mixer_2_3_status" rep="integer" idx="66">00000001</item>
+		<item name="BM_Mixer_2_4_status" rep="integer" idx="67">00000001</item>
+        <item name="BM_Mixer_2_5_status" rep="integer" idx="68">00000001</item>
+		<item name="BM_Mixer_2_6_status" rep="integer" idx="69">00000001</item>
+		<item name="BM_Mixer_2_7_status" rep="integer" idx="70">00000001</item>
+		<item name="BM_Mixer_2_8_status" rep="integer" idx="71">00000001</item>	
+		<item name="BM_Mixer_3_1_status" rep="integer" idx="72">00000001</item>
+		<item name="BM_Mixer_3_2_status" rep="integer" idx="73">00000001</item>
+		<item name="BM_Mixer_3_3_status" rep="integer" idx="74">00000002</item>
+		<item name="BM_Mixer_3_4_status" rep="integer" idx="75">00000001</item>
+        <item name="BM_Mixer_3_5_status" rep="integer" idx="76">00000001</item>
+		<item name="BM_Mixer_3_6_status" rep="integer" idx="77">00000001</item>
+		<item name="BM_Mixer_3_7_status" rep="integer" idx="78">00000001</item>
+		<item name="BM_Mixer_3_8_status" rep="integer" idx="79">00000001</item>
+		<item name="BM_Mixer_4_1_status" rep="integer" idx="80">00000001</item>
+		<item name="BM_Mixer_4_2_status" rep="integer" idx="81">00000001</item>
+		<item name="BM_Mixer_4_3_status" rep="integer" idx="82">00000001</item>
+		<item name="BM_Mixer_4_4_status" rep="integer" idx="83">00000002</item>
+        <item name="BM_Mixer_4_5_status" rep="integer" idx="84">00000001</item>
+		<item name="BM_Mixer_4_6_status" rep="integer" idx="85">00000001</item>
+		<item name="BM_Mixer_4_7_status" rep="integer" idx="86">00000001</item>
+		<item name="BM_Mixer_4_8_status" rep="integer" idx="87">00000001</item>	
+		<item name="BM_Mixer_5_1_status" rep="integer" idx="88">00000001</item>
+		<item name="BM_Mixer_5_2_status" rep="integer" idx="89">00000001</item>
+		<item name="BM_Mixer_5_3_status" rep="integer" idx="90">00000001</item>
+		<item name="BM_Mixer_5_4_status" rep="integer" idx="91">00000001</item>
+        <item name="BM_Mixer_5_5_status" rep="integer" idx="92">00000002</item>
+		<item name="BM_Mixer_5_6_status" rep="integer" idx="93">00000001</item>
+		<item name="BM_Mixer_5_7_status" rep="integer" idx="94">00000001</item>
+		<item name="BM_Mixer_5_8_status" rep="integer" idx="95">00000001</item>
+		<item name="BM_Mixer_6_1_status" rep="integer" idx="96">00000001</item>
+		<item name="BM_Mixer_6_2_status" rep="integer" idx="97">00000001</item>
+		<item name="BM_Mixer_6_3_status" rep="integer" idx="98">00000001</item>
+		<item name="BM_Mixer_6_4_status" rep="integer" idx="99">00000001</item>
+        <item name="BM_Mixer_6_5_status" rep="integer" idx="100">00000001</item>
+		<item name="BM_Mixer_6_6_status" rep="integer" idx="101">00000002</item>
+		<item name="BM_Mixer_6_7_status" rep="integer" idx="102">00000001</item>
+		<item name="BM_Mixer_6_8_status" rep="integer" idx="103">00000001</item>	
+		<item name="BM_Mixer_7_1_status" rep="integer" idx="104">00000001</item>
+		<item name="BM_Mixer_7_2_status" rep="integer" idx="105">00000001</item>
+		<item name="BM_Mixer_7_3_status" rep="integer" idx="106">00000001</item>
+		<item name="BM_Mixer_7_4_status" rep="integer" idx="107">00000001</item>
+        <item name="BM_Mixer_7_5_status" rep="integer" idx="108">00000001</item>
+		<item name="BM_Mixer_7_6_status" rep="integer" idx="109">00000001</item>
+		<item name="BM_Mixer_7_7_status" rep="integer" idx="110">00000002</item>
+		<item name="BM_Mixer_7_8_status" rep="integer" idx="111">00000001</item>
+		<item name="BM_Mixer_8_1_status" rep="integer" idx="112">00000001</item>
+		<item name="BM_Mixer_8_2_status" rep="integer" idx="113">00000001</item>
+		<item name="BM_Mixer_8_3_status" rep="integer" idx="114">00000001</item>
+		<item name="BM_Mixer_8_4_status" rep="integer" idx="115">00000001</item>
+        <item name="BM_Mixer_8_5_status" rep="integer" idx="116">00000001</item>
+		<item name="BM_Mixer_8_6_status" rep="integer" idx="117">00000001</item>
+		<item name="BM_Mixer_8_7_status" rep="integer" idx="118">00000001</item>
+		<item name="BM_Mixer_8_8_status" rep="integer" idx="119">00000002</item>		
+		<item name="BM_Mixer_9_1_status" rep="integer" idx="120">00000001</item>
+		<item name="BM_Mixer_9_2_status" rep="integer" idx="121">00000001</item>
+		<item name="BM_Mixer_9_3_status" rep="integer" idx="122">00000001</item>
+		<item name="BM_Mixer_9_4_status" rep="integer" idx="123">00000001</item>
+        <item name="BM_Mixer_9_5_status" rep="integer" idx="124">00000001</item>
+		<item name="BM_Mixer_9_6_status" rep="integer" idx="125">00000001</item>
+		<item name="BM_Mixer_9_7_status" rep="integer" idx="126">00000001</item>
+		<item name="BM_Mixer_9_8_status" rep="integer" idx="127">00000001</item>
+        <item name="BM_Mixer_1_1" rep="float" range="gain" idx="128">00000000</item>
+		<item name="BM_Mixer_1_2" rep="float" range="gain" idx="129">00000000</item>
+		<item name="BM_Mixer_1_3" rep="float" range="gain" idx="130">00000000</item>
+		<item name="BM_Mixer_1_4" rep="float" range="gain" idx="131">00000000</item>
+        <item name="BM_Mixer_1_5" rep="float" range="gain" idx="132">00000000</item>
+		<item name="BM_Mixer_1_6" rep="float" range="gain" idx="133">00000000</item>
+		<item name="BM_Mixer_1_7" rep="float" range="gain" idx="134">00000000</item>
+		<item name="BM_Mixer_1_8" rep="float" range="gain" idx="135">00000000</item>
+		<item name="BM_Mixer_2_1" rep="float" range="gain" idx="136">00000000</item>
+		<item name="BM_Mixer_2_2" rep="float" range="gain" idx="137">00000000</item>
+		<item name="BM_Mixer_2_3" rep="float" range="gain" idx="138">00000000</item>
+		<item name="BM_Mixer_2_4" rep="float" range="gain" idx="139">00000000</item>
+        <item name="BM_Mixer_2_5" rep="float" range="gain" idx="140">00000000</item>
+		<item name="BM_Mixer_2_6" rep="float" range="gain" idx="141">00000000</item>
+		<item name="BM_Mixer_2_7" rep="float" range="gain" idx="142">00000000</item>
+		<item name="BM_Mixer_2_8" rep="float" range="gain" idx="143">00000000</item>
+		<item name="BM_Mixer_3_1" rep="float" range="gain" idx="144">00000000</item>
+		<item name="BM_Mixer_3_2" rep="float" range="gain" idx="145">00000000</item>
+		<item name="BM_Mixer_3_3" rep="float" range="gain" idx="146">00000000</item>
+		<item name="BM_Mixer_3_4" rep="float" range="gain" idx="147">00000000</item>
+        <item name="BM_Mixer_3_5" rep="float" range="gain" idx="148">00000000</item>
+		<item name="BM_Mixer_3_6" rep="float" range="gain" idx="149">00000000</item>
+		<item name="BM_Mixer_3_7" rep="float" range="gain" idx="150">00000000</item>
+		<item name="BM_Mixer_3_8" rep="float" range="gain" idx="151">00000000</item>
+		<item name="BM_Mixer_4_1" rep="float" range="gain" idx="152">00000000</item>
+		<item name="BM_Mixer_4_2" rep="float" range="gain" idx="153">00000000</item>
+		<item name="BM_Mixer_4_3" rep="float" range="gain" idx="154">00000000</item>
+		<item name="BM_Mixer_4_4" rep="float" range="gain" idx="155">00000000</item>
+        <item name="BM_Mixer_4_5" rep="float" range="gain" idx="156">00000000</item>
+		<item name="BM_Mixer_4_6" rep="float" range="gain" idx="157">00000000</item>
+		<item name="BM_Mixer_4_7" rep="float" range="gain" idx="158">00000000</item>
+		<item name="BM_Mixer_4_8" rep="float" range="gain" idx="159">00000000</item>
+		<item name="BM_Mixer_5_1" rep="float" range="gain" idx="160">00000000</item>
+		<item name="BM_Mixer_5_2" rep="float" range="gain" idx="161">00000000</item>
+		<item name="BM_Mixer_5_3" rep="float" range="gain" idx="162">00000000</item>
+		<item name="BM_Mixer_5_4" rep="float" range="gain" idx="163">00000000</item>
+        <item name="BM_Mixer_5_5" rep="float" range="gain" idx="164">00000000</item>
+		<item name="BM_Mixer_5_6" rep="float" range="gain" idx="165">00000000</item>
+		<item name="BM_Mixer_5_7" rep="float" range="gain" idx="166">00000000</item>
+		<item name="BM_Mixer_5_8" rep="float" range="gain" idx="167">00000000</item>
+		<item name="BM_Mixer_6_1" rep="float" range="gain" idx="168">00000000</item>
+		<item name="BM_Mixer_6_2" rep="float" range="gain" idx="169">00000000</item>
+		<item name="BM_Mixer_6_3" rep="float" range="gain" idx="170">00000000</item>
+		<item name="BM_Mixer_6_4" rep="float" range="gain" idx="171">00000000</item>
+        <item name="BM_Mixer_6_5" rep="float" range="gain" idx="172">00000000</item>
+		<item name="BM_Mixer_6_6" rep="float" range="gain" idx="173">00000000</item>
+		<item name="BM_Mixer_6_7" rep="float" range="gain" idx="174">00000000</item>
+		<item name="BM_Mixer_6_8" rep="float" range="gain" idx="175">00000000</item>
+		<item name="BM_Mixer_7_1" rep="float" range="gain" idx="176">00000000</item>
+		<item name="BM_Mixer_7_2" rep="float" range="gain" idx="177">00000000</item>
+		<item name="BM_Mixer_7_3" rep="float" range="gain" idx="178">00000000</item>
+		<item name="BM_Mixer_7_4" rep="float" range="gain" idx="179">00000000</item>
+        <item name="BM_Mixer_7_5" rep="float" range="gain" idx="180">00000000</item>
+		<item name="BM_Mixer_7_6" rep="float" range="gain" idx="181">00000000</item>
+		<item name="BM_Mixer_7_7" rep="float" range="gain" idx="182">00000000</item>
+		<item name="BM_Mixer_7_8" rep="float" range="gain" idx="183">00000000</item>
+		<item name="BM_Mixer_8_1" rep="float" range="gain" idx="184">00000000</item>
+		<item name="BM_Mixer_8_2" rep="float" range="gain" idx="185">00000000</item>
+		<item name="BM_Mixer_8_3" rep="float" range="gain" idx="186">00000000</item>
+		<item name="BM_Mixer_8_4" rep="float" range="gain" idx="187">00000000</item>
+        <item name="BM_Mixer_8_5" rep="float" range="gain" idx="188">00000000</item>
+		<item name="BM_Mixer_8_6" rep="float" range="gain" idx="189">00000000</item>
+		<item name="BM_Mixer_8_7" rep="float" range="gain" idx="190">00000000</item>
+		<item name="BM_Mixer_8_8" rep="float" range="gain" idx="191">00000000</item>	
+		<item name="BM_Mixer_9_1" rep="float" range="gain" idx="192">00000000</item>
+		<item name="BM_Mixer_9_2" rep="float" range="gain" idx="193">00000000</item>
+		<item name="BM_Mixer_9_3" rep="float" range="gain" idx="194">00000000</item>
+		<item name="BM_Mixer_9_4" rep="float" range="gain" idx="195">00000000</item>
+        <item name="BM_Mixer_9_5" rep="float" range="gain" idx="196">00000000</item>
+		<item name="BM_Mixer_9_6" rep="float" range="gain" idx="197">00000000</item>
+		<item name="BM_Mixer_9_7" rep="float" range="gain" idx="198">00000000</item>
+		<item name="BM_Mixer_9_8" rep="float" range="gain" idx="199">00000000</item>
+        <item name="BM_Mixer_1_1_pol" rep="integer" idx="200">00000000</item>
+		<item name="BM_Mixer_1_2_pol" rep="integer" idx="201">00000000</item>
+		<item name="BM_Mixer_1_3_pol" rep="integer" idx="202">00000000</item>
+		<item name="BM_Mixer_1_4_pol" rep="integer" idx="203">00000000</item>
+        <item name="BM_Mixer_1_5_pol" rep="integer" idx="204">00000000</item>
+		<item name="BM_Mixer_1_6_pol" rep="integer" idx="205">00000000</item>
+		<item name="BM_Mixer_1_7_pol" rep="integer" idx="206">00000000</item>
+		<item name="BM_Mixer_1_8_pol" rep="integer" idx="207">00000000</item>
+		<item name="BM_Mixer_2_1_pol" rep="integer" idx="208">00000000</item>
+		<item name="BM_Mixer_2_2_pol" rep="integer" idx="209">00000000</item>
+		<item name="BM_Mixer_2_3_pol" rep="integer" idx="210">00000000</item>
+		<item name="BM_Mixer_2_4_pol" rep="integer" idx="211">00000000</item>
+        <item name="BM_Mixer_2_5_pol" rep="integer" idx="212">00000000</item>
+		<item name="BM_Mixer_2_6_pol" rep="integer" idx="213">00000000</item>
+		<item name="BM_Mixer_2_7_pol" rep="integer" idx="214">00000000</item>
+		<item name="BM_Mixer_2_8_pol" rep="integer" idx="215">00000000</item>
+		<item name="BM_Mixer_3_1_pol" rep="integer" idx="216">00000000</item>
+		<item name="BM_Mixer_3_2_pol" rep="integer" idx="217">00000000</item>
+		<item name="BM_Mixer_3_3_pol" rep="integer" idx="218">00000000</item>
+		<item name="BM_Mixer_3_4_pol" rep="integer" idx="219">00000000</item>
+        <item name="BM_Mixer_3_5_pol" rep="integer" idx="220">00000000</item>
+		<item name="BM_Mixer_3_6_pol" rep="integer" idx="221">00000000</item>
+		<item name="BM_Mixer_3_7_pol" rep="integer" idx="222">00000000</item>
+		<item name="BM_Mixer_3_8_pol" rep="integer" idx="223">00000000</item>
+		<item name="BM_Mixer_4_1_pol" rep="integer" idx="224">00000000</item>
+		<item name="BM_Mixer_4_2_pol" rep="integer" idx="225">00000000</item>
+		<item name="BM_Mixer_4_3_pol" rep="integer" idx="226">00000000</item>
+		<item name="BM_Mixer_4_4_pol" rep="integer" idx="227">00000000</item>
+        <item name="BM_Mixer_4_5_pol" rep="integer" idx="228">00000000</item>
+		<item name="BM_Mixer_4_6_pol" rep="integer" idx="229">00000000</item>
+		<item name="BM_Mixer_4_7_pol" rep="integer" idx="230">00000000</item>
+		<item name="BM_Mixer_4_8_pol" rep="integer" idx="231">00000000</item>
+		<item name="BM_Mixer_5_1_pol" rep="integer" idx="232">00000000</item>
+		<item name="BM_Mixer_5_2_pol" rep="integer" idx="233">00000000</item>
+		<item name="BM_Mixer_5_3_pol" rep="integer" idx="234">00000000</item>
+		<item name="BM_Mixer_5_4_pol" rep="integer" idx="235">00000000</item>
+        <item name="BM_Mixer_5_5_pol" rep="integer" idx="236">00000000</item>
+		<item name="BM_Mixer_5_6_pol" rep="integer" idx="237">00000000</item>
+		<item name="BM_Mixer_5_7_pol" rep="integer" idx="238">00000000</item>
+		<item name="BM_Mixer_5_8_pol" rep="integer" idx="239">00000000</item>
+		<item name="BM_Mixer_6_1_pol" rep="integer" idx="240">00000000</item>
+		<item name="BM_Mixer_6_2_pol" rep="integer" idx="241">00000000</item>
+		<item name="BM_Mixer_6_3_pol" rep="integer" idx="242">00000000</item>
+		<item name="BM_Mixer_6_4_pol" rep="integer" idx="243">00000000</item>
+        <item name="BM_Mixer_6_5_pol" rep="integer" idx="244">00000000</item>
+		<item name="BM_Mixer_6_6_pol" rep="integer" idx="245">00000000</item>
+		<item name="BM_Mixer_6_7_pol" rep="integer" idx="246">00000000</item>
+		<item name="BM_Mixer_6_8_pol" rep="integer" idx="247">00000000</item>
+		<item name="BM_Mixer_7_1_pol" rep="integer" idx="248">00000000</item>
+		<item name="BM_Mixer_7_2_pol" rep="integer" idx="249">00000000</item>
+		<item name="BM_Mixer_7_3_pol" rep="integer" idx="250">00000000</item>
+		<item name="BM_Mixer_7_4_pol" rep="integer" idx="251">00000000</item>
+        <item name="BM_Mixer_7_5_pol" rep="integer" idx="252">00000000</item>
+		<item name="BM_Mixer_7_6_pol" rep="integer" idx="253">00000000</item>
+		<item name="BM_Mixer_7_7_pol" rep="integer" idx="254">00000000</item>
+		<item name="BM_Mixer_7_8_pol" rep="integer" idx="255">00000000</item>
+		<item name="BM_Mixer_8_1_pol" rep="integer" idx="256">00000000</item>
+		<item name="BM_Mixer_8_2_pol" rep="integer" idx="257">00000000</item>
+		<item name="BM_Mixer_8_3_pol" rep="integer" idx="258">00000000</item>
+		<item name="BM_Mixer_8_4_pol" rep="integer" idx="259">00000000</item>
+        <item name="BM_Mixer_8_5_pol" rep="integer" idx="260">00000000</item>
+		<item name="BM_Mixer_8_6_pol" rep="integer" idx="261">00000000</item>
+		<item name="BM_Mixer_8_7_pol" rep="integer" idx="262">00000000</item>
+		<item name="BM_Mixer_8_8_pol" rep="integer" idx="263">00000000</item>		
+		<item name="BM_Mixer_9_1_pol" rep="integer" idx="264">00000000</item>
+		<item name="BM_Mixer_9_2_pol" rep="integer" idx="265">00000000</item>
+		<item name="BM_Mixer_9_3_pol" rep="integer" idx="266">00000000</item>
+		<item name="BM_Mixer_9_4_pol" rep="integer" idx="267">00000000</item>
+        <item name="BM_Mixer_9_5_pol" rep="integer" idx="268">00000000</item>
+		<item name="BM_Mixer_9_6_pol" rep="integer" idx="269">00000000</item>
+		<item name="BM_Mixer_9_7_pol" rep="integer" idx="270">00000000</item>
+		<item name="BM_Mixer_9_8_pol" rep="integer" idx="271">00000000</item>
+		<!-- These are the normal BM Filter -->
+		<!-- These will overwite the individual filter so when the set all is use, make sure is copy to the below as well, both bypass status and coeff --> 
+        <filter type="BM_BPF" chn="1" band="1" idx="272">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF" chn="1" band="5" idx="292">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<filter type="BM_BPF" chn="2" band="1" idx="312">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF" chn="2" band="5" idx="332">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<filter type="BM_BPF" chn="3" band="1" idx="352">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF" chn="3" band="5" idx="372">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<filter type="BM_BPF" chn="4" band="1" idx="392">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF" chn="4" band="5" idx="412">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<filter type="BM_BPF" chn="5" band="1" idx="432">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF" chn="5" band="5" idx="452">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<filter type="BM_BPF" chn="6" band="1" idx="472">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF" chn="6" band="5" idx="492">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<filter type="BM_BPF" chn="7" band="1" idx="512">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF" chn="7" band="5" idx="532">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<filter type="BM_BPF" chn="8" band="1" idx="552">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,0.000042443368140115214,0.00008488673628023043,0.000042443368140115214,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BM_BPF" chn="8" band="5" idx="572">
+            <freq range="bmbpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>LRHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,0.9907866979376808,-1.9815733958753616,0.9907866979376808,1.9814885091390815,-0.9816582826116418,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <item name="Out_Mixer_0_0_status" rep="integer" idx="592">00000002</item>
+		<item name="Out_Mixer_0_1_status" rep="integer" idx="593">00000001</item>
+		<item name="Out_Mixer_0_2_status" rep="integer" idx="594">00000001</item>
+		<item name="Out_Mixer_0_3_status" rep="integer" idx="595">00000001</item>
+        <item name="Out_Mixer_0_4_status" rep="integer" idx="596">00000001</item>
+		<item name="Out_Mixer_0_5_status" rep="integer" idx="597">00000001</item>
+		<item name="Out_Mixer_0_6_status" rep="integer" idx="598">00000001</item>
+		<item name="Out_Mixer_0_7_status" rep="integer" idx="599">00000001</item>
+		<item name="Out_Mixer_1_0_status" rep="integer" idx="600">00000001</item>
+		<item name="Out_Mixer_1_1_status" rep="integer" idx="601">00000002</item>
+		<item name="Out_Mixer_1_2_status" rep="integer" idx="602">00000001</item>
+		<item name="Out_Mixer_1_3_status" rep="integer" idx="603">00000001</item>
+        <item name="Out_Mixer_1_4_status" rep="integer" idx="604">00000001</item>
+		<item name="Out_Mixer_1_5_status" rep="integer" idx="605">00000001</item>
+		<item name="Out_Mixer_1_6_status" rep="integer" idx="606">00000001</item>
+		<item name="Out_Mixer_1_7_status" rep="integer" idx="607">00000001</item>
+		<item name="Out_Mixer_2_0_status" rep="integer" idx="608">00000001</item>
+		<item name="Out_Mixer_2_1_status" rep="integer" idx="609">00000001</item>
+		<item name="Out_Mixer_2_2_status" rep="integer" idx="610">00000002</item>
+		<item name="Out_Mixer_2_3_status" rep="integer" idx="611">00000001</item>
+        <item name="Out_Mixer_2_4_status" rep="integer" idx="612">00000001</item>
+		<item name="Out_Mixer_2_5_status" rep="integer" idx="613">00000001</item>
+		<item name="Out_Mixer_2_6_status" rep="integer" idx="614">00000001</item>
+		<item name="Out_Mixer_2_7_status" rep="integer" idx="615">00000001</item>
+		<item name="Out_Mixer_3_0_status" rep="integer" idx="616">00000001</item>
+		<item name="Out_Mixer_3_1_status" rep="integer" idx="617">00000001</item>
+		<item name="Out_Mixer_3_2_status" rep="integer" idx="618">00000001</item>
+		<item name="Out_Mixer_3_3_status" rep="integer" idx="619">00000002</item>
+        <item name="Out_Mixer_3_4_status" rep="integer" idx="620">00000001</item>
+		<item name="Out_Mixer_3_5_status" rep="integer" idx="621">00000001</item>
+		<item name="Out_Mixer_3_6_status" rep="integer" idx="622">00000001</item>
+		<item name="Out_Mixer_3_7_status" rep="integer" idx="623">00000001</item>
+		<item name="Out_Mixer_4_0_status" rep="integer" idx="624">00000001</item>
+		<item name="Out_Mixer_4_1_status" rep="integer" idx="625">00000001</item>
+		<item name="Out_Mixer_4_2_status" rep="integer" idx="626">00000001</item>
+		<item name="Out_Mixer_4_3_status" rep="integer" idx="627">00000001</item>
+        <item name="Out_Mixer_4_4_status" rep="integer" idx="628">00000002</item>
+		<item name="Out_Mixer_4_5_status" rep="integer" idx="629">00000001</item>
+		<item name="Out_Mixer_4_6_status" rep="integer" idx="630">00000001</item>
+		<item name="Out_Mixer_4_7_status" rep="integer" idx="631">00000001</item>
+		<item name="Out_Mixer_5_0_status" rep="integer" idx="632">00000001</item>
+		<item name="Out_Mixer_5_1_status" rep="integer" idx="633">00000001</item>
+		<item name="Out_Mixer_5_2_status" rep="integer" idx="634">00000001</item>
+		<item name="Out_Mixer_5_3_status" rep="integer" idx="635">00000001</item>
+        <item name="Out_Mixer_5_4_status" rep="integer" idx="636">00000001</item>
+		<item name="Out_Mixer_5_5_status" rep="integer" idx="637">00000002</item>
+		<item name="Out_Mixer_5_6_status" rep="integer" idx="638">00000001</item>
+		<item name="Out_Mixer_5_7_status" rep="integer" idx="639">00000001</item>
+		<item name="Out_Mixer_6_0_status" rep="integer" idx="640">00000001</item>
+		<item name="Out_Mixer_6_1_status" rep="integer" idx="641">00000001</item>
+		<item name="Out_Mixer_6_2_status" rep="integer" idx="642">00000001</item>
+		<item name="Out_Mixer_6_3_status" rep="integer" idx="643">00000001</item>
+        <item name="Out_Mixer_6_4_status" rep="integer" idx="644">00000001</item>
+		<item name="Out_Mixer_6_5_status" rep="integer" idx="645">00000001</item>
+		<item name="Out_Mixer_6_6_status" rep="integer" idx="646">00000002</item>
+		<item name="Out_Mixer_6_7_status" rep="integer" idx="647">00000001</item>
+		<item name="Out_Mixer_7_0_status" rep="integer" idx="648">00000001</item>
+		<item name="Out_Mixer_7_1_status" rep="integer" idx="649">00000001</item>
+		<item name="Out_Mixer_7_2_status" rep="integer" idx="650">00000001</item>
+		<item name="Out_Mixer_7_3_status" rep="integer" idx="651">00000001</item>
+        <item name="Out_Mixer_7_4_status" rep="integer" idx="652">00000001</item>
+		<item name="Out_Mixer_7_5_status" rep="integer" idx="653">00000001</item>
+		<item name="Out_Mixer_7_6_status" rep="integer" idx="654">00000001</item>
+		<item name="Out_Mixer_7_7_status" rep="integer" idx="655">00000002</item>
+        <item name="Out_Mixer_0_0" rep="float" range="gain" idx="656">00000000</item>
+		<item name="Out_Mixer_0_1" rep="float" range="gain" idx="657">00000000</item>
+		<item name="Out_Mixer_0_2" rep="float" range="gain" idx="658">00000000</item>
+		<item name="Out_Mixer_0_3" rep="float" range="gain" idx="659">00000000</item>
+        <item name="Out_Mixer_0_4" rep="float" range="gain" idx="660">00000000</item>
+		<item name="Out_Mixer_0_5" rep="float" range="gain" idx="661">00000000</item>
+		<item name="Out_Mixer_0_6" rep="float" range="gain" idx="662">00000000</item>
+		<item name="Out_Mixer_0_7" rep="float" range="gain" idx="663">00000000</item>
+		<item name="Out_Mixer_1_0" rep="float" range="gain" idx="664">00000000</item>
+		<item name="Out_Mixer_1_1" rep="float" range="gain" idx="665">00000000</item>
+		<item name="Out_Mixer_1_2" rep="float" range="gain" idx="666">00000000</item>
+		<item name="Out_Mixer_1_3" rep="float" range="gain" idx="667">00000000</item>
+        <item name="Out_Mixer_1_4" rep="float" range="gain" idx="668">00000000</item>
+		<item name="Out_Mixer_1_5" rep="float" range="gain" idx="669">00000000</item>
+		<item name="Out_Mixer_1_6" rep="float" range="gain" idx="670">00000000</item>
+		<item name="Out_Mixer_1_7" rep="float" range="gain" idx="671">00000000</item>	
+		<item name="Out_Mixer_2_0" rep="float" range="gain" idx="672">00000000</item>
+		<item name="Out_Mixer_2_1" rep="float" range="gain" idx="673">00000000</item>
+		<item name="Out_Mixer_2_2" rep="float" range="gain" idx="674">00000000</item>
+		<item name="Out_Mixer_2_3" rep="float" range="gain" idx="675">00000000</item>
+        <item name="Out_Mixer_2_4" rep="float" range="gain" idx="676">00000000</item>
+		<item name="Out_Mixer_2_5" rep="float" range="gain" idx="677">00000000</item>
+		<item name="Out_Mixer_2_6" rep="float" range="gain" idx="678">00000000</item>
+		<item name="Out_Mixer_2_7" rep="float" range="gain" idx="679">00000000</item>
+		<item name="Out_Mixer_3_0" rep="float" range="gain" idx="680">00000000</item>
+		<item name="Out_Mixer_3_1" rep="float" range="gain" idx="681">00000000</item>
+		<item name="Out_Mixer_3_2" rep="float" range="gain" idx="682">00000000</item>
+		<item name="Out_Mixer_3_3" rep="float" range="gain" idx="683">00000000</item>
+        <item name="Out_Mixer_3_4" rep="float" range="gain" idx="684">00000000</item>
+		<item name="Out_Mixer_3_5" rep="float" range="gain" idx="685">00000000</item>
+		<item name="Out_Mixer_3_6" rep="float" range="gain" idx="686">00000000</item>
+		<item name="Out_Mixer_3_7" rep="float" range="gain" idx="687">00000000</item>	
+		<item name="Out_Mixer_4_0" rep="float" range="gain" idx="688">00000000</item>
+		<item name="Out_Mixer_4_1" rep="float" range="gain" idx="689">00000000</item>
+		<item name="Out_Mixer_4_2" rep="float" range="gain" idx="690">00000000</item>
+		<item name="Out_Mixer_4_3" rep="float" range="gain" idx="691">00000000</item>
+        <item name="Out_Mixer_4_4" rep="float" range="gain" idx="692">00000000</item>
+		<item name="Out_Mixer_4_5" rep="float" range="gain" idx="693">00000000</item>
+		<item name="Out_Mixer_4_6" rep="float" range="gain" idx="694">00000000</item>
+		<item name="Out_Mixer_4_7" rep="float" range="gain" idx="695">00000000</item>
+		<item name="Out_Mixer_5_0" rep="float" range="gain" idx="696">00000000</item>
+		<item name="Out_Mixer_5_1" rep="float" range="gain" idx="697">00000000</item>
+		<item name="Out_Mixer_5_2" rep="float" range="gain" idx="698">00000000</item>
+		<item name="Out_Mixer_5_3" rep="float" range="gain" idx="699">00000000</item>
+        <item name="Out_Mixer_5_4" rep="float" range="gain" idx="700">00000000</item>
+		<item name="Out_Mixer_5_5" rep="float" range="gain" idx="701">00000000</item>
+		<item name="Out_Mixer_5_6" rep="float" range="gain" idx="702">00000000</item>
+		<item name="Out_Mixer_5_7" rep="float" range="gain" idx="703">00000000</item>	
+		<item name="Out_Mixer_6_0" rep="float" range="gain" idx="704">00000000</item>
+		<item name="Out_Mixer_6_1" rep="float" range="gain" idx="705">00000000</item>
+		<item name="Out_Mixer_6_2" rep="float" range="gain" idx="706">00000000</item>
+		<item name="Out_Mixer_6_3" rep="float" range="gain" idx="707">00000000</item>
+        <item name="Out_Mixer_6_4" rep="float" range="gain" idx="708">00000000</item>
+		<item name="Out_Mixer_6_5" rep="float" range="gain" idx="709">00000000</item>
+		<item name="Out_Mixer_6_6" rep="float" range="gain" idx="710">00000000</item>
+		<item name="Out_Mixer_6_7" rep="float" range="gain" idx="711">00000000</item>
+		<item name="Out_Mixer_7_0" rep="float" range="gain" idx="712">00000000</item>
+		<item name="Out_Mixer_7_1" rep="float" range="gain" idx="713">00000000</item>
+		<item name="Out_Mixer_7_2" rep="float" range="gain" idx="714">00000000</item>
+		<item name="Out_Mixer_7_3" rep="float" range="gain" idx="715">00000000</item>
+        <item name="Out_Mixer_7_4" rep="float" range="gain" idx="716">00000000</item>
+		<item name="Out_Mixer_7_5" rep="float" range="gain" idx="717">00000000</item>
+		<item name="Out_Mixer_7_6" rep="float" range="gain" idx="718">00000000</item>
+		<item name="Out_Mixer_7_7" rep="float" range="gain" idx="719">00000000</item>
+        <item name="Out_Mixer_0_0_pol" rep="integer" idx="720">00000000</item>
+		<item name="Out_Mixer_0_1_pol" rep="integer" idx="721">00000000</item>
+		<item name="Out_Mixer_0_2_pol" rep="integer" idx="722">00000000</item>
+		<item name="Out_Mixer_0_3_pol" rep="integer" idx="723">00000000</item>
+        <item name="Out_Mixer_0_4_pol" rep="integer" idx="724">00000000</item>
+		<item name="Out_Mixer_0_5_pol" rep="integer" idx="725">00000000</item>
+		<item name="Out_Mixer_0_6_pol" rep="integer" idx="726">00000000</item>
+		<item name="Out_Mixer_0_7_pol" rep="integer" idx="727">00000000</item>
+		<item name="Out_Mixer_1_0_pol" rep="integer" idx="728">00000000</item>
+		<item name="Out_Mixer_1_1_pol" rep="integer" idx="729">00000000</item>
+		<item name="Out_Mixer_1_2_pol" rep="integer" idx="730">00000000</item>
+		<item name="Out_Mixer_1_3_pol" rep="integer" idx="731">00000000</item>
+        <item name="Out_Mixer_1_4_pol" rep="integer" idx="732">00000000</item>
+		<item name="Out_Mixer_1_5_pol" rep="integer" idx="733">00000000</item>
+		<item name="Out_Mixer_1_6_pol" rep="integer" idx="734">00000000</item>
+		<item name="Out_Mixer_1_7_pol" rep="integer" idx="735">00000000</item>
+		<item name="Out_Mixer_2_0_pol" rep="integer" idx="736">00000000</item>
+		<item name="Out_Mixer_2_1_pol" rep="integer" idx="737">00000000</item>
+		<item name="Out_Mixer_2_2_pol" rep="integer" idx="738">00000000</item>
+		<item name="Out_Mixer_2_3_pol" rep="integer" idx="739">00000000</item>
+        <item name="Out_Mixer_2_4_pol" rep="integer" idx="740">00000000</item>
+		<item name="Out_Mixer_2_5_pol" rep="integer" idx="741">00000000</item>
+		<item name="Out_Mixer_2_6_pol" rep="integer" idx="742">00000000</item>
+		<item name="Out_Mixer_2_7_pol" rep="integer" idx="743">00000000</item>
+		<item name="Out_Mixer_3_0_pol" rep="integer" idx="744">00000000</item>
+		<item name="Out_Mixer_3_1_pol" rep="integer" idx="745">00000000</item>
+		<item name="Out_Mixer_3_2_pol" rep="integer" idx="746">00000000</item>
+		<item name="Out_Mixer_3_3_pol" rep="integer" idx="747">00000000</item>
+        <item name="Out_Mixer_3_4_pol" rep="integer" idx="748">00000000</item>
+		<item name="Out_Mixer_3_5_pol" rep="integer" idx="749">00000000</item>
+		<item name="Out_Mixer_3_6_pol" rep="integer" idx="750">00000000</item>
+		<item name="Out_Mixer_3_7_pol" rep="integer" idx="751">00000000</item>
+		<item name="Out_Mixer_4_0_pol" rep="integer" idx="752">00000000</item>
+		<item name="Out_Mixer_4_1_pol" rep="integer" idx="753">00000000</item>
+		<item name="Out_Mixer_4_2_pol" rep="integer" idx="754">00000000</item>
+		<item name="Out_Mixer_4_3_pol" rep="integer" idx="755">00000000</item>
+        <item name="Out_Mixer_4_4_pol" rep="integer" idx="756">00000000</item>
+		<item name="Out_Mixer_4_5_pol" rep="integer" idx="757">00000000</item>
+		<item name="Out_Mixer_4_6_pol" rep="integer" idx="758">00000000</item>
+		<item name="Out_Mixer_4_7_pol" rep="integer" idx="759">00000000</item>
+		<item name="Out_Mixer_5_0_pol" rep="integer" idx="760">00000000</item>
+		<item name="Out_Mixer_5_1_pol" rep="integer" idx="761">00000000</item>
+		<item name="Out_Mixer_5_2_pol" rep="integer" idx="762">00000000</item>
+		<item name="Out_Mixer_5_3_pol" rep="integer" idx="763">00000000</item>
+        <item name="Out_Mixer_5_4_pol" rep="integer" idx="764">00000000</item>
+		<item name="Out_Mixer_5_5_pol" rep="integer" idx="765">00000000</item>
+		<item name="Out_Mixer_5_6_pol" rep="integer" idx="766">00000000</item>
+		<item name="Out_Mixer_5_7_pol" rep="integer" idx="767">00000000</item>
+		<item name="Out_Mixer_6_0_pol" rep="integer" idx="768">00000000</item>
+		<item name="Out_Mixer_6_1_pol" rep="integer" idx="769">00000000</item>
+		<item name="Out_Mixer_6_2_pol" rep="integer" idx="770">00000000</item>
+		<item name="Out_Mixer_6_3_pol" rep="integer" idx="771">00000000</item>
+        <item name="Out_Mixer_6_4_pol" rep="integer" idx="772">00000000</item>
+		<item name="Out_Mixer_6_5_pol" rep="integer" idx="773">00000000</item>
+		<item name="Out_Mixer_6_6_pol" rep="integer" idx="774">00000000</item>
+		<item name="Out_Mixer_6_7_pol" rep="integer" idx="775">00000000</item>
+		<item name="Out_Mixer_7_0_pol" rep="integer" idx="776">00000000</item>
+		<item name="Out_Mixer_7_1_pol" rep="integer" idx="777">00000000</item>
+		<item name="Out_Mixer_7_2_pol" rep="integer" idx="778">00000000</item>
+		<item name="Out_Mixer_7_3_pol" rep="integer" idx="779">00000000</item>
+        <item name="Out_Mixer_7_4_pol" rep="integer" idx="780">00000000</item>
+		<item name="Out_Mixer_7_5_pol" rep="integer" idx="781">00000000</item>
+		<item name="Out_Mixer_7_6_pol" rep="integer" idx="782">00000000</item>
+		<item name="Out_Mixer_7_7_pol" rep="integer" idx="783">00000000</item>
+        <item name="Meter_In_1" rep="integer" idx="784">00000000</item>
+        <item name="Meter_In_2" rep="integer" idx="785">00000000</item>
+		<item name="Meter_In_3" rep="integer" idx="786">00000000</item>
+        <item name="Meter_In_4" rep="integer" idx="787">00000000</item>
+		<item name="Meter_In_5" rep="integer" idx="788">00000000</item>
+        <item name="Meter_In_6" rep="integer" idx="789">00000000</item>
+		<item name="Meter_In_7" rep="integer" idx="790">00000000</item>
+        <item name="Meter_In_8" rep="integer" idx="791">00000000</item>
+  		<item name="Meter_D_In_1" rep="integer" idx="792">00000000</item>
+        <item name="Meter_D_In_2" rep="integer" idx="793">00000000</item>
+		<item name="Meter_D_In_3" rep="integer" idx="794">00000000</item>
+        <item name="Meter_D_In_4" rep="integer" idx="795">00000000</item>
+		<item name="Meter_D_In_5" rep="integer" idx="796">00000000</item>
+        <item name="Meter_D_In_6" rep="integer" idx="797">00000000</item>
+		<item name="Meter_D_In_7" rep="integer" idx="798">00000000</item>
+        <item name="Meter_D_In_8" rep="integer" idx="799">00000000</item>
+        <item name="Meter_D_Out_1" rep="integer" idx="800">00000000</item>
+        <item name="Meter_D_Out_2" rep="integer" idx="801">00000000</item>
+		<item name="Meter_D_Out_3" rep="integer" idx="802">00000000</item>
+        <item name="Meter_D_Out_4" rep="integer" idx="803">00000000</item>
+		<item name="Meter_D_Out_5" rep="integer" idx="804">00000000</item>
+        <item name="Meter_D_Out_6" rep="integer" idx="805">00000000</item>
+		<item name="Meter_D_Out_7" rep="integer" idx="806">00000000</item>
+        <item name="Meter_D_Out_8" rep="integer" idx="807">00000000</item>
+		<item name="Meter_Comp_1" rep="integer" idx="808">00000000</item>
+        <item name="Meter_Comp_2" rep="integer" idx="809">00000000</item>
+        <item name="Meter_Comp_3" rep="integer" idx="810">00000000</item>
+        <item name="Meter_Comp_4" rep="integer" idx="811">00000000</item>
+        <item name="Meter_Comp_5" rep="integer" idx="812">00000000</item>
+        <item name="Meter_Comp_6" rep="integer" idx="813">00000000</item>
+        <item name="Meter_Comp_7" rep="integer" idx="814">00000000</item>
+        <item name="Meter_Comp_8" rep="integer" idx="815">00000000</item>
+        <item name="Meter_Out_1" rep="integer" idx="816">00000000</item>
+        <item name="Meter_Out_2" rep="integer" idx="817">00000000</item>
+        <item name="Meter_Out_3" rep="integer" idx="818">00000000</item>
+        <item name="Meter_Out_4" rep="integer" idx="819">00000000</item>
+        <item name="Meter_Out_5" rep="integer" idx="820">00000000</item>
+        <item name="Meter_Out_6" rep="integer" idx="821">00000000</item>
+        <item name="Meter_Out_7" rep="integer" idx="822">00000000</item>
+        <item name="Meter_Out_8" rep="integer" idx="823">00000000</item>
+        <item name="DGain_1_0_status" rep="integer" idx="824">00000002</item>
+        <item name="COMP_1_0_status" rep="integer" idx="825">00000003</item>
+        <item name="DGain_1_0" rep="float" range="gain" idx="826">00000000</item>
+        <item name="COMP_1_0_threshold" rep="float" range="compressor/threshold" idx="827">C1F00000</item>
+        <item name="COMP_1_0_gain" rep="float" idx="828">00000000</item>
+        <item name="COMP_1_0_ratio" rep="float" range="compressor/ratio" idx="829">40800000</item>
+        <item name="COMP_1_0_knee" rep="float" idx="830">41A00000</item>
+        <item name="COMP_1_0_atime" rep="float" range="compressor/atime" idx="831">42200000</item>
+        <item name="COMP_1_0_rtime" rep="float" range="compressor/rtime" idx="832">42C80000</item>
+    	<item name="Delay_1_0" rep="samplecnt" range="delay" idx="833">00000000</item>
+        <item name="Meter_1_0" rep="integer" idx="834">00000000</item><!-- Values not displayed -->
+        <item name="Meter_1_1" rep="integer" idx="835">00000000</item>
+        <item name="Meter_1_2" rep="integer" idx="836">00000000</item>
+        <item name="polarity_out_1_0" rep="integer" idx="837">00000000</item>
+        <filter type="PEQ" chn="1" band="1" idx="838">
+            <freq range="peq/frequency">20</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="2" idx="843">
+            <freq range="peq/frequency">40</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="3" idx="848">
+            <freq range="peq/frequency">80</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="4" idx="853">
+            <freq range="peq/frequency">160</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="5" idx="858">
+            <freq range="peq/frequency">320</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="6" idx="863">
+            <freq range="peq/frequency">640</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="7" idx="868">
+            <freq range="peq/frequency">1280</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="8" idx="873">
+            <freq range="peq/frequency">2560</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="9" idx="878">
+            <freq range="peq/frequency">5120</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="1" band="10" idx="883">
+            <freq range="peq/frequency">10240</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="1" band="1" idx="888">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042324375459811486,0.00008464875091962297,0.000042324375459811486,1.975933280159253,-0.9761025776610925,0.0000426227085455773,0.0000852454170911546,0.0000426227085455773,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="1" band="5" idx="908">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9880089644550863,-1.9760179289101727,0.9880089644550863,1.975933280159253,-0.9761025776610925,0.9949731726667363,-1.9899463453334727,0.9949731726667363,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<item name="DGain_2_0_status" rep="integer" idx="928">00000002</item>
+        <item name="COMP_2_0_status" rep="integer" idx="929">00000003</item>
+        <item name="DGain_2_0" rep="float" range="gain" idx="930">00000000</item>
+        <item name="COMP_2_0_threshold" rep="float" range="compressor/threshold" idx="931">C1F00000</item>
+        <item name="COMP_2_0_gain" rep="float" idx="932">00000000</item>
+        <item name="COMP_2_0_ratio" rep="float" range="compressor/ratio" idx="933">40800000</item>
+        <item name="COMP_2_0_knee" rep="float" idx="934">41A00000</item>
+        <item name="COMP_2_0_atime" rep="float" range="compressor/atime" idx="935">42200000</item>
+        <item name="COMP_2_0_rtime" rep="float" range="compressor/rtime" idx="936">42C80000</item>
+        <item name="Delay_2_0" rep="samplecnt" range="delay" idx="937">00000000</item>
+        <item name="Meter_2_0" rep="integer" idx="938">00000000</item>
+        <item name="Meter_2_1" rep="integer" idx="939">00000000</item>
+        <item name="Meter_2_2" rep="integer" idx="940">00000000</item>
+        <item name="polarity_out_2_0" rep="integer" idx="941">00000000</item>
+        <filter type="PEQ" chn="2" band="1" idx="942">
+            <freq range="peq/frequency">20</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="2" idx="947">
+            <freq range="peq/frequency">40</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="3" idx="952">
+            <freq range="peq/frequency">80</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="4" idx="957">
+            <freq range="peq/frequency">160</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="5" idx="962">
+            <freq range="peq/frequency">320</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="6" idx="967">
+            <freq range="peq/frequency">640</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="7" idx="972">
+            <freq range="peq/frequency">1280</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="8" idx="977">
+            <freq range="peq/frequency">2560</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="9" idx="982">
+            <freq range="peq/frequency">5120</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="2" band="10" idx="987">
+            <freq range="peq/frequency">10240</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+ 		<filter type="BPF" chn="2" band="1" idx="992">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042324375459811486,0.00008464875091962297,0.000042324375459811486,1.975933280159253,-0.9761025776610925,0.0000426227085455773,0.0000852454170911546,0.0000426227085455773,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="2" band="5" idx="1012">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9880089644550863,-1.9760179289101727,0.9880089644550863,1.975933280159253,-0.9761025776610925,0.9949731726667363,-1.9899463453334727,0.9949731726667363,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+		<item name="DGain_3_0_status" rep="integer" idx="1032">00000002</item>
+        <item name="COMP_3_0_status" rep="integer" idx="1033">00000003</item>
+        <item name="DGain_3_0" rep="float" range="gain" idx="1034">00000000</item>
+        <item name="COMP_3_0_threshold" rep="float" range="compressor/threshold" idx="1035">C1F00000</item>
+        <item name="COMP_3_0_gain" rep="float" idx="1036">00000000</item>
+        <item name="COMP_3_0_ratio" rep="float" range="compressor/ratio" idx="1037">40800000</item>
+        <item name="COMP_3_0_knee" rep="float" idx="1038">41A00000</item>
+        <item name="COMP_3_0_atime" rep="float" range="compressor/atime" idx="1039">42200000</item>
+        <item name="COMP_3_0_rtime" rep="float" range="compressor/rtime" idx="1040">42C80000</item>
+        <item name="Delay_3_0" rep="samplecnt" range="delay" idx="1041">00000000</item>
+        <item name="Meter_3_0" rep="integer" idx="1042">00000000</item>
+        <item name="Meter_3_1" rep="integer" idx="1043">00000000</item>
+        <item name="Meter_3_2" rep="integer" idx="1044">00000000</item>
+        <item name="polarity_out_3_0" rep="integer" idx="1045">00000000</item>
+		<filter type="PEQ" chn="3" band="1" idx="1046">
+            <freq range="peq/frequency">20</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="2" idx="1051">
+            <freq range="peq/frequency">40</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="3" idx="1056">
+            <freq range="peq/frequency">80</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="4" idx="1061">
+            <freq range="peq/frequency">160</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="5" idx="1066">
+            <freq range="peq/frequency">320</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="6" idx="1071">
+            <freq range="peq/frequency">640</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="7" idx="1076">
+            <freq range="peq/frequency">1280</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="8" idx="1081">
+            <freq range="peq/frequency">2560</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="9" idx="1086">
+            <freq range="peq/frequency">5120</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="3" band="10" idx="1091">
+            <freq range="peq/frequency">10240</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+   		<filter type="BPF" chn="3" band="1" idx="1096">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042324375459811486,0.00008464875091962297,0.000042324375459811486,1.975933280159253,-0.9761025776610925,0.0000426227085455773,0.0000852454170911546,0.0000426227085455773,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="3" band="5" idx="1116">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9880089644550863,-1.9760179289101727,0.9880089644550863,1.975933280159253,-0.9761025776610925,0.9949731726667363,-1.9899463453334727,0.9949731726667363,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+ 		<item name="DGain_4_0_status" rep="integer" idx="1136">00000002</item>
+        <item name="COMP_4_0_status" rep="integer" idx="1137">00000003</item>
+        <item name="DGain_4_0" rep="float" range="gain" idx="1138">00000000</item>
+        <item name="COMP_4_0_threshold" rep="float" range="compressor/threshold" idx="1139">C1F00000</item>
+        <item name="COMP_4_0_gain" rep="float" idx="1140">00000000</item>
+        <item name="COMP_4_0_ratio" rep="float" range="compressor/ratio" idx="1141">40800000</item>
+        <item name="COMP_4_0_knee" rep="float" idx="1142">41A00000</item>
+        <item name="COMP_4_0_atime" rep="float" range="compressor/atime" idx="1143">42200000</item>
+        <item name="COMP_4_0_rtime" rep="float" range="compressor/rtime" idx="1144">42C80000</item>
+        <item name="Delay_4_0" rep="samplecnt" range="delay" idx="1145">00000000</item>
+        <item name="Meter_4_0" rep="integer" idx="1146">00000000</item>
+        <item name="Meter_4_1" rep="integer" idx="1147">00000000</item>
+        <item name="Meter_4_2" rep="integer" idx="1148">00000000</item>
+        <item name="polarity_out_4_0" rep="integer" idx="1149">00000000</item>
+		<filter type="PEQ" chn="4" band="1" idx="1150">
+            <freq range="peq/frequency">20</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="2" idx="1155">
+            <freq range="peq/frequency">40</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="3" idx="1160">
+            <freq range="peq/frequency">80</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="4" idx="1165">
+            <freq range="peq/frequency">160</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="5" idx="1170">
+            <freq range="peq/frequency">320</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="6" idx="1175">
+            <freq range="peq/frequency">640</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="7" idx="1180">
+            <freq range="peq/frequency">1280</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="8" idx="1185">
+            <freq range="peq/frequency">2560</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="9" idx="1190">
+            <freq range="peq/frequency">5120</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="4" band="10" idx="1195">
+            <freq range="peq/frequency">10240</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+		<filter type="BPF" chn="4" band="1" idx="1200">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042324375459811486,0.00008464875091962297,0.000042324375459811486,1.975933280159253,-0.9761025776610925,0.0000426227085455773,0.0000852454170911546,0.0000426227085455773,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="4" band="5" idx="1220">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9880089644550863,-1.9760179289101727,0.9880089644550863,1.975933280159253,-0.9761025776610925,0.9949731726667363,-1.9899463453334727,0.9949731726667363,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <item name="DGain_5_0_status" rep="integer" idx="1240">00000002</item>
+        <item name="COMP_5_0_status" rep="integer" idx="1241">00000003</item>
+        <item name="DGain_5_0" rep="float" range="gain" idx="1242">00000000</item>
+        <item name="COMP_5_0_threshold" rep="float" range="compressor/threshold" idx="1243">C1F00000</item>
+        <item name="COMP_5_0_gain" rep="float" idx="1244">00000000</item>
+        <item name="COMP_5_0_ratio" rep="float" range="compressor/ratio" idx="1245">40800000</item>
+        <item name="COMP_5_0_knee" rep="float" idx="1246">41A00000</item>
+        <item name="COMP_5_0_atime" rep="float" range="compressor/atime" idx="1247">42200000</item>
+        <item name="COMP_5_0_rtime" rep="float" range="compressor/rtime" idx="1248">42C80000</item>
+        <item name="Delay_5_0" rep="samplecnt" range="delay" idx="1249">00000000</item>
+        <item name="Meter_5_0" rep="integer" idx="1250">00000000</item>
+        <item name="Meter_5_1" rep="integer" idx="1251">00000000</item>
+        <item name="Meter_5_2" rep="integer" idx="1252">00000000</item>
+        <item name="polarity_out_5_0" rep="integer" idx="1253">00000000</item>
+		<filter type="PEQ" chn="5" band="1" idx="1254">
+            <freq range="peq/frequency">20</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="2" idx="1259">
+            <freq range="peq/frequency">40</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="3" idx="1264">
+            <freq range="peq/frequency">80</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="4" idx="1269">
+            <freq range="peq/frequency">160</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="5" idx="1274">
+            <freq range="peq/frequency">320</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="6" idx="1279">
+            <freq range="peq/frequency">640</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="7" idx="1284">
+            <freq range="peq/frequency">1280</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="8" idx="1289">
+            <freq range="peq/frequency">2560</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="9" idx="1294">
+            <freq range="peq/frequency">5120</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="5" band="10" idx="1299">
+            <freq range="peq/frequency">10240</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+		<filter type="BPF" chn="5" band="1" idx="1304">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042324375459811486,0.00008464875091962297,0.000042324375459811486,1.975933280159253,-0.9761025776610925,0.0000426227085455773,0.0000852454170911546,0.0000426227085455773,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="5" band="5" idx="1324">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9880089644550863,-1.9760179289101727,0.9880089644550863,1.975933280159253,-0.9761025776610925,0.9949731726667363,-1.9899463453334727,0.9949731726667363,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <item name="DGain_6_0_status" rep="integer" idx="1344">00000002</item>
+        <item name="COMP_6_0_status" rep="integer" idx="1345">00000003</item>
+        <item name="DGain_6_0" rep="float" range="gain" idx="1346">00000000</item>
+        <item name="COMP_6_0_threshold" rep="float" range="compressor/threshold" idx="1347">C1F00000</item>
+        <item name="COMP_6_0_gain" rep="float" idx="1348">00000000</item>
+        <item name="COMP_6_0_ratio" rep="float" range="compressor/ratio" idx="1349">40800000</item>
+        <item name="COMP_6_0_knee" rep="float" idx="1350">41A00000</item>
+        <item name="COMP_6_0_atime" rep="float" range="compressor/atime" idx="1351">42200000</item>
+        <item name="COMP_6_0_rtime" rep="float" range="compressor/rtime" idx="1352">42C80000</item>
+        <item name="Delay_6_0" rep="samplecnt" range="delay" idx="1353">00000000</item>
+        <item name="Meter_6_0" rep="integer" idx="1354">00000000</item>
+        <item name="Meter_6_1" rep="integer" idx="1355">00000000</item>
+        <item name="Meter_6_2" rep="integer" idx="1356">00000000</item>
+        <item name="polarity_out_6_0" rep="integer" idx="1357">00000000</item>
+		<filter type="PEQ" chn="6" band="1" idx="1358">
+            <freq range="peq/frequency">20</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="2" idx="1363">
+            <freq range="peq/frequency">40</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="3" idx="1368">
+            <freq range="peq/frequency">80</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="4" idx="1373">
+            <freq range="peq/frequency">160</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="5" idx="1378">
+            <freq range="peq/frequency">320</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="6" idx="1383">
+            <freq range="peq/frequency">640</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="7" idx="1388">
+            <freq range="peq/frequency">1280</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="8" idx="1393">
+            <freq range="peq/frequency">2560</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="9" idx="1398">
+            <freq range="peq/frequency">5120</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="6" band="10" idx="1403">
+            <freq range="peq/frequency">10240</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+		<filter type="BPF" chn="6" band="1" idx="1408">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042324375459811486,0.00008464875091962297,0.000042324375459811486,1.975933280159253,-0.9761025776610925,0.0000426227085455773,0.0000852454170911546,0.0000426227085455773,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="6" band="5" idx="1428">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9880089644550863,-1.9760179289101727,0.9880089644550863,1.975933280159253,-0.9761025776610925,0.9949731726667363,-1.9899463453334727,0.9949731726667363,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <item name="DGain_7_0_status" rep="integer" idx="1448">00000002</item>
+        <item name="COMP_7_0_status" rep="integer" idx="1449">00000003</item>
+        <item name="DGain_7_0" rep="float" range="gain" idx="1450">00000000</item>
+        <item name="COMP_7_0_threshold" rep="float" range="compressor/threshold" idx="1451">C1F00000</item>
+        <item name="COMP_7_0_gain" rep="float" idx="1452">00000000</item>
+        <item name="COMP_7_0_ratio" rep="float" range="compressor/ratio" idx="1453">40800000</item>
+        <item name="COMP_7_0_knee" rep="float" idx="1454">41A00000</item>
+        <item name="COMP_7_0_atime" rep="float" range="compressor/atime" idx="1455">42200000</item>
+        <item name="COMP_7_0_rtime" rep="float" range="compressor/rtime" idx="1456">42C80000</item>
+        <item name="Delay_7_0" rep="samplecnt" range="delay" idx="1457">00000000</item>
+        <item name="Meter_7_0" rep="integer" idx="1458">00000000</item>
+        <item name="Meter_7_1" rep="integer" idx="1459">00000000</item>
+        <item name="Meter_7_2" rep="integer" idx="1460">00000000</item>
+        <item name="polarity_out_7_0" rep="integer" idx="1461">00000000</item>
+		<filter type="PEQ" chn="7" band="1" idx="1462">
+            <freq range="peq/frequency">20</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="2" idx="1467">
+            <freq range="peq/frequency">40</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="3" idx="1472">
+            <freq range="peq/frequency">80</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="4" idx="1477">
+            <freq range="peq/frequency">160</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="5" idx="1482">
+            <freq range="peq/frequency">320</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="6" idx="1487">
+            <freq range="peq/frequency">640</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="7" idx="1492">
+            <freq range="peq/frequency">1280</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="8" idx="1497">
+            <freq range="peq/frequency">2560</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="9" idx="1502">
+            <freq range="peq/frequency">5120</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="7" band="10" idx="1507">
+            <freq range="peq/frequency">10240</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+		<filter type="BPF" chn="7" band="1" idx="1512">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042324375459811486,0.00008464875091962297,0.000042324375459811486,1.975933280159253,-0.9761025776610925,0.0000426227085455773,0.0000852454170911546,0.0000426227085455773,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="7" band="5" idx="1532">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9880089644550863,-1.9760179289101727,0.9880089644550863,1.975933280159253,-0.9761025776610925,0.9949731726667363,-1.9899463453334727,0.9949731726667363,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <item name="DGain_8_0_status" rep="integer" idx="1552">00000002</item>
+        <item name="COMP_8_0_status" rep="integer" idx="1553">00000003</item>
+        <item name="DGain_8_0" rep="float" range="gain" idx="1554">00000000</item>
+        <item name="COMP_8_0_threshold" rep="float" range="compressor/threshold" idx="1555">C1F00000</item>
+        <item name="COMP_8_0_gain" rep="float" idx="1556">00000000</item>
+        <item name="COMP_8_0_ratio" rep="float" range="compressor/ratio" idx="1557">40800000</item>
+        <item name="COMP_8_0_knee" rep="float" idx="1558">41A00000</item>
+        <item name="COMP_8_0_atime" rep="float" range="compressor/atime" idx="1559">42200000</item>
+        <item name="COMP_8_0_rtime" rep="float" range="compressor/rtime" idx="1560">42C80000</item>
+        <item name="Delay_8_0" rep="samplecnt" range="delay" idx="1561">00000000</item>
+        <item name="Meter_8_0" rep="integer" idx="1562">00000000</item>
+        <item name="Meter_8_1" rep="integer" idx="1563">00000000</item>
+        <item name="Meter_8_2" rep="integer" idx="1564">00000000</item>
+        <item name="polarity_out_8_0" rep="integer" idx="1565">00000000</item>
+		<filter type="PEQ" chn="8" band="1" idx="1566">
+            <freq range="peq/frequency">20</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="2" idx="1571">
+            <freq range="peq/frequency">40</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="3" idx="1576">
+            <freq range="peq/frequency">80</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="4" idx="1581">
+            <freq range="peq/frequency">160</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="5" idx="1586">
+            <freq range="peq/frequency">320</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="6" idx="1591">
+            <freq range="peq/frequency">640</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="7" idx="1596">
+            <freq range="peq/frequency">1280</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="8" idx="1601">
+            <freq range="peq/frequency">2560</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="9" idx="1606">
+            <freq range="peq/frequency">5120</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+        <filter type="PEQ" chn="8" band="10" idx="1611">
+            <freq range="peq/frequency">10240</freq>
+            <q range="peq/q">0.707</q>
+            <boost range="peq/gain">0</boost>
+            <type>PK</type>
+            <bypass>0</bypass>
+            <dec>1,0,0,0,0</dec>
+        </filter>
+		<filter type="BPF" chn="8" band="1" idx="1616">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWLPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.000042324375459811486,0.00008464875091962297,0.000042324375459811486,1.975933280159253,-0.9761025776610925,0.0000426227085455773,0.0000852454170911546,0.0000426227085455773,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+        <filter type="BPF" chn="8" band="5" idx="1636">
+            <freq range="bpf/frequency">100</freq>
+            <q>0</q>
+            <boost>0</boost>
+            <type>BWHPF_4</type>
+            <bypass>1</bypass>
+            <dec>0.9880089644550863,-1.9760179289101727,0.9880089644550863,1.975933280159253,-0.9761025776610925,0.9949731726667363,-1.9899463453334727,0.9949731726667363,1.9898610999163815,-0.9900315907505638,1,0,0,0,0,1,0,0,0,0</dec>
+        </filter>
+	</params>
+</XML>

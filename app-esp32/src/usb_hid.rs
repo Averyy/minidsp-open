@@ -25,7 +25,7 @@ use log::{debug, error, info, warn};
 use minidsp_protocol::device::probe::is_official_usb_device;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 /// USB HID class code.
 const USB_CLASS_HID: u8 = 0x03;
@@ -147,6 +147,7 @@ struct CallbackState {
 }
 
 static CB_STATE: OnceLock<CallbackState> = OnceLock::new();
+static GLOBAL_BUS: OnceLock<Arc<UsbHidBus>> = OnceLock::new();
 
 fn cb_state() -> &'static CallbackState {
     CB_STATE.get_or_init(|| CallbackState {
@@ -963,6 +964,17 @@ impl UsbHidBus {
         std::thread::sleep(CLOSE_SETTLE_DELAY);
         result
     }
+}
+
+pub fn register_global_bus(bus: Arc<UsbHidBus>) {
+    let _ = GLOBAL_BUS.set(bus);
+}
+
+pub fn recycle_root_port_global(reason: &str) -> Result<(), UsbHidError> {
+    GLOBAL_BUS
+        .get()
+        .ok_or_else(|| UsbHidError::Init("USB HID bus not initialized".into()))?
+        .recycle_root_port(reason)
 }
 
 impl Drop for UsbHidBus {

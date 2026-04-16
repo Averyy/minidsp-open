@@ -190,13 +190,17 @@ fn parse_raw_linked_selector_write(
     Some((addr, u32::from_le_bytes(value_bytes) as u16))
 }
 
-pub(super) async fn mirror_raw_command_to_shadow(
+pub(super) async fn mirror_raw_command_to_shadow<F>(
     payload: &[u8],
     dialect: &minidsp_protocol::dialect::Dialect,
     peq_shadow: &Arc<Mutex<HashMap<u16, PeqShadow>>>,
     scalar_shadow: &Arc<Mutex<HashMap<u16, u32>>>,
     selector_shadow: &Arc<Mutex<HashMap<u16, u16>>>,
-) {
+    prefer_scalar_shadow_for_addr: F,
+)
+where
+    F: Fn(u16) -> bool,
+{
     if let Some((addr, coeffs)) = parse_raw_write_biquad(payload, dialect) {
         let mut shadow = peq_shadow.lock().await;
         if let Some(entry) = shadow.get_mut(&addr) {
@@ -216,7 +220,11 @@ pub(super) async fn mirror_raw_command_to_shadow(
     if let Some((addr, value)) = parse_raw_selector_write(payload, dialect)
         .or_else(|| parse_raw_linked_selector_write(payload, dialect))
     {
-        selector_shadow.lock().await.insert(addr, value);
+        if prefer_scalar_shadow_for_addr(addr) {
+            scalar_shadow.lock().await.insert(addr, value as u32);
+        } else {
+            selector_shadow.lock().await.insert(addr, value);
+        }
         return;
     }
 
@@ -394,6 +402,7 @@ impl MiniDspClient {
                 &self.peq_shadow,
                 &self.scalar_shadow,
                 &self.selector_shadow,
+                |addr| self.prefers_scalar_shadow_for_addr(addr),
             )
             .await;
         }

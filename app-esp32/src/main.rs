@@ -168,6 +168,7 @@ fn main() {
         ensure_audio_driver_installed(&audio_state, &mut audio_driver_installed);
     }
     if let Some(ref bus) = bus {
+        usb_hid::register_global_bus(bus.clone());
         match discover_and_activate_device(bus, Duration::from_secs(30)) {
             Ok(state) => {
                 usb_state = UsbState::ProtocolReady;
@@ -340,6 +341,16 @@ fn ensure_audio_driver_installed(audio_state: &usb_audio::SharedAudioState, inst
     }
 }
 
+fn probe_error_is_root_port_recoverable(err: &usb_hid::UsbHidError) -> bool {
+    match err {
+        usb_hid::UsbHidError::Timeout | usb_hid::UsbHidError::Transfer(_) => true,
+        usb_hid::UsbHidError::Init(message) => {
+            message.contains("interface_claim") || message.contains("alloc xfer")
+        }
+        _ => false,
+    }
+}
+
 fn discover_and_activate_device(
     bus: &Arc<usb_hid::UsbHidBus>,
     timeout: Duration,
@@ -359,8 +370,8 @@ fn discover_and_activate_device(
 
     match probe_device_with_retries(bus.clone(), Duration::from_secs(20)) {
         Ok(state) => Ok(state),
-        Err(err @ (usb_hid::UsbHidError::Timeout | usb_hid::UsbHidError::Transfer(_)))
-            if bus.has_present_device().unwrap_or(false) =>
+        Err(err) if probe_error_is_root_port_recoverable(&err)
+            && bus.has_present_device().unwrap_or(false) =>
         {
             warn!(
                 "USB state: probe failed while a device is still present ({err}); recycling root port"

@@ -523,6 +523,22 @@ impl DeviceState {
         }
     }
 
+    pub fn begin_operation_with_wait(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(guard) = self.try_begin_operation() {
+                return Some(guard);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     // -- Accessors --
 
     pub fn hw_id(&self) -> &HardwareId {
@@ -1901,6 +1917,7 @@ impl DeviceState {
         // freshly-written preset image.
         if let Ok(before) = self.read_master_status_once() {
             if before.preset == preset && reset_mode != commands::PRESET_CHANGE_RELOAD_SAME_SLOT {
+                self.update_active_preset(preset);
                 return Ok(());
             }
         }
@@ -1919,6 +1936,7 @@ impl DeviceState {
             std::thread::sleep(VERIFY_POLL_DELAY);
             if let Ok(status) = self.read_master_status_once() {
                 if status.preset == preset {
+                    self.update_active_preset(preset);
                     std::thread::sleep(POST_SET_CONFIG_SETTLE_DELAY);
                     return Ok(());
                 }

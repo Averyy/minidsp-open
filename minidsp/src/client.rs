@@ -670,6 +670,7 @@ impl MiniDspClient {
     async fn wait_for_reset_recovery_until(
         &self,
         timeout: Duration,
+        initial_reconnect_epoch: u64,
     ) -> Result<eeprom::MasterStatusRaw, ClientError> {
         let deadline = Instant::now() + timeout;
         let mut outage_started: Option<Instant> = None;
@@ -692,6 +693,10 @@ impl MiniDspClient {
                 .await
             {
                 Ok(master) => {
+                    if self.queue.reconnect_epoch() != initial_reconnect_epoch {
+                        return Ok(master);
+                    }
+
                     if let Some(started) = outage_started {
                         let outage_duration = started.elapsed();
                         if saw_disconnect
@@ -932,6 +937,7 @@ impl MiniDspClient {
     /// then responsive again when the hardware does not return `ResetComplete`.
     async fn reset_with_verification_locked(&self) -> Result<(), ClientError> {
         self.queue.pause_levels();
+        let reconnect_epoch = self.queue.reconnect_epoch();
         let result = async {
             match self
                 .execute_write_with_timeout(
@@ -944,15 +950,20 @@ impl MiniDspClient {
             {
                 Ok(()) => Ok(()),
                 Err(ClientError::Transport(TransportError::Timeout))
+                | Err(ClientError::Transport(TransportError::Hid(_)))
+                | Err(ClientError::Transport(TransportError::Io(_)))
                 | Err(ClientError::Timeout) => {
                     tracing::debug!(
-                        "reset response timed out; verifying via master-status recovery"
+                        "reset response dropped during device reset; verifying via master-status recovery"
                     );
-                    self.wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT)
+                    self.wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT, reconnect_epoch)
                         .await?;
                     Ok(())
                 }
-                Err(err) => Err(err),
+                Err(err) => {
+                    tracing::warn!("reset command failed before recovery verification: {err}");
+                    Err(err)
+                }
             }
         }
         .await;
@@ -965,6 +976,7 @@ impl MiniDspClient {
     /// master-status recovery.
     async fn reboot_with_verification_locked(&self) -> Result<(), ClientError> {
         self.queue.pause_levels();
+        let reconnect_epoch = self.queue.reconnect_epoch();
         let result = async {
             match self
                 .execute_write_with_timeout(
@@ -982,16 +994,26 @@ impl MiniDspClient {
                 }
                 Err(ClientError::Transport(TransportError::Timeout))
                 | Err(ClientError::Transport(TransportError::Disconnected))
+                | Err(ClientError::Transport(TransportError::Hid(_)))
+                | Err(ClientError::Transport(TransportError::Io(_)))
                 | Err(ClientError::Timeout) => {
                     tracing::debug!(
                         "enter bootloader response dropped during reboot; verifying via master-status recovery"
                     );
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    tracing::warn!("reboot command failed before recovery verification: {err}");
+                    return Err(err);
+                }
             }
 
-            self.wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT)
-                .await?;
+            if let Err(err) = self
+                .wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT, reconnect_epoch)
+                .await
+            {
+                tracing::warn!("reboot recovery verification failed: {err}");
+                return Err(err);
+            }
             Ok(())
         }
         .await;
@@ -1945,9 +1967,9 @@ impl MiniDspClient {
     }
 
     /// Device-only recovery path matching the official "initialize to default
-    /// settings" flow for non-Dirac families: rebuild preset 1, copy it to the
-    /// remaining slots, overwrite all four tokens with the recovery marker, and
-    /// optionally reboot the unit.
+    /// settings" flow for the bundled modern SHARC families: rebuild preset 1,
+    /// copy it to the remaining slots, overwrite all four tokens with the
+    /// recovery marker, and optionally reboot the unit.
     pub async fn initialize_all_presets_to_defaults(
         &self,
         reboot: bool,
@@ -2296,7 +2318,8 @@ impl MiniDspClient {
     /// passthrough identity biquad and clear all bypass flags. This matches
     /// the official Device Console "Initialize to default Settings" action,
     /// which writes the same identity biquad (`<dec>1,0,0,0,0</dec>`) to
-    /// every PEQ slot per `app/Audio Firmware/{family}/DSP_default_parameters.xml`
+    /// every PEQ slot per
+    /// `protocol/assets/audio_firmware/{family}/DSP_default_parameters.xml`
     /// `<filter name="PEQ_*_*">` defaults.
     ///
     /// Returns the number of bands that were touched.
@@ -2969,7 +2992,7 @@ mod tests {
     use minidsp_protocol::dialect::Dialect;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     struct DummyTransport;
 
@@ -3250,6 +3273,79 @@ mod tests {
         }
     }
 
+    struct RebootCommandDropTransport {
+        last_payload: Arc<Mutex<Vec<u8>>>,
+        drop_reboot_send_once: Arc<AtomicBool>,
+    }
+
+    impl RebootCommandDropTransport {
+        fn new() -> Self {
+            Self {
+                last_payload: Arc::new(Mutex::new(Vec::new())),
+                drop_reboot_send_once: Arc::new(AtomicBool::new(true)),
+            }
+        }
+    }
+
+    impl crate::transport::Transport for RebootCommandDropTransport {
+        fn send_frame(
+            &self,
+            payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            let payload = payload.to_vec();
+            let last_payload = self.last_payload.clone();
+            let drop_reboot_send_once = self.drop_reboot_send_once.clone();
+
+            Box::pin(async move {
+                *last_payload.lock().await = payload.clone();
+                if payload.first().copied() == Some(commands::CMD_ENTER_BOOTLOADER)
+                    && drop_reboot_send_once.swap(false, Ordering::SeqCst)
+                {
+                    return Err(TransportError::Hid(
+                        "device vanished while reboot command was in flight".into(),
+                    ));
+                }
+                Ok(())
+            })
+        }
+
+        fn recv_frame(
+            &self,
+            _timeout_ms: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            let last_payload = self.last_payload.clone();
+
+            Box::pin(async move {
+                let payload = last_payload.lock().await.clone();
+                match payload.first().copied() {
+                    Some(commands::CMD_READ_FLASH)
+                        if payload.len() >= 4
+                            && payload[1] == eeprom::MASTER_STATUS_ADDR.0
+                            && payload[2] == eeprom::MASTER_STATUS_ADDR.1 =>
+                    {
+                        Ok(vec![commands::CMD_READ_FLASH, 0, 0, 0, 0])
+                    }
+                    Some(opcode) => Err(TransportError::Io(format!(
+                        "unexpected transport payload {opcode:#04x}: {payload:02x?}"
+                    ))),
+                    None => Err(TransportError::Io("missing transport payload".into())),
+                }
+            })
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn url(&self) -> String {
+            "mock://reboot-command-drop".into()
+        }
+    }
+
     #[tokio::test]
     async fn mirror_raw_biquad_write_updates_shadow() {
         let peq_shadow = Arc::new(Mutex::new(HashMap::from([(
@@ -3270,6 +3366,7 @@ mod tests {
             &peq_shadow,
             &scalar_shadow,
             &selector_shadow,
+            |_| false,
         )
         .await;
 
@@ -3296,6 +3393,7 @@ mod tests {
             &peq_shadow,
             &scalar_shadow,
             &selector_shadow,
+            |_| false,
         )
         .await;
 
@@ -3409,6 +3507,7 @@ mod tests {
             &peq_shadow,
             &scalar_shadow,
             &selector_shadow,
+            |_| false,
         )
         .await;
 
@@ -3429,6 +3528,7 @@ mod tests {
             &peq_shadow,
             &scalar_shadow,
             &selector_shadow,
+            |_| false,
         )
         .await;
 
@@ -3449,6 +3549,7 @@ mod tests {
             &peq_shadow,
             &scalar_shadow,
             &selector_shadow,
+            |_| false,
         )
         .await;
 
@@ -3469,11 +3570,54 @@ mod tests {
             &peq_shadow,
             &scalar_shadow,
             &selector_shadow,
+            |_| false,
         )
         .await;
 
         assert_eq!(scalar_shadow.lock().await.get(&28), Some(&0.0f32.to_bits()));
         assert!(selector_shadow.lock().await.get(&28).is_none());
+    }
+
+    #[tokio::test]
+    async fn mirror_raw_persisted_zero_float_write_can_prefer_scalar_shadow() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let payload = commands::write_dsp(28, 0.0, true, &Dialect::NEW);
+
+        mirror_raw_command_to_shadow(
+            &payload,
+            &Dialect::NEW,
+            &peq_shadow,
+            &scalar_shadow,
+            &selector_shadow,
+            |addr| addr == 28,
+        )
+        .await;
+
+        assert_eq!(scalar_shadow.lock().await.get(&28), Some(&0.0f32.to_bits()));
+        assert!(selector_shadow.lock().await.get(&28).is_none());
+    }
+
+    #[tokio::test]
+    async fn mirror_raw_persisted_delay_write_can_prefer_scalar_shadow() {
+        let peq_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let selector_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let scalar_shadow = Arc::new(Mutex::new(HashMap::new()));
+        let payload = commands::write_dsp_delay(66, 60, true, &Dialect::NEW);
+
+        mirror_raw_command_to_shadow(
+            &payload,
+            &Dialect::NEW,
+            &peq_shadow,
+            &scalar_shadow,
+            &selector_shadow,
+            |addr| addr == 66,
+        )
+        .await;
+
+        assert_eq!(scalar_shadow.lock().await.get(&66), Some(&60));
+        assert!(selector_shadow.lock().await.get(&66).is_none());
     }
 
     #[tokio::test]
@@ -3858,10 +4002,51 @@ mod tests {
         };
 
         let err = client
-            .wait_for_reset_recovery_until(Duration::from_millis(700))
+            .wait_for_reset_recovery_until(Duration::from_millis(700), client.queue.reconnect_epoch())
             .await
             .expect_err("single transient read failure should not verify reset");
         assert!(matches!(err, ClientError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_reset_recovery_accepts_hidden_reconnect_epoch_advance() {
+        let client = Arc::new(MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(
+                0,
+            )))),
+            transport_url: "mock://reset-epoch".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
+            active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
+        });
+        let initial_reconnect_epoch = client.queue.reconnect_epoch();
+        let queue = client.queue.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            queue.note_reconnect_for_test();
+        });
+
+        client
+            .wait_for_reset_recovery_until(Duration::from_millis(700), initial_reconnect_epoch)
+            .await
+            .expect("reconnect epoch advance should verify hidden reset recovery");
     }
 
     #[tokio::test]
@@ -3897,6 +4082,44 @@ mod tests {
             .reset_with_verification()
             .await
             .expect("reset recovery verification should accept sustained outage");
+    }
+
+    #[tokio::test]
+    async fn reboot_succeeds_when_command_stage_hid_drop_is_followed_by_reconnect() {
+        let client = Arc::new(MiniDspClient {
+            queue: Arc::new(CommandQueue::new(Box::new(RebootCommandDropTransport::new()))),
+            transport_url: "mock://reboot-command-drop".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
+            active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
+        });
+        let queue = client.queue.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            queue.note_reconnect_for_test();
+        });
+
+        client
+            .reboot_device()
+            .await
+            .expect("reboot recovery should accept a command-stage HID drop once the device recovers");
     }
 
     #[test]

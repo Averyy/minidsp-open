@@ -68,7 +68,7 @@ References:
 - [daemon/src/state.rs](./daemon/src/state.rs:258)
 - [daemon/src/state.rs](./daemon/src/state.rs:413)
 - [docs/ref-device-coverage.md](./docs/ref-device-coverage.md:15)
-- [app/Audio Firmware/RE-NOTES.md](./app/Audio%20Firmware/RE-NOTES.md:269)
+- [docs/ref-device-state-recovery.md](./docs/ref-device-state-recovery.md:1)
 
 Important implication:
 
@@ -84,7 +84,6 @@ References:
 
 - [docs/NOTES-device-console-hid-logging.md](./docs/NOTES-device-console-hid-logging.md:131)
 - [docs/ref-command-pacing.md](./docs/ref-command-pacing.md:103)
-- [app/Audio Firmware/RE-NOTES.md](./app/Audio%20Firmware/RE-NOTES.md:280)
 
 Important implication:
 

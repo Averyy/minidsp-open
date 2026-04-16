@@ -232,6 +232,7 @@ class Harness:
 
     def write_report(self, path: Path) -> None:
         lines = ["# Live Validation Report", "", *self.summary_lines(), ""]
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines))
 
     def summary_payload(self) -> dict[str, Any]:
@@ -250,6 +251,7 @@ class Harness:
         }
 
     def write_json_report(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.summary_payload(), indent=2) + "\n")
 
 
@@ -634,6 +636,30 @@ def wait_for_http(url: str, timeout: float) -> None:
             pass
         time.sleep(0.5)
     raise StepFailed(f"timed out waiting for {url} (last status: {last_status})")
+
+
+def wait_for_upstream_ezbeq_catalogue(base_url: str, timeout: float) -> None:
+    deadline = time.time() + timeout
+    last_status = None
+    last_detail = "catalogue not ready"
+    while time.time() < deadline:
+        try:
+            resp = http_request("GET", base_url.rstrip("/") + "/api/1/authors", timeout=2.0)
+            last_status = resp.status
+            if resp.status == 200:
+                data = json.loads(resp.text)
+                if isinstance(data, list) and data:
+                    return
+                last_detail = "authors list empty"
+            else:
+                last_detail = f"authors returned HTTP {resp.status}"
+        except (StepFailed, json.JSONDecodeError) as exc:
+            last_detail = str(exc)
+        time.sleep(0.5)
+    raise StepFailed(
+        f"timed out waiting for upstream ezBEQ catalogue readiness at {base_url} "
+        f"(last status: {last_status}, detail: {last_detail})"
+    )
 
 
 def make_target(label: str, kind: str, base_url: str, args: argparse.Namespace, cli_transport: str | None) -> Target:
@@ -1216,7 +1242,7 @@ def run_playback_suite(harness: Harness, target: Target) -> None:
 
     if target.kind == "esp32":
         def playback_busy_step() -> str:
-            http_json(
+            _, play_data = http_json(
                 "POST",
                 target.path(f"/devices/{target.device_id}/play"),
                 {
@@ -1227,10 +1253,25 @@ def run_playback_suite(harness: Harness, target: Target) -> None:
                 },
                 timeout=max(10.0, harness.args.timeout),
             )
-            status = http_request("GET", target.path(f"/devices/{target.device_id}"))
-            assert_true(status.status == 409, f"{target.label}: GET /devices/{target.device_id} during playback expected 409, got {status.status}")
-            devices = http_request("GET", target.path("/api/2/devices"))
-            assert_true(devices.status == 409, f"{target.label}: GET /api/2/devices during playback expected 409, got {devices.status}")
+            deadline = time.time() + 2.0
+            status_code = None
+            devices_code = None
+            saw_busy = False
+            while time.time() < deadline:
+                status = http_request("GET", target.path(f"/devices/{target.device_id}"))
+                devices = http_request("GET", target.path("/api/2/devices"))
+                status_code = status.status
+                devices_code = devices.status
+                if status_code == 409 and devices_code == 409:
+                    saw_busy = True
+                    break
+                time.sleep(0.1)
+            assert_true(
+                saw_busy,
+                f"{target.label}: playback busy guard expected 409/409, got {status_code}/{devices_code}",
+            )
+            if isinstance(play_data, dict):
+                wait_for_playback_completion(play_data)
             return "busy guard returned 409 during active playback"
 
         harness.run_step(section, "playback busy guard", playback_busy_step)
@@ -1656,6 +1697,7 @@ def spawn_upstream_ezbeq(cli_bin: Path, target: Target, port: int) -> SpawnedEzb
     base_url = f"http://127.0.0.1:{port}"
     try:
         wait_for_http(base_url + "/api/1/version", timeout=60.0)
+        wait_for_upstream_ezbeq_catalogue(base_url, timeout=60.0)
     except Exception:
         with contextlib.suppress(Exception):
             proc.terminate()

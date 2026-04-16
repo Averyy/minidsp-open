@@ -280,6 +280,12 @@ impl CommandQueue {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn note_reconnect_for_test(&self) {
+        self.reconnect_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Process the next command in the queue.
     async fn process_next(&self) {
         let _processing = self.processing.lock().await;

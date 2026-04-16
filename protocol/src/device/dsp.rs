@@ -109,8 +109,9 @@ pub struct BassManagement {
     pub per_channel_bpf: &'static [(u16, u16)], // (lpf, hpf) per channel
     /// 9 × 8 bass-management routing matrix. The 9th row is the LFE virtual
     /// channel from the `LFE_CHN STANDALONE_DSP_MODULE`. Each cell has its own
-    /// status, gain, and polarity address. See `app/Audio Firmware/113/
-    /// DSP_default_parameters.xml` lines 159..271 for the canonical layout.
+    /// status, gain, and polarity address. See
+    /// `protocol/assets/audio_firmware/113/DSP_default_parameters.xml` for the
+    /// canonical layout.
     pub bm_routing: BmMatrixMixer,
 }
 
@@ -190,7 +191,8 @@ impl BmMatrixMixer {
 /// `DSP_default_parameters.xml` delay `<range>`/`<step>` metadata per family.
 /// Used to clamp HTTP/CLI delay writes so invalid out-of-range floats never
 /// reach DSP memory. See `docs/ref-address-tables.md` for per-family values
-/// and `app/Audio Firmware/{family}/DSP_default_parameters.xml` for source.
+/// and `protocol/assets/audio_firmware/{family}/DSP_default_parameters.xml`
+/// for source.
 #[derive(Debug, Clone, Copy)]
 pub struct DelayRange {
     /// Minimum delay in milliseconds (always 0 for shipped families).
@@ -560,7 +562,8 @@ pub static DSP_101: DspTable = DspTable {
     },
     meters: &DSP101_METERS,
     // Dirac block starts immediately after the main param region. Values
-    // match `app/Audio Firmware/101/DSP_default_parameters.xml` `<dirac>`.
+    // match `protocol/assets/audio_firmware/101/DSP_default_parameters.xml`
+    // `<dirac>`.
     dirac: Some(DiracBlock {
         base_addr: 1792,
         size: 5124,
@@ -597,7 +600,8 @@ pub static DSP_105: DspTable = DspTable {
         cols: 4,
     },
     meters: &DSP101_METERS,
-    // Dirac block per `app/Audio Firmware/105/DSP_default_parameters.xml`.
+    // Dirac block per
+    // `protocol/assets/audio_firmware/105/DSP_default_parameters.xml`.
     // SHD reuses the 2/4 output layout of DSP 101 but its Dirac block is
     // larger (more FIR taps for the longer 96 kHz impulse response).
     dirac: Some(DiracBlock {
@@ -905,8 +909,8 @@ static DSP113_BASS_MGMT: BassManagement = BassManagement {
     per_channel_bpf: &DSP113_BM_BPF,
     // 9 × 8 BM matrix mixer with the LFE virtual row at row 9 (0-based 8).
     // Status idx 56..127 (= 9*8 = 72 cells), gain idx 128..199, polarity
-    // idx 200..271 — verified against `app/Audio Firmware/113/
-    // DSP_default_parameters.xml` lines 159..271. DSP 115 reuses the
+    // idx 200..271 — verified against
+    // `protocol/assets/audio_firmware/113/DSP_default_parameters.xml`. DSP 115 reuses the
     // identical layout (verified at lines 809..1024 of 115's defaults).
     bm_routing: BmMatrixMixer {
         rows: 9,
@@ -1333,7 +1337,7 @@ pub static LEGACY_MSHARC_4X8: DspTable = DspTable {
     // 0 means "unknown — do not use for bounds checking".
     param_memory_size: 0,
     // Legacy families predate the modern `<CMD_VERSION>` tagging in
-    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    // Official app `info.xml` metadata. 0 = unknown.
     cmd_version: 0,
     // No documented firmware convert paths for legacy families.
     intermediate_dsp_id: None,
@@ -1503,7 +1507,7 @@ pub static LEGACY_DDRC_88BM: DspTable = DspTable {
     // 0 means "unknown — do not use for bounds checking".
     param_memory_size: 0,
     // Legacy families predate the modern `<CMD_VERSION>` tagging in
-    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    // Official app `info.xml` metadata. 0 = unknown.
     cmd_version: 0,
     // No documented firmware convert paths for legacy families.
     intermediate_dsp_id: None,
@@ -1662,7 +1666,7 @@ pub static LEGACY_CDSP_8X12_V2: DspTable = DspTable {
     // 0 means "unknown — do not use for bounds checking".
     param_memory_size: 0,
     // Legacy families predate the modern `<CMD_VERSION>` tagging in
-    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    // Official app `info.xml` metadata. 0 = unknown.
     cmd_version: 0,
     // No documented firmware convert paths for legacy families.
     intermediate_dsp_id: None,
@@ -1829,7 +1833,7 @@ pub static LEGACY_10X10HD: DspTable = DspTable {
     // 0 means "unknown — do not use for bounds checking".
     param_memory_size: 0,
     // Legacy families predate the modern `<CMD_VERSION>` tagging in
-    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    // Official app `info.xml` metadata. 0 = unknown.
     cmd_version: 0,
     // No documented firmware convert paths for legacy families.
     intermediate_dsp_id: None,
@@ -1944,7 +1948,7 @@ pub static LEGACY_4X10HD: DspTable = DspTable {
     // 0 means "unknown — do not use for bounds checking".
     param_memory_size: 0,
     // Legacy families predate the modern `<CMD_VERSION>` tagging in
-    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    // Official app `info.xml` metadata. 0 = unknown.
     cmd_version: 0,
     // No documented firmware convert paths for legacy families.
     intermediate_dsp_id: None,
@@ -2028,7 +2032,7 @@ pub static LEGACY_M2X4: DspTable = DspTable {
     // 0 means "unknown — do not use for bounds checking".
     param_memory_size: 0,
     // Legacy families predate the modern `<CMD_VERSION>` tagging in
-    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    // Official app `info.xml` metadata. 0 = unknown.
     cmd_version: 0,
     // No documented firmware convert paths for legacy families.
     intermediate_dsp_id: None,
@@ -2207,7 +2211,7 @@ pub static LEGACY_NANODIGI_2X8: DspTable = DspTable {
     // 0 means "unknown — do not use for bounds checking".
     param_memory_size: 0,
     // Legacy families predate the modern `<CMD_VERSION>` tagging in
-    // `app/Audio Firmware/info.xml`. 0 = unknown.
+    // Official app `info.xml` metadata. 0 = unknown.
     cmd_version: 0,
     // No documented firmware convert paths for legacy families.
     intermediate_dsp_id: None,
@@ -2256,7 +2260,7 @@ const fn peq_bands_5(base: u16) -> [PeqBand; 5] {
 /// Default PEQ band frequencies in Hz used by the official app for a fresh
 /// 10-band PEQ chain. Doubling schedule from 20 Hz. A client reset-to-defaults
 /// should seed every band at these frequencies with Q=0.7, boost=0, type=PK,
-/// matching what `app/Audio Firmware/{family}/DSP_default_parameters.xml`
+/// matching what `protocol/assets/audio_firmware/{family}/DSP_default_parameters.xml`
 /// encodes in every `<filter name="PEQ_*_*">` default block.
 pub const DEFAULT_PEQ_FREQS_HZ: [u32; 10] = [20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
 
@@ -2300,7 +2304,8 @@ mod tests {
     #[test]
     fn modern_families_match_xml_derived_delay_ranges() {
         // DSP100 2x4 HD / Flex @ 96 kHz: 0..80 ms step 0.01 per
-        // app/Audio Firmware/100/DSP_default_parameters.xml <range> attrs.
+        // protocol/assets/audio_firmware/100/DSP_default_parameters.xml
+        // `<range>` attrs.
         assert_eq!(DSP_100.delay_range.max_ms, 80.0);
         assert_eq!(DSP_100.delay_range.step_ms, 0.01);
         // DSP101 DDRC-24 / Flex DL @ 48 kHz: 0..30 ms step 0.02.
@@ -2398,8 +2403,8 @@ mod tests {
 
     #[test]
     fn ht_bm_routing_matches_xml_addresses() {
-        // Verified against `app/Audio Firmware/113/DSP_default_parameters.xml`
-        // and `115/DSP_default_parameters.xml`. Both share the identical
+        // Verified against `protocol/assets/audio_firmware/113/` and `115/`
+        // `DSP_default_parameters.xml`. Both share the identical
         // BM_Mixer layout (113 lines 159..271, 115 lines 809..1024).
         let bm = DSP_113
             .bass_management

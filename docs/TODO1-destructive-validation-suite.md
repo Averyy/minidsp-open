@@ -29,6 +29,11 @@ The remaining work is:
 - stronger concurrency / busy-behavior assertions during snapshot export / restore
 - broader ESP32 and multi-profile rollout beyond the already verified paths
 
+This plan is no longer blocked on shared snapshot import/export.
+That prerequisite is already complete and documented in:
+
+- [docs/ref-device-state-recovery.md](./docs/ref-device-state-recovery.md:1)
+
 ## Goal
 
 Extend the existing live validation harness into a full destructive regression
@@ -84,20 +89,21 @@ Those are the remaining gaps this plan should close.
 
 ## Dependency
 
-This plan depends on the strict snapshot/import-export plan in:
+This plan depends on the shared recovery reference surface in:
 
-- [docs/TODO1-controller-snapshot-import-export.md](./docs/TODO1-controller-snapshot-import-export.md:1)
+- [docs/ref-device-state-recovery.md](./docs/ref-device-state-recovery.md:1)
 
 The destructive suite should not invent its own backup format in Python.
 It should call the shared snapshot export/import feature and treat that as the
 single source of truth.
 
-Important current limitation:
+Important current state:
 
-- the existing shared `apply_shadow_state()` helper is not a hardware restore
-  path
-- this suite therefore depends on a new replay-capable snapshot import feature,
-  not just the current shadow serializer
+- the existing shared `apply_shadow_state()` helper is still not a hardware
+  restore path
+- that is no longer a blocker here, because the shared replay-capable snapshot
+  import/export path now exists and is the recovery primitive this suite should
+  use
 
 ## Design Principles
 
@@ -226,8 +232,9 @@ Run the current restore-capable checks and extend them:
 
 Important sequencing rule:
 
-- once full snapshot restore exists, these mutations should no longer depend on
-  scattered hand-written per-feature restore logic
+- now that full snapshot restore exists for the verified desktop path, these
+  mutations should no longer depend on scattered hand-written per-feature
+  restore logic
 - targeted local restore is still useful inside a single step, but the
   authoritative end-of-run rollback should come from the shared snapshot import
 
@@ -457,7 +464,8 @@ The destructive suite should trust:
 
 It should not trust:
 
-- ad-hoc field-by-field "restore" logic once full snapshot restore exists
+- ad-hoc field-by-field "restore" logic on profiles where shared snapshot
+  restore already exists
 - current in-memory shadow alone as proof that hardware has been restored
 
 ## Validation Of The Validation Tool
@@ -514,12 +522,20 @@ If we keep extending this plan, the right next items are:
 5. only then promote the harness to the stronger "full destructive profile"
    shape described here
 
-## Recommended Implementation Order
+## Remaining Implementation Order
 
-1. land strict snapshot export/import
-2. teach `run-live-validation.py` to create artifact directories and call
-   snapshot export/import
-3. convert existing destructive checks to rely on the shared restore path
-4. add manual checkpoint recording for audio / reconnect / official app
-5. extend the suite to reboot / reconnect and full ezBEQ coverage
-6. only after that, retire any duplicated ad-hoc restore logic
+These earlier prerequisites are already done for the verified desktop path:
+
+1. strict snapshot export/import exists
+2. `run-live-validation.py` already creates artifact directories and calls the
+   shared snapshot export/import path for destructive desktop runs
+3. the desktop destructive flow already relies on the shared restore path
+
+The next implementation order is:
+
+1. add manual checkpoint recording for audio / reconnect / official app
+2. make the direct-USB desktop lane an explicit required matrix item
+3. add snapshot concurrency / busy-behavior assertions during restore
+4. extend the suite to reboot / reconnect and fuller ezBEQ coverage
+5. only after that, promote the harness to the stronger "full destructive
+   profile" shape described here and retire any duplicated ad-hoc restore logic
