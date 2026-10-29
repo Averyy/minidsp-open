@@ -1842,7 +1842,7 @@ mod tests {
     #[test]
     fn parse_official_setting_xml_extracts_shadow_and_fir() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../app/minidsp-snapshots/20260408-130500-preset1-after-reset-live/official-setting1.xml");
+            .join("tests/fixtures/official-setting-2x4hd-factory-reset.xml");
         let profile = probe::identify(10, 100);
         let (selector_addrs, scalar_addrs) = official_xml_shadow_addrs(&profile);
         let (timestamp, parsed) =

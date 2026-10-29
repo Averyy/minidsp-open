@@ -822,7 +822,7 @@ mod tests {
     #[test]
     fn parse_official_setting_xml_extracts_timestamp_and_shadow_values() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../app/minidsp-snapshots/20260408-130500-preset1-after-reset-live/official-setting1.xml");
+            .join("../minidsp/tests/fixtures/official-setting-2x4hd-factory-reset.xml");
         let (selector_addrs, scalar_addrs) = official_xml_shadow_addrs(&probe::identify(10, 100));
         let (timestamp, preset) =
             parse_official_setting_xml(&path, &selector_addrs, &scalar_addrs, 100)
@@ -878,7 +878,7 @@ mod tests {
     #[test]
     fn parse_official_setting_xml_rejects_mismatched_dsp_version() {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../app/minidsp-snapshots/20260408-130500-preset1-after-reset-live/official-setting1.xml");
+            .join("../minidsp/tests/fixtures/official-setting-2x4hd-factory-reset.xml");
         let temp = std::env::temp_dir().join(format!(
             "minidsp-open-mismatched-setting-{}-{}.xml",
             std::process::id(),

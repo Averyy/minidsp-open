@@ -19,6 +19,11 @@ other original rights holders retain their rights. These files are excluded
 from this repository's MIT license; no MiniDSP redistribution license is granted
 by this notice or inferred from their availability in minidsp-rs.
 
+minidsp/tests/fixtures/official-setting-2x4hd-factory-reset.xml is a Device
+Console settings export of a 2x4 HD preset right after a factory reset, kept
+as a parser test fixture. It holds MiniDSP default parameter values and is
+covered by the same terms as the vendor XML above.
+
 Generated data in docs/generated/device-support-matrix.json,
 protocol/src/device/generated_official.rs, and build-generated default/reset
 payloads derives from these vendor resources and other Device Console metadata.

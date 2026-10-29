@@ -23,6 +23,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - The workspace builds clippy-clean.
 - ESP32 builds use ESP-IDF 6.0.3 and esp-uac2-host v0.1.3; the first move from IDF 5.4 requires a USB bootloader flash.
 - Repository build and flashing wrappers select the pinned ESP-IDF and esptool versions and track external UAC2 component changes.
+- CI and release builds pin esp-uac2-host v0.1.3, espup v0.16.0 and Xtensa Rust 1.93.0.0 (1.97.0.0 crashes LLVM on this firmware), and host tests no longer read local-only device captures.
 - ESP32 partitions now provide two 3 MB firmware slots and about 9.9 MB of bundle storage; existing boards need a USB flash to change layouts.
 - Hosted ezBEQ is pinned to 2.12.4 with checksum verification, slot title/author metadata, custom biquad uploads, filter-author and new-title queries, and active-slot/output controls.
 - Catalogue bundles include device-ready 96 kHz float32 coefficients with an authored-filter fallback and a sample-rate guard.
