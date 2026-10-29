@@ -44,6 +44,7 @@ pub struct HidTransport {
     path: String,
     vid: u16,
     pid: u16,
+    serial_number: Option<String>,
 }
 
 impl HidTransport {
@@ -61,6 +62,7 @@ impl HidTransport {
         Ok(Self {
             vid: info.vendor_id(),
             pid: info.product_id(),
+            serial_number: info.serial_number().map(str::to_owned),
             device: Arc::new(Mutex::new(device)),
             path: path.to_string(),
         })
@@ -240,10 +242,11 @@ impl Transport for HidTransport {
 
     fn url(&self) -> String {
         format!(
-            "usb:{}?vid={:04x}&pid={:04x}",
+            "usb:{}?vid={:04x}&pid={:04x}&serial={}",
             urlencoding::encode(&self.path),
             self.vid,
             self.pid,
+            urlencoding::encode(self.serial_number.as_deref().unwrap_or("")),
         )
     }
 }

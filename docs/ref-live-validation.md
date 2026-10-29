@@ -1,7 +1,7 @@
 # Live Validation Harness
 
 This file documents the repeatable validation workflow built around
-[`tools/run-live-validation.py`](./tools/run-live-validation.py).
+[`tools/run-live-validation.py`](../tools/run-live-validation.py).
 
 The goal is simple: after any material change, run one command for the
 machine-checkable compatibility surface instead of trying to remember a long
@@ -122,4 +122,4 @@ If you already know the repo is built and only want live checks:
 - If playback changed, run the harness again with `--allow-audio`, listen to sweep-only, marker-only, and combined playback, and record explicit human approval.
 - If reconnect behavior changed, do live unplug / replug and power-cycle checks on the ESP32 path after the harness completes.
 - If TCP bridge or discovery code changed, do one focused official Device Console sanity pass.
-- If device-matrix code changed, update `docs/todo-checker.md` and `PROGRESS.md` with what hardware was actually re-verified.
+- If device-matrix code changed, update `docs/todo-checker.md` and `PROGRESS.md` with what hardware was actually re-verified. Record user-visible changes in [CHANGELOG.md](../CHANGELOG.md) under Unreleased; keep dated history out of `PROGRESS.md`.

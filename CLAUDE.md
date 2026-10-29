@@ -1,8 +1,8 @@
 # minidsp-open
 
-Clean-room MiniDSP controller (not a fork). HTTP API and CLI. Runs on Linux/macOS/Windows AND ESP32-S3 from one Rust codebase. Protocol knowledge from minidsp-rs (credited) + Device Console XML extraction.
+Original MiniDSP controller implementation (not a fork). HTTP API and CLI. Runs on Linux/macOS/Windows AND ESP32-S3 from one Rust codebase. Protocol knowledge from minidsp-rs (credited) + Device Console XML extraction.
 
-When progress or verification status changes, update `PROGRESS.md`. Do not turn this file into a dated progress log.
+Record user-visible changes in `CHANGELOG.md` under Unreleased (Keep a Changelog). Keep `PROGRESS.md` as current status and open items only, never a dated log.
 
 ## Build
 
@@ -10,10 +10,11 @@ When progress or verification status changes, update `PROGRESS.md`. Do not turn 
 # Desktop
 cargo build && cargo test
 
-# ESP32 — `esp` wrapper handles all environment setup
-cd app-esp32
-esp cargo build
+# ESP32 — ESP-IDF v6.0.3; repo wrapper handles espup environment setup
+tools/esp-cargo build
 ```
+
+Do not build with an activated ESP-IDF environment (`. export.sh`, or the personal `esp` wrapper with `--idf`): its environment variables override the pinned version. `tools/esp-cargo` clears those variables so esp-idf-sys installs the pinned IDF and matching build tools. esp-idf-sys 0.38 doesn't watch `component_dirs`, so the `ESP_IDF_GLOB_UAC2_*` entries in `app-esp32/.cargo/config.toml` make Cargo rebuild after a `~/code/esp-uac2-host/components/usb_host_uac2` edit; keep them in step with the component's build inputs. Plain `esp cargo …` works too: the wrapper sees the pin and activates no IDF.
 
 **Use `/esp-idf` for general ESP-IDF knowledge** — environment setup, flashing, serial monitoring, common gotchas, DTR/RTS, Python issues.
 
@@ -23,17 +24,20 @@ Use `tools/flash-esp32.sh` as the default local flashing workflow. It builds the
 
 This is the correct dev workflow even while the published ezBEQ site is stale because the board comes up with a real stored bundle immediately after flash instead of depending on an immediate post-boot download.
 
-If you need the low-level primitive directly, flash with `esptool.py` (not espflash — it panics on our CH340 boards). The build produces an ELF that must be converted first:
+For the first move from ESP-IDF 5.4 to 6.x, use `tools/flash-esp32.sh` to update the bootloader; OTA never updates it. Once a board has the 6.x bootloader and runs OTA-capable firmware, push new builds over WiFi instead: `tools/ota-push.sh --board http://BOARD:5380` builds, uploads to `POST /firmware`, and waits for the reboot. The board verifies the image, and rolls back by itself if the new firmware never gets back on the network. USB flashing is only needed for partition-table/bootloader changes or a bricked board. Firmware updates are documented in `docs/ref-firmware-updates.md`.
+
+If you need the low-level primitive directly, flash with `tools/esptool` (not espflash — it panics on our CH340 boards). The build produces an ELF that must be converted first. Offsets come from `app-esp32/partitions.csv` (app in `ota_0` at `0x20000`); erasing `otadata` makes the bootloader start `ota_0`:
 
 ```bash
 # 1. Close serial-mcp session
-# 2. Convert ELF → bin, then flash all three parts
-esp esptool.py --chip esp32s3 elf2image app-esp32/target/xtensa-esp32s3-espidf/debug/minidsp-esp32 -o /tmp/app.bin
-esp esptool.py --chip esp32s3 -p /dev/ttyUSB0 -b 460800 write_flash \
-  --flash_size 16MB \
+# 2. Convert ELF → bin, erase otadata, then flash all three parts
+tools/esptool --chip esp32s3 elf2image app-esp32/target/xtensa-esp32s3-espidf/debug/minidsp-esp32 -o /tmp/app.bin
+tools/esptool --chip esp32s3 -p "$PORT" -b 460800 erase-region 0x10000 0x2000
+tools/esptool --chip esp32s3 -p "$PORT" -b 460800 write-flash \
+  --flash-size 16MB \
   0x0 app-esp32/target/xtensa-esp32s3-espidf/debug/bootloader.bin \
   0x8000 app-esp32/target/xtensa-esp32s3-espidf/debug/partition-table.bin \
-  0x10000 /tmp/app.bin
+  0x20000 /tmp/app.bin
 # 3. Reopen serial-mcp
 ```
 
@@ -41,19 +45,15 @@ Bootloader/partition-table binaries are in `app-esp32/target/xtensa-esp32s3-espi
 
 `tools/flash-esp32-with-site.sh` remains available as the explicit updater-path fallback for testing `/debug/updater` against a temporary local site.
 
-## ESP32 Dev Boards
-
-| Serial | Port | Role |
-|--------|------|------|
-| firmware-board | `/dev/ttyUSB0` | minidsp-open firmware target (USB host) |
-| simulator-board | `/dev/ttyUSB1` | retired original firmware target board; defective, do not use |
+Board serials, USB ports, and LAN addresses for the maintainer's hardware live in the gitignored `CLAUDE.local.md`.
 
 ## Key Files
 
 | File | What |
 |------|------|
 | `PROJECT.md` | Architecture, protocol reference, device tables, goals |
-| `PROGRESS.md` | Task checklist by phase |
+| `CHANGELOG.md` | User-visible changes and development milestones |
+| `PROGRESS.md` | Current status, verification limits, and open work |
 | `docs/ref-devices.md` | Device registry — hw_ids, DSP IDs, USB PIDs, capabilities |
 | `docs/ref-compatibility.md` | External compatibility contract — CLI, HTTP, WebSocket, TCP, UDP |
 | `docs/ref-address-tables.md` | DSP register addresses for all 7 SHARC structures |
@@ -70,8 +70,8 @@ Bootloader/partition-table binaries are in `app-esp32/target/xtensa-esp32s3-espi
 - **All devices from day one.** 13 devices full PEQ, 3 more basic support.
 - **Dual target.** `cfg(target_os = "espidf")` for platform splits. Protocol crate is shared.
 - **Desktop: tokio + axum.** ESP32: blocking std on ESP-IDF, EspHttpServer, esp-idf-sys FFI for USB host.
-- **Clean-room.** No copied code. Protocol knowledge from minidsp-rs (credited) + manufacturer XML.
-- **MIT license.**
+- **Original implementation.** Protocol knowledge from minidsp-rs (Apache-2.0, credited in `NOTICE`). Vendor XML files are included for interoperability under the provenance notices; generated tables and reset payloads derive from vendor data.
+- **MIT license for original code.** Vendor data is excluded; see `NOTICE` and the asset READMEs.
 
 ## Protocol Quick Reference
 

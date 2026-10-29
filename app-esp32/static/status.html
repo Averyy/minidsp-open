@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>miniDSP-Open Status</title><style>
+:root{color-scheme:light dark;--bg:#f4f5f8;--card:#fff;--text:#182131;--muted:#586477;--border:#d7dce4;--accent:#175cc4;--active:#e3eeff}
+@media(prefers-color-scheme:dark){:root{--bg:#10131a;--card:#191f2b;--text:#e8edf6;--muted:#aab6ca;--border:#354054;--accent:#8ab8ff;--active:#233d60}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,sans-serif}main{max-width:800px;margin:auto;padding:1rem}header{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}h1{font-size:1.5rem}h2{font-size:1.15rem;margin:0 0 .75rem}section{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin:1rem 0}a{color:var(--accent)}dl{display:grid;grid-template-columns:auto 1fr;gap:.3rem 1rem;margin:0}dt,.muted{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.7rem}label{display:block;font-size:.9rem}.wide{grid-column:1/-1}input,button{font:inherit;border:1px solid var(--border);border-radius:6px;padding:.6rem;background:var(--card);color:var(--text);width:100%;min-height:44px}input{margin-top:.25rem}button{cursor:pointer;color:var(--accent);font-weight:600}button:disabled{opacity:.45;cursor:default}.buttons{display:flex;gap:.7rem;margin-top:1rem}#tone{font-size:clamp(1.8rem,6vw,3rem);font-weight:700;line-height:1.2;margin:1.2rem 0 .4rem}#schedule{max-height:320px;overflow:auto;padding-left:2.2rem}#schedule li{padding:.3rem .5rem;border-radius:4px}#schedule .current{background:var(--active);font-weight:700}#message,#result{white-space:pre-wrap;overflow-wrap:anywhere}.error{color:#d43c3c}@media(prefers-color-scheme:dark){.error{color:#ff9696}}p{margin:.6rem 0}#connection:empty,#message:empty,#result:empty{display:none}
+</style></head><body><main>
+<header><h1>miniDSP-Open</h1><a href="/update">Firmware updates</a></header>
+<p id="connection" role="status" class="error"></p>
+<section><h2>Device</h2><dl><dt>Firmware</dt><dd id="firmware">…</dd><dt>Uptime</dt><dd id="uptime">…</dd><dt>WiFi</dt><dd id="wifi">…</dd><dt>IP</dt><dd id="ip">…</dd><dt>miniDSP</dt><dd id="device">…</dd><dt>Serial</dt><dd id="serial">…</dd></dl></section>
+<section><h2>miniDSP</h2><dl><dt>Master volume</dt><dd id="volume">Unknown</dd><dt>Mute</dt><dd id="mute">Unknown</dd><dt>Source</dt><dd id="source">Unknown</dd><dt>Preset</dt><dd id="preset">Unknown</dd></dl><p id="hid" class="muted"></p></section>
+<section><h2>Playback state</h2><p id="playback" role="status">Checking…</p></section>
+<section><h2>Rattle finder</h2><form id="form"><div class="fields">
+<label class="wide">Tones (Hz, comma separated)<input id="tones" value="20,25,31.5,40,50,63,80,100,125,160,200" required></label>
+<label>Tone seconds<input id="hold" type="number" min="0.5" max="600" step="any" value="4" required></label>
+<label>Gap seconds<input id="gap" type="number" min="0" max="600" step="any" value="1" required></label>
+<label>Cycles<input id="cycles" type="number" min="1" step="1" value="1" required></label>
+<label class="wide">Volumes (dB, comma separated, 0.5 dB steps)<input id="volumes" value="-35" required></label>
+</div><p class="muted">Plays through your speakers. Start quietly. The previous master volume and source are restored afterwards; volume restoration is skipped if audio cannot be confirmed stopped.</p>
+<div class="buttons"><button id="start" type="submit" disabled>Start</button><button id="stop" type="button" disabled>Stop with fade</button></div></form>
+<p id="message" role="alert"></p><div id="tone" aria-live="polite">Ready</div><p id="position" class="muted"></p><p id="result" role="status"></p><p id="schedule-position" class="muted"></p><ol id="schedule" aria-label="Tone schedule"></ol>
+</section></main><script>
+'use strict';
+const $ = id => document.getElementById(id);
+let rattle = {playing:false}, playBusy = false, pending = false, scheduleKey = '', activeStep = -1, connected = false;
+async function request(path, options) {
+  const response = await fetch(path, {cache:'no-store', ...options});
+  const data = await response.json();
+  if (!response.ok) { const error = new Error([data.error, data.volumeRestoreError, data.sourceRestoreError].filter(Boolean).join('\n') || ('HTTP ' + response.status)); error.status = response.status; throw error; }
+  return data;
+}
+function message(text, error = false) { $('message').textContent = text; $('message').className = error ? 'error' : ''; }
+function buttons() { $('start').disabled = pending || !connected || playBusy || rattle.playing; $('stop').disabled = pending || !rattle.playing || rattle.last?.state !== 'playing'; }
+function displaySource(source) {
+  return ({__proto__:null, Usb:'USB', Toslink:'TOSLINK', Spdif:'S/PDIF', Analog:'Analog'})[source] ?? source;
+}
+function renderSchedule(run, current) {
+  const count = run ? run.schedule.frequenciesHz.length * run.schedule.volumesDb.length * run.schedule.cycles : 0;
+  const sameRun = run && scheduleKey.startsWith(String(run.startedAtUs) + ':');
+  const step = current ? current.step : sameRun && activeStep >= 0 ? activeStep : 0;
+  const key = run ? `${run.startedAtUs}:${step}:${!!current}` : '';
+  if (key === scheduleKey) return;
+  scheduleKey = key; activeStep = step; $('schedule').replaceChildren();
+  $('schedule-position').textContent = count ? `Step ${step + 1} of ${count}` : '';
+  if (!run) return;
+  const s = run.schedule, fragment = document.createDocumentFragment();
+  const first = Math.max(0, step - 10), end = Math.min(count, step + 21);
+  $('schedule').start = first + 1;
+  for (let k = first; k < end; k++) {
+    const pass = Math.floor(k / s.frequenciesHz.length), li = document.createElement('li');
+    const frequency = s.frequenciesHz[k % s.frequenciesHz.length], volume = s.volumesDb[pass % s.volumesDb.length];
+    const start = (s.leadInSamples + k * (s.toneSamples + s.gapSamples)) / s.sampleRate;
+    li.textContent = `${frequency} Hz @ ${volume} dB · cycle ${Math.floor(pass / s.volumesDb.length) + 1} · ${start.toFixed(1)} s`;
+    if (current && k === step) li.classList.add('current');
+    fragment.appendChild(li);
+  }
+  $('schedule').appendChild(fragment);
+}
+function render(status) {
+  rattle = status; renderSchedule(status.last, status.current);
+  const c = status.current;
+  if (c) {
+    $('tone').textContent = c.label;
+    const phase = c.phase === 'leadIn' ? 'Lead-in' : c.phase === 'gap' ? 'Gap' : 'Tone';
+    $('position').textContent = `Step ${c.step + 1} of ${c.steps} · cycle ${c.cycle + 1} of ${c.cycles} · ${phase}: ${c.remainingSec.toFixed(1)} s left`;
+  } else {
+    $('tone').textContent = status.playing ? 'Finishing…' : 'Ready';
+    $('position').textContent = '';
+  }
+  const run = status.last;
+  $('result').textContent = run && run.state !== 'playing' ? ['Last run: ' + run.state, run.error, run.volumeRestoreError, run.sourceRestoreError].filter(Boolean).join('\n') : '';
+  $('result').className = run && (run.error || run.volumeRestoreError || run.sourceRestoreError) ? 'error' : '';
+  $('playback').textContent = status.playing ? 'Rattle running' : playBusy ? '/play running' : 'Idle';
+  buttons();
+}
+async function pollRattle() {
+  try {
+    // Read the shared busy flag first: completion between these reads must
+    // never pair an old busy=true with a newly completed rattle status.
+    const play = await request('/devices/0/play');
+    const status = await request('/devices/0/rattle');
+    playBusy = play.playing;
+    if (rattle.playing && !status.playing) playBusy = (await request('/devices/0/play')).playing;
+    render(status); $('connection').textContent = '';
+  }
+  catch (e) { $('connection').textContent = 'Status unavailable: ' + e.message; }
+  setTimeout(pollRattle, rattle.playing ? 300 : 1800);
+}
+async function pollDevice() {
+  try {
+    const info = await request('/debug/info'); connected = info.usb.connected;
+    $('firmware').textContent = info.firmware;
+    $('uptime').textContent = `${Math.floor(info.uptime_secs / 3600)}h ${Math.floor(info.uptime_secs / 60) % 60}m ${info.uptime_secs % 60}s`;
+    $('wifi').textContent = info.wifi.connected ? `${info.wifi.ssid || 'Connected'} · ${info.wifi.rssi ?? '?'} dBm` : 'Disconnected';
+    $('ip').textContent = info.wifi.ip || '—'; $('device').textContent = info.usb.device || 'Disconnected'; $('serial').textContent = info.usb.serial ?? '—';
+    try {
+      const status = await request('/devices/0'), m = status.master;
+      $('volume').textContent = m.volume + ' dB'; $('mute').textContent = m.mute ? 'Muted' : 'Unmuted';
+      $('source').textContent = displaySource(m.source); $('preset').textContent = String(m.preset + 1); $('hid').textContent = '';
+    } catch (e) { $('hid').textContent = e.status === 409 ? 'Last known values · busy while audio plays' : e.message; }
+    render(rattle);
+  } catch (e) { connected = false; buttons(); $('connection').textContent = 'Device unavailable: ' + e.message; }
+  setTimeout(pollDevice, 4000);
+}
+function numbers(id) {
+  const parts = $(id).value.split(',').map(value => value.trim());
+  if (parts.some(value => !value || !Number.isFinite(Number(value)))) throw new Error('Enter a comma-separated number list for ' + id + '.');
+  return parts.map(Number);
+}
+$('form').onsubmit = async event => {
+  event.preventDefault(); if (pending || rattle.playing || playBusy) return;
+  try {
+    const volumes = numbers('volumes'), frequencies = numbers('tones');
+    if (volumes.some(v => v < -127 || v > 0)) throw new Error('Volumes must be between -127 and 0 dB.');
+    if (volumes.some(v => !Number.isInteger(v * 2))) throw new Error('Volumes must use multiples of 0.5 dB.');
+    if (volumes.some(v => v > -20) && !confirm('A volume above -20 dB can be very loud. Start this speaker test?')) return;
+    pending = true; buttons(); message('Starting…');
+    const response = await request('/devices/0/rattle', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({frequenciesHz:frequencies, toneSec:Number($('hold').value), gapSec:Number($('gap').value), cycles:Number($('cycles').value), volumesDb:volumes})});
+    render({playing:true,last:{startedAtUs:response.startedAtUs, schedule:response.schedule, state:'playing'}}); message('');
+  } catch (e) { message(e.message, true); }
+  finally { pending = false; buttons(); }
+};
+$('stop').onclick = async () => {
+  pending = true; buttons();
+  try { render(await request('/devices/0/rattle/stop', {method:'POST'})); message('Stop requested; fading out…'); }
+  catch (e) { message(e.message, true); }
+  finally { pending = false; buttons(); }
+};
+pollRattle(); pollDevice();
+</script></body></html>

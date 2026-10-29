@@ -146,7 +146,7 @@ Current generated guardrails from the cached legacy corpus:
 
 This stage is complete for the cached corpus. Remaining work is no longer per-device table extraction; it is broader official-app identity coverage outside the exact XML/config.xml matrix.
 
-**We do NOT copy minidsp-rs's generated Rust files or codegen pipeline.** We use the same source data (SigmaStudio XML exports) and write our own code, consistent with the clean-room approach used for all SHARC devices.
+**We do NOT copy minidsp-rs's generated Rust files or codegen pipeline.** We use the same source data (SigmaStudio XML exports) and write our own code, using the same original-code/vendor-data distinction as SHARC devices. The XML retains its upstream rights and is excluded from our MIT license; see `../NOTICE` and `../third_party/legacy-configs/README.md`.
 
 ### For miniDSP 2x4 (non-HD):
 

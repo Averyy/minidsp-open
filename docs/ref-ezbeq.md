@@ -191,230 +191,186 @@ Verified against ezBEQ source (2026-04-03). Not needed for Phase 1 compatibility
 - **ezBEQ WebSocket protocol:** Server sends JSON `{"message": "DeviceState"|"Catalogue"|"CatalogueEntries"|"Levels"|"Error", "data": ...}`. Client sends `"load catalogue"` and `"subscribe levels {device_name}"`. `Levels` messages must include `data.name`, `data.levels`, and a real monotonic `data.ts` in seconds; the hosted React levels plot uses that timestamp as the x-axis. Catalogue entries are sent in chunks.
 - **`ignoreRetcode`:** Config flag that suppresses exit code checking from minidsp CLI.
 
-## ESP32 Strategy: Replace the Entire Stack
+## ESP32 hosted ezBEQ contract
 
-### The problem today
+We consume ezBEQ, which is 3ll3d00d's product. We serve the upstream **2.12.4**
+React build and implement its backend contract in firmware. We do not fork the
+React components or change its generated JavaScript/CSS. The only change to the
+upstream HTML is a script tag loading the ESP32 catalogue transport adapter.
+Catalogue content and published device profiles remain upstream data, refreshed
+automatically; adopting a new UI version is a deliberate compatibility change.
 
-A typical ezBEQ setup requires:
-- Raspberry Pi ($35-75)
-- SD card, power supply, case ($20-30)
-- Linux knowledge (SSH, systemd, config files)
-- Install minidsp-rs (Rust binary)
-- Install ezBEQ (Python 3.13 + dependencies)
-- Configure `ezbeq.yml` with device descriptor
-- USB cable to MiniDSP
-- Optional: WI-DG ($75) if you want wireless
+### Bundle and storage
 
-Total: $55-180 + significant setup time. Multiple forum users report struggling with the RPi setup and giving up.
+Build with `mkdir -p DIR && uv run tools/build-catalogue.py --output-dir DIR`.
+The builder fails if manifest files plus the manifest exceed **8,000,000 bytes**.
+This leaves filesystem/update headroom in the `0x9E0000` storage partition.
+The updater downloads only `manifest.json`'s `files` entries:
 
-### Our ESP32 solution
+| File | Purpose |
+|------|---------|
+| `catalogue.bin` | BEQ v3, 96 kHz coefficients and digest-prefix binary index |
+| `database.json.gz` | Compressed slim browser listing, served as `/database.json` with gzip encoding |
+| `entry-metadata.jsonl` | `[id, title, author]` per entry; catalogue.bin records point at each row |
+| `recent-changes.jsonl` | What's New rows from the last 180 days, newest first |
+| `authors.json`, `filterauthors.json`, `years.json`, `audiotypes.json`, `contenttypes.json`, `languages.json` | Startup facets; years are descending integers |
+| `version.txt` | Installed site version, including catalogue, UI and payload identity |
+| `catalogue-built-at.txt` | Snapshot timestamp for feed defaults before the board has a wall clock |
+| `ui/*` | Upstream UI, WOFF2 fonts and shared shim; unused gzip/Brotli/WOFF siblings are omitted |
+| `licenses/*` | ezBEQ's LICENSE extracted from the pinned wheel, beqcatalogue's published LICENSE and attribution |
 
-A single ESP32-S3 dev board ($10) plugged into the MiniDSP's USB port. Flash our firmware once. Connect to WiFi. Open `http://minidsp.local` on your phone. Browse BEQ, tap a movie, done.
+`database.json` (the full published database) and `overviews.json.gz` (digest →
+overview) are **Pages-only assets**. They are not in the manifest and must never
+be downloaded to the ESP32. Each manifest file is SHA-256 checked by the updater.
+All bundled licenses are served at `/licenses/ezbeq-LICENSE.txt`,
+`/licenses/beqcatalogue-LICENSE.txt` and `/licenses/ATTRIBUTION.txt`.
 
-No RPi. No Linux. No SSH. No Python. No config files.
+Updates plan changed files by their 4096-byte allocation sizes, with shrinking
+files first and `ui/index.html` last. The updater keeps each old file until its
+replacement verifies when space permits, otherwise deletes each changed file
+just before downloading its replacement. Both plans reserve a 64 KiB margin.
+The durable incomplete journal prevents partial updates from appearing current;
+version commit and obsolete-file reclamation follow successful downloads.
+Obsolete UI assets remain until commit so the previous page can still load them.
 
-### Why can't we just run ezBEQ on ESP32?
+BEQ v3 has a 12-byte header: `BEQ\x03`, little-endian u32 entry count and sample
+rate. A sorted index contains 8-byte digest prefixes and u32 absolute record
+offsets. Each variable record contains a u8 filter count (high bit means
+optimised), f32 MV adjustment, count × five f32 coefficients, then a u32 byte
+offset into `entry-metadata.jsonl`. That row carries the full digest, formatted
+title and author, so firmware resolves slot metadata without browser request
+rewriting. Duplicate full digests keep the first published entry, as upstream does.
+Distinct digests sharing a prefix fail the build. Legacy
+BEQ v2 indexes remain readable during upgrade, but have no title/author index;
+legacy loads use the digest as their title until the bundle updates.
 
-ezBEQ is a Python application (Python 3.13+, Twisted, Flask, SQLite). The BEQ catalogue alone is ~34.5 MB — larger than ESP32's entire flash. Python doesn't run on ESP32 at all.
+For `float32-96k`, the builder consumes `beqcatalogue/docs/devices/index.json`
+and the indicated profile file, verifying its SHA-256, schema, rate, precision
+and loading model. Published decimal strings are converted to float32 in
+`b0,b1,b2,a1,a2` order. Feedback is already additive: **do not negate it again**.
+An entry uses published coefficients only when its full digest matches and its
+optimised count equals the authored count. Missing/malformed entries, or an
+unavailable/invalid profile, use authored coefficients. Only the selected set
+is stored. A bundle build reports optimised/fallback counts and per-file sizes.
 
-But we don't need to run ezBEQ. We serve ezBEQ's **unmodified pre-built React UI** from flash and implement its backend API natively. A GitHub Action keeps everything synced automatically. We maintain zero ezBEQ code and zero UI code.
+The firmware checks the binary rate against the detected DSP rate **before
+changing presets or writing coefficients**. A 48 kHz device cannot load this
+96 kHz catalogue. Published float32 optimisation also requires a float32 DSP.
+Additional sample rates and device-specific BEQ output routing require a future
+bundle/backend change; they are not silently approximated.
 
-### How ezBEQ's data flow actually works
+### Thin browser adapter
 
-Understanding why this matters: ezBEQ's React frontend **never receives biquad coefficients**. When the backend sends the catalogue to the browser over WebSocket, it deliberately strips out the `filters` and `digest` fields — the browser only gets display metadata (title, year, author, etc.). When the user picks a movie, the browser sends just an entry ID string to the backend, and the backend does the lookup in SQLite to get the biquad coefficients.
+`app-esp32/static/ezbeq-shim.js` is the sole source. The builder copies it into
+`ui/ezbeq-shim.js`; firmware serves that installed copy at `/ezbeq-shim.js`, with
+its embedded copy as the fallback when the bundle is absent.
 
-This means we can't just "put the catalogue in the browser and have it send coefficients to the ESP32" — the browser never has the coefficients, and the frontend code sends entry IDs, not filter data.
+The stock 2.12.4 `StateService` keeps entries in React memory, tracks catalogue
+version/count, and reloads on version changes or incomplete reconnects. It does
+**not** persist the catalogue across page loads. The shim intercepts
+`load catalogue`, loads the same-origin compressed listing, and delivers stock
+`CatalogueEntries` messages. IndexedDB caches that listing by the installed site
+version announced in the upstream Catalogue message, avoiding a duplicate HTTP
+version check and repeated transfers of roughly 10 MB of decoded metadata
+through the board's single httpd task. Upstream retains responsibility for
+reconnects, heartbeat probes, UI state, filtering and selection. Firmware sends
+API failure explanations through the stock state socket Error message because
+the upstream HTTP service reports only the response status. PUT and PATCH
+entry uploads use the stock requests; firmware resolves title and author by
+digest from the installed catalogue and metadata feed. The adapter does not
+wrap mutation fetches, format titles or recompute snapshot freshness.
 
-### Our approach: ezBEQ's own UI, auto-updating, zero maintenance
+After sending the listing, the adapter lazily fetches `overviews.json.gz` from
+`/debug/updater`'s configured `updaterBaseUrl`, defaulting to
+`https://averyy.github.io/minidsp-open`. It handles both raw gzip on Pages and
+hosts that apply Content-Encoding, caches summaries in IndexedDB by site
+version, and publishes another normal entry update when ready. Offline,
+unsupported decompression or CORS failures silently leave the listing usable.
+It never downloads the full upstream database for overview hydration.
 
-We serve ezBEQ's **unmodified pre-built React UI** from ESP32 flash. We implement ezBEQ's backend API natively in Rust. A GitHub Action automatically syncs the catalogue index and UI build artifacts. The ESP32 self-updates its data partition on every boot — no firmware releases needed for catalogue or UI changes.
+### HTTP and WebSocket behaviour
 
-**We maintain zero ezBEQ code. Zero UI code.** The ESP32 is a thin shell: it serves ezBEQ's own UI, resolves entry IDs from a pre-built biquad index, and writes to the MiniDSP.
+One USB device is exposed as `master`, with four one-based slots. REST mutations
+return the plain upstream device object; `/api/2/devices` wraps it by name and
+`DeviceState` wraps it in a WS message. State includes `connected`, slot
+`optimise`, input/output gains/mutes, and loaded `coefficients`/`profile`.
+`optimisation` is deliberately **null**: 2.12.4's `Optimisation.jsx` then hides the
+sticky toggle and profile search/comparison while still showing a loaded slot's
+Optimised chip. The bundle always selects published optimisation when available;
+it does not store both sets or offer a nonfunctional switch. An explicit PATCH
+request disabling optimisation returns 400. Authored fallback is `standard`.
 
-#### The auto-update pipeline (GitHub Action)
+Supported routes include:
 
-A GitHub Action in our repo runs every 15 minutes (~80 lines of Python):
+- `GET /api/2/devices`, startup facet endpoints, `/api/1/version`, and device levels.
+- `PUT/DELETE /api/1/devices/master/filter/{slot}` and
+  `PUT /api/1/devices/master/config/{slot}/active`.
+- `PATCH /api/3/devices/master` for master volume/mute, entry loads/clears, input
+  gains/mutes, output gains/mutes and slot activation. Controls are applied before
+  entry loads/clears, then the presence of `active` activates the slot (including
+  `active: false`, matching upstream). Advertised controls write through
+  `DeviceState`; fields/types/channels/ranges are validated before mutations.
+- `PUT /api/1/devices/master/commands` for miniDSP `bq` coefficient text, selected
+  one-based inputs/outputs and slot, and overwrite bypass of unused bands.
+  Empty command text with overwrite enabled bypasses all selected bands.
+  Successful uploads return device state and mark input loads CUSTOM. The shared
+  `protocol/src/biquad.rs` provides validation, not parametric design or a command
+  interpreter: `filt` and `rs` return a clear 400 rather than claiming success.
+- `GET /api/1/whats-new?since=<Unix-seconds>&limit=<integer>` streams the precomputed
+  feed, sorted by `max(created_at,updated_at)` descending. Defaults are two weeks
+  and 50 entries; nonpositive limits are unbounded, like upstream. Fresh/Updated/
+  Stale use upstream's inclusive two-week cutoff and created-before-updated
+  priority, with Unknown for missing timestamps. One builder function computes
+  freshness for both listing and feed at the catalogue snapshot's build time.
+  Before the ESP32 has a synchronised wall clock, the default two-week window
+  uses `catalogue-built-at.txt`; explicit `since` queries retain their meaning.
 
-**Catalogue sync (every 15 min):**
-1. Fetch `version.txt` from `3ll3d00d/beqcatalogue` — if unchanged, exit immediately (~2 seconds, costs nothing)
-2. If changed, download `database.json` (~34.5 MB)
-3. Generate two compact artifacts:
-   - **`catalogue-meta.bin`** — the same metadata fields ezBEQ's backend sends over WebSocket (`UI_FIELDS`: title, year, author, audioTypes, mvAdjust, etc. — deliberately excludes `filters` and `digest`, matching ezBEQ's own behavior). Pre-formatted in ezBEQ's chunked WebSocket message format so the ESP32 can stream it directly to the browser without parsing. **~1.5-2 MB gzipped.**
-   - **`catalogue-biquads.bin`** — compact binary index mapping `entry_id → biquad coefficients` at each sample rate (48kHz, 96kHz). ~4000 entries × ~10 filters × 5 coefficients × 4 bytes ≈ **~1 MB**. The ESP32 uses this to resolve entry IDs into actual DSP writes.
-4. Publish to GitHub Pages + update `manifest.json`
+The `/ws` handler tracks up to four independent sessions and queues closure of
+the oldest beyond the bound, within httpd's 13-socket limit. State sessions get
+DeviceState and Catalogue broadcasts. `subscribe levels master` marks only
+that session for 4 Hz Levels; closing Levels leaves the state socket working.
+Text `ping` receives JSON `{"message":"Pong"}`, and protocol ping/pong remains
+supported. A single PSRAM worker handles levels, catalogue version changes and
+coalesced complete state broadcasts. Detached sends never run on the single
+httpd task or create a thread per subscriber/update. Close and failed-send paths
+close and remove only the affected session. Recipient snapshots and pending
+state consumption share the registry lock with new-client registration.
 
-Future watcher/matching extension:
+Filter-parameter comparison is intentionally unavailable:
+`/api/1/catalogue/filters` returns a JSON 404 and the stock comparison view shows
+“Unable to load filters”. Composite devices and multiple catalogue sources are
+not implemented by this single-device adapter.
 
-- If Apple TV Companion matching needs a search-oriented catalogue view on the device, extend this same derived artifact set instead of introducing a second catalogue source.
-- The likely shape is a compact watcher-search index containing fields such as normalized title, original title, runtime/duration, year, content type, and digest.
-- That keeps the external ezBEQ catalogue as the only source of truth while still letting the ESP32 do local title/runtime matching against a small index.
+### Deliberately advancing the UI pin
 
-**ezBEQ UI sync (on ezBEQ release):**
-1. Same Action also checks the latest `3ll3d00d/ezbeq` release tag via GitHub API
-2. If new, downloads the pre-built React static files from their release
-3. Repackages as **`ui.tar.gz`** (~1 MB gzipped)
-4. Publishes to GitHub Pages + updates `manifest.json`
+`UI_VERSION` and `UI_WHEEL_SHA256` in `tools/build-catalogue.py` pin the PyPI
+`ezbeq-2.12.4-py3-none-any.whl` to
+`72873c702dbdcf0b55d00b63595d3580fc750cafc8e27c9f7d89efc5e5c66873`.
+The downloaded wheel bytes must match; the builder never follows latest PyPI.
 
-**Version manifest** (published at `https://our-org.github.io/minidsp-open/manifest.json`):
-```json
-{"catalogue": "2026-03-28-abcdef", "ui": "4.2.0"}
-```
+For a bump, inspect the proposed upstream tag's React services/components and
+backend contract, update the version and wheel digest from that version's PyPI
+release metadata, implement any firmware contract changes, then rebuild. Verify
+startup facets/feed, browse/load/clear, metadata on PUT/PATCH, gains/mutes,
+custom uploads/errors, Levels round-trip navigation, multiple clients, heartbeat,
+reconnect and offline reload in a real browser before publishing the bundle.
+Keep catalogue data automatic; do not add a separate UI fork to accommodate an
+unreviewed release.
 
-The Action touches zero ezBEQ application code. It just downloads public build artifacts and catalogue data and repackages them.
-
-**Cost:** GitHub free tier = 2,000 Actions minutes/month. The 15-minute version check = ~96 min/month. Full rebuilds only run when something changes (catalogue: a few times/week, UI: a few times/year). Well within free tier.
-
-**Future optimization:** If we collaborate with 3ll3d00d, he could add a `repository_dispatch` webhook to trigger our Action instantly on catalogue update — zero polling, zero delay.
-
-#### ESP32 self-update (no firmware releases needed)
-
-The ESP32 flash has two partitions:
-
-| Partition | Contents | How it updates |
-|-----------|----------|----------------|
-| **Firmware** | Rust binary (API server, USB HID, WiFi) | OTA — only when we ship new features/fixes |
-| **Data** | ezBEQ UI + catalogue index | **Automatically on every boot** from GitHub Pages |
-
-On every boot:
-1. Fetch `manifest.json` from our GitHub Pages (~100 bytes, instant)
-2. Compare `catalogue` and `ui` versions with what's in flash
-3. If catalogue changed → download `catalogue-biquads.bin` + `catalogue-meta.bin` (~3 MB, 2-3 sec on WiFi)
-4. If UI changed → download `ui.tar.gz` (~1 MB, ~1 sec)
-5. Write to data partition. Ready to serve.
-
-**The ESP32 keeps itself current without any firmware updates from us.** New BEQ titles appear within 15 minutes of community submission. New ezBEQ UI versions appear within hours of release. The user does nothing. We do nothing.
-
-#### Local dev workflow while the published site is stale
-
-The production intent is still "flash firmware once, then let the board update itself from the published site." But while the published `minidsp-open` site is behind or unavailable, a freshly flashed board can only serve whatever ezBEQ bundle is already present in its data partition. That means:
-
-- if the board already has a previously installed bundle, it will boot and serve that stale bundle immediately
-- if the data partition is empty, the board still serves the MiniDSP control API, but hosted ezBEQ remains unavailable until a bundle is installed
-
-To make local development deterministic, use the canonical flash wrapper:
+Validation commands:
 
 ```bash
-tools/flash-esp32.sh --board-url http://BOARD:5380
+uv run tools/test-build-catalogue.py
+cargo +stable test
+tools/esp-cargo build
+mkdir -p /tmp/ezbeq-site
+uv run tools/build-catalogue.py --output-dir /tmp/ezbeq-site
 ```
 
-That wrapper:
-
-1. flashes the current ESP32 firmware with the same `esptool.py` flow documented in `CLAUDE.md`
-2. builds the latest local ezBEQ bundle via `uv run tools/build-catalogue.py`
-3. creates a LittleFS image for the `storage` partition from that bundle
-4. flashes the `storage` partition image at the partition-table offset
-5. optionally verifies the board's `/version.txt` matches the flashed bundle after boot
-
-This keeps the board usable immediately after flash even when the published site is still stale, without baking catalogue/UI artifacts into the firmware image itself.
-
-The runtime updater still matters. After boot, the board should continue checking the configured remote site and self-updating when a newer published bundle exists. The local flash seed is only the initial stored baseline.
-
-`tools/flash-esp32-with-site.sh` is kept as the explicit updater-path fallback when you want to test `/debug/updater` itself against a temporary local site instead of flashing the storage partition directly.
-
-#### How it all fits together
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  Phone/Tablet/Laptop Browser                             │
-│                                                          │
-│  ┌─────────────────────────────────────────────────────┐ │
-│  │  ezBEQ React UI (unmodified, served from ESP32)     │ │
-│  │                                                     │ │
-│  │  1. Connects WebSocket → receives catalogue         │ │
-│  │     metadata in chunks (streamed from ESP32 flash)  │ │
-│  │  2. User browses/searches movies                    │ │
-│  │  3. User taps "load" → sends entry ID to ESP32      │ │
-│  │  4. Receives state updates via WebSocket            │ │
-│  └──────────────────────┬──────────────────────────────┘ │
-│                         │                                │
-│   PUT /api/1/devices/{name}/filter/{slot}                │
-│   body: {"entryId": "abc123_0"}                          │
-└─────────────────────────┼────────────────────────────────┘
-                          │ WiFi
-                          ▼
-┌────────────────────────────────────┐  USB HID  ┌──────────┐
-│  ESP32-S3 ($10)                    │──────────▶│ MiniDSP  │
-│                                    │           └──────────┘
-│  Firmware partition (OTA only):    │
-│  ├─ ezBEQ backend API             │
-│  ├─ minidsp-rs compat API         │
-│  ├─ USB HID transport             │
-│  ├─ WebSocket (levels/state)      │
-│  ├─ WiFi + mDNS                   │
-│  └─ Auto-update manager           │
-│                                    │
-│  Data partition (auto-updated):    │
-│  ├─ ezBEQ UI static files   ~1 MB │ ← from their releases
-│  ├─ catalogue-meta.bin      ~2 MB │ ← from beqcatalogue
-│  ├─ catalogue-biquads.bin   ~1 MB │ ← from beqcatalogue
-│  └─ device state (NVS)            │
-└────────────────────────────────────┘
-        │               ▲
-        │  on boot:     │
-        │  check        │  versions changed?
-        ▼               │
-┌─────────────────────────────────────┐
-│  Our GitHub Pages                   │
-│  (auto-published by GitHub Action)  │
-│                                     │
-│  manifest.json                      │
-│  catalogue-meta.bin                 │
-│  catalogue-biquads.bin              │
-│  ui.tar.gz                          │
-└─────────────────────────────────────┘
-        ▲
-        │  every 15 min: version changed?
-┌───────┴─────────────────────────────┐
-│  Upstream repos (not ours)          │
-│                                     │
-│  3ll3d00d/beqcatalogue              │
-│  └─ database.json, version.txt     │
-│                                     │
-│  3ll3d00d/ezbeq                     │
-│  └─ release artifacts (React SPA)   │
-└─────────────────────────────────────┘
-```
-
-#### Flash budget
-
-| Component | Size | Updates |
-|-----------|------|---------|
-| Firmware (Rust + esp-idf) | ~2-3 MB | OTA only — our releases |
-| ezBEQ UI static files (gzip) | ~1 MB | Auto — on ezBEQ release |
-| Catalogue metadata | ~1.5-2 MB | Auto — within 15 min of catalogue change |
-| Biquad index | ~1 MB | Auto — within 15 min of catalogue change |
-| Device state (NVS) | ~4 KB | On device write |
-| **Total** | **~5.5-7 MB** | ESP32-S3 has 8-16 MB flash |
-
-#### What the ESP32 implements
-
-Two API surfaces that share the same device control core:
-
-**minidsp-rs compatible API** (for desktop ezBEQ, Home Assistant, etc.):
-- HTTP endpoints on port 5380
-- WebSocket on `/devices/{id}` with compatibility query params
-- TCP bridge on port 5333
-- UDP discovery on port 3999
-
-**ezBEQ compatible API** (for the embedded React UI):
-- WebSocket: `Catalogue` message on connect, `"load catalogue"` handler, `CatalogueEntries` chunks streamed from flash, `DeviceState` pushes
-- REST: `PUT/DELETE /api/1/devices/{name}/filter/{slot}` — resolve entry ID from biquad index in flash, write to MiniDSP
-- REST: `PATCH /api/2/devices/{name}`, `PATCH /api/3/devices/{name}` — with MV adjust support
-- REST: `GET /api/2/devices` — device state
-- Static file serving: `/*` → ezBEQ React SPA from data partition
-
-### What we maintain vs what we don't
-
-| Component | Who maintains it | Our code |
-|-----------|-----------------|----------|
-| BEQ catalogue content | 3ll3d00d + community | Zero |
-| ezBEQ Python backend | 3ll3d00d | Zero |
-| ezBEQ React UI | 3ll3d00d | Zero — we serve their unmodified build |
-| Catalogue index pipeline | Us | ~80 lines Python (GitHub Action) |
-| minidsp-rs + ezBEQ API | Us | Core project — both APIs share device control |
-| Device control (USB HID) | Us | Core project |
-
-**Zero ezBEQ code. Zero UI code. Everything auto-updates.** We consume public build artifacts and catalogue data. The ~80-line GitHub Action is the only thing that touches the catalogue. The ESP32 self-updates. The only time we ship firmware is when our own Rust code changes.
+Local firmware/storage seeding remains `tools/flash-esp32.sh --board-url
+http://BOARD:5380`. It builds the bundle and flashes only manifest-listed files
+into LittleFS. The runtime updater subsequently checks the configured remote
+site. `tools/flash-esp32-with-site.sh` remains the explicit updater-path test.
 
 ### Desktop users: intended drop-in replacement
 
@@ -440,5 +396,5 @@ Verified reality today:
 - Desktop daemon preset-content writes now also mirror the official app's explicit active-preset token save, so that verified shadow state has the same freshness marker the official app relies on when direct runtime readback is missing.
 - Desktop daemon can now also import missing preset shadow from the official Device Console `setting*.xml` files when the XML timestamp matches the live preset token, so a fresh attach can recover sane controller-side state even for presets the daemon did not write itself.
 - Desktop status reads also stay compatible on the physical 2x4 HD when DSP100 meter polling misbehaves: the daemon now treats those meter reads as best-effort and clamps failures to `-140 dB` silence instead of breaking `minidsp -o jsonline` / `GET /devices/{id}` consumers.
-- ESP32 physical-hardware validation has only closed status/meter/basic-control paths so far.
+- ESP32 uses the same read-back and shadow model for config, snapshot backup/restore and ezBEQ writes; broader device coverage still needs hardware validation.
 - This removes the previous ESP32 config-route parity blocker on the physical 2x4 HD. Broader device-matrix coverage still depends on the importer/codegen work tracked in `PROGRESS.md`, `docs/ref-device-coverage.md`, and the permanent device reference docs.

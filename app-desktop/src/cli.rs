@@ -13,8 +13,338 @@ use minidsp::transport::tcp::TcpTransport;
 use minidsp::transport::ws::WsTransport;
 use minidsp_daemon::http::json::{DeviceJson, VersionJson};
 use minidsp_protocol::device::probe;
+use minidsp_protocol::rattle::{
+    RattleCurrentPhase, RattlePlan, RattleRequest, RattleResponse, RattleRunState, RattleStatus,
+};
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::DeviceInfo;
+use tokio::io::AsyncWriteExt;
+
+#[derive(clap::Args, Clone, Debug, Default)]
+pub(crate) struct RattleArgs {
+    /// Comma-separated tone frequencies in Hz
+    #[arg(long, value_delimiter = ',', conflicts_with_all = ["start_hz", "end_hz", "count"])]
+    tones: Option<Vec<f32>>,
+    /// First logarithmically spaced frequency in Hz
+    #[arg(long, requires_all = ["end_hz", "count"])]
+    start_hz: Option<f32>,
+    /// Last logarithmically spaced frequency in Hz
+    #[arg(long, requires_all = ["start_hz", "count"])]
+    end_hz: Option<f32>,
+    /// Number of logarithmically spaced tones
+    #[arg(long, requires_all = ["start_hz", "end_hz"])]
+    count: Option<u32>,
+    /// Seconds per tone
+    #[arg(long)]
+    hold: Option<f32>,
+    /// Seconds of silence between tones
+    #[arg(long)]
+    gap: Option<f32>,
+    /// Number of cycles through all volumes and tones
+    #[arg(long)]
+    cycles: Option<u32>,
+    /// Comma-separated master volumes in dB, quietest first
+    #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+    volume: Option<Vec<f32>>,
+}
+
+impl RattleArgs {
+    fn request(&self) -> RattleRequest {
+        let defaults = RattleRequest::default();
+        RattleRequest {
+            frequencies_hz: self.tones.clone(),
+            start_hz: self.start_hz,
+            end_hz: self.end_hz,
+            count: self.count,
+            tone_sec: self.hold.unwrap_or(defaults.tone_sec),
+            gap_sec: self.gap.unwrap_or(defaults.gap_sec),
+            cycles: self.cycles.unwrap_or(defaults.cycles),
+            volumes_db: self.volume.clone().unwrap_or(defaults.volumes_db),
+            ..defaults
+        }
+    }
+}
+
+/// Use HTTP rather than opening a control transport: the server owns the audio.
+pub(crate) async fn rattle(cli: &Cli, args: &RattleArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let env_url = std::env::var("MINIDSPD_URL").ok();
+    let base = cli.daemon_url.as_deref().or(env_url.as_deref());
+    if base.is_none() && cli.daemon_sock.is_none() {
+        return Err("rattle requires --daemon-url (or MINIDSPD_URL) pointing to a desktop daemon or ESP32 HTTP API; direct USB/TCP control transports cannot play audio".into());
+    }
+    let request = args.request();
+    RattlePlan::build(request.clone())?;
+    let id = cli
+        .device_index
+        .or(std::env::var("MINIDSP_INDEX")
+            .ok()
+            .and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let path = format!("/devices/{id}/rattle");
+    let body = serde_json::to_vec(&request)?;
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let response = start_rattle_safely(
+        rattle_http(cli.daemon_sock.as_deref(), base, "POST", &path, &body),
+        &mut interrupt,
+        || stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, &path),
+    )
+    .await?;
+    let Some(response) = response else {
+        return Ok(());
+    };
+    let machine = matches!(cli.output.as_deref(), Some("json" | "jsonline"));
+    let mut previous = None;
+    loop {
+        let bytes = tokio::select! {
+            signal = &mut interrupt => {
+                signal?;
+                stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, &path).await?;
+                return Ok(());
+            },
+            bytes = rattle_http(cli.daemon_sock.as_deref(), base, "GET", &path, b"") => bytes,
+        };
+        let status: RattleStatus =
+            match bytes.and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into)) {
+                Ok(status) => status,
+                Err(error) => {
+                    stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, &path).await?;
+                    return Err(error);
+                }
+            };
+        if machine {
+            println!("{}", serde_json::to_string(&status)?);
+        } else if let Some(current) = &status.current {
+            let key = (current.step, current.phase);
+            if previous != Some(key) {
+                let marker = match current.phase {
+                    RattleCurrentPhase::Tone => "▶",
+                    RattleCurrentPhase::Gap => "gap:",
+                    RattleCurrentPhase::LeadIn => "starting:",
+                };
+                println!(
+                    "{marker} {}  (step {}/{}, cycle {}/{})",
+                    current.label,
+                    current.step + 1,
+                    current.steps,
+                    current.cycle + 1,
+                    current.cycles
+                );
+                previous = Some(key);
+            }
+        }
+        let last = status
+            .last
+            .as_ref()
+            .filter(|run| run.started_at_us == response.started_at_us)
+            .ok_or("rattle session was replaced or its status is unavailable")?;
+        if !status.playing {
+            if !machine {
+                println!(
+                    "{}",
+                    serde_json::to_value(last.state)?
+                        .as_str()
+                        .unwrap_or("unknown")
+                );
+                for error in [
+                    &last.error,
+                    &last.volume_restore_error,
+                    &last.source_restore_error,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    eprintln!("{error}");
+                }
+            }
+            return if last.state == RattleRunState::Failed {
+                Err(last
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "rattle session failed".into())
+                    .into())
+            } else {
+                Ok(())
+            };
+        }
+        tokio::select! {
+            signal = &mut interrupt => {
+                signal?;
+                stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, &path).await?;
+                return Ok(());
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {},
+        }
+    }
+}
+
+async fn start_rattle_safely<S, I, C, F>(
+    start: S,
+    interrupt: I,
+    mut cleanup: C,
+) -> Result<Option<RattleResponse>, Box<dyn std::error::Error>>
+where
+    S: std::future::Future<Output = Result<Vec<u8>, Box<dyn std::error::Error>>>,
+    I: std::future::Future<Output = std::io::Result<()>>,
+    C: FnMut() -> F,
+    F: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    tokio::pin!(start);
+    tokio::pin!(interrupt);
+    let result = tokio::select! {
+        biased;
+        signal = &mut interrupt => {
+            signal?;
+            // Request stop immediately while the POST is still pending. Wait
+            // for it to settle, then stop/confirm again to cover a delayed start.
+            let (_, stopped) = tokio::join!(&mut start, cleanup());
+            stopped?;
+            cleanup().await?;
+            return Ok(None);
+        },
+        result = &mut start => result,
+    };
+    match result {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(response) => Ok(Some(response)),
+            Err(error) => {
+                cleanup().await?;
+                Err(error.into())
+            }
+        },
+        Err(error) => {
+            // A complete HTTP rejection is definitive. Transport failures
+            // (including timeouts/truncated replies) can hide a running worker.
+            if !error.to_string().starts_with("HTTP/1.1 ") {
+                cleanup().await?;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn stop_rattle_and_confirm(
+    socket: Option<&str>,
+    base: Option<&str>,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stop_rattle_and_confirm_with(path, |method, path| async move {
+        rattle_http(socket, base, method, &path, b"").await
+    })
+    .await
+}
+
+async fn stop_rattle_and_confirm_with<F, Fut>(
+    path: &str,
+    mut http: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(&'static str, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, Box<dyn std::error::Error>>>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let confirm = async {
+        loop {
+            let stopped = http("POST", format!("{path}/stop")).await;
+            let accepted = stopped
+                .as_ref()
+                .map(|_| true)
+                .unwrap_or_else(|error| error.to_string().starts_with("HTTP/1.1 409 "));
+            if accepted {
+                let status = http("GET", path.to_string()).await;
+                // ESP32 rattle status has no active run during startup; /play's
+                // shared busy flag also covers setup and restoration.
+                let play_path = path.trim_end_matches("/rattle").to_string() + "/play";
+                let play = http("GET", play_path).await;
+                if let (Ok(status), Ok(play)) = (status, play) {
+                    let status: RattleStatus = serde_json::from_slice(&status)?;
+                    let play: minidsp_protocol::playback::PlaybackStatus =
+                        serde_json::from_slice(&play)?;
+                    if !status.playing && !play.playing {
+                        if let Some(run) = status.last {
+                            for error in [
+                                run.error,
+                                run.volume_restore_error,
+                                run.source_restore_error,
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                eprintln!("{error}");
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    };
+    tokio::time::timeout_at(deadline, confirm).await
+        .map_err(|_| "could not confirm rattle stopped after 120 s; check the device before leaving it unattended")?
+}
+
+async fn rattle_http(
+    socket: Option<&str>,
+    base: Option<&str>,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let addr = base
+        .map(crate::normalize_http_addr)
+        .unwrap_or_else(|| "localhost".into());
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut request = request.into_bytes();
+    request.extend_from_slice(body);
+    let exchange = async {
+        #[cfg(unix)]
+        if let Some(socket) = socket {
+            let mut stream = tokio::net::UnixStream::connect(socket).await?;
+            stream.write_all(&request).await?;
+            return crate::read_http_response(&mut stream).await;
+        }
+        #[cfg(not(unix))]
+        if socket.is_some() {
+            return Err(std::io::Error::other(
+                "Unix sockets are unsupported on this platform",
+            ));
+        }
+        let mut stream = tokio::net::TcpStream::connect(&addr).await?;
+        stream.write_all(&request).await?;
+        crate::read_http_response(&mut stream).await
+    };
+    let data = tokio::time::timeout(std::time::Duration::from_secs(30), exchange).await??;
+    parse_rattle_http_response(&data)
+}
+
+fn parse_rattle_http_response(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let end = crate::find_subslice(data, b"\r\n\r\n").ok_or("invalid HTTP response")?;
+    let head = std::str::from_utf8(&data[..end])?;
+    let raw = &data[end + 4..];
+    let body = if crate::header_contains_token(head, "Transfer-Encoding", "chunked") {
+        crate::decode_chunked_body(raw)?
+    } else {
+        raw.to_vec()
+    };
+    if head
+        .lines()
+        .next()
+        .and_then(|s| s.split_whitespace().nth(1))
+        != Some("200")
+    {
+        return Err(format!(
+            "{}: {}",
+            head.lines().next().unwrap_or(head),
+            String::from_utf8_lossy(&body)
+        )
+        .into());
+    }
+    Ok(body)
+}
 
 /// TOML config file structure (minidsp-rs compatible).
 #[derive(Debug, serde::Deserialize, Default)]
@@ -40,6 +370,7 @@ struct TcpServerConfig {
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(default)]
 struct AdvertiseConfig {
+    #[serde(alias = "name")]
     hostname: Option<String>,
     ip: Option<String>,
 }
@@ -193,8 +524,7 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let client = MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
         devices_out.push(device_json_from_info(&client.device_info()));
     } else if let Some(url) = cli.url.as_deref().or(env_url.as_deref()) {
-        if url.starts_with("tcp://") {
-            let addr = &url["tcp://".len()..];
+        if let Some(addr) = url.strip_prefix("tcp://") {
             let client =
                 MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
             devices_out.push(device_json_from_info(&client.device_info()));
@@ -303,14 +633,12 @@ pub async fn server(
         .and_then(|t| t.bind_address.as_deref())
         .unwrap_or("0.0.0.0:5333");
     // CLI --advertise overrides config file hostname
-    let hostname = cli_advertise
-        .or_else(|| {
-            config
-                .advertise
-                .as_ref()
-                .and_then(|a| a.hostname.as_deref())
-        })
-        .unwrap_or("minidsp-open");
+    let hostname = cli_advertise.or_else(|| {
+        config
+            .advertise
+            .as_ref()
+            .and_then(|a| a.hostname.as_deref())
+    });
 
     let state = Arc::new(DaemonState::new());
 
@@ -351,7 +679,7 @@ pub async fn server(
     // appliance-mode beacons as devices come and go.
     // CLI --ip overrides config file ip; advertise_hostname is passed through
     // so operators can still force a specific instance name via CLI flag.
-    let _ = hostname; // hostname flag retained for backwards compat; beacon name is now derived per-device
+    let disc_name = hostname.map(str::to_owned);
     let disc_override_ip: Option<std::net::Ipv4Addr> =
         cli_ip.and_then(|s| s.parse().ok()).or_else(|| {
             config
@@ -362,8 +690,12 @@ pub async fn server(
         });
     let disc_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            minidsp_daemon::discovery::broadcast_loop(disc_state, disc_override_ip).await
+        if let Err(e) = minidsp_daemon::discovery::broadcast_loop_with_name(
+            disc_state,
+            disc_override_ip,
+            disc_name,
+        )
+        .await
         {
             tracing::error!("UDP discovery error: {e}");
         }
@@ -453,7 +785,8 @@ pub async fn execute_file(path: &str, cli: &Cli) -> Result<(), Box<dyn std::erro
         return Ok(());
     }
 
-    let client = connect(cli).await?;
+    let mut client = connect(cli).await?;
+    apply_force_kind(&mut client, cli).await?;
 
     for (line_num, line) in contents.lines().enumerate() {
         let line = line.trim();
@@ -1092,4 +1425,200 @@ pub async fn channel_command(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn rattle_arguments_preserve_defaults_and_parse_negative_volume_lists() {
+        let cli = Cli::try_parse_from(["minidsp", "rattle"]).unwrap();
+        let Some(crate::Command::Rattle(args)) = cli.command else {
+            panic!("expected rattle")
+        };
+        assert_eq!(args.request(), RattleRequest::default());
+        let cli = Cli::try_parse_from([
+            "minidsp",
+            "--daemon-url",
+            "http://board:5380",
+            "-d",
+            "2",
+            "-o",
+            "jsonline",
+            "rattle",
+            "--tones",
+            "20,25,31.5",
+            "--hold",
+            "4",
+            "--gap",
+            "1",
+            "--cycles",
+            "2",
+            "--volume",
+            "-40,-30",
+        ])
+        .unwrap();
+        assert_eq!(cli.device_index, Some(2));
+        let Some(crate::Command::Rattle(args)) = cli.command else {
+            panic!("expected rattle")
+        };
+        let request = args.request();
+        assert_eq!(request.frequencies_hz, Some(vec![20.0, 25.0, 31.5]));
+        assert_eq!(request.volumes_db, vec![-40.0, -30.0]);
+        assert_eq!(request.cycles, 2);
+        assert!(RattlePlan::build(request).is_ok());
+    }
+
+    #[test]
+    fn rattle_log_spacing_requires_complete_exclusive_arguments() {
+        for flags in [
+            vec!["--start-hz", "20"],
+            vec!["--end-hz", "80"],
+            vec!["--count", "3"],
+            vec![
+                "--tones",
+                "40",
+                "--start-hz",
+                "20",
+                "--end-hz",
+                "80",
+                "--count",
+                "3",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(["minidsp", "rattle"].into_iter().chain(flags)).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "minidsp",
+            "rattle",
+            "--start-hz",
+            "20",
+            "--end-hz",
+            "80",
+            "--count",
+            "3",
+        ])
+        .unwrap();
+        let Some(crate::Command::Rattle(args)) = cli.command else {
+            panic!("expected rattle")
+        };
+        let plan = RattlePlan::build(args.request()).unwrap();
+        assert_eq!(plan.schedule().frequencies_hz, vec![20.0, 40.0, 80.0]);
+    }
+
+    #[tokio::test]
+    async fn rattle_stop_retries_startup_conflict_until_shared_busy_flag_is_clear() {
+        use std::cell::RefCell;
+        let requests = RefCell::new(Vec::new());
+        stop_rattle_and_confirm_with("/devices/1/rattle", |method, path| {
+            let mut requests = requests.borrow_mut();
+            requests.push((method, path.clone()));
+            let result = match requests.len() {
+                1 => Err("HTTP/1.1 409 Conflict: not started yet".into()),
+                2 | 5 => Ok(br#"{"playing":false}"#.to_vec()),
+                3 => Ok(br#"{"playing":true}"#.to_vec()),
+                4 | 6 => Ok(br#"{"playing":false}"#.to_vec()),
+                _ => panic!("confirmation should have finished"),
+            };
+            async { result }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            &*requests.borrow(),
+            &[
+                ("POST", "/devices/1/rattle/stop".to_string()),
+                ("GET", "/devices/1/rattle".to_string()),
+                ("GET", "/devices/1/play".to_string()),
+                ("POST", "/devices/1/rattle/stop".to_string()),
+                ("GET", "/devices/1/rattle".to_string()),
+                ("GET", "/devices/1/play".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rattle_start_timeout_and_connection_drop_always_stop_and_confirm() {
+        use std::cell::Cell;
+        for message in [
+            "deadline has elapsed",
+            "connection reset",
+            "invalid HTTP response",
+        ] {
+            let calls = Cell::new(0);
+            let result = start_rattle_safely(
+                async { Err(message.into()) },
+                std::future::pending(),
+                || {
+                    calls.set(calls.get() + 1);
+                    async { Ok(()) }
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rattle_start_interrupt_stops_before_post_settles_and_again_afterwards() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let start = async {
+            tokio::task::yield_now().await;
+            assert!(calls.get() >= 1, "stop must be sent while POST is pending");
+            Err("deadline has elapsed".into())
+        };
+        let result = start_rattle_safely(start, async { Ok(()) }, || {
+            calls.set(calls.get() + 1);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn rattle_http_decodes_chunked_status_and_reports_errors() {
+        assert_eq!(parse_rattle_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n11\r\n{\"playing\":false}\r\n0\r\n\r\n").unwrap(), b"{\"playing\":false}");
+        let error =
+            parse_rattle_http_response(b"HTTP/1.1 409 Conflict\r\n\r\n{\"error\":\"busy\"}")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("409"));
+        assert!(error.contains("busy"));
+    }
+
+    #[test]
+    fn version_clears_ezbeq_htx_input_gate() {
+        // ezBEQ enables Flex HTx input PEQs only when the last token of
+        // `minidsp -V` is semver > 0.1.12 (see docs/ref-compatibility.md).
+        let parse = |version: &str| -> Vec<u64> {
+            version
+                .split(['+', '-'])
+                .next()
+                .unwrap()
+                .split('.')
+                .map(|part| part.parse().unwrap())
+                .collect()
+        };
+        assert!(parse(env!("CARGO_PKG_VERSION")) > parse("0.1.12"));
+    }
+
+    #[test]
+    fn advertise_config_accepts_upstream_name_and_legacy_hostname() {
+        for key in ["name", "hostname"] {
+            let config: DaemonConfig = toml::from_str(&format!(
+                "[advertise]\n{key} = \"Living room\"\nip = \"192.168.1.2\""
+            ))
+            .unwrap();
+            assert_eq!(
+                config.advertise.unwrap().hostname.as_deref(),
+                Some("Living room")
+            );
+        }
+    }
 }

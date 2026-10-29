@@ -7,6 +7,9 @@
 
 #![allow(dead_code)] // Public API — used by main.rs and future modules
 
+#[path = "bundle_update.rs"]
+mod bundle;
+
 use crate::storage;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
@@ -128,7 +131,7 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
             }
         }
     }
-    let installed = storage_installed.or(nvs_installed);
+    let installed = storage_installed;
     let has_catalogue = has_catalogue_data();
 
     let remote_version = match fetch_remote_version(&base_url) {
@@ -184,25 +187,72 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
     );
     let _led = crate::led::begin_background_update();
 
-    // Clear installed version FIRST — if anything fails, next boot retries everything.
-    // Bail out on failure: if we can't clear NVS and then delete the on-flash
-    // files, a later download failure would leave the old version string pointing
-    // at an empty data partition and the next boot would believe it was current.
-    if let Err(e) = write_nvs_version(nvs, "") {
-        error!("failed to clear NVS version before update: {e}");
-        return UpdateResult::Error(format!("clear NVS version: {e}"));
+    // Two current bundles exceed the storage partition, so files are replaced
+    // one at a time. The durable journal prevents a partial bundle from ever
+    // appearing current.
+    if !manifest.files.contains_key("catalogue.bin") || new_version.trim().is_empty() {
+        return UpdateResult::Error("manifest has no catalogue or version".into());
+    }
+    for filename in manifest.files.keys() {
+        if !bundle::safe_filename(filename) {
+            return UpdateResult::Error(format!("unsafe filename: {filename}"));
+        }
+    }
+    // Discard downloads interrupted by reset before calculating free space.
+    let root = storage::full_path("");
+    if let Err(e) = bundle::discard_downloads(std::path::Path::new(&root)) {
+        return UpdateResult::Error(format!("remove interrupted downloads: {e}"));
+    }
+    // Files already on flash with the manifest's size and hash need no
+    // download. Besides saving bandwidth, this lets an update interrupted
+    // after most renames resume: those files no longer count against free
+    // space, which is otherwise too tight to replace them a second time.
+    // version.txt is the commit marker, never an ordinary manifest asset.
+    let pending: Vec<(&String, &FileInfo)> = manifest
+        .files
+        .iter()
+        .filter(|(filename, info)| {
+            filename.as_str() != "version.txt"
+                && !installed_file_matches(&storage::full_path(filename), info)
+        })
+        .collect();
+    let replacements: Vec<_> = pending
+        .iter()
+        .map(|(filename, info)| bundle::PendingFile {
+            name: filename.as_str(),
+            old_size: std::fs::metadata(storage::full_path(filename))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            new_size: info.size,
+        })
+        .collect();
+    let available = match storage::info() {
+        Ok(info) => info.total_bytes.saturating_sub(info.used_bytes) as u64,
+        Err(e) => return UpdateResult::Error(format!("storage info: {e}")),
+    };
+    const SPACE_MARGIN: u64 = 64 * 1024;
+    let plan = match bundle::replacement_plan(&replacements, available, SPACE_MARGIN) {
+        Ok(plan) => plan,
+        Err(e) => return UpdateResult::Error(e),
+    };
+    let delete_before_download = plan.delete_before_download;
+    if delete_before_download {
+        warn!(
+            "not enough space to keep old files during the update ({} bytes free); replacing in place",
+            available
+        );
+    }
+    if let Err(e) = bundle::begin(std::path::Path::new(&root)) {
+        return UpdateResult::Error(format!("begin bundle update: {e}"));
     }
 
-    // Delete all existing data files before downloading new ones (all-or-nothing)
-    delete_data_files();
-
-    // Download each file
+    // Retain obsolete assets until commit so the currently published UI can
+    // still load them. The planner accounts only for pending replacements.
     let mut downloaded = 0;
-    for (filename, info) in &manifest.files {
-        // Sanitize filename to prevent path traversal
-        if filename.contains("..") || filename.starts_with('/') || filename.contains('\0') {
-            warn!("unsafe filename in manifest: {filename}");
-            return UpdateResult::Error(format!("unsafe filename: {filename}"));
+    for index in plan.order {
+        let (filename, info) = pending[index];
+        if delete_before_download {
+            let _ = std::fs::remove_file(storage::full_path(filename));
         }
         match download_file(&base_url, filename, info) {
             Ok(()) => {
@@ -216,12 +266,21 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
         }
     }
 
-    // All files downloaded — save version to NVS and data partition
+    // Publish the marker only after every asset passed size/hash verification.
+    if let Err(e) = bundle::commit(std::path::Path::new(&root), &new_version) {
+        return UpdateResult::Error(format!("commit bundle version: {e}"));
+    }
+    // Content-hashed UI assets change name every release; without this the
+    // partition fills with old releases until no update fits. An interrupted
+    // reclaim only leaves dead files for the next update to remove.
+    let keep: std::collections::HashSet<&str> = manifest.files.keys().map(String::as_str).collect();
+    match bundle::reclaim_unreferenced(std::path::Path::new(&root), &keep) {
+        Ok(0) => {}
+        Ok(removed) => info!("removed {removed} file(s) no longer in the bundle"),
+        Err(e) => warn!("failed to remove stale bundle files: {e}"),
+    }
     if let Err(e) = write_nvs_version(nvs, &new_version) {
         warn!("failed to save version to NVS: {e}");
-    }
-    if let Err(e) = storage::write_file("version.txt", new_version.as_bytes()) {
-        warn!("failed to save version.txt to data partition: {e}");
     }
 
     UpdateResult::Updated {
@@ -338,34 +397,6 @@ fn log_update_result(result: UpdateResult) {
     }
 }
 
-/// Delete all data files from the storage partition (catalogue + UI).
-fn delete_data_files() {
-    let base = storage::full_path("");
-    let base_path = std::path::Path::new(&base);
-
-    if !base_path.exists() {
-        return;
-    }
-
-    // Walk the data directory and delete all files, then empty directories
-    fn remove_recursive(path: &std::path::Path) {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    remove_recursive(&p);
-                    let _ = std::fs::remove_dir(&p);
-                } else {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-        }
-    }
-
-    remove_recursive(base_path);
-    info!("cleared data partition for fresh download");
-}
-
 /// Fetch and parse the manifest.json.
 fn fetch_manifest(base_url: &str) -> Result<Manifest, Box<dyn std::error::Error>> {
     let url = format!("{base_url}/manifest.json");
@@ -421,9 +452,12 @@ fn download_file(
             if n == 0 {
                 break;
             }
+            total += n as u64;
+            if total > info.size {
+                return Err(format!("download exceeds manifest size for {filename}").into());
+            }
             std::io::Write::write_all(&mut file, &buf[..n])?;
             hasher.update(&buf[..n]);
-            total += n as u64;
         }
 
         if total != info.size {
@@ -452,9 +486,31 @@ fn download_file(
         return Err(err);
     }
 
-    let _ = std::fs::remove_file(&path);
     std::fs::rename(&temp_path, &path)?;
     Ok(())
+}
+
+/// True if `path` already holds exactly the file `info` describes.
+fn installed_file_matches(path: &str, info: &FileInfo) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != info.size {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; DOWNLOAD_CHUNK];
+    loop {
+        match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return false,
+        }
+    }
+    hasher.finish_hex() == info.sha256
 }
 
 /// Fetch a small URL entirely into memory.
@@ -506,10 +562,7 @@ fn read_nvs_version(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<St
 }
 
 fn read_storage_version() -> Option<String> {
-    crate::storage::read_file("version.txt")
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    bundle::installed_version(std::path::Path::new(&storage::full_path("")))
 }
 
 fn version_sort_key(version: &str) -> Option<&str> {
@@ -585,8 +638,8 @@ fn write_nvs_base_url(
 }
 
 /// Get the currently installed catalogue version (if any).
-pub fn installed_version(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
-    read_storage_version().or_else(|| read_nvs_version(nvs))
+pub fn installed_version(_nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
+    read_storage_version()
 }
 
 #[cfg(test)]
@@ -695,43 +748,27 @@ pub fn has_catalogue_data() -> bool {
     storage::file_exists("catalogue.bin")
 }
 
-/// Minimal SHA-256 wrapper using ESP-IDF's mbedtls.
-struct Sha256 {
-    ctx: sys::mbedtls_sha256_context,
+/// Portable SHA-256 shared by bundle downloads and firmware OTA verification.
+pub(crate) struct Sha256 {
+    ctx: sha2::Sha256,
 }
 
 impl Sha256 {
-    fn new() -> Self {
-        let mut ctx: sys::mbedtls_sha256_context = unsafe { std::mem::zeroed() };
-        unsafe {
-            sys::mbedtls_sha256_init(&mut ctx);
-            let ret = sys::mbedtls_sha256_starts(&mut ctx, 0); // 0 = SHA-256 (not SHA-224)
-            assert!(ret == 0, "mbedtls_sha256_starts failed: {ret}");
-        }
-        Self { ctx }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        unsafe {
-            let ret = sys::mbedtls_sha256_update(&mut self.ctx, data.as_ptr(), data.len());
-            assert!(ret == 0, "mbedtls_sha256_update failed: {ret}");
+    pub(crate) fn new() -> Self {
+        use sha2::Digest;
+        Self {
+            ctx: sha2::Sha256::new(),
         }
     }
 
-    fn finish_hex(mut self) -> String {
-        let mut hash = [0u8; 32];
-        unsafe {
-            let ret = sys::mbedtls_sha256_finish(&mut self.ctx, hash.as_mut_ptr());
-            assert!(ret == 0, "mbedtls_sha256_finish failed: {ret}");
-        }
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        use sha2::Digest;
+        self.ctx.update(data);
+    }
+
+    pub(crate) fn finish_hex(self) -> String {
+        use sha2::Digest;
+        let hash = self.ctx.finalize();
         hash.iter().map(|b| format!("{b:02x}")).collect()
-    }
-}
-
-impl Drop for Sha256 {
-    fn drop(&mut self) {
-        unsafe {
-            sys::mbedtls_sha256_free(&mut self.ctx);
-        }
     }
 }

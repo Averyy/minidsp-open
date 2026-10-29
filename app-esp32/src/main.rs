@@ -23,8 +23,10 @@ mod diagnostics;
 mod ezbeq;
 mod http_server;
 mod led;
+mod ota;
 mod snapshot;
 mod storage;
+mod threads;
 mod updater;
 mod usb_audio;
 mod usb_hid;
@@ -74,8 +76,9 @@ fn main() {
 
     let reset_reason = unsafe { sys::esp_reset_reason() };
     info!(
-        "minidsp-open v{} starting (reset reason: {} / {})",
-        env!("CARGO_PKG_VERSION"),
+        "minidsp-open v{} ({}) starting (reset reason: {} / {})",
+        ota::FIRMWARE_VERSION,
+        ota::FIRMWARE_BUILD,
         reset_reason as i32,
         reset_reason_label(reset_reason)
     );
@@ -94,6 +97,7 @@ fn main() {
     }
 
     // Step 1: WiFi connection (or provisioning)
+    diagnostics::log_internal_heap("before WiFi");
     info!("step 1: WiFi setup");
     led::set_mode(led::LedMode::WifiConnecting);
     let wifi_handle = match wifi::connect_or_provision(nvs.clone()) {
@@ -115,6 +119,11 @@ fn main() {
     };
 
     let wifi_is_sta = wifi_handle.as_ref().is_some_and(|h| h.is_sta);
+
+    // A freshly OTA-updated image must prove it's reachable or roll back.
+    if let Err(e) = ota::start_health_check(wifi::has_saved_credentials(&nvs)) {
+        error!("failed to spawn OTA health check: {e}");
+    }
 
     // Shared device state (None until USB device is probed)
     let device_state: http_server::SharedDeviceState = Arc::new(Mutex::new(None));
@@ -143,12 +152,14 @@ fn main() {
             Ok(server) => {
                 info!("captive portal running on port 80");
                 Box::leak(Box::new(server));
+                ota::mark_http_ready();
             }
             Err(e) => error!("captive portal HTTP failed: {e}"),
         }
     }
 
     // Step 3: USB Host HID initialization (sets up host library + background threads)
+    diagnostics::log_internal_heap("after WiFi");
     info!("step 3: USB Host HID setup");
     let bus = match usb_hid::UsbHidBus::init() {
         Ok(bus) => Some(Arc::new(bus)),
@@ -200,6 +211,7 @@ fn main() {
 
     // Step 6: Start HTTP server (STA mode — SoftAP portal already started above)
     if wifi_is_sta && wifi_handle.is_some() {
+        diagnostics::log_internal_heap("after USB");
         info!("step 6: starting HTTP server on port 5380");
         match http_server::start(
             device_state.clone(),
@@ -212,10 +224,13 @@ fn main() {
             Ok(server) => {
                 info!("HTTP server running on port 5380");
                 Box::leak(Box::new(server));
+                ota::mark_http_ready();
             }
             Err(e) => error!("HTTP server failed: {e}"),
         }
     }
+
+    diagnostics::log_internal_heap("after HTTP");
 
     // Step 7: TCP bridge (port 5333) — Device Console compatibility
     if wifi_is_sta {
@@ -235,13 +250,10 @@ fn main() {
     // Step 8: UDP discovery broadcast (port 3999)
     if wifi_is_sta {
         let udp_state = device_state.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name("udp_disc".into())
-            .stack_size(8192)
-            .spawn(move || {
-                udp_discovery(udp_state);
-            })
-        {
+        // Sockets only, never flash: its stack can live in PSRAM.
+        if let Err(e) = threads::spawn_psram_thread(c"udp_disc", "udp_disc", 8192, move || {
+            udp_discovery(udp_state);
+        }) {
             error!("failed to spawn UDP discovery: {e}");
         }
     }
@@ -259,19 +271,18 @@ fn main() {
             if let Err(e) = updater::start_background_updater(nvs.clone()) {
                 error!("failed to spawn update thread: {e}");
             }
+            if let Err(e) = ota::start_background_checker() {
+                error!("failed to spawn firmware check thread: {e}");
+            }
         } else {
             // SoftAP mode — keep the wifi handle alive but no monitor
             Box::leak(Box::new(handle.wifi));
         }
     }
 
+    diagnostics::log_internal_heap("ready");
+    diagnostics::log_task_stacks();
     info!("minidsp-open ready");
-
-    // Dump the boot log from ring buffer so late serial connections can see it
-    let boot_log = diagnostics::log_snapshot();
-    for line in boot_log.lines() {
-        info!("[boot] {line}");
-    }
 
     // Main loop: diagnostics tick + USB device detection/reconnection
     let mut usb_backoff = Duration::from_secs(5);
@@ -370,8 +381,9 @@ fn discover_and_activate_device(
 
     match probe_device_with_retries(bus.clone(), Duration::from_secs(20)) {
         Ok(state) => Ok(state),
-        Err(err) if probe_error_is_root_port_recoverable(&err)
-            && bus.has_present_device().unwrap_or(false) =>
+        Err(err)
+            if probe_error_is_root_port_recoverable(&err)
+                && bus.has_present_device().unwrap_or(false) =>
         {
             warn!(
                 "USB state: probe failed while a device is still present ({err}); recycling root port"
@@ -724,9 +736,7 @@ fn fallback_discovery_serial() -> u16 {
 /// Get the ESP32's STA IP address.
 fn get_sta_ip() -> Option<[u8; 4]> {
     unsafe {
-        let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(
-            b"WIFI_STA_DEF\0".as_ptr() as *const _
-        );
+        let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr());
         if netif.is_null() {
             return None;
         }

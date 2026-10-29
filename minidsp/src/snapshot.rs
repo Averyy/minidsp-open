@@ -472,11 +472,12 @@ impl MiniDspClient {
         }
     }
 
-    async fn restore_preset_snapshot(
+    pub(crate) async fn restore_preset_snapshot(
         &self,
         preset: &PresetSnapshot,
         current: Option<&PresetSnapshot>,
     ) -> Result<(), ClientError> {
+        let _state_transition_guard = self.state_transition_lock.lock().await;
         let shadow = preset.shadow.as_ref().ok_or_else(|| {
             ClientError::Protocol(format!(
                 "preset {} has no restorable shadow payload",
@@ -484,14 +485,15 @@ impl MiniDspClient {
             ))
         })?;
 
-        let payload_matches = current.is_some_and(|current| preset_payload_matches(preset, current));
+        let payload_matches =
+            current.is_some_and(|current| preset_payload_matches(preset, current));
         if payload_matches {
             tracing::info!(
                 "snapshot restore: skipping preset {} payload rewrite; current state already matches",
                 preset.slot
             );
         } else {
-            self.set_config_with_mode(preset.slot, commands::PRESET_CHANGE_WITHOUT_RESET)
+            self.set_config_with_mode_locked(preset.slot, commands::PRESET_CHANGE_WITHOUT_RESET)
                 .await?;
             apply_shadow_to_active_preset(self, shadow, &preset.fir_blocks).await?;
         }
@@ -854,12 +856,11 @@ fn build_official_xml_preset_source(
     let mut fir_blocks = Vec::new();
     if let Some(table) = profile.dsp_table {
         for input in table.inputs {
-            if let Some(fir) = input.fir {
-                if let Some(block) =
+            if let Some(fir) = input.fir
+                && let Some(block) =
                     required_fir_block(&file.shadow, &file.fir_blocks, fir, &mut issues)
-                {
-                    fir_blocks.push(block);
-                }
+            {
+                fir_blocks.push(block);
             }
         }
         for output in table.outputs {
@@ -1416,7 +1417,7 @@ fn default_param_coeffs(image: &DefaultPresetImage, addr: u16) -> Option<[f32; 5
 
 fn default_bypass_map(image: &DefaultPresetImage) -> HashMap<u16, bool> {
     let mut map = HashMap::new();
-    for chunk in image.bypass.chunks_exact(3) {
+    for chunk in image.bypass.as_chunks::<3>().0.iter() {
         let addr = u16::from_be_bytes([chunk[1], chunk[2]]);
         map.insert(addr, chunk[0] & 0x80 != 0);
     }
@@ -1570,17 +1571,17 @@ fn default_fir_blocks(
     };
 
     for input in table.inputs {
-        if let Some(fir) = input.fir {
-            if let Some(block) = default_fir_block(image, shadow, fir) {
-                blocks.push(block);
-            }
+        if let Some(fir) = input.fir
+            && let Some(block) = default_fir_block(image, shadow, fir)
+        {
+            blocks.push(block);
         }
     }
     for output in table.outputs {
-        if let Some(fir) = output.fir {
-            if let Some(block) = default_fir_block(image, shadow, fir) {
-                blocks.push(block);
-            }
+        if let Some(fir) = output.fir
+            && let Some(block) = default_fir_block(image, shadow, fir)
+        {
+            blocks.push(block);
         }
     }
     blocks
@@ -1732,7 +1733,7 @@ fn shadow_from_device_config(
         if let Some(addr) = output.delay {
             shadow
                 .scalar
-                .insert(addr, profile.delay_ms_to_samples(output_cfg.delay) as u32);
+                .insert(addr, profile.delay_ms_to_samples(output_cfg.delay));
         }
         if let Some(addr) = output.polarity {
             shadow.selector.insert(addr, 0);

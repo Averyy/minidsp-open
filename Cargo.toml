@@ -11,10 +11,10 @@ members = [
 exclude = ["app-esp32"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/alevitt/minidsp-open"
+repository = "https://github.com/Averyy/minidsp-open"
 
 [workspace.dependencies]
 # Shared across crates

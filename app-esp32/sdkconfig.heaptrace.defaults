@@ -1,0 +1,12 @@
+# Debug profile: ESP-IDF heap tracing for leak hunts. Build with
+#   CARGO_TARGET_DIR=target-heaptrace \
+#   ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.heaptrace.defaults" tools/esp-cargo build --release
+# The separate target directory keeps the normal build from a full rebuild. It
+# must sit directly in app-esp32/: esp-idf-sys treats the target directory's
+# parent as the project, for cargo metadata (extra components) and for every
+# relative path (these defaults files, partitions.csv).
+# Then POST /debug/heaptrace/start, exercise the board, and
+# POST /debug/heaptrace/stop to log the internal-RAM allocations still held.
+# Decode the alloced_by addresses with xtensa-esp32s3-elf-addr2line -pfiaC -e <elf>.
+CONFIG_HEAP_TRACING_STANDALONE=y
+CONFIG_HEAP_TRACING_STACK_DEPTH=6

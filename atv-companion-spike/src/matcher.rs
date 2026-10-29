@@ -410,8 +410,8 @@ mod tests {
     #[test]
     fn normalize_title_collapses_punctuation() {
         assert_eq!(
-            normalize_title("Example Film B"),
-            "peaky blinders the immortal man"
+            normalize_title("Example Film: The Sequel"),
+            "example film the sequel"
         );
         assert_eq!(normalize_title("F1: The Movie"), "f1 the movie");
     }

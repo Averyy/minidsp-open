@@ -209,7 +209,7 @@ User-visible LED behavior during that sequence now follows `docs/ref-rgb-led.md`
 | WiFi connect | Semi-blocking | Block up to 30s. If no connection, start API anyway with stale data |
 | USB HID init | Non-blocking | Start immediately. Device might not be plugged in yet |
 | manifest.json fetch | Non-blocking | 3s timeout. API already serving. Done in background |
-| Data download | Non-blocking | API serves stale data while downloading. Update atomically when done |
+| Data download | Non-blocking | API serves installed files while downloading. Replace verified files atomically (see the partition-limited bundle scheme below) |
 | HTTP API start | As early as possible | Start the moment we have an IP (or even before, on AP interface during provisioning) |
 
 ### Timeout recommendations
@@ -261,9 +261,30 @@ First boot with WiFi but empty data partition:
 └──────────────────────────────────────────────────────┘
 ```
 
+### Bundle replacement on the current partition
+
+Since the OTA layout (`docs/ref-firmware-updates.md`) the storage partition is
+`0x9E0000` (~9.9 MiB) and the bundle must stay under 8 MB; the slim browser
+catalogue (`database.json.gz`, plot summaries dropped) keeps it around 6-7 MB.
+Two full bundles don't fit, so the updater replaces files one at a time:
+
+- Skip files already on flash with the manifest's size and SHA-256, so an interrupted update resumes instead of starting over.
+- Check free space for the remaining files' growth. If there's also room for the largest old file and its replacement at once, keep each old file until its replacement verifies; otherwise delete each changed file just before downloading its replacement.
+- Sync `.update-incomplete` before replacing any installed asset.
+- Download each file to `.part`, check its size and SHA-256, sync it, then rename it over the installed file without deleting the old file first.
+- Commit `version.txt` only after every asset validates, then remove the incomplete marker and mirror the version to NVS.
+- Ignore both stored version markers while the incomplete marker exists; discard interrupted `.part` files and retry the full manifest on the next check.
+
+- After the commit, delete files the new manifest no longer lists (old content-hashed UI assets).
+
+An interrupted update can leave a mixture of verified old and new files (or, in
+delete-first mode, a missing file); it can't roll back the whole bundle on this
+partition. The incomplete bundle is never treated as current, the next check
+finishes the job, and the MiniDSP control API stays available throughout.
+
 ### State: EMPTY (first boot, no prior sync)
 
-- **Detection:** Version file in NVS is absent or reads as zeroed
+- **Detection:** No committed storage version/catalogue is available
 - **minidsp-rs HTTP API:** Fully functional (device control, PEQ, WebSocket levels)
 - **ezBEQ API:** `/api/2/devices` returns devices but no catalogue. `Catalogue` WebSocket message sends empty list
 - **Static UI files:** Return 503 with JSON status message
@@ -273,7 +294,7 @@ First boot with WiFi but empty data partition:
 
 ### State: STALE (has data, update check failed)
 
-- **Detection:** Version file in NVS has values, but last manifest check failed or returned different versions
+- **Detection:** A committed storage version exists, but the last update check failed or returned different versions
 - **All APIs:** Fully functional with existing data
 - **ezBEQ UI:** Works normally — user sees catalogue as of last successful sync
 - **Behavior:** Indistinguishable from CURRENT to the end user. Only logging reveals staleness
@@ -281,7 +302,7 @@ First boot with WiFi but empty data partition:
 
 ### State: CURRENT (has data, matches manifest)
 
-- **Detection:** Version file in NVS matches latest manifest.json
+- **Detection:** Committed `version.txt` matches the latest manifest and `.update-incomplete` is absent
 - **All APIs:** Fully functional with current data
 - **This is the normal operating state**
 
@@ -390,10 +411,10 @@ let wifi = Provisioner::new(wifi, nvs)
 ### Data partition wear math
 
 **Assumptions for minidsp-open:**
-- Current data partition size: `0xBF0000` bytes = ~11.94 MB
-- 11.94 MB / 4 KB = 3,056 sectors
+- Current data partition size: `0x9E0000` bytes = ~9.9 MB
+- 9.9 MB / 4 KB = 2,528 sectors
 - Current measured payload build (2026-04-13): `catalogue.bin` ~3.0 MB, UI files ~1.35 MB, total site payload ~4.3 MB
-- With ESP-IDF wear leveling: erases are distributed across all 3,056 sectors
+- With ESP-IDF wear leveling: erases are distributed across all 2,528 sectors
 
 **Update scenarios:**
 

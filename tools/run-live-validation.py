@@ -695,8 +695,8 @@ def run_static_checks(harness: Harness, args: argparse.Namespace) -> None:
     if args.esp32_url:
         harness.run_step(
             section,
-            "esp cargo build",
-            lambda: command_detail(["esp", "cargo", "build"], cwd=ROOT / "app-esp32"),
+            "tools/esp-cargo build",
+            lambda: command_detail([str(ROOT / "tools/esp-cargo"), "build"]),
         )
         harness.run_step(section, "build catalogue bundle", lambda: build_catalogue_artifacts())
 

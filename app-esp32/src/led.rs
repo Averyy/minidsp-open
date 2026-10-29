@@ -114,9 +114,9 @@ struct LedStatus {
 
 #[derive(Clone, Copy, Debug)]
 enum LedCommand {
-    SetMode(LedMode),
-    SetDeviceReady(bool),
-    SetBackgroundUpdate(bool),
+    Mode(LedMode),
+    DeviceReady(bool),
+    BackgroundUpdate(bool),
 }
 
 pub struct BackgroundUpdateGuard;
@@ -155,10 +155,12 @@ impl LedController {
     fn spawn() -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        thread::Builder::new()
-            .name("rgb_led".into())
-            .stack_size(LED_THREAD_STACK_BYTES)
-            .spawn(move || match Led::new() {
+        // GPIO/RMT only, never flash: its stack can live in PSRAM.
+        crate::threads::spawn_psram_thread(
+            c"rgb_led",
+            "rgb_led",
+            LED_THREAD_STACK_BYTES,
+            move || match Led::new() {
                 Ok(led) => {
                     let _ = ready_tx.send(Ok(()));
                     run_led_controller(led, rx);
@@ -166,8 +168,9 @@ impl LedController {
                 Err(e) => {
                     let _ = ready_tx.send(Err(format!("RGB LED init failed: {e}")));
                 }
-            })
-            .map_err(|e| format!("RGB LED thread spawn failed: {e}"))?;
+            },
+        )
+        .map_err(|e| format!("RGB LED thread spawn failed: {e}"))?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(Self { tx }),
             Ok(Err(e)) => Err(e),
@@ -176,15 +179,15 @@ impl LedController {
     }
 
     pub fn set_mode(&self, mode: LedMode) {
-        let _ = self.tx.send(LedCommand::SetMode(mode));
+        let _ = self.tx.send(LedCommand::Mode(mode));
     }
 
     pub fn set_device_ready(&self, ready: bool) {
-        let _ = self.tx.send(LedCommand::SetDeviceReady(ready));
+        let _ = self.tx.send(LedCommand::DeviceReady(ready));
     }
 
     pub fn set_background_update(&self, active: bool) {
-        let _ = self.tx.send(LedCommand::SetBackgroundUpdate(active));
+        let _ = self.tx.send(LedCommand::BackgroundUpdate(active));
     }
 }
 
@@ -320,8 +323,8 @@ impl<'d> Led<'d> {
     }
 
     fn flash_color(color: Rgb, elapsed: Duration, on_time: Duration, off_time: Duration) -> Rgb {
-        let cycle_ms = (on_time + off_time).as_millis().max(1) as u128;
-        if elapsed.as_millis() % cycle_ms < on_time.as_millis() as u128 {
+        let cycle_ms = (on_time + off_time).as_millis().max(1);
+        if elapsed.as_millis() % cycle_ms < on_time.as_millis() {
             color
         } else {
             Rgb::BLACK
@@ -406,13 +409,13 @@ fn run_led_controller(mut led: Led<'static>, rx: Receiver<LedCommand>) {
 
 fn apply_command(status: &mut LedStatus, command: LedCommand) {
     match command {
-        LedCommand::SetMode(LedMode::Fatal) => status.mode = LedMode::Fatal,
-        LedCommand::SetMode(mode) => {
+        LedCommand::Mode(LedMode::Fatal) => status.mode = LedMode::Fatal,
+        LedCommand::Mode(mode) => {
             if status.mode != LedMode::Fatal {
                 status.mode = mode;
             }
         }
-        LedCommand::SetDeviceReady(ready) => status.device_ready = ready,
-        LedCommand::SetBackgroundUpdate(active) => status.background_update = active,
+        LedCommand::DeviceReady(ready) => status.device_ready = ready,
+        LedCommand::BackgroundUpdate(active) => status.background_update = active,
     }
 }

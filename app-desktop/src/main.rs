@@ -112,6 +112,8 @@ fn resolve_force_kind(kind: &str) -> Option<(u8, u8)> {
 enum Command {
     /// Print device status (default if no command given)
     Status,
+    /// Find room rattles with steady tones through a daemon or ESP32 HTTP API
+    Rattle(cli::RattleArgs),
     /// Enumerate connected devices
     Probe {
         /// Listen for advertisement broadcasts from WI-DG / network daemons
@@ -507,6 +509,9 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(Command::Rattle(args)) = &cli.command {
+        return cli::rattle(&cli, args).await;
+    }
     // Handle file execution mode
     if let Some(file_path) = &cli.file {
         return cli::execute_file(file_path, &cli).await;
@@ -765,7 +770,9 @@ async fn execute_command(
                 );
             }
         },
-        Some(Command::Probe { .. }) | Some(Command::Server { .. }) => unreachable!(),
+        Some(Command::Probe { .. }) | Some(Command::Server { .. }) | Some(Command::Rattle(_)) => {
+            unreachable!()
+        }
     }
     Ok(())
 }
@@ -835,8 +842,7 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
     // 3. --url flag or MINIDSP_URL env var (tcp://host:port, usb://path, usb:path)
     let url_source = cli.url.as_deref().or(env_url.as_deref());
     if let Some(url) = url_source {
-        if url.starts_with("tcp://") {
-            let addr = &url["tcp://".len()..];
+        if let Some(addr) = url.strip_prefix("tcp://") {
             let transport = TcpTransport::connect(addr).await?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
         } else if url.starts_with("ws://") || url.starts_with("http://") {
@@ -853,12 +859,12 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
             }
             let transport = WsTransport::connect(url, device_idx).await?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
-        } else if url.starts_with("usb://") {
-            let path = parse_usb_url_path(&url["usb://".len()..])?;
+        } else if let Some(path) = url.strip_prefix("usb://") {
+            let path = parse_usb_url_path(path)?;
             let transport = HidTransport::open(&path)?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
-        } else if url.starts_with("usb:") {
-            let path = parse_usb_url_path(&url["usb:".len()..])?;
+        } else if let Some(path) = url.strip_prefix("usb:") {
+            let path = parse_usb_url_path(path)?;
             let transport = HidTransport::open(&path)?;
             return Ok(MiniDspClient::connect(Box::new(transport)).await?);
         } else {
@@ -1048,11 +1054,11 @@ where
     let mut scratch = [0u8; 4096];
 
     loop {
-        if let Some(expected_len) = expected_http_response_len(&buf)? {
-            if buf.len() >= expected_len {
-                buf.truncate(expected_len);
-                return Ok(buf);
-            }
+        if let Some(expected_len) = expected_http_response_len(&buf)?
+            && buf.len() >= expected_len
+        {
+            buf.truncate(expected_len);
+            return Ok(buf);
         }
 
         let read = stream.read(&mut scratch).await?;
@@ -1078,10 +1084,9 @@ fn expected_http_response_len(data: &[u8]) -> io::Result<Option<usize>> {
 
     if let Some(content_len) =
         header_value(head, "Content-Length").and_then(|value| value.trim().parse::<usize>().ok())
+        && body.len() >= content_len
     {
-        if body.len() >= content_len {
-            return Ok(Some(headers_end + 4 + content_len));
-        }
+        return Ok(Some(headers_end + 4 + content_len));
     }
 
     Ok(None)
@@ -1265,7 +1270,7 @@ mod tests {
 
     #[test]
     fn parse_chunked_devices_http_response() {
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n9b\r\n[{\"product_name\":\"2x4HD\",\"url\":\"ws://192.0.2.251:5380/devices/0/ws\",\"version\":{\"dsp_version\":100,\"fw_major\":1,\"fw_minor\":85,\"hw_id\":10,\"serial\":912345}}]\r\n0\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n99\r\n[{\"product_name\":\"2x4HD\",\"url\":\"ws://192.0.2.251:5380/devices/0/ws\",\"version\":{\"dsp_version\":100,\"fw_major\":1,\"fw_minor\":85,\"hw_id\":10,\"serial\":912345}}]\r\n0\r\n\r\n";
         let devices = parse_device_list_response(resp).unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].product_name, "2x4HD");

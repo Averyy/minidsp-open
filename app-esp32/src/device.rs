@@ -669,7 +669,10 @@ impl DeviceState {
 
         if let Some(previous) = previous {
             let snapshot = self.capture_active_shadow();
-            let mut preset_shadows = self.preset_shadows.lock().unwrap_or_else(|e| e.into_inner());
+            let mut preset_shadows = self
+                .preset_shadows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let trusted = self
                 .trusted_snapshot_presets
                 .lock()
@@ -728,9 +731,21 @@ impl DeviceState {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(active_preset) = active_preset {
-            presets
-                .entry(active_preset)
-                .or_insert_with(|| self.capture_active_shadow());
+            let captured = self.capture_active_shadow();
+            let trusted = self
+                .trusted_snapshot_presets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&active_preset);
+            let snapshot = if trusted {
+                presets
+                    .remove(&active_preset)
+                    .map(|existing| merge_trusted_snapshot(existing, captured.clone()))
+                    .unwrap_or(captured)
+            } else {
+                captured
+            };
+            presets.insert(active_preset, snapshot);
         }
         presets
     }
@@ -885,15 +900,12 @@ impl DeviceState {
         for (ch_idx, input) in table.inputs.iter().enumerate() {
             let mut peq = Vec::new();
             for (band_idx, band) in input.peq.iter().enumerate() {
-                match self.read_peq_coeffs(band.addr) {
-                    Ok(coeffs) => {
-                        peq.push(PeqBandConfig {
-                            index: band_idx as u8,
-                            coeff: BiquadCoeffs::from_array(&coeffs),
-                            bypass: self.read_peq_bypass(band.addr).unwrap_or(false),
-                        });
-                    }
-                    _ => {}
+                if let Ok(coeffs) = self.read_peq_coeffs(band.addr) {
+                    peq.push(PeqBandConfig {
+                        index: band_idx as u8,
+                        coeff: BiquadCoeffs::from_array(&coeffs),
+                        bypass: self.read_peq_bypass(band.addr).unwrap_or(false),
+                    });
                 }
             }
 
@@ -942,15 +954,12 @@ impl DeviceState {
         for (ch_idx, output) in table.outputs.iter().enumerate() {
             let mut peq = Vec::new();
             for (band_idx, band) in output.peq.iter().enumerate() {
-                match self.read_peq_coeffs(band.addr) {
-                    Ok(coeffs) => {
-                        peq.push(PeqBandConfig {
-                            index: band_idx as u8,
-                            coeff: BiquadCoeffs::from_array(&coeffs),
-                            bypass: self.read_peq_bypass(band.addr).unwrap_or(false),
-                        });
-                    }
-                    _ => {}
+                if let Ok(coeffs) = self.read_peq_coeffs(band.addr) {
+                    peq.push(PeqBandConfig {
+                        index: band_idx as u8,
+                        coeff: BiquadCoeffs::from_array(&coeffs),
+                        bypass: self.read_peq_bypass(band.addr).unwrap_or(false),
+                    });
                 }
             }
 
@@ -975,28 +984,20 @@ impl DeviceState {
                 }
             }
 
-            let fir = if let Some(fir) = output.fir {
-                Some(FirConfig {
-                    bypass: self.read_config_bypass(fir.bypass).unwrap_or(false),
-                    active_taps: self.read_fir_tap_count(fir.index).unwrap_or(0),
-                })
-            } else {
-                None
-            };
+            let fir = output.fir.map(|fir| FirConfig {
+                bypass: self.read_config_bypass(fir.bypass).unwrap_or(false),
+                active_taps: self.read_fir_tap_count(fir.index).unwrap_or(0),
+            });
 
-            let compressor = if let Some(comp) = &output.compressor {
-                Some(CompressorConfig {
-                    bypass: self.read_config_bypass(comp.bypass).unwrap_or(false),
-                    threshold: self.read_config_gain_db(comp.threshold).unwrap_or(0.0),
-                    gain: self.read_config_gain_db(comp.gain).unwrap_or(0.0),
-                    ratio: self.read_config_gain_db(comp.ratio).unwrap_or(0.0),
-                    knee: self.read_config_gain_db(comp.knee).unwrap_or(0.0),
-                    attack: self.read_config_gain_db(comp.attack).unwrap_or(0.0),
-                    release: self.read_config_gain_db(comp.release).unwrap_or(0.0),
-                })
-            } else {
-                None
-            };
+            let compressor = output.compressor.as_ref().map(|comp| CompressorConfig {
+                bypass: self.read_config_bypass(comp.bypass).unwrap_or(false),
+                threshold: self.read_config_gain_db(comp.threshold).unwrap_or(0.0),
+                gain: self.read_config_gain_db(comp.gain).unwrap_or(0.0),
+                ratio: self.read_config_gain_db(comp.ratio).unwrap_or(0.0),
+                knee: self.read_config_gain_db(comp.knee).unwrap_or(0.0),
+                attack: self.read_config_gain_db(comp.attack).unwrap_or(0.0),
+                release: self.read_config_gain_db(comp.release).unwrap_or(0.0),
+            });
 
             let delay = if let Some(delay_addr) = output.delay {
                 self.read_config_delay(delay_addr)
@@ -1307,9 +1308,7 @@ impl DeviceState {
         let db_values: Vec<f32> = all_values
             .iter()
             .map(|&v| {
-                if !v.is_finite() {
-                    -140.0
-                } else if v <= -140.0 || v.abs() < 1e-10 {
+                if !v.is_finite() || v <= -140.0 || v.abs() < 1e-10 {
                     -140.0
                 } else {
                     v
@@ -1326,7 +1325,7 @@ impl DeviceState {
     }
 
     pub fn set_volume_db(&self, db: f32) -> Result<(), UsbHidError> {
-        let value = ((-db) * 2.0).round().max(0.0).min(255.0) as u8;
+        let value = ((-db) * 2.0).round().clamp(0.0, 255.0) as u8;
         self.set_volume(value)
     }
 

@@ -768,60 +768,26 @@ Practical implication:
 
 A separate repo only makes sense later if we deliberately extract a generic reusable Apple TV watcher library.
 
-## Current Spike Status
+## Current spike status
 
-The disposable desktop spike now exists in `atv-companion-spike`.
+The desktop spike in [atv-companion-spike](../atv-companion-spike/) implements
+discovery, pairing, restricted credential storage keyed by stable device ID,
+IPv4/IPv6 reconnect hints, decoded asynchronous events, and replayable movie
+suggestions. Completed changes are in [CHANGELOG.md](../CHANGELOG.md).
 
-What is already proven on real hardware:
+Real Apple TV checks established:
 
-- `scan` discovers Companion services and persists them in `.scratch/atv-companion/devices.json`
-- pairing succeeds against the real `Example TV._companion-link._tcp` Apple TV
-- credentials are persisted in `.scratch/atv-companion/credentials.json` with restrictive permissions
-- reconnect after process restart works with the stored credentials
-- the credential store is keyed by the stable Companion device ID (`rpMRtID`), not by IPv4 address or display name
-- the same stored credential record can reconnect over an alternate live IPv6 address for the same Apple TV without re-pairing
-- discovery merges repeated advertisements for the same Apple TV into one device record and keeps all observed addresses
-- async `NowPlayingInfo` events are now captured and decoded during a real Infuse playback session
-- the live Infuse sample is currently yielding stable normalized fields for title and duration, with the `NowPlayingInfo` event arriving about `0.84–0.85 s` after the explicit fetch trigger
-- the current Infuse baseline sample is pinned at `.scratch/atv-companion/debug/infuse-sample.json` for later comparison against Netflix, Plex, and matching logic
-- a live Plex movie sample now yields stable title and duration data for `Example Film B`, but still behaves like a sparse third-party payload with no bundle ID or program ID
-- the current Plex baseline sample is pinned at `.scratch/atv-companion/debug/plex-sample.json`
-- a live Amazon Prime Video sample now shows materially richer third-party metadata than Infuse, including bundle ID `com.amazon.aiv.AIVApp`, canonical ID, and a stable Amazon content identifier for `Example Film C`
-- the current Amazon Prime baseline sample is pinned at `.scratch/atv-companion/debug/amazon-prime-sample.json`
-- a live Apple TV movie sample now provides the strongest direct now-playing payload captured so far, including bundle ID `com.apple.TVWatchList`, canonical ID, program ID, iTunes Store ID, duration, and non-zero progress for `Example Film F`
-- the current Apple TV movie baseline sample is pinned at `.scratch/atv-companion/debug/apple-tv-movie-sample.json`
-- a live Netflix movie sample currently decodes to repeated empty `TVRCNowPlayingInfo` shells with `metadata = null`, even during sustained active playback
-- the current Netflix negative sample is pinned at `.scratch/atv-companion/debug/netflix-sample.json`
-- the spike now also follows pyatv's Companion attention-state bootstrap more closely: `FetchAttentionState` succeeds live and returns `state = 3` during active Netflix playback, but that still does not populate the Netflix `NowPlayingInfo` payload
-- the spike now also matches pyatv's `_touchStart -> _sessionStart -> _tiStart` ordering more closely, and that still did not unlock the empty Netflix payloads
-- the repeated empty Netflix `NowPlayingInfoKey` blobs are also much smaller than the good samples, at about `538` bytes versus roughly `73 KB` for the good Plex sample, `103 KB` for the good Prime sample, and `252 KB` for the good Apple TV sample; current evidence therefore points to the metadata being absent from the received payload, not merely hidden inside it
+- Infuse and Plex provide title/duration, but no reliable app/program identity or progress. Per-item UUIDs aren't app routing keys.
+- Prime supplies app/content identifiers but lacks program/show/episode fields in the captured movie sample; Apple TV movie payloads also supply program/store identifiers and progress.
+- Netflix supplies empty now-playing metadata even after attention-state/bootstrap checks. Up Next can be stale or fail, so it isn't a reliable third-party playback source.
+- Useful metadata arrives in later events rather than the almost-empty direct fetch reply. Address churn must be handled without re-pairing.
 
-Important nuance from the current live network:
-
-- the latest `Example TV` scan shows one IPv4 address plus multiple IPv6 addresses, not two distinct IPv4 addresses
-- the reconnect implementation therefore needs to tolerate address churn and alternate address families, not assume one fixed IPv4 string forever
-
-Current CLI path:
-
-- `cargo +esp run -p atv-companion-spike -- scan --timeout-secs 3`
-- `cargo +esp run -p atv-companion-spike -- --verbose pair <device-id>`
-- `cargo +esp run -p atv-companion-spike -- --verbose watch <device-id> --once`
-- `cargo +esp run -p atv-companion-spike -- --verbose watch <device-id> --host <address> --once`
-
-What is still incomplete:
-
-- `FetchCurrentNowPlayingInfoEvent` still returns an almost-empty direct response body; the useful metadata arrives later as a `NowPlayingInfo` event
-- the live Infuse now-playing event is still missing `bundleID`, `programID`, and meaningful progress (`timeOffset` is currently `0.0`)
-- the live Plex movie sample is also missing `bundleID`, `programID`, and meaningful progress (`timeOffset` is currently `0.0`), even though the title and duration are stable
-- the current Infuse and Plex samples also do not expose a trustworthy app identity: `bundleID` is null, `iTunesStoreIdentifier` is `0`, the canonical ID stays at `com.apple.tvremote.canonical-identifier.unknown`, and repeated title swaps now show that the UUID-like `identifier` changes per playback rather than per app (`Example Film A -> Example Film D` on Infuse, `Example Film B -> Example Film E` on Plex)
-- for the approved first matching pass, that app-identity gap is acceptable only for movie detection: require an exact normalized title match plus duration within `±15 min`, prefer stronger identifiers when they exist, and keep the flow suggestion-only instead of auto-apply
-- the live Amazon Prime sample exposes a real `bundleID` and stronger content identifiers, but it still omits `programID`, product-page URLs, and show or episode fields for the current movie sample
-- the live Apple TV movie sample exposes the strongest current identifier set, with direct `bundleID`, `canonicalID`, `programID`, `iTunesStoreIdentifier`, duration, and progress in the now-playing payload
-- the live Netflix sample currently emits valid `NowPlayingInfo` envelopes but no useful payload fields at all; repeated events over more than thirty seconds stayed empty
-- subscribing to `TVSystemStatus` and successfully issuing `FetchAttentionState` did not change the empty Netflix result, so the remaining gap is likely deeper than just missing the basic power / attention bootstrap
-- moving `_touchStart` ahead of `_sessionStart` also did not change the empty Netflix result, so the remaining gap is likely deeper than the obvious pyatv bootstrap differences
-- `FetchUpNextInfoEvent` can decode rich Apple TV+ watchlist-style entries, but during the active Infuse sample it returned `AMSErrorDomain / 301`, and during the active Netflix sample it stayed stale on the previous Prime title instead of the current playback
-- Infuse and Plex playback samples are now captured, pinned, and ready to drive the first BEQ matching-policy pass, including repeat-title comparisons at `.scratch/atv-companion/debug/infuse-comparison-sample.json` and `.scratch/atv-companion/debug/plex-comparison-sample.json`
+The matcher uses normalized title plus duration within ±15 min and exposes
+candidate variants. It doesn't determine the actual audio mix; manual variant
+selection remains required even for one hit. Backend/session rules, sustained
+reconnect/watch behavior, ESP32 feasibility, and the product phases below are
+still open. Samples and replay output stay under ignored
+`.scratch/atv-companion/`.
 
 ## Approved First Matching Pass
 
@@ -1070,7 +1036,7 @@ ESP timing clarification:
 - ATV phase 0 is the desktop-native proof that already established pair, reconnect, and now-playing capture
 - the next product steps are: backend session model first, then an early ESP32 feasibility gate, then the narrow custom UI only if ESP passes
 - the ESP32 check is no longer a late follow-up; it is an early go/no-go decision for the entire ATV feature
-- current flash/storage budget does not look like the blocker: the active ESP32 layout is `4 MB` app + `11.94 MB` data, and the current embedded ezBEQ site payload measures about `4.3 MB`
+- budget the ESP32 feasibility gate against the current dual-slot layout: two 3 MB app slots and about 9.9 MB data, with the current ezBEQ bundle about 6.9 MB; remeasure watcher headroom rather than using the old single-app layout
 - if watcher matching needs extra search fields on ESP32 later, extend the existing compact catalogue artifacts rather than introducing a second watcher-only database
 
 Before attempting the custom ATV UI, all of this should be true:

@@ -1,6 +1,15 @@
 # PWR-ICE125/250 Support (Future)
 
-## BLOCKED: Need Help From a PWR-ICE Owner
+## Current status
+
+Keep this plan open. No PWR-ICE DSP profile/address table or hardware signoff
+exists in this repo. [TcpTransport](../minidsp/src/transport/tcp.rs) uses the
+generic length-prefixed codec in [packet.rs](../protocol/src/packet.rs); it
+doesn't auto-detect or pad a dedicated 70-byte PWR-ICE transport. Plugin/XML
+acquisition, address extraction, transport verification, and owner testing
+remain open; retain the research below as design input.
+
+## Blocked on owner-supplied data
 
 Full PEQ/crossover support requires DSP register addresses that we cannot obtain ourselves. We have exhaustively searched the Device Console app, the Android miniDSP Controller APK, all public documentation, and every online source. **The addresses only exist in the standalone PWR_ICE2_2x2 plugin, which MiniDSP has effectively stopped distributing** (multiple owners report the UserDownloads page is empty as of 2024-2025).
 
@@ -12,11 +21,11 @@ Full PEQ/crossover support requires DSP register addresses that we cannot obtain
 
 Contact us on GitHub or post in the miniDSP community forum PWR-ICE section. User `m-diers` on GitHub (minidsp-rs issue #245) has a PWR-ICE and has already done basic packet captures.
 
-**Without this, basic control works (volume, mute, preset switching) but PEQ, crossover, compressor, delay, FIR, and metering are not possible.**
+**Basic volume, mute, and preset commands still need PWR-ICE hardware verification. PEQ, crossover, compressor, delay, FIR, and metering also need a source-backed address table.**
 
 ---
 
-Not shipping at launch. Different product line, different DSP chip, no Device Console XML, no address tables. Transport layer support (70-byte TCP frames) is included in minidsp-open core, but full device control (PEQ, crossover, delay, FIR, metering) requires the register addresses from the standalone plugin.
+Not shipping at launch. Different product line, different DSP chip, no Device Console XML, no address tables. The generic TCP codec exists, but PWR-ICE framing and basic control aren't verified. Full device control (PEQ, crossover, delay, FIR, metering) also requires the register addresses from the standalone plugin.
 
 ## Product Overview
 
@@ -45,16 +54,16 @@ The PWR-ICE125 ($399) and PWR-ICE250 ($499) are DSP-controlled plate amplifier m
 | Frame padding | 0x00 | 0xFF |
 | MAC OUI | varies | 00:50:C2 (DSP4YOU) |
 
-## What Works Today (Generic Fallback)
+## Generic commands awaiting verification
 
-With minidsp-open's auto-detected 70-byte TCP transport:
+The following are candidates for the generic command path, not hardware-verified support claims:
 
 | Feature | Status |
 |---------|--------|
-| Discovery (UDP 3999) | Works -- broadcasts as "PWR-ICE2" |
-| Master volume | Works |
-| Master mute | Works |
-| Preset switching (1-4) | Works |
+| Discovery (UDP 3999) | Captured PWR-ICE beacons are documented below; live discovery is unverified here |
+| Master volume | Unverified |
+| Master mute | Unverified |
+| Preset switching (1-4) | Unverified |
 | Source selection | Unknown -- reports "NotInstalled" |
 | PEQ (input + output per channel) | Not working -- no address table |
 | Crossover (IIR or FIR) | Not working -- no address table |
@@ -306,16 +315,15 @@ This is very tedious but doesn't require the plugin software at all.
 
 ## Implementation Plan (When Ready)
 
-1. Obtain config.xml from a PWR-ICE owner (Path 2) or decompile the plugin (Path 1)
-2. Parse the config.xml to extract symbol-to-address mapping
-3. Create `devtools/src/codegen/pwr_ice/config.xml` and `mod.rs`
-4. Add hw_id 3 / dsp_version 51 to the probe table
-5. Generate the device definition with `minidsp-devtools codegen`
-6. Implement fixed-point value encoding/decoding (shared with m2x4/nanodigi2x8)
-7. Handle 70-byte TCP frame transport (already done in core)
-8. Test with a real device
+1. Obtain config.xml or the standalone plugin from an owner.
+2. Extract symbol-to-address mappings and confirm the runtime HW/DSP identity from source evidence.
+3. Extend the repo's importer/generated device tables with a PWR-ICE profile rather than guessing addresses.
+4. Reuse the existing legacy fixed-point dialect support; confirm its behavior against the device's values.
+5. Verify/adapt the generic TCP transport for the device's 70-byte frames.
+6. Test discovery, basic commands, DSP controls, and metering with an owner.
 
-Estimated effort: 1-2 days once config.xml is obtained. The codegen pipeline already handles ADAU1445 devices.
+The shared dialect/codec is a dependency, not PWR-ICE hardware signoff. Existing
+protocol support is recorded in [CHANGELOG.md](../CHANGELOG.md).
 
 ## Action Items
 
@@ -324,4 +332,4 @@ Estimated effort: 1-2 days once config.xml is obtained. The codegen pipeline alr
   2. Or the plugin installer itself for decompilation
 - [ ] Contact m-diers (GitHub user from minidsp-rs #245) who owns a PWR-ICE and has already been capturing packets
 - [ ] If we get the plugin, decompile with JPEXS Free Flash Decompiler to extract ActionScript constants
-- [ ] If we get config.xml, generate device definition using the existing minidsp-rs codegen pipeline pattern
+- [ ] If we get config.xml, generate a source-backed device definition through this repo's importer/table pipeline

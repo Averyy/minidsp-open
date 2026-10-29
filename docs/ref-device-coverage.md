@@ -82,7 +82,7 @@ These lists are the strongest repeatable evidence that the current packaged desk
 
 ## DSP Config Typing Snapshot
 
-The Device Console XML exposes typed config storage directly through `rep`, `range`, and default hex values. This is the clean-room source for systematizing config typing beyond the 2x4 HD workaround.
+The Device Console XML exposes typed config storage directly through `rep`, `range`, and default hex values. This is the vendor-data source (see NOTICE) for systematizing config typing beyond the 2x4 HD workaround.
 
 | DSP | Rep Counts | Filter Counts | Example Typed Slots | Ranges |
 |-----|------------|---------------|---------------------|--------|

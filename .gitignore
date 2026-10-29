@@ -2,9 +2,22 @@ app/
 .DS_Store
 .playwright-mcp/
 target/
+# ESP32 heap-tracing profile build (see app-esp32/sdkconfig.heaptrace.defaults)
+target-heaptrace/
 .scratch/
 __pycache__/
 *.pyc
 
 .codex-dobby/
 .claude/
+
+# Personal Claude Code notes (board serials, ports, LAN addresses)
+CLAUDE.local.md
+
+# Local secrets and generated ESP-IDF configuration
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+sdkconfig

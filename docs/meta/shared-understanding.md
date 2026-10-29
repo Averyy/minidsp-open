@@ -5,20 +5,17 @@ Three separate repos, one calibration workflow. The end goal is a single app whe
 ## The Projects
 
 ### 1. minidsp-open (this repo)
-**What:** Clean-room MiniDSP hardware controller. Rust. HTTP API + CLI.
+**What:** Original MiniDSP hardware controller; vendor data provenance is documented in `NOTICE`. Rust. HTTP API + CLI.
 **Role:** The device control layer. Talks USB HID / TCP to MiniDSP hardware. The normal control surface is exposed through the daemon/app HTTP and WebSocket APIs, while the CLI remains primarily probe/debug/raw-transport tooling. Config inspection is implemented, with some DSP100 state still reconstructed from verified shadow data because the physical 2x4 HD does not expose authoritative runtime readback for every field; the desktop daemon now also mirrors the official app's explicit modification-token writes after preset-content mutations and can import token-matched official Device Console preset XML, so reconstructed state survives reconnects with a real freshness marker and a stronger controller-side fallback than stale local cache.
-**Replaces:** minidsp-rs (an upstream protocol reference) + MiniDSP Plugin (closed-source GUI) + $75 WI-DG WiFi bridge (ESP32 target).
-**Repo:** `~/code/minidsp-open`
+**Replaces:** the hardware-control and network-bridge roles served by minidsp-rs, MiniDSP Plugin, and WI-DG.
 
 ### 2. open-sub-optimizer
 **What:** Multi-subwoofer optimizer. Electron + React + TypeScript.
 **Role:** Stage 1 of calibration. Measures each sub individually at multiple seats, runs a JADE/EPSDE optimizer to compute optimal delay, gain, polarity, and PEQ per sub, then pushes the config to MiniDSP hardware. Replaces the REW + MSO + MiniDSP Plugin three-app shuffle.
-**Repo:** `~/code/open-sub-optimizer`
 
 ### 3. dirac-sparr
 **What:** Automated Dirac Live calibration client. Electron + React + TypeScript.
 **Role:** Stage 2 of calibration + host app. Auto-discovers the receiver, pre-configures it via eISCP, guides mic placement, runs measurement sweeps, sends to Dirac's cloud for filter computation, uploads FIR filters to the receiver. Imports open-sub-optimizer as an npm package for optional Stage 1 sub optimization. Discovers minidsp-open on the network via UDP broadcast (port 3999), mDNS (`_minidsp._tcp`), or manual IP entry — does NOT bundle or manage minidsp-open.
-**Repo:** `~/code/dirac-sparr`
 
 ## The Calibration Flow
 
@@ -79,16 +76,12 @@ minidsp-open ◄──── open-sub-optimizer
 - **dirac-sparr** talks directly to the receiver (DiracIO gRPC) — independent of minidsp-open for Dirac calibration. Discovers minidsp-open on the network for optional Stage 1 sub optimization. Does not bundle or spawn minidsp-open.
 - **minidsp-open** is useful standalone (CLI, API, ESP32 WiFi bridge) independent of the other two. Both open-sub-optimizer and dirac-sparr discover and consume it as an external HTTP service.
 
-## The User's Setup
+## Example Calibration Setup
 
-```
-Receiver (Onkyo RZ50)
-├── Speaker outputs → Mains (7 channels)
-└── Sub pre-out ──→ MiniDSP 2x4 HD ──→ Sub 1, Sub 2, Sub 3
-                         (USB to PC)
-```
-
-Receiver handles mains + Dirac (FIR filters in receiver DSP). MiniDSP handles sub optimization only (PEQ biquads, 10 bands per output). UMIK-1 mic used for both stages.
+A receiver can handle main speakers and room correction while a MiniDSP handles
+delay, gain, and PEQ for multiple subwoofers. A measurement microphone can serve
+both calibration stages. The exact hardware and channel counts are deployment
+choices.
 
 ## Build Order
 

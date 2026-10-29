@@ -249,7 +249,7 @@ From miniDSP Controller app and minidsp-rs. These use ADAU1445 SigmaDSP (fixed-p
 | Has display | Yes | Yes |
 | Has DRE option | **No** (not in Device Console XML — only Flex Eight and Flex HT have DRE) | **No** |
 | REW supported | Yes | Yes |
-| minidsp-rs status | Supported (DSP 113 only) — **DSP 115 BROKEN** |
+| minidsp-rs status | Release v0.1.12 (Oct 2024): DSP 113 only, DSP 115 detected as Generic (#701). `dev` since 2026-04-15 (PR #767, unreleased): DSP 115 with 10 input PEQs per channel, but output PEQs dropped and DSP 113 now falls to Generic. minidsp-open keeps both firmwares and both PEQ banks. Upstream numbers input PEQ bands in reverse (band 0 = `PEQ_1_10`); minidsp-open uses Device Console order (band 0 = `PEQ_1_1`). | |
 
 ---
 

@@ -15,10 +15,13 @@ use axum::{
     routing::{get, post},
 };
 use minidsp_protocol::playback::{
-    PlayRequest, PlaybackPlan, SyncRequest, SyncResponse, ToneBurstParams,
+    PlayRequest, PlaybackPlan, PlaybackStatus, SyncRequest, SyncResponse, ToneBurstParams,
 };
+use minidsp_protocol::rattle::{RattlePlan, RattleRequest, RattleResponse, RattleStatus};
+use minidsp_protocol::source::Source;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -107,10 +110,7 @@ async fn get_device_or_404(
     state: &DaemonState,
     id: usize,
 ) -> ApiResult<Arc<minidsp::client::MiniDspClient>> {
-    state
-        .get_device(id)
-        .await
-        .ok_or_else(|| ApiError::not_found())
+    state.get_device(id).await.ok_or_else(ApiError::not_found)
 }
 
 async fn get_ready_device_or_404(
@@ -154,7 +154,12 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/devices/{id}/volume/{direction}", post(volume_direction))
         .route("/devices/{id}/source/{source}", post(set_source))
         .route("/devices/{id}/preset/{preset}", post(set_preset))
-        .route("/devices/{id}/play", post(play_device))
+        .route("/devices/{id}/play", get(playback_status).post(play_device))
+        .route(
+            "/devices/{id}/rattle",
+            get(rattle_status).post(start_rattle),
+        )
+        .route("/devices/{id}/rattle/stop", post(stop_rattle))
         .route("/sync", post(sync_clock))
         .route("/devices/{id}/display", get(get_display).post(set_display))
         .route("/devices/{id}/dre", get(get_dre).post(set_dre))
@@ -474,6 +479,14 @@ async fn sync_clock(Json(body): Json<SyncRequest>) -> impl IntoResponse {
     })
 }
 
+async fn playback_status(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> ApiResult<Json<PlaybackStatus>> {
+    get_device_or_404(&state, id).await?;
+    Ok(Json(state.playback_status()))
+}
+
 async fn play_device(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
@@ -521,51 +534,69 @@ async fn play_device(
         }
         None => PlaybackPlan::build(request).map_err(|e| ApiError::bad_request(e.to_string()))?,
     };
-    let current_source = client
-        .get_master_status()
-        .await
-        .map_err(|e| ApiError::internal(format!("read source: {e}")))?;
-    let current_source = client
-        .profile()
-        .sources
-        .source_for_index(current_source.source)
-        .ok_or_else(|| ApiError::internal("current source unavailable"))?;
-    let usb_index = client
-        .profile()
-        .sources
-        .index_for_source(minidsp_protocol::source::Source::Usb)
-        .ok_or_else(|| ApiError::internal("USB source missing from device profile"))?;
-
-    let mut source_changed = false;
-    let mut previous_source = None;
-    let mut restore_source = None;
-    if current_source != minidsp_protocol::source::Source::Usb {
-        client
-            .set_source(usb_index)
-            .await
-            .map_err(|e| ApiError::internal(format!("set_source: {e}")))?;
-        source_changed = true;
-        previous_source = Some(current_source.pascal_case().to_string());
-        restore_source = Some(current_source);
-    }
-
+    let output = playback_output_for_device(&state, &client).await?;
     let client_for_task = client.clone();
     let state_for_task = state.clone();
     let (tx, rx) = oneshot::channel::<Result<minidsp_protocol::playback::PlayResponse, String>>();
+    // Everything that changes the device runs in this task, which owns the
+    // playback busy flag: if the HTTP client disconnects mid-request, the
+    // source switch still pairs with playback and a restore.
     tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            playback::run_playback(plan, source_changed, previous_source, tx)
+        let (source_changed, previous_source, restore_source) =
+            match switch_to_usb_for_playback(&client_for_task).await {
+                Ok(switched) => switched,
+                Err((err, restore_source)) => {
+                    let _ = tx.send(Err(err));
+                    // The switch may have landed even though verification failed.
+                    if let Some(source) = restore_source
+                        && let Some(index) =
+                            client_for_task.profile().sources.index_for_source(source)
+                        && let Err(err) = client_for_task.set_source(index).await
+                    {
+                        tracing::warn!("failed to restore source after playback setup: {err}");
+                    }
+                    state_for_task.finish_playback();
+                    return;
+                }
+            };
+        let started = Arc::new(AtomicBool::new(false));
+        let result = tokio::task::spawn_blocking({
+            let state = state_for_task.clone();
+            let started = started.clone();
+            move || {
+                playback::run_playback(
+                    output,
+                    plan,
+                    source_changed,
+                    previous_source,
+                    |response| {
+                        // Record before the 200 goes out so a status poll
+                        // right after it already sees this run.
+                        state.record_playback_run_started(response);
+                        started.store(true, Ordering::SeqCst);
+                    },
+                    tx,
+                )
+            }
         })
         .await;
 
-        match result {
-            Ok(Ok(())) => {}
+        let run_error = match result {
+            Ok(Ok(())) => None,
             Ok(Err(err)) => {
                 tracing::warn!("desktop playback failed: {err}");
+                Some(err.to_string())
             }
             Err(err) => {
                 tracing::warn!("desktop playback task failed: {err}");
+                Some(format!("playback task failed: {err}"))
             }
+        };
+        // A run that failed before starting answered /play with an error;
+        // leave the previous run's record alone.
+        let started = started.load(Ordering::SeqCst);
+        if started {
+            state_for_task.finish_last_playback_run(run_error);
         }
 
         if let Some(source) = restore_source
@@ -573,6 +604,11 @@ async fn play_device(
             && let Err(err) = client_for_task.set_source(index).await
         {
             tracing::warn!("failed to restore source after desktop playback: {err}");
+            if started {
+                state_for_task.set_last_playback_run_source_restore_error(format!(
+                    "failed to restore source after playback: {err}"
+                ));
+            }
         }
         state_for_task.finish_playback();
     });
@@ -587,11 +623,205 @@ async fn play_device(
     Ok(Json(value))
 }
 
+async fn rattle_status(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> ApiResult<Json<RattleStatus>> {
+    get_device_or_404(&state, id).await?;
+    Ok(Json(state.rattle_status(id)))
+}
+
+async fn stop_rattle(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+) -> ApiResult<Json<RattleStatus>> {
+    if !state.request_rattle_stop(id) {
+        return Err(ApiError::conflict("no rattle session is running"));
+    }
+    Ok(Json(state.rattle_status(id)))
+}
+
+async fn start_rattle(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+    body: Bytes,
+) -> ApiResult<Json<RattleResponse>> {
+    let request = if body.is_empty() {
+        RattleRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("invalid rattle request: {e}")))?
+    };
+    let plan = RattlePlan::build(request).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if !state.try_begin_playback() {
+        return Err(ApiError::conflict("playback already in progress"));
+    }
+    let mut guard = PlaybackGuard::new(state.clone());
+    let client = state
+        .get_device(id)
+        .await
+        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "device not found"))?;
+    if state.device_operation_active(id) {
+        return Err(ApiError::conflict("device busy"));
+    }
+    if !client.profile().has_usb_audio {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "device does not support USB audio playback",
+        ));
+    }
+    let output = playback_output_for_device(&state, &client).await?;
+    let operation = DeviceOperationGuard::begin(state.clone(), id)?;
+    let generator = Arc::new(std::sync::Mutex::new(plan.generator()));
+    let latency = Arc::new(AtomicI64::new(0));
+    state.prepare_rattle(id, generator.clone(), latency.clone());
+    let (tx, rx) = oneshot::channel();
+    // Own setup, streaming and both restores even if the requester disconnects.
+    tokio::spawn(async move {
+        let _operation = operation;
+        let _levels = client.queue().pause_levels();
+        let previous_volume = match client.get_master_status().await {
+            Ok(status) => status.volume,
+            Err(err) => {
+                let _ = tx.send(Err(format!("read volume: {err}")));
+                state.finish_rattle(None, None);
+                return;
+            }
+        };
+        let switched = switch_to_usb_for_playback(&client).await;
+        let (source_changed, previous_source, restore_source) = match switched {
+            Ok(switched) => switched,
+            Err((err, restore_source)) => {
+                let _ = tx.send(Err(err));
+                let source_error = restore_rattle_source(&client, restore_source).await;
+                state.finish_rattle(None, source_error);
+                return;
+            }
+        };
+        let result = match client.set_volume_db(plan.master_volume_db()).await {
+            Ok(()) => {
+                let response = RattleResponse {
+                    started_at_us: 0,
+                    schedule: plan.schedule(),
+                    previous_volume_db: Some(-0.5 * f32::from(previous_volume)),
+                    source_changed,
+                    previous_source,
+                };
+                let state_for_audio = state.clone();
+                match tokio::task::spawn_blocking(move || {
+                    playback::run_rattle(
+                        output,
+                        plan,
+                        generator,
+                        latency,
+                        response,
+                        |response| {
+                            state_for_audio.record_rattle_run_started(response);
+                        },
+                        tx,
+                    )
+                })
+                .await
+                {
+                    Ok(result) => result.map_err(|err| err.to_string()),
+                    Err(err) => Err(format!("rattle playback task failed: {err}")),
+                }
+            }
+            Err(err) => {
+                let error = format!("set rattle volume: {err}");
+                let _ = tx.send(Err(error.clone()));
+                Err(error)
+            }
+        };
+        state.finish_rattle_audio(result.err());
+        // Restore the raw volume byte so the original hardware setting is exact.
+        let volume_error = client
+            .set_volume(previous_volume)
+            .await
+            .err()
+            .map(|err| format!("restore volume: {err}"));
+        let source_error = restore_rattle_source(&client, restore_source).await;
+        state.finish_rattle(volume_error, source_error);
+    });
+    guard.disarm();
+    let response = rx
+        .await
+        .map_err(|_| ApiError::internal("rattle playback thread ended unexpectedly"))?
+        .map_err(|err| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, err))?;
+    Ok(Json(response))
+}
+
+async fn playback_output_for_device(
+    state: &DaemonState,
+    client: &minidsp::client::MiniDspClient,
+) -> ApiResult<cpal::Device> {
+    let count = state
+        .devices
+        .read()
+        .await
+        .values()
+        .filter(|device| {
+            device.transport_url().starts_with("usb:") && device.profile().has_usb_audio
+        })
+        .count();
+    playback::select_output_device(client, count)
+        .map_err(|err| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string()))
+}
+
+async fn restore_rattle_source(
+    client: &minidsp::client::MiniDspClient,
+    source: Option<Source>,
+) -> Option<String> {
+    if let Some(source) = source
+        && let Some(index) = client.profile().sources.index_for_source(source)
+    {
+        return client
+            .set_source(index)
+            .await
+            .err()
+            .map(|err| format!("restore source: {err}"));
+    }
+    None
+}
+
+/// Switch to USB for playback. Returns (source changed, previous source name,
+/// source to restore afterwards); on error, also the source to restore.
+async fn switch_to_usb_for_playback(
+    client: &minidsp::client::MiniDspClient,
+) -> Result<(bool, Option<String>, Option<Source>), (String, Option<Source>)> {
+    let status = client
+        .get_master_status()
+        .await
+        .map_err(|e| (format!("read source: {e}"), None))?;
+    let current_source = client
+        .profile()
+        .sources
+        .source_for_index(status.source)
+        .ok_or_else(|| ("current source unavailable".to_string(), None))?;
+    if current_source == Source::Usb {
+        return Ok((false, None, None));
+    }
+    let usb_index = client
+        .profile()
+        .sources
+        .index_for_source(Source::Usb)
+        .ok_or_else(|| ("USB source missing from device profile".to_string(), None))?;
+    client
+        .set_source(usb_index)
+        .await
+        .map_err(|e| (format!("set_source: {e}"), Some(current_source)))?;
+    Ok((
+        true,
+        Some(current_source.pascal_case().to_string()),
+        Some(current_source),
+    ))
+}
+
 async fn export_snapshot(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> ApiResult<impl IntoResponse> {
-    let client = get_device_or_404(&state, id).await?;
+    let client = get_ready_device_or_404(&state, id).await?;
     let _operation = DeviceOperationGuard::begin(state.clone(), id)?;
     let snapshot = client
         .capture_device_snapshot()
@@ -610,7 +840,7 @@ async fn import_snapshot(
     Path(id): Path<usize>,
     body: Bytes,
 ) -> ApiResult<impl IntoResponse> {
-    let client = get_device_or_404(&state, id).await?;
+    let client = get_ready_device_or_404(&state, id).await?;
     let _operation = DeviceOperationGuard::begin(state.clone(), id)?;
     let snapshot: minidsp::snapshot::DeviceSnapshot = serde_json::from_slice(&body)
         .map_err(|_| ApiError::bad_request("invalid snapshot JSON"))?;
@@ -630,7 +860,7 @@ async fn learn_snapshot(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
 ) -> ApiResult<impl IntoResponse> {
-    let client = get_device_or_404(&state, id).await?;
+    let client = get_ready_device_or_404(&state, id).await?;
     let _operation = DeviceOperationGuard::begin(state.clone(), id)?;
     let snapshot = client
         .learn_device_snapshot()
@@ -759,12 +989,68 @@ async fn set_preset(
     }))
 }
 
+fn validate_config_indices(
+    body: &ConfigWriteJson,
+    table: &minidsp_protocol::device::dsp::DspTable,
+) -> Result<(), StatusCode> {
+    // minidsp-rs reports missing channels/PEQs as HTTP 500. Validate all of
+    // them before applying master status or any channel writes.
+    for input in body.inputs.iter().flatten() {
+        let channel = table
+            .inputs
+            .get(input.index as usize)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        for peq in input.peq.iter().flatten() {
+            if channel.peq.get(peq.index as usize).is_none() {
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+        for route in input.routing.iter().flatten() {
+            if table.outputs.get(route.output as usize).is_none() {
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+    for output in body.outputs.iter().flatten() {
+        let channel = table
+            .outputs
+            .get(output.index as usize)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        for peq in output.peq.iter().flatten() {
+            if channel.peq.get(peq.index as usize).is_none() {
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+        if channel.crossover.is_some() {
+            for group in output.crossover.iter().flatten() {
+                if group.index > 1
+                    || group
+                        .filters
+                        .iter()
+                        .flatten()
+                        .any(|filter| filter.index >= 4)
+                {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn write_config(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
     Json(body): Json<ConfigWriteJson>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = get_ready_device_or_status(&state, id).await?;
+    if body.inputs.is_some() || body.outputs.is_some() {
+        let table = client
+            .profile()
+            .dsp_table
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        validate_config_indices(&body, table)?;
+    }
 
     if let Some(ms) = body.master_status {
         if let Some(preset) = ms.preset {
@@ -835,22 +1121,22 @@ async fn write_config(
                     }
                 }
                 // Per-channel gain (input channels have Option<u16> addresses)
-                if let Some(gain) = input.gain {
-                    if let Some(gain_addr) = input_ch.gain {
-                        client
-                            .set_channel_gain(gain_addr, gain)
-                            .await
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    }
+                if let Some(gain) = input.gain
+                    && let Some(gain_addr) = input_ch.gain
+                {
+                    client
+                        .set_channel_gain(gain_addr, gain)
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
                 // Per-channel mute
-                if let Some(mute) = input.mute {
-                    if let Some(mute_addr) = input_ch.mute {
-                        client
-                            .set_channel_mute(mute_addr, mute)
-                            .await
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    }
+                if let Some(mute) = input.mute
+                    && let Some(mute_addr) = input_ch.mute
+                {
+                    client
+                        .set_channel_mute(mute_addr, mute)
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
                 if let Some(routes) = input.routing {
                     for route in routes {
@@ -913,24 +1199,24 @@ async fn write_config(
                 // Delay (Duration format: secs + nanos → sample count).
                 // Per-family range clamping lives on the profile so invalid
                 // inputs cannot propagate to the DSP.
-                if let Some(delay) = output.delay {
-                    if let Some(delay_addr) = output_ch.delay {
-                        let delay_ms = delay.as_secs_f32() * 1000.0;
-                        let samples = client.profile().delay_ms_to_samples(delay_ms);
-                        client
-                            .set_channel_delay_samples(delay_addr, samples)
-                            .await
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    }
+                if let Some(delay) = output.delay
+                    && let Some(delay_addr) = output_ch.delay
+                {
+                    let delay_ms = delay.as_secs_f32() * 1000.0;
+                    let samples = client.profile().delay_ms_to_samples(delay_ms);
+                    client
+                        .set_channel_delay_samples(delay_addr, samples)
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
                 // Polarity inversion (dialect-aware encoding)
-                if let Some(invert) = output.invert {
-                    if let Some(polarity_addr) = output_ch.polarity {
-                        client
-                            .set_invert(polarity_addr, invert)
-                            .await
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    }
+                if let Some(invert) = output.invert
+                    && let Some(polarity_addr) = output_ch.polarity
+                {
+                    client
+                        .set_invert(polarity_addr, invert)
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 }
                 if let Some(crossover_groups) = output.crossover
                     && let Some(xover) = output_ch.crossover
@@ -1635,7 +1921,7 @@ async fn openapi() -> impl IntoResponse {
         "info": {
             "title": "minidsp-open API",
             "description": "MiniDSP controller HTTP API. Drop-in replacement for minidsp-rs.",
-            "version": "0.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "license": { "name": "MIT" }
         },
         "servers": [
@@ -1787,6 +2073,55 @@ async fn openapi() -> impl IntoResponse {
                     }
                 }
             },
+            "/devices/{id}/rattle": {
+                "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+                "post": {
+                    "summary": "Start steady rattle-finder tones; shares the /play busy flag",
+                    "operationId": "startRattle",
+                    "requestBody": { "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "description": "Omit frequency fields for defaults, or supply frequenciesHz, or all of startHz/endHz/count. Session limit: one hour and 4096 steps.",
+                        "properties": {
+                            "frequenciesHz": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "type": "number", "minimum": 5, "maximum": 2000 }, "default": [20,25,31.5,40,50,63,80,100,125,160,200] },
+                            "startHz": { "type": "number", "minimum": 5, "maximum": 2000 },
+                            "endHz": { "type": "number", "minimum": 5, "maximum": 2000 },
+                            "count": { "type": "integer", "minimum": 1, "maximum": 64 },
+                            "toneSec": { "type": "number", "minimum": 0.5, "maximum": 600, "default": 4 },
+                            "gapSec": { "type": "number", "minimum": 0, "maximum": 600, "default": 1 },
+                            "cycles": { "type": "integer", "minimum": 1, "default": 1 },
+                            "volumesDb": { "type": "array", "minItems": 1, "items": { "type": "number", "minimum": -127, "maximum": 0 }, "default": [-35] },
+                            "sampleRate": { "type": "integer", "minimum": 1, "maximum": 384000, "default": 48000 },
+                            "bitDepth": { "type": "string", "enum": ["16", "24"], "default": "16" }
+                        }
+                    } } } },
+                    "responses": {
+                        "200": { "description": "RattleResponse: startedAtUs, compact schedule, previousVolumeDb, sourceChanged and optional PascalCase previousSource; stream has started" },
+                        "400": { "description": "Invalid rattle request" },
+                        "409": { "description": "Playback or device operation already in progress" },
+                        "503": { "description": "Device or audio output unavailable, or startup failed" }
+                    }
+                },
+                "get": {
+                    "summary": "Read rattle status and clock-mapped current tone",
+                    "operationId": "rattleStatus",
+                    "responses": {
+                        "200": { "description": "RattleStatus: playing through restoration; optional current and last (state, schedule, error, volumeRestoreError, sourceRestoreError)" },
+                        "404": { "description": "Device not found" }
+                    }
+                }
+            },
+            "/devices/{id}/rattle/stop": {
+                "post": {
+                    "summary": "Fade out the running rattle session; poll status until restoration finishes",
+                    "operationId": "stopRattle",
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+                    "responses": {
+                        "200": { "description": "RattleStatus after requesting a stop" },
+                        "409": { "description": "No rattle session is running" }
+                    }
+                }
+            },
             "/sync": {
                 "post": {
                     "summary": "Read the platform playback clock used by /play.startedAtUs",
@@ -1880,7 +2215,212 @@ async fn llms_txt() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::ws_state_interval_ms;
+    use super::*;
+    use minidsp::transport::{Transport, TransportError};
+    use std::{collections::VecDeque, future::Future, pin::Pin, sync::Mutex};
+
+    struct RattleTestTransport(Mutex<VecDeque<Vec<u8>>>);
+
+    impl Transport for RattleTestTransport {
+        fn send_frame(
+            &self,
+            _: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn recv_frame(
+            &self,
+            _: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            Box::pin(async {
+                self.0.lock().unwrap().pop_front().ok_or_else(|| {
+                    TransportError::Io("unexpected hardware access in rattle route test".into())
+                })
+            })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn url(&self) -> String {
+            "mock://rattle".into()
+        }
+    }
+
+    async fn rattle_test_state() -> Arc<DaemonState> {
+        let transport = RattleTestTransport(Mutex::new(VecDeque::from([
+            vec![0x31, 1, 13, 10],
+            vec![0x05, 100],
+            vec![0x05, 0, 1],
+            vec![0x05, 0, 0, 70, 0],
+        ])));
+        let client = minidsp::client::MiniDspClient::connect(Box::new(transport))
+            .await
+            .unwrap();
+        let state = Arc::new(DaemonState::new());
+        // Avoid add_device's shadow import/persistence: only identity is needed.
+        state.devices.write().await.insert(0, Arc::new(client));
+        state
+    }
+
+    #[tokio::test]
+    async fn rattle_rejects_invalid_plans_before_hardware_access() {
+        for body in [
+            r#"{"toneSec":0}"#,
+            r#"{"volumesDb":[-35.2]}"#,
+            r#"{"unknown":1}"#,
+            r#"{"frequenciesHz":[40],"startHz":20,"endHz":80,"count":3}"#,
+        ] {
+            let state = Arc::new(DaemonState::new());
+            let err = start_rattle(
+                State(state.clone()),
+                Path(0),
+                Bytes::copy_from_slice(body.as_bytes()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(!state.playback_status().playing);
+        }
+    }
+
+    #[tokio::test]
+    async fn rattle_defaults_require_a_device_and_idle_stop_conflicts() {
+        let state = Arc::new(DaemonState::new());
+        assert_eq!(
+            start_rattle(State(state.clone()), Path(0), Bytes::new())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!state.playback_status().playing);
+        assert_eq!(
+            stop_rattle(State(state), Path(0)).await.unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn rattle_and_play_share_busy_flag() {
+        let state = rattle_test_state().await;
+        assert!(state.try_begin_playback());
+        assert_eq!(
+            start_rattle(State(state.clone()), Path(0), Bytes::new())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let plan = RattlePlan::build(RattleRequest::default()).unwrap();
+        state.prepare_rattle(
+            0,
+            Arc::new(Mutex::new(plan.generator())),
+            Arc::new(AtomicI64::new(0)),
+        );
+        assert_eq!(
+            play_device(
+                State(state.clone()),
+                Path(0),
+                Query(PlayQueryParams::default()),
+                Bytes::new()
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            start_rattle(State(state.clone()), Path(0), Bytes::new())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        state.finish_rattle(None, None);
+        assert!(!state.playback_status().playing);
+    }
+
+    #[tokio::test]
+    async fn rattle_status_and_stop_preserve_run_and_restore_errors() {
+        let state = rattle_test_state().await;
+        let Json(status) = rattle_status(State(state.clone()), Path(0)).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!({"playing": false})
+        );
+        let plan = RattlePlan::build(RattleRequest::default()).unwrap();
+        let response = RattleResponse {
+            started_at_us: playback::server_time_us(),
+            schedule: plan.schedule(),
+            previous_volume_db: Some(-40.0),
+            source_changed: false,
+            previous_source: None,
+        };
+        assert!(state.try_begin_playback());
+        let generator = Arc::new(Mutex::new(plan.generator()));
+        state.prepare_rattle(0, generator.clone(), Arc::new(AtomicI64::new(0)));
+        state.record_rattle_run_started(&response);
+        let Json(status) = rattle_status(State(state.clone()), Path(0)).await.unwrap();
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["playing"], true);
+        assert_eq!(value["last"]["state"], "playing");
+        assert_eq!(value["current"]["label"], "20 Hz @ -35 dB");
+        assert_eq!(value["current"]["step"], 0);
+        assert!(value["last"].get("error").is_none());
+        let Json(stopping) = stop_rattle(State(state.clone()), Path(0)).await.unwrap();
+        assert!(stopping.playing);
+        assert!(generator.lock().unwrap().was_stopped());
+        state.finish_rattle_audio(None);
+        assert!(state.rattle_status(0).playing);
+        assert!(state.rattle_status(0).current.is_none());
+        state.finish_rattle(
+            Some("volume restore failed".into()),
+            Some("source restore failed".into()),
+        );
+        let value = serde_json::to_value(state.rattle_status(0)).unwrap();
+        assert_eq!(value["playing"], false);
+        assert!(value.get("current").is_none());
+        assert_eq!(value["last"]["state"], "stopped");
+        assert_eq!(value["last"]["volumeRestoreError"], "volume restore failed");
+        assert_eq!(value["last"]["sourceRestoreError"], "source restore failed");
+        // Failed startup must not replace or mutate the last accepted run.
+        assert!(state.try_begin_playback());
+        state.prepare_rattle(0, generator, Arc::new(AtomicI64::new(0)));
+        state.finish_rattle_audio(Some("startup failed".into()));
+        state.finish_rattle(None, None);
+        assert_eq!(serde_json::to_value(state.rattle_status(0)).unwrap(), value);
+    }
+
+    #[test]
+    fn config_indices_reject_invalid_channels_and_peqs_before_writes() {
+        let table = minidsp_protocol::device::probe::identify(10, 100)
+            .dsp_table
+            .unwrap();
+        for value in [
+            serde_json::json!({"inputs": [{"index": 255}]}),
+            serde_json::json!({"outputs": [{"index": 255}]}),
+            serde_json::json!({"inputs": [{"index": 0, "peq": [{"index": 255}]}]}),
+            serde_json::json!({"outputs": [{"index": 0, "peq": [{"index": 255}]}]}),
+            serde_json::json!({"master_status": {"volume": -20.0}, "inputs": [
+                {"index": 0, "gain": -10.0}, {"index": 255}
+            ]}),
+        ] {
+            let body = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                validate_config_indices(&body, table),
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            );
+        }
+        let body = serde_json::from_value(serde_json::json!({
+            "inputs": [{"index": 0, "peq": [{"index": 0, "bypass": false}]}],
+            "outputs": [{"index": 0, "gain": -10.0}]
+        }))
+        .unwrap();
+        assert_eq!(validate_config_indices(&body, table), Ok(()));
+    }
 
     #[test]
     fn ws_levels_interval_matches_official_meter_cadence() {

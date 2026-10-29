@@ -1,5 +1,15 @@
 # Shared Architecture: Second Pass
 
+## Current status
+
+This plan still has open work. `build_peq_shadow`, scalar sanitation, and raw
+write parsers remain separate in [the desktop client](../minidsp/src/client.rs),
+[desktop shadow module](../minidsp/src/client/shadow.rs), and
+[ESP32 device layer](../app-esp32/src/device.rs). Shared protocol/playback and
+bridge response encoding already exist; the helper/planner extraction,
+persistence policy, and API metadata questions below aren't complete.
+Completed shared features are recorded in [CHANGELOG.md](../CHANGELOG.md).
+
 ## Goal
 
 Reduce duplicated device and API behavior between ESP32 and desktop/Linux without forcing both targets into the same runtime model.

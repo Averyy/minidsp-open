@@ -3,10 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$ROOT_DIR/app-esp32"
-DEFAULT_PORT="/dev/ttyUSB0"
 DEFAULT_HTTP_PORT=8766
 
-PORT="$DEFAULT_PORT"
+PORT="${MINIDSP_ESP32_PORT:-}"
 BOARD_URL="${MINIDSP_BOARD_URL:-}"
 SITE_DIR=""
 LOCAL_PORT="$DEFAULT_HTTP_PORT"
@@ -27,15 +26,22 @@ LittleFS storage image directly.
 
 Options:
   --board-url URL      Board base URL, e.g. http://192.0.2.251:5380
-  --port DEV           Serial port for esptool flashing
+  --port DEV           Serial port for esptool flashing (or MINIDSP_ESP32_PORT)
   --site-dir DIR       Existing site bundle directory (skips local site build)
   --http-port N        Local temporary HTTP port for side-load server
-  --skip-build         Skip `esp cargo build`
+  --skip-build         Skip `tools/esp-cargo build`
   --skip-flash         Skip esptool flashing
   --skip-site-build    Skip `tools/build-catalogue.py` (requires --site-dir)
   --keep-override      Leave the board updater override pointed at the local site
   -h, --help           Show this help
 EOF
+}
+
+partition_csv_value() {
+  awk -F, -v name="$1" -v field="$2" '
+    function trim_field(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    $0 !~ /^[[:space:]]*#/ && trim_field($1) == name { print trim_field($field); exit }
+  ' "$APP_DIR/partitions.csv"
 }
 
 require_cmd() {
@@ -96,6 +102,11 @@ parse_args() {
   if [[ -z "$BOARD_URL" ]]; then
     echo "--board-url is required" >&2
     usage >&2
+    exit 1
+  fi
+
+  if [[ -z "$PORT" ]]; then
+    echo "--port or MINIDSP_ESP32_PORT is required" >&2
     exit 1
   fi
 
@@ -162,7 +173,7 @@ main() {
   require_cmd curl
   require_cmd uv
   if [[ "$SKIP_BUILD" -eq 0 || "$SKIP_FLASH" -eq 0 ]]; then
-    require_cmd esp
+    require_cmd uvx
   fi
 
   local local_ip
@@ -183,19 +194,22 @@ main() {
 
   if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "==> Building ESP32 firmware"
-    (cd "$APP_DIR" && esp cargo build)
+    "$ROOT_DIR/tools/esp-cargo" build
   fi
 
   if [[ "$SKIP_FLASH" -eq 0 ]]; then
     echo "==> Flashing ESP32 firmware on $PORT"
-    esp esptool.py --chip esp32s3 elf2image \
+    "$ROOT_DIR/tools/esptool" --chip esp32s3 elf2image \
       "$APP_DIR/target/xtensa-esp32s3-espidf/debug/minidsp-esp32" \
       -o /tmp/app.bin
-    esp esptool.py --chip esp32s3 -p "$PORT" -b 460800 write_flash \
-      --flash_size 16MB \
+    # Blank otadata makes the bootloader start ota_0, the slot written here.
+    "$ROOT_DIR/tools/esptool" --chip esp32s3 -p "$PORT" -b 460800 erase-region \
+      "$(partition_csv_value otadata 4)" "$(partition_csv_value otadata 5)"
+    "$ROOT_DIR/tools/esptool" --chip esp32s3 -p "$PORT" -b 460800 write-flash \
+      --flash-size 16MB \
       0x0 "$APP_DIR/target/xtensa-esp32s3-espidf/debug/bootloader.bin" \
       0x8000 "$APP_DIR/target/xtensa-esp32s3-espidf/debug/partition-table.bin" \
-      0x10000 /tmp/app.bin
+      "$(partition_csv_value ota_0 4)" /tmp/app.bin
   fi
 
   if [[ -z "$SITE_DIR" ]]; then

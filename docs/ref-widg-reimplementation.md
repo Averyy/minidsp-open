@@ -12,7 +12,7 @@ protocol logic inside it — it's a transparent 64-byte pipe — so this
 reverse-engineering pass revealed no new knowledge about DSP control,
 compressor readback, FIR state, or any other DSP feature quirk. DSP
 control-surface parity is a separate, ongoing workstream tracked in
-`PROGRESS.md` Active Work. See `docs/plan-widg-parity.md` for the
+[PROGRESS.md](../PROGRESS.md#device-control-and-compatibility). See `docs/plan-widg-parity.md` for the
 relationship between these two workstreams and the "Relationship to the
 control-surface workstream" section there.
 
@@ -40,14 +40,14 @@ tests in `app/widg-re/live-verification-plan.md` — all either MEDIUM/LOW
 priority or confirming-not-discovering findings — that require a physical
 Wi-DG to settle.
 
-**Clean-room.** No Wi-DG source code exists (this is an OEM firmware, not
-open-source). All findings in this spec and its companion docs are derived
+**Interoperability research.** The implementation is original; this is not a
+claim of a separated clean-room process. Findings in this spec and its companion docs are derived
 from (a) decompiled pseudocode, (b) raw memory/byte reads, and (c)
 human-readable config files that are effectively their own source.
 
 This document (`ref-widg-reimplementation.md`) and `plan-widg-parity.md`
-are expressed in our own words and are safe to ship under the minidsp-open
-MIT license. The detailed RE internals under `app/widg-re/` and
+record interoperability behavior in independently written descriptions. This
+does not grant rights to vendor expressions or data; see the root `NOTICE`. The detailed RE internals under `app/widg-re/` and
 `app/ref-widg-firmware.md` live in the **gitignored `app/` directory** and
 are not checked in — they contain verbatim excerpts of MiniDSP's firmware
 configs, decompiled C pseudocode, and strings from the extracted image,

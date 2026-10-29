@@ -4,14 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$ROOT_DIR/app-esp32"
 PARTITIONS_CSV="$APP_DIR/partitions.csv"
-DEFAULT_PORT="/dev/ttyUSB0"
 DEFAULT_BAUD="460800"
 LITTLEFS_PY_VERSION="0.15.0"
 LITTLEFS_BLOCK_SIZE=4096
 DEFAULT_NAME_MAX=64
 MIN_STORAGE_HEADROOM_BYTES=$((1024 * 1024))
 
-PORT="$DEFAULT_PORT"
+PORT="${MINIDSP_ESP32_PORT:-}"
 BAUD="$DEFAULT_BAUD"
 BOARD_URL="${MINIDSP_BOARD_URL:-}"
 SITE_DIR=""
@@ -30,10 +29,10 @@ storage images, then optionally verifies the board's /version.txt after boot.
 
 Options:
   --board-url URL       Optional board base URL to verify after flash, e.g. http://192.0.2.251:5380
-  --port DEV            Serial port for esptool flashing
+  --port DEV            Serial port for esptool flashing (or MINIDSP_ESP32_PORT)
   --baud N              Serial baud for esptool flashing (default: 460800)
   --site-dir DIR        Existing site bundle directory (skips local site build)
-  --skip-build          Skip `esp cargo build` for the firmware app image
+  --skip-build          Skip `tools/esp-cargo build` for the firmware app image
   --skip-site-build     Skip `tools/build-catalogue.py` (requires --site-dir)
   --skip-app-flash      Do not flash bootloader/partition-table/app
   --skip-storage-flash  Do not flash the LittleFS storage image
@@ -102,6 +101,11 @@ parse_args() {
         ;;
     esac
   done
+
+  if [[ -z "$PORT" ]]; then
+    echo "--port or MINIDSP_ESP32_PORT is required" >&2
+    exit 1
+  fi
 
   BOARD_URL="${BOARD_URL%/}"
 
@@ -183,12 +187,15 @@ main() {
 
   require_cmd uv
   if [[ "$SKIP_APP_FLASH" -eq 0 || "$SKIP_STORAGE_FLASH" -eq 0 || "$SKIP_BUILD" -eq 0 ]]; then
-    require_cmd esp
+    require_cmd uvx
   fi
   if [[ -n "$BOARD_URL" ]]; then
     require_cmd curl
   fi
 
+  local app_offset
+  local otadata_offset
+  local otadata_size
   local storage_offset_raw
   local storage_size_raw
   local storage_offset
@@ -211,10 +218,17 @@ main() {
   fi
   storage_offset="$storage_offset_raw"
   storage_size=$((storage_size_raw))
+  app_offset="$(partition_csv_value ota_0 4)"
+  otadata_offset="$(partition_csv_value otadata 4)"
+  otadata_size="$(partition_csv_value otadata 5)"
+  if [[ -z "$app_offset" || -z "$otadata_offset" || -z "$otadata_size" ]]; then
+    echo "failed to read ota_0/otadata partitions from $PARTITIONS_CSV" >&2
+    exit 1
+  fi
 
   if [[ "$SKIP_BUILD" -eq 0 && "$SKIP_APP_FLASH" -eq 0 ]]; then
     echo "==> Building ESP32 firmware (release)"
-    (cd "$APP_DIR" && esp cargo build --release)
+    "$ROOT_DIR/tools/esp-cargo" build --release
   fi
 
   if [[ -z "$SITE_DIR" ]]; then
@@ -297,20 +311,23 @@ for relative_path in manifest["files"]:
   if [[ "$SKIP_APP_FLASH" -eq 0 || "$SKIP_STORAGE_FLASH" -eq 0 ]]; then
     echo "==> Flashing ESP32 on $PORT"
     if [[ "$SKIP_APP_FLASH" -eq 0 ]]; then
-      esp esptool.py --chip esp32s3 elf2image \
+      "$ROOT_DIR/tools/esptool" --chip esp32s3 elf2image \
         "$APP_DIR/target/xtensa-esp32s3-espidf/release/minidsp-esp32" \
         -o /tmp/app.bin
-      esp esptool.py --chip esp32s3 -p "$PORT" -b "$BAUD" write_flash --flash_size 16MB \
+      # Blank otadata makes the bootloader start ota_0, the slot written here;
+      # otherwise a board that last OTA-updated into ota_1 would keep booting it.
+      "$ROOT_DIR/tools/esptool" --chip esp32s3 -p "$PORT" -b "$BAUD" erase-region "$otadata_offset" "$otadata_size"
+      "$ROOT_DIR/tools/esptool" --chip esp32s3 -p "$PORT" -b "$BAUD" write-flash --flash-size 16MB \
         0x0 "$APP_DIR/target/xtensa-esp32s3-espidf/release/bootloader.bin" \
         0x8000 "$APP_DIR/target/xtensa-esp32s3-espidf/release/partition-table.bin" \
-        0x10000 /tmp/app.bin
+        "$app_offset" /tmp/app.bin
     fi
 
     if [[ "$SKIP_STORAGE_FLASH" -eq 0 ]]; then
       echo "==> Erasing storage partition region $storage_offset ($storage_size_raw)"
-      esp esptool.py --chip esp32s3 -p "$PORT" -b "$BAUD" erase_region "$storage_offset" "$storage_size_raw"
+      "$ROOT_DIR/tools/esptool" --chip esp32s3 -p "$PORT" -b "$BAUD" erase-region "$storage_offset" "$storage_size_raw"
       echo "==> Flashing LittleFS storage image at $storage_offset"
-      esp esptool.py --chip esp32s3 -p "$PORT" -b "$BAUD" write_flash --flash_size 16MB \
+      "$ROOT_DIR/tools/esptool" --chip esp32s3 -p "$PORT" -b "$BAUD" write-flash --flash-size 16MB \
         "$storage_offset" "$TEMP_STORAGE_IMAGE"
     fi
   fi

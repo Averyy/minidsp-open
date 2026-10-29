@@ -1,6 +1,6 @@
 [package]
 name = "minidsp-esp32"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
@@ -8,10 +8,13 @@ license = "MIT"
 # Shared protocol crate (std mode — ESP-IDF is std-on-FreeRTOS)
 minidsp-protocol = { path = "../protocol" }
 
-# ESP-IDF Rust ecosystem (v0.52 = latest stable, targets IDF v5.4)
-esp-idf-svc = { version = "0.52", features = ["alloc"] }
-esp-idf-hal = "0.46"
-esp-idf-sys = { version = "0.37", features = ["binstart"] }
+# ESP-IDF Rust ecosystem with ESP-IDF 6.0 support.
+esp-idf-svc = { version = "0.53", features = ["alloc"] }
+esp-idf-hal = "0.47"
+esp-idf-sys = { version = "0.38.1", features = ["binstart"] }
+# Keep the libc ABI checked by esp-idf-sys reproducible.
+libc = "=0.2.189"
+sha2 = { version = "0.10.9", default-features = false }
 
 # JSON
 serde = { version = "1", features = ["derive"] }
@@ -22,7 +25,13 @@ time = { version = "0.3", default-features = false, features = ["formatting", "s
 log = "0.4"
 
 [build-dependencies]
-embuild = "0.33"
+embuild = "0.33.5"
+
+# USB Host moved out of core IDF in v6.0. Generate bindings in the crate root
+# because esp-idf-sys's built-in header only checks the old core component name.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/usb", version = "^1.6.0" }
+bindings_header = "usb_host_bindings.h"
 
 # Pull espressif/mdns from IDF Component Registry (moved out of core IDF in v5.4).
 # This sets cfg(esp_idf_comp_espressif__mdns_enabled) at build time.
@@ -34,4 +43,9 @@ remote_component = { name = "espressif/mdns", version = "1.4" }
 remote_component = { name = "joltwallet/littlefs", version = "1.20" }
 
 [[package.metadata.esp-idf-sys.extra_components]]
-component_dirs = ["../../../code/esp-uac2-host/components/uac2_host"]
+component_dirs = ["../../../code/esp-uac2-host/components/usb_host_uac2"]
+
+# Unoptimised builds (~4.7 MB) overflow the 3 MB OTA app slots; size-optimise
+# dev builds while keeping debug info. Release keeps the default opt-level.
+[profile.dev]
+opt-level = "s"

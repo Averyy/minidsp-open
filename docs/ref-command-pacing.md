@@ -476,3 +476,43 @@ On ESP32 (embassy), replace:
 | Busy handling | Silent queueing at Mutex | Explicit: reject, queue, or skip by caller type |
 | Reconnection | None | Auto-reconnect with exponential backoff |
 | Error propagation | Some commands silently fail | All commands get a response or timeout error |
+
+## Remaining Desktop Transition Exclusion
+
+The desktop queue now drains submitted commands independently of caller futures,
+keeps an active batch contiguous, and reopens an ambiguous response stream before
+sending another request. Disconnect recovery replays only known reads and
+absolute-value writes; raw bridge requests and stateful commands are never replayed.
+Closing the queue or dropping its last handle stops recovery. The typed FIR loader
+restarts an uncertain transfer from `FirLoadStart`, with one whole-transfer retry.
+USB reopening requires the original HID serial as well as VID/PID; a device with
+no HID serial cannot be safely reselected and reconnect fails closed.
+
+The client transition mutex still excludes only other transition operations.
+Snapshot preset restore now holds that mutex across selection, payload replay,
+token restoration, and shadow installation. Ordinary typed writes and direct queue
+users can still interleave with transitions. This remains a correctness gap.
+
+Closing that gap requires a shared transaction mechanism at the queue boundary:
+
+- Acquire exclusive ownership before reading the starting preset. Keep it through
+  `SetConfig`, status verification, settling, and installation of the new active
+  shadow. Preset restore must retain ownership through its entire payload/token
+  replay; staged FIR operations also need exclusive ownership.
+- Route ordinary typed writes and raw bridge commands through the same mechanism.
+  Hold ownership through both device exchange and corresponding shadow updates.
+  A mutex added only inside `execute_write` is insufficient: transition helpers
+  call it recursively, raw queue users bypass it, and shadow updates follow it.
+- Pass an explicit transaction handle to internal helpers so status verification
+  and nested writes can use the owning transaction without reacquiring its gate.
+  Other requests, including telemetry, must wait outside that transaction.
+- Make the executor own an accepted transaction until completion or cleanup, so
+  cancelling a caller cannot release exclusion while the device is switching or
+  while FIR data is staged. Release ownership on every error/cleanup path.
+
+Required concurrency checks should hold a transition at its acknowledgement,
+status-verification, and settling stages and prove that both typed PEQ writes and
+raw writes wait. They should also cover a competing preset switch during snapshot
+payload replay, overlapping FIR loads, caller cancellation, and cleanup failures.
+The current snapshot regression covers exclusion against another transition during
+payload replay; it does not establish exclusion against ordinary writes.

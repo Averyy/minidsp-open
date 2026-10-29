@@ -17,7 +17,12 @@ fn write_fast_sin_lut(out_dir: &Path) {
     let mut source = String::from("const FAST_SIN_LUT: [f32; 513] = [\n");
     for idx in 0..=FAST_SIN_TABLE_SIZE {
         let phase = (idx as f64 * 2.0 * PI) / FAST_SIN_TABLE_SIZE as f64;
-        source.push_str(&format!("    {:.9}f32,\n", phase.sin() as f32));
+        // Preserve the original nine-decimal rounding, including signed zero,
+        // then emit the resulting f32 in its shortest round-trip form.
+        let value: f32 = format!("{:.9}", phase.sin() as f32)
+            .parse()
+            .expect("formatted sine is a valid f32");
+        source.push_str(&format!("    {value:?}f32,\n"));
     }
     source.push_str("];\n");
 

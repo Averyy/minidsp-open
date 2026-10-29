@@ -2,20 +2,11 @@
 
 ## Status
 
-### Completed first-pass scope
-
-The harness is no longer just a plan for the verified desktop path.
-Today it already does all of this:
-
-- captures a strict snapshot baseline before destructive desktop runs
-- restores that snapshot automatically at the end of the run
-- writes durable artifact directories under `.scratch/live-validation-runs/<timestamp>/`
-- verifies post-restore snapshot equality
-- covers desktop HTTP / WS / TCP / CLI compatibility checks
-- covers desktop `/play` sweep-only, marker-only, and legacy-field rejection checks
-- has a live-verified one-command desktop run on the attached 2x4 HD `912345`
-
-That means the "snapshot-backed destructive desktop first pass" is complete.
+The snapshot-backed desktop first pass is implemented and live-verified on a
+2x4 HD: strict baseline capture, automatic restore, equality checks, durable
+artifacts, compatibility transports, and playback checks. Completed work is in
+[CHANGELOG.md](../CHANGELOG.md); the implementation is
+[tools/run-live-validation.py](../tools/run-live-validation.py).
 
 ### Remaining scope
 
@@ -32,7 +23,7 @@ The remaining work is:
 This plan is no longer blocked on shared snapshot import/export.
 That prerequisite is already complete and documented in:
 
-- [docs/ref-device-state-recovery.md](./docs/ref-device-state-recovery.md:1)
+- [docs/ref-device-state-recovery.md](ref-device-state-recovery.md#L1)
 
 ## Goal
 
@@ -58,9 +49,9 @@ This suite should become the default gate for any material change that touches:
 
 The repo already has a good starting point:
 
-- [`tools/run-live-validation.py`](./tools/run-live-validation.py:1)
+- [`tools/run-live-validation.py`](../tools/run-live-validation.py#L1)
   covers the machine-checkable compatibility surface
-- [`docs/ref-live-validation.md`](./docs/ref-live-validation.md:1)
+- [`docs/ref-live-validation.md`](ref-live-validation.md#L1)
   documents the safe vs destructive split
 - `--allow-audio` and `--allow-destructive` already gate the riskiest paths
 
@@ -91,7 +82,7 @@ Those are the remaining gaps this plan should close.
 
 This plan depends on the shared recovery reference surface in:
 
-- [docs/ref-device-state-recovery.md](./docs/ref-device-state-recovery.md:1)
+- [docs/ref-device-state-recovery.md](ref-device-state-recovery.md#L1)
 
 The destructive suite should not invent its own backup format in Python.
 It should call the shared snapshot export/import feature and treat that as the
@@ -500,17 +491,6 @@ The harness itself needs staged proof:
 - the suite refuses to run a "full" destructive profile on hardware where the
   snapshot model is still incomplete
 
-## First-Pass Exit Criteria Already Met
-
-These are now done for the verified desktop path:
-
-- one command runs the machine-checkable destructive desktop surface and
-  restores the original state automatically
-- durable artifacts are emitted for every destructive run
-- the run fails when restore fails
-- the suite now depends on the shared snapshot export/import path rather than
-  ad-hoc end-of-run hand restoration
-
 ## Next Honest Steps
 
 If we keep extending this plan, the right next items are:
@@ -523,13 +503,6 @@ If we keep extending this plan, the right next items are:
    shape described here
 
 ## Remaining Implementation Order
-
-These earlier prerequisites are already done for the verified desktop path:
-
-1. strict snapshot export/import exists
-2. `run-live-validation.py` already creates artifact directories and calls the
-   shared snapshot export/import path for destructive desktop runs
-3. the desktop destructive flow already relies on the shared restore path
 
 The next implementation order is:
 

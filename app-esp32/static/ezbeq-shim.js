@@ -1,6 +1,6 @@
 /**
- * ezbeq-shim.js served directly by firmware so the board does not keep stale
- * browser discovery behavior from older LittleFS UI bundles.
+ * Shared source for the firmware fallback and versioned UI bundle.
+ * Catalogue browsing stays offline; summaries hydrate from the Pages asset.
  */
 (function() {
   'use strict';
@@ -8,8 +8,14 @@
   const BOARD_BASE = new URL('.', document.currentScript?.src || window.location.href)
     .href
     .replace(/\/$/, '');
-  const DB_NAME = 'ezbeq-cache';
+  // Upstream 2.12.4 retains entries only in React memory and reloads them on
+  // each page load. IndexedDB avoids repeatedly streaming ~10 MB of decoded
+  // metadata through the single ESP32 httpd task. A separate name invalidates
+  // older caches whose entries were transformed by previous shim versions.
+  const DB_NAME = 'ezbeq-2.12.4-cache';
   const STORE_NAME = 'catalogue';
+  const DEFAULT_SITE_BASE = 'https://averyy.github.io/minidsp-open';
+  let currentEntries = null;
   let entryMap = {};
 
   function openDB() {
@@ -34,52 +40,78 @@
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const req = tx.objectStore(STORE_NAME).put(value, key);
-      req.onsuccess = () => resolve();
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error);
       req.onerror = () => reject(req.error);
     });
   }
 
-  function processEntry(entry) {
-    delete entry.filters;
-    entry.id = entry.digest || (entry.title + '_' + entry.year + '_' + (entry.audioTypes || []).join('_'));
-    entry.contentType = entry.content_type || 'film';
-    entry.mvAdjust = parseFloat(entry.mv || '0');
-    entry.collection = typeof entry.collection === 'string'
-      ? entry.collection
-      : (entry.collection && typeof entry.collection.name === 'string'
-          ? entry.collection.name
-          : '');
-
-    let fmt = entry.title || '';
-    if (entry.season) {
-      fmt += ' S' + entry.season;
-      if (entry.episode) {
-        fmt += 'E' + entry.episode;
+  // React owns selection and receives JSON copies, so hydrate through its
+  // existing catalogue update path after the offline listing has been sent.
+  // Cache only summaries, keyed by the board's site version and digest/id.
+  async function hydrateOverviews(ws, entries, version) {
+    if (entries.every(entry => Object.prototype.hasOwnProperty.call(entry, 'overview'))) return;
+    let db = null;
+    try {
+      db = await openDB().catch(() => null);
+      const cached = db ? await idbGet(db, 'overviews').catch(() => null) : null;
+      let values = cached && cached.version === version ? cached.values : null;
+      if (!values) {
+        if (navigator.onLine === false) return;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        try {
+          let base = DEFAULT_SITE_BASE;
+          try {
+            const config = await fetch(BOARD_BASE + '/debug/updater', { signal: controller.signal });
+            if (config.ok) base = (await config.json()).updaterBaseUrl || base;
+          } catch (e) { /* default published site */ }
+          const resp = await fetch(base.replace(/\/$/, '') + '/overviews.json.gz', { signal: controller.signal });
+          if (!resp.ok) return;
+          const bytes = new Uint8Array(await resp.arrayBuffer());
+          // Pages serves .gz as a file; other hosts may decode Content-Encoding.
+          const body = bytes[0] === 0x1f && bytes[1] === 0x8b
+            ? new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')))
+            : new Response(bytes);
+          values = await body.json();
+        } finally {
+          clearTimeout(timeout);
+        }
+        if (db) await idbPut(db, 'overviews', { version, values }).catch(() => {});
       }
+      // A reconnect/version change may have replaced this catalogue meanwhile.
+      if (currentEntries !== entries || ws.readyState !== OrigWebSocket.OPEN) return;
+      let changed = false;
+      for (const entry of entries) {
+        if (values[entry.id] && !entry.overview) {
+          entry.overview = values[entry.id];
+          changed = true;
+        }
+      }
+      if (changed) {
+        ws.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({ message: 'CatalogueEntries', data: entries })
+        }));
+      }
+    } catch (e) {
+      // Internet/CORS/cache failures are optional: the offline listing is ready.
+    } finally {
+      if (db) db.close();
     }
-    entry.formattedTitle = fmt;
-    return entry;
   }
 
-  async function loadCatalogue(ws) {
+  async function loadCatalogue(ws, remoteVersion) {
     let entries = null;
+    let catalogueVersion = null;
+    let db = null;
 
     try {
-      const db = await openDB();
-      const cachedVersion = await idbGet(db, 'version').catch(() => null);
-      let remoteVersion = null;
-
-      try {
-        const vResp = await fetch(BOARD_BASE + '/version.txt');
-        if (vResp.ok) {
-          remoteVersion = (await vResp.text()).trim();
-        }
-      } catch (e) {
-        // Ignore and fall through to cache or a fresh board-origin fetch.
-      }
-
+      db = await openDB().catch(() => null);
+      const cached = db ? await idbGet(db, 'snapshot').catch(() => null) : null;
+      const cachedVersion = cached && cached.version;
       if (cachedVersion && (remoteVersion === null || remoteVersion === cachedVersion)) {
-        entries = await idbGet(db, 'entries').catch(() => null);
+        entries = cached.entries;
+        catalogueVersion = cachedVersion;
         if (entries) {
           console.log('[ezbeq-shim] using cached catalogue v' + cachedVersion +
                       ' (' + entries.length + ' entries) via ' + BOARD_BASE);
@@ -93,10 +125,12 @@
           throw new Error('HTTP ' + resp.status);
         }
         const raw = await resp.json();
-        entries = raw.map(processEntry);
+        entries = raw;
         const version = remoteVersion || 'unknown';
-        await idbPut(db, 'version', version);
-        await idbPut(db, 'entries', entries);
+        catalogueVersion = version;
+        if (db) {
+          await idbPut(db, 'snapshot', { version, entries }).catch(() => {});
+        }
         console.log('[ezbeq-shim] cached ' + entries.length + ' entries (v' + version +
                     ') via ' + BOARD_BASE);
       }
@@ -104,22 +138,22 @@
       console.error('[ezbeq-shim] catalogue load failed:', err);
       const errMsg = JSON.stringify({
         message: 'Error',
-        data: 'Could not load catalogue. Check internet connection.'
+        data: 'Could not load catalogue from the board.'
       });
       ws.dispatchEvent(new MessageEvent('message', { data: errMsg }));
       return;
+    } finally {
+      if (db) db.close();
     }
 
-    entryMap = {};
-    for (const entry of entries) {
-      if (entry.id) {
-        entryMap[entry.id] = entry;
-      }
-    }
+    if (ws.readyState !== OrigWebSocket.OPEN) return;
+    currentEntries = entries;
+    entryMap = Object.fromEntries(entries.map(entry => [entry.id, entry]));
 
     const msg = JSON.stringify({ message: 'CatalogueEntries', data: entries });
     ws.dispatchEvent(new MessageEvent('message', { data: msg }));
     console.log('[ezbeq-shim] dispatched ' + entries.length + ' entries to UI');
+    void hydrateOverviews(ws, entries, catalogueVersion);
   }
 
   const OrigWebSocket = window.WebSocket;
@@ -129,14 +163,25 @@
       ? new OrigWebSocket(url, protocols)
       : new OrigWebSocket(url);
 
-    if (!url.endsWith('/ws')) {
+    if (new URL(url, BOARD_BASE).pathname !== '/ws') {
       return ws;
     }
 
+    // Reuse the upstream Catalogue version announcement; only persistence is
+    // ESP32-specific. Do not add a second HTTP version-check protocol.
+    let version = null;
+    ws.addEventListener('message', event => {
+      if (typeof event.data !== 'string' ||
+          !/"message"\s*:\s*"Catalogue"/.test(event.data.slice(0, 1024))) return;
+      try {
+        const message = JSON.parse(event.data);
+        if (message.data) version = message.data.version;
+      } catch (e) { /* upstream handles invalid messages */ }
+    });
     const origSend = ws.send.bind(ws);
     ws.send = function(data) {
       if (typeof data === 'string' && data.trim() === 'load catalogue') {
-        loadCatalogue(ws);
+        loadCatalogue(ws, version);
         return;
       }
       origSend(data);
@@ -150,39 +195,6 @@
   window.WebSocket.OPEN = OrigWebSocket.OPEN;
   window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
   window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
-
-  const origFetch = window.fetch;
-
-  window.fetch = function(url, opts) {
-    if (typeof url === 'string' && opts && opts.method) {
-      try {
-        const method = opts.method.toUpperCase();
-        const body = JSON.parse(opts.body);
-
-        if (/\/api\/\d+\/devices\/[^/]+\/filter\/\d+/.test(url) && method === 'PUT') {
-          if (body.entryId && entryMap[body.entryId]) {
-            const entry = entryMap[body.entryId];
-            let changed = false;
-
-            if (!body.title && entry.title) {
-              body.title = entry.title;
-              changed = true;
-            }
-            if (!body.author && entry.author) {
-              body.author = entry.author;
-              changed = true;
-            }
-            if (changed) {
-              opts = Object.assign({}, opts, { body: JSON.stringify(body) });
-            }
-          }
-        }
-      } catch (e) {
-        // Pass malformed or non-JSON bodies through unchanged.
-      }
-    }
-    return origFetch.call(this, url, opts);
-  };
 
   console.log('[ezbeq-shim] loaded — board origin ' + BOARD_BASE);
 })();

@@ -10,6 +10,23 @@ build-std = ["std", "panic_abort"]
 
 [env]
 MCU = "esp32s3"
-# ESP-IDF v5.4 — matches esp-uac2-host driver
-ESP_IDF_VERSION = "v5.4"
+# ESP-IDF 6.0 patch release; USB Host is supplied by espressif/usb.
+ESP_IDF_VERSION = "v6.0.3"
 ESP_IDF_TOOLS_INSTALL_DIR = "global"
+# esp-idf-sys 0.38 hands Cargo.toml's component_dirs to CMake without telling
+# Cargo to watch them, so a uac2_host driver edit alone left the firmware
+# stale. It does watch files matched by ESP_IDF_GLOB_* globs. It also copies
+# them into its CMake project dir, under usb_host_uac2/, which CMake doesn't scan
+# (so BASE can't be the component dir itself: its CMakeLists.txt would land
+# on the project's). The globs walk all of BASE, so keep it this narrow.
+# These globs are the component's build inputs; keep them in step with
+# component_dirs. Cargo doesn't rerun esp-idf-sys when they change, so after
+# editing them, touch usb_host_bindings.h once so each profile picks them up.
+# Remove them once esp-idf-sys watches component_dirs itself.
+ESP_IDF_GLOB_UAC2_BASE = { value = "../../../code/esp-uac2-host/components", relative = true }
+ESP_IDF_GLOB_UAC2_1 = "usb_host_uac2/CMakeLists.txt"
+ESP_IDF_GLOB_UAC2_2 = "usb_host_uac2/Kconfig"
+ESP_IDF_GLOB_UAC2_3 = "usb_host_uac2/idf_component.yml"
+ESP_IDF_GLOB_UAC2_4 = "usb_host_uac2/*.c"
+ESP_IDF_GLOB_UAC2_5 = "usb_host_uac2/*.h"
+ESP_IDF_GLOB_UAC2_6 = "usb_host_uac2/include/**/*.h"

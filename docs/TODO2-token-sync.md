@@ -1,5 +1,17 @@
 # ESP32 Token-Gated Preset Cache
 
+## Current status
+
+Per-preset in-memory capture on preset switch and structured snapshot export
+with shadow/tokens are implemented in [device.rs](../app-esp32/src/device.rs)
+and [snapshot.rs](../app-esp32/src/snapshot.rs), with routes in
+[http_server.rs](../app-esp32/src/http_server.rs). Those completed pieces are
+recorded in [CHANGELOG.md](../CHANGELOG.md).
+NVS persistence is still PEQ-only; token-matched full-preset persistence,
+mutation token commits, bridge journaling, and the official XML helper remain
+open. Existing token writes used by reset/snapshot restore don't complete that
+mutation/persistence workflow.
+
 ## Goal
 
 Current scope:
@@ -33,8 +45,8 @@ The MiniDSP stores four 4-byte per-preset modification tokens at `0xFFC8` (`4 pr
 
 References:
 
-- [protocol/src/eeprom.rs](./protocol/src/eeprom.rs:67)
-- [docs/ref-command-pacing.md](./docs/ref-command-pacing.md:100)
+- [protocol/src/eeprom.rs](../protocol/src/eeprom.rs#L67)
+- [docs/ref-command-pacing.md](ref-command-pacing.md#L100)
 
 Important implication:
 
@@ -48,8 +60,8 @@ The official app does not appear to reconstruct full DSP100 / 2x4 HD preset stat
 
 References:
 
-- [docs/NOTES-cli-verification.md](./docs/NOTES-cli-verification.md:272)
-- [docs/ref-widg-reimplementation.md](./docs/ref-widg-reimplementation.md:356)
+- [docs/NOTES-cli-verification.md](NOTES-cli-verification.md#L272)
+- [docs/ref-widg-reimplementation.md](ref-widg-reimplementation.md#L356)
 - Official 2x4 HD Device Console manual: `It is not possible to load a preset from the 2x4 HD back to the Device Console.` (<https://docs.minidsp.com/product-manuals/2x4-hd/device-console.html>)
 - Official Device Console docs: the template device mirrors the real device when you change presets and when you disconnect, and editing from a different computer triggers the same changed-settings dialog (<https://docs.minidsp.com/getting-started/device-console.html>)
 
@@ -64,11 +76,11 @@ The desktop daemon already imports the official app's `setting*.xml` files when 
 
 References:
 
-- [daemon/src/state.rs](./daemon/src/state.rs:218)
-- [daemon/src/state.rs](./daemon/src/state.rs:258)
-- [daemon/src/state.rs](./daemon/src/state.rs:413)
-- [docs/ref-device-coverage.md](./docs/ref-device-coverage.md:15)
-- [docs/ref-device-state-recovery.md](./docs/ref-device-state-recovery.md:1)
+- [daemon/src/state.rs](../daemon/src/state.rs#L218)
+- [daemon/src/state.rs](../daemon/src/state.rs#L258)
+- [daemon/src/state.rs](../daemon/src/state.rs#L413)
+- [docs/ref-device-coverage.md](ref-device-coverage.md#L15)
+- [docs/ref-device-state-recovery.md](ref-device-state-recovery.md#L1)
 
 Important implication:
 
@@ -82,8 +94,8 @@ The repo notes are explicit that raw DSP writes on the physical 2x4 HD do not au
 
 References:
 
-- [docs/NOTES-device-console-hid-logging.md](./docs/NOTES-device-console-hid-logging.md:131)
-- [docs/ref-command-pacing.md](./docs/ref-command-pacing.md:103)
+- [docs/NOTES-device-console-hid-logging.md](NOTES-device-console-hid-logging.md#L131)
+- [docs/ref-command-pacing.md](ref-command-pacing.md#L103)
 
 Important implication:
 
@@ -101,11 +113,11 @@ The desktop daemon:
 
 References:
 
-- [minidsp/src/client/shadow.rs](./minidsp/src/client/shadow.rs:417)
-- [minidsp/src/client/shadow.rs](./minidsp/src/client/shadow.rs:457)
-- [daemon/src/state.rs](./daemon/src/state.rs:87)
-- [daemon/src/state.rs](./daemon/src/state.rs:120)
-- [daemon/src/bridge.rs](./daemon/src/bridge.rs:66)
+- [minidsp/src/client/shadow.rs](../minidsp/src/client/shadow.rs#L417)
+- [minidsp/src/client/shadow.rs](../minidsp/src/client/shadow.rs#L457)
+- [daemon/src/state.rs](../daemon/src/state.rs#L87)
+- [daemon/src/state.rs](../daemon/src/state.rs#L120)
+- [daemon/src/bridge.rs](../daemon/src/bridge.rs#L66)
 
 This is the best current model in the repo.
 
@@ -121,14 +133,14 @@ The ESP32 build does these things today:
 
 References:
 
-- [app-esp32/src/device.rs](./app-esp32/src/device.rs:415)
-- [app-esp32/src/device.rs](./app-esp32/src/device.rs:722)
-- [app-esp32/src/device.rs](./app-esp32/src/device.rs:756)
-- [app-esp32/src/device.rs](./app-esp32/src/device.rs:864)
-- [app-esp32/src/device.rs](./app-esp32/src/device.rs:1814)
-- [app-esp32/src/device.rs](./app-esp32/src/device.rs:1821)
-- [app-esp32/src/device.rs](./app-esp32/src/device.rs:1321)
-- [app-esp32/src/http_server.rs](./app-esp32/src/http_server.rs:872)
+- [app-esp32/src/device.rs](../app-esp32/src/device.rs#L415)
+- [app-esp32/src/device.rs](../app-esp32/src/device.rs#L722)
+- [app-esp32/src/device.rs](../app-esp32/src/device.rs#L756)
+- [app-esp32/src/device.rs](../app-esp32/src/device.rs#L864)
+- [app-esp32/src/device.rs](../app-esp32/src/device.rs#L1814)
+- [app-esp32/src/device.rs](../app-esp32/src/device.rs#L1821)
+- [app-esp32/src/device.rs](../app-esp32/src/device.rs#L1321)
+- [app-esp32/src/http_server.rs](../app-esp32/src/http_server.rs#L872)
 
 What ESP32 does not do today:
 
@@ -286,7 +298,7 @@ Outputs:
 
 Relevant host cache path logic already exists in desktop:
 
-- [daemon/src/state.rs](./daemon/src/state.rs:313)
+- [daemon/src/state.rs](../daemon/src/state.rs#L313)
 
 ### Why a host helper is necessary
 
@@ -314,12 +326,14 @@ Blindly forcing only the timestamp to match the device token would suppress mism
 
 ### Suggested implementation shape
 
-Expose a structured export from ESP32 such as:
+Use the existing ESP32 read surfaces:
 
 - `GET /devices/0/tokens`
 - `GET /devices/0/config`
-- new debug/state export endpoint returning per-preset shadow plus tokens
-- optional mutation/event stream so a host helper can react to committed token changes instead of polling
+- `GET /devices/0/snapshot` for strict per-preset shadow plus tokens
+
+An optional mutation/event stream remains open so a host helper can react to
+committed token changes instead of polling.
 
 Then a host helper:
 
@@ -417,7 +431,7 @@ Why this is more expensive:
 
 What drives scope:
 
-- exposing an authoritative export from `minidsp-open`
+- consuming the existing strict snapshot export from `minidsp-open`
 - mapping that export onto `setting*.xml`
 - atomic rewrite strategy
 - validation against the real Device Console attach flow
@@ -585,13 +599,11 @@ Good enabling layer, not the standalone fix.
 
 ## Implementation Checklist
 
-- [ ] Port desktop-style token refresh / save helpers into `app-esp32`
+- [ ] Integrate the existing token read/write helpers with desktop-style mutation commits and cache refresh in `app-esp32`
 - [ ] Replace PEQ-only NVS persistence with per-preset `PresetShadowState + token`
 - [ ] Restore shadow only after live-token match
-- [ ] Snapshot previous preset on preset switch
 - [ ] Detect raw bridge token writes and persist committed preset shadow on that boundary
 - [ ] Classify ESP32 `/devices/0/config` preset-content mutations and bump active token after success
-- [ ] Add a structured export endpoint for per-preset shadow plus tokens
 - [ ] Build a host-side helper that can update official `setting*.xml` files atomically
 - [ ] Validate that Device Console reconnects cleanly after:
   - Device Console-originated edits through ESP32
@@ -610,7 +622,7 @@ Good enabling layer, not the standalone fix.
 
 1. Implement Phase 1 on ESP32.
 2. Add bridge commit journaling.
-3. Expose structured preset-shadow export.
+3. Use the existing strict snapshot export for structured preset shadow and tokens.
 4. Build the optional host helper for full bidirectional no-reset behavior.
 
 That sequence gives immediate value:

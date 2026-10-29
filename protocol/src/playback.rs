@@ -3,6 +3,7 @@
 //! This module is platform-independent. It contains the `/play` request/response
 //! schema plus the deterministic sweep generator used by both desktop and ESP32.
 
+use alloc::string::String;
 use core::f32::consts::PI;
 
 #[cfg(feature = "std")]
@@ -24,16 +25,22 @@ const DEFAULT_DECAY_SEC: f32 = 2.0;
 const LINEAR_LOG_CROSSOVER_HZ: f32 = 10.0;
 const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
 const DEFAULT_PREAMBLE_LEVEL_DBFS: f32 = -60.0;
-const CHANNELS: usize = 2;
+pub(crate) const CHANNELS: usize = 2;
 const FAST_SIN_TABLE_SIZE: usize = 512;
+const SWEEP_DELTA_REANCHOR_SAMPLES: usize = 1024;
+/// Upper bounds that keep every sample count and offset representable in a
+/// 32-bit `usize` (ESP32): 600 s at 384 kHz is ~2^28 samples per segment.
+pub(crate) const MAX_SEGMENT_SEC: f32 = 600.0;
+const MAX_SAMPLE_RATE_HZ: u32 = 384_000;
 
 include!(concat!(env!("OUT_DIR"), "/fast_sin_lut.rs"));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
 pub enum BitDepth {
     #[cfg_attr(feature = "std", serde(rename = "16"))]
+    #[default]
     Pcm16,
     #[cfg_attr(feature = "std", serde(rename = "24"))]
     Pcm24,
@@ -52,12 +59,6 @@ impl BitDepth {
             Self::Pcm16 => 16,
             Self::Pcm24 => 24,
         }
-    }
-}
-
-impl Default for BitDepth {
-    fn default() -> Self {
-        Self::Pcm16
     }
 }
 
@@ -200,6 +201,70 @@ pub struct SyncResponse {
     pub server_time_us: i64,
 }
 
+/// `GET /devices/{id}/play`: whether playback is busy, and how the most
+/// recent run that returned `200` from `POST /play` ended. `/play` answers
+/// once streaming starts, so this is how a client learns that the rest of
+/// the signal failed to play.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
+pub struct PlaybackStatus {
+    /// True from `POST /play` until the run, including any source restore,
+    /// is finished. A new `/play` is rejected with `409` while true.
+    pub playing: bool,
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
+    pub last: Option<PlaybackRunStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
+pub struct PlaybackRunStatus {
+    /// Same value the run's `/play` response returned.
+    pub started_at_us: i64,
+    pub total_samples: usize,
+    pub sample_rate: u32,
+    pub state: PlaybackRunState,
+    /// Why the signal did not play to the end (`state == failed`).
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
+    pub error: Option<String>,
+    /// The source switched for playback could not be restored.
+    #[cfg_attr(feature = "std", serde(skip_serializing_if = "Option::is_none"))]
+    pub source_restore_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
+pub enum PlaybackRunState {
+    Playing,
+    Completed,
+    Failed,
+}
+
+impl PlaybackRunStatus {
+    pub fn started(response: &PlayResponse) -> Self {
+        Self {
+            started_at_us: response.started_at_us,
+            total_samples: response.total_samples,
+            sample_rate: response.sample_rate,
+            state: PlaybackRunState::Playing,
+            error: None,
+            source_restore_error: None,
+        }
+    }
+
+    /// Settle a run: completed, or failed with `error`.
+    pub fn finish(&mut self, error: Option<String>) {
+        self.state = if error.is_some() {
+            PlaybackRunState::Failed
+        } else {
+            PlaybackRunState::Completed
+        };
+        self.error = error;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaybackOffsets {
     pub tone_burst_offset_samples: usize,
@@ -229,6 +294,10 @@ pub struct PlaybackPlan {
     pub raw_sweep_samples: usize,
     pub sweep_phase_scale: f32,
     pub sweep_ratio_step: f32,
+    /// `ln(sweep_ratio_step)`, kept separately because `sweep_ratio_step`
+    /// itself is within a few f32 ulps of 1.0 and too coarse to rebuild the
+    /// phase increment from.
+    pub sweep_log_step: f32,
     pub preamble_samples: usize,
     pub tone_burst_samples: usize,
     pub gap_samples: usize,
@@ -291,7 +360,7 @@ impl PlaybackPlan {
 
         let sweep_samples = find_truncated_sweep_len(
             raw_sweep_samples,
-            request.resolved_sweep.duration,
+            request.sample_rate,
             sweep_f1,
             sweep_f2,
             linear_section_samples,
@@ -304,16 +373,18 @@ impl PlaybackPlan {
         } else {
             0.0
         };
-        let sweep_ratio_step = if log_samples > 0 {
-            (sweep_ln_ratio / log_samples as f32).exp()
+        let sweep_log_step = if log_samples > 0 {
+            sweep_ln_ratio / log_samples as f32
         } else {
-            1.0
+            0.0
         };
+        let sweep_ratio_step = sweep_log_step.exp();
 
         Ok(Self {
             raw_sweep_samples,
             sweep_phase_scale,
             sweep_ratio_step,
+            sweep_log_step,
             preamble_samples: seconds_to_samples(
                 request.resolved_preamble_sec,
                 request.sample_rate,
@@ -347,8 +418,11 @@ impl PlaybackPlan {
         bit_depth: BitDepth,
         decay_sec: f32,
     ) -> Result<Self, PlaybackError> {
-        if sample_rate == 0 {
-            return Err(PlaybackError::InvalidRequest("sampleRate must be > 0"));
+        validate_sample_rate(sample_rate)?;
+        if !decay_sec.is_finite() || decay_sec > MAX_SEGMENT_SEC {
+            return Err(PlaybackError::InvalidRequest(
+                "segment durations must be finite and at most 600 s",
+            ));
         }
         if decay_sec < 0.0 {
             return Err(PlaybackError::InvalidRequest(
@@ -381,6 +455,7 @@ impl PlaybackPlan {
             raw_sweep_samples: 0,
             sweep_phase_scale: 0.0,
             sweep_ratio_step: 1.0,
+            sweep_log_step: 0.0,
             preamble_samples: 0,
             tone_burst_samples: 0,
             gap_samples: 0,
@@ -421,19 +496,48 @@ impl PlaybackPlan {
         }
     }
 
+    /// The sweep fades in over at least one cycle of its start frequency: the
+    /// default 20 ms is a tenth of a 5 Hz cycle, and that abrupt an onset
+    /// thumps a subwoofer. An explicit zero fade stays zero, and the fade-out
+    /// keeps the requested length (the sweep ends high, where 20 ms is many
+    /// cycles).
+    fn sweep_fade_in_samples(&self) -> usize {
+        let requested = self.request.resolved_sweep.fade_duration;
+        let fade = if requested > 0.0 && self.sweep_f1 > 0.0 {
+            requested.max(1.0 / self.sweep_f1)
+        } else {
+            requested
+        };
+        seconds_to_samples(fade, self.request.sample_rate).min(self.sweep_samples / 2)
+    }
+
+    fn sweep_fade_out_samples(&self) -> usize {
+        seconds_to_samples(
+            self.request.resolved_sweep.fade_duration,
+            self.request.sample_rate,
+        )
+        .min(self.sweep_samples / 2)
+    }
+
     pub fn generator(&self) -> PlaybackGenerator {
         PlaybackGenerator {
             plan: self.clone(),
             offsets: self.offsets(),
-            fade_samples: seconds_to_samples(
-                self.request.resolved_sweep.fade_duration,
-                self.request.sample_rate,
-            )
-            .min(self.sweep_samples),
+            fade_in_samples: self.sweep_fade_in_samples(),
+            fade_out_samples: self.sweep_fade_out_samples(),
             cursor: 0,
             sweep_phase: 0.0,
-            sweep_phase_delta: self.sweep_phase_scale * (self.sweep_ratio_step - 1.0),
+            sweep_phase_delta: self.sweep_phase_delta_at(0),
         }
+    }
+
+    /// Phase advance from log-section sample `log_index` to the next one,
+    /// in closed form. `exp_m1` keeps the increment exact for narrow sweeps,
+    /// where `sweep_ratio_step - 1.0` rounds to zero in f32.
+    fn sweep_phase_delta_at(&self, log_index: usize) -> f32 {
+        self.sweep_phase_scale
+            * self.sweep_log_step.exp_m1()
+            * (self.sweep_log_step * log_index as f32).exp()
     }
 
     pub fn sample_at(&self, index: usize) -> f32 {
@@ -522,7 +626,8 @@ fn resolve_play_request(mut request: PlayRequest) -> Result<ResolvedPlayRequest,
 pub struct PlaybackGenerator {
     plan: PlaybackPlan,
     offsets: PlaybackOffsets,
-    fade_samples: usize,
+    fade_in_samples: usize,
+    fade_out_samples: usize,
     cursor: usize,
     sweep_phase: f32,
     sweep_phase_delta: f32,
@@ -682,7 +787,7 @@ impl PlaybackGenerator {
     }
 
     fn next_sweep_sample(&mut self, index: usize) -> f32 {
-        let mut sample = if index < self.plan.linear_section_samples {
+        let sample = if index < self.plan.linear_section_samples {
             // Linear chirp section — compute directly (no incremental state needed
             // since the linear section is short).
             let sr = self.plan.request.sample_rate as f32;
@@ -704,39 +809,43 @@ impl PlaybackGenerator {
                 self.sweep_phase =
                     2.0 * PI * (f_start * t + (f_end - f_start) / (2.0 * ld) * t * t);
                 self.sweep_phase %= 2.0 * PI;
-                self.sweep_phase_delta =
-                    self.plan.sweep_phase_scale * (self.plan.sweep_ratio_step - 1.0);
+                self.sweep_phase_delta = self.plan.sweep_phase_delta_at(0);
             }
             let s = fast_sin_wrapped(self.sweep_phase);
             self.sweep_phase += self.sweep_phase_delta;
             if self.sweep_phase >= 2.0 * PI {
                 self.sweep_phase -= 2.0 * PI;
             }
-            self.sweep_phase_delta *= self.plan.sweep_ratio_step;
+            // The per-sample ratio is rounded to an f32 ulp near 1.0, and that
+            // error compounds over the sweep (a 5-400 Hz sweep ended near
+            // 397 Hz). Re-anchor to the closed form periodically; between
+            // anchors the recurrence drifts by well under 0.01%.
+            let next_log_index = index + 1 - self.plan.linear_section_samples;
+            if next_log_index.is_multiple_of(SWEEP_DELTA_REANCHOR_SAMPLES) {
+                self.sweep_phase_delta = self.plan.sweep_phase_delta_at(next_log_index);
+            } else {
+                self.sweep_phase_delta *= self.plan.sweep_ratio_step;
+            }
             s
         };
-        if self.fade_samples > 0 {
-            if index < self.fade_samples {
-                sample *= 0.5 * (1.0 - (PI * index as f32 / self.fade_samples as f32).cos());
-            }
-            let tail_start = self.plan.sweep_samples.saturating_sub(self.fade_samples);
-            if index >= tail_start {
-                let tail_index = index - tail_start;
-                sample *= 0.5 * (1.0 + (PI * tail_index as f32 / self.fade_samples as f32).cos());
-            }
-        }
         sample
+            * sweep_gain(
+                index,
+                self.plan.sweep_samples,
+                self.fade_in_samples,
+                self.fade_out_samples,
+            )
     }
 }
 
 fn fill_preamble_pcm16(start_index: usize, out: &mut [u8]) {
-    for (frame_idx, frame) in out.chunks_exact_mut(4).enumerate() {
+    for (frame_idx, frame) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         write_pcm16_stereo(preamble_noise_pcm16(start_index + frame_idx), frame);
     }
 }
 
 fn fill_preamble_pcm24(start_index: usize, out: &mut [u8]) {
-    for (frame_idx, frame) in out.chunks_exact_mut(6).enumerate() {
+    for (frame_idx, frame) in out.as_chunks_mut::<6>().0.iter_mut().enumerate() {
         write_pcm24_stereo(preamble_noise_pcm24(start_index + frame_idx), frame);
     }
 }
@@ -778,7 +887,7 @@ fn fill_tone_pcm24(
 }
 
 fn fill_sweep_pcm16(generator: &mut PlaybackGenerator, start_index: usize, out: &mut [u8]) {
-    for (frame_idx, frame) in out.chunks_exact_mut(4).enumerate() {
+    for (frame_idx, frame) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         write_pcm16_stereo(
             quantize_pcm16(generator.next_sweep_sample(start_index + frame_idx)),
             frame,
@@ -787,7 +896,7 @@ fn fill_sweep_pcm16(generator: &mut PlaybackGenerator, start_index: usize, out: 
 }
 
 fn fill_sweep_pcm24(generator: &mut PlaybackGenerator, start_index: usize, out: &mut [u8]) {
-    for (frame_idx, frame) in out.chunks_exact_mut(6).enumerate() {
+    for (frame_idx, frame) in out.as_chunks_mut::<6>().0.iter_mut().enumerate() {
         write_pcm24_stereo(
             quantize_pcm24(generator.next_sweep_sample(start_index + frame_idx)),
             frame,
@@ -851,11 +960,32 @@ fn default_decay_sec() -> f32 {
     DEFAULT_DECAY_SEC
 }
 
-fn default_sample_rate_hz() -> u32 {
+pub(crate) fn default_sample_rate_hz() -> u32 {
     DEFAULT_SAMPLE_RATE_HZ
 }
 
 fn validate_request(request: &PlayRequest) -> Result<(), PlaybackError> {
+    validate_sample_rate(request.sample_rate)?;
+    if !request.resolved_sweep.f1.is_finite() || !request.resolved_sweep.f2.is_finite() {
+        return Err(PlaybackError::InvalidRequest(
+            "frequencies and cycle counts must be finite",
+        ));
+    }
+    let durations = [
+        request.resolved_sweep.duration,
+        request.resolved_sweep.fade_duration,
+        request.resolved_preamble_sec,
+        request.resolved_gap_sec,
+        request.decay_sec,
+    ];
+    if durations
+        .iter()
+        .any(|seconds| !seconds.is_finite() || *seconds > MAX_SEGMENT_SEC)
+    {
+        return Err(PlaybackError::InvalidRequest(
+            "segment durations must be finite and at most 600 s",
+        ));
+    }
     if request.resolved_sweep.f1 <= 0.0 {
         return Err(PlaybackError::InvalidRequest("sweepStartHz must be > 0"));
     }
@@ -877,9 +1007,6 @@ fn validate_request(request: &PlayRequest) -> Result<(), PlaybackError> {
         "markerCycles must be >= 0",
         "markerFrequencyHz must be > 0 when markerCycles > 0",
     )?;
-    if request.sample_rate == 0 {
-        return Err(PlaybackError::InvalidRequest("sampleRate must be > 0"));
-    }
     if request.resolved_tone_burst.cycles > 0.0
         && tone_burst_samples(request.resolved_tone_burst, request.sample_rate) == 0
     {
@@ -912,7 +1039,19 @@ fn validate_request(request: &PlayRequest) -> Result<(), PlaybackError> {
     Ok(())
 }
 
-fn seconds_to_samples(seconds: f32, sample_rate: u32) -> usize {
+pub(crate) fn validate_sample_rate(sample_rate: u32) -> Result<(), PlaybackError> {
+    if sample_rate == 0 {
+        return Err(PlaybackError::InvalidRequest("sampleRate must be > 0"));
+    }
+    if sample_rate > MAX_SAMPLE_RATE_HZ {
+        return Err(PlaybackError::InvalidRequest(
+            "sampleRate must be at most 384000",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn seconds_to_samples(seconds: f32, sample_rate: u32) -> usize {
     (seconds * sample_rate as f32).round() as usize
 }
 
@@ -921,11 +1060,21 @@ fn validate_tone_burst(
     cycles_error: &'static str,
     frequency_error: &'static str,
 ) -> Result<(), PlaybackError> {
+    if !tone_burst.frequency.is_finite() || !tone_burst.cycles.is_finite() {
+        return Err(PlaybackError::InvalidRequest(
+            "frequencies and cycle counts must be finite",
+        ));
+    }
     if tone_burst.cycles < 0.0 {
         return Err(PlaybackError::InvalidRequest(cycles_error));
     }
     if tone_burst.cycles > 0.0 && tone_burst.frequency <= 0.0 {
         return Err(PlaybackError::InvalidRequest(frequency_error));
+    }
+    if tone_burst.cycles > 0.0 && tone_burst.cycles / tone_burst.frequency > MAX_SEGMENT_SEC {
+        return Err(PlaybackError::InvalidRequest(
+            "marker signal must be at most 600 s",
+        ));
     }
     Ok(())
 }
@@ -990,7 +1139,7 @@ fn tone_burst_sample(index: usize, sample_rate: u32, tone: ToneBurstParams) -> f
     sample
 }
 
-fn raised_cosine_fade_in_gain(index: usize, fade_samples: usize) -> f32 {
+pub(crate) fn raised_cosine_fade_in_gain(index: usize, fade_samples: usize) -> f32 {
     if fade_samples <= 1 {
         return 0.0;
     }
@@ -998,7 +1147,7 @@ fn raised_cosine_fade_in_gain(index: usize, fade_samples: usize) -> f32 {
     0.5 * (1.0 - (PI * index as f32 / denom).cos())
 }
 
-fn raised_cosine_fade_out_gain(index: usize, fade_samples: usize) -> f32 {
+pub(crate) fn raised_cosine_fade_out_gain(index: usize, fade_samples: usize) -> f32 {
     if fade_samples <= 1 {
         return 0.0;
     }
@@ -1052,33 +1201,40 @@ fn hybrid_sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
     fast_sin(linear_end_phase + k * (((n / total) * l).exp() - 1.0))
 }
 
-fn sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
-    let mut sample = hybrid_sweep_sample(index, plan);
-    let fade_samples = seconds_to_samples(
-        plan.request.resolved_sweep.fade_duration,
-        plan.request.sample_rate,
-    )
-    .min(plan.sweep_samples / 2);
-    if fade_samples > 0 {
-        // Fade-in
-        if index < fade_samples {
-            sample *= raised_cosine_fade_in_gain(index, fade_samples);
-        }
-        // Fade-out
-        let tail_start = plan.sweep_samples.saturating_sub(fade_samples);
-        if index >= tail_start {
-            let tail_index = index - tail_start;
-            sample *= raised_cosine_fade_out_gain(tail_index, fade_samples);
-        }
+/// The sweep's fade envelope, shared by `sweep_sample` and the streaming
+/// generator so both produce the same samples.
+fn sweep_gain(
+    index: usize,
+    sweep_samples: usize,
+    fade_in_samples: usize,
+    fade_out_samples: usize,
+) -> f32 {
+    let mut gain = 1.0;
+    if index < fade_in_samples {
+        gain *= raised_cosine_fade_in_gain(index, fade_in_samples);
     }
-    sample
+    let tail_start = sweep_samples.saturating_sub(fade_out_samples);
+    if fade_out_samples > 0 && index >= tail_start {
+        gain *= raised_cosine_fade_out_gain(index - tail_start, fade_out_samples);
+    }
+    gain
+}
+
+fn sweep_sample(index: usize, plan: &PlaybackPlan) -> f32 {
+    hybrid_sweep_sample(index, plan)
+        * sweep_gain(
+            index,
+            plan.sweep_samples,
+            plan.sweep_fade_in_samples(),
+            plan.sweep_fade_out_samples(),
+        )
 }
 
 fn find_truncated_sweep_len(
     raw_sweep_samples: usize,
-    _sweep_duration_sec: f32,
-    _sweep_f1: f32,
-    _sweep_f2: f32,
+    sample_rate: u32,
+    sweep_f1: f32,
+    sweep_f2: f32,
     linear_section_samples: usize,
     log_start_hz: f32,
 ) -> Result<usize, PlaybackError> {
@@ -1091,7 +1247,8 @@ fn find_truncated_sweep_len(
     // Build a temporary plan-like struct just for zero-crossing search.
     // We search backwards from the end to find the last zero crossing so
     // the sweep ends cleanly.
-    let sr = 48_000.0f32; // Only used for relative phase — sample rate cancels out.
+    // Phase scales with 1/sample_rate, so this must be the real rate.
+    let sr = sample_rate as f32;
     let log_samples = raw_sweep_samples.saturating_sub(linear_section_samples);
 
     let sample_at = |index: usize| -> f32 {
@@ -1101,19 +1258,19 @@ fn find_truncated_sweep_len(
             let t = index as f32 / sr;
             let ld = linear_section_samples as f32 / sr;
             let f_end = log_start_hz;
-            fast_sin(2.0 * PI * (_sweep_f1 * t + (f_end - _sweep_f1) / (2.0 * ld) * t * t))
+            fast_sin(2.0 * PI * (sweep_f1 * t + (f_end - sweep_f1) / (2.0 * ld) * t * t))
         } else {
             let li = index - linear_section_samples;
             let n = li as f32;
             let total = log_samples as f32;
             let log_dur = log_samples as f32 / sr;
             let w1 = 2.0 * PI * log_start_hz;
-            let l = (_sweep_f2 / log_start_hz).ln();
+            let l = (sweep_f2 / log_start_hz).ln();
             let k = w1 * log_dur / l;
             let linear_end_phase = if linear_section_samples > 0 {
                 let t = linear_section_samples as f32 / sr;
                 let ld = linear_section_samples as f32 / sr;
-                2.0 * PI * (_sweep_f1 * t + (log_start_hz - _sweep_f1) / (2.0 * ld) * t * t)
+                2.0 * PI * (sweep_f1 * t + (log_start_hz - sweep_f1) / (2.0 * ld) * t * t)
             } else {
                 0.0
             };
@@ -1143,31 +1300,31 @@ fn encode_frame(sample: f32, layout: SampleLayout, out: &mut [u8]) {
         BitDepth::Pcm16 => {
             let quantized = (clamped * i16::MAX as f32).round() as i16;
             let bytes = quantized.to_le_bytes();
-            for chunk in out.chunks_exact_mut(2) {
+            for chunk in out.as_chunks_mut::<2>().0 {
                 chunk.copy_from_slice(&bytes);
             }
         }
         BitDepth::Pcm24 => {
             let quantized = (clamped * 8_388_607.0).round() as i32;
             let bytes = quantized.to_le_bytes();
-            for chunk in out.chunks_exact_mut(3) {
+            for chunk in out.as_chunks_mut::<3>().0 {
                 chunk.copy_from_slice(&bytes[..3]);
             }
         }
     }
 }
 
-fn quantize_pcm16(sample: f32) -> i16 {
+pub(crate) fn quantize_pcm16(sample: f32) -> i16 {
     let clamped = sample.clamp(-1.0, 1.0);
     (clamped * i16::MAX as f32) as i16
 }
 
-fn quantize_pcm24(sample: f32) -> i32 {
+pub(crate) fn quantize_pcm24(sample: f32) -> i32 {
     let clamped = sample.clamp(-1.0, 1.0);
     (clamped * 8_388_607.0) as i32
 }
 
-fn write_pcm16_stereo(sample: i16, out: &mut [u8]) {
+pub(crate) fn write_pcm16_stereo(sample: i16, out: &mut [u8]) {
     let bytes = sample.to_le_bytes();
     out[0] = bytes[0];
     out[1] = bytes[1];
@@ -1175,7 +1332,7 @@ fn write_pcm16_stereo(sample: i16, out: &mut [u8]) {
     out[3] = bytes[1];
 }
 
-fn write_pcm24_stereo(sample: i32, out: &mut [u8]) {
+pub(crate) fn write_pcm24_stereo(sample: i32, out: &mut [u8]) {
     let bytes = sample.to_le_bytes();
     out[0] = bytes[0];
     out[1] = bytes[1];
@@ -1185,7 +1342,7 @@ fn write_pcm24_stereo(sample: i32, out: &mut [u8]) {
     out[5] = bytes[2];
 }
 
-fn db_to_linear(db: f32) -> f32 {
+pub(crate) fn db_to_linear(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
 }
 
@@ -1197,7 +1354,7 @@ fn fast_sin(phase: f32) -> f32 {
     fast_sin_wrapped(wrapped)
 }
 
-fn fast_sin_wrapped(phase: f32) -> f32 {
+pub(crate) fn fast_sin_wrapped(phase: f32) -> f32 {
     let position = phase * (FAST_SIN_TABLE_SIZE as f32 / (2.0 * PI));
     let index = position as usize;
     let next = index + 1;
@@ -1364,6 +1521,15 @@ mod tests {
     }
 
     #[test]
+    fn fast_sine_lut_preserves_original_generated_bits() {
+        for (idx, actual) in FAST_SIN_LUT.iter().enumerate() {
+            let phase = (idx as f64 * 2.0 * std::f64::consts::PI) / 512.0;
+            let original: f32 = format!("{:.9}", phase.sin() as f32).parse().unwrap();
+            assert_eq!(actual.to_bits(), original.to_bits(), "LUT entry {idx}");
+        }
+    }
+
+    #[test]
     fn fast_sine_approximation_stays_close_to_stdlib() {
         for step in 0..4096usize {
             let phase = (step as f32 / 4096.0) * 64.0 * PI;
@@ -1508,6 +1674,90 @@ mod tests {
     }
 
     #[test]
+    fn sweep_fade_in_spans_one_start_frequency_cycle() {
+        // Default 5 Hz start: one cycle is 200 ms, ten times the 20 ms fade.
+        let plan = PlaybackPlan::build(PlayRequest::default()).unwrap();
+        assert_eq!(plan.sweep_fade_in_samples(), 48_000 / 5);
+        let fade_end = plan.sweep_fade_in_samples();
+        assert!(sweep_sample(fade_end / 10, &plan).abs() < 0.03);
+
+        // At or above 50 Hz one cycle is <= 20 ms, so the requested fade wins.
+        let plan = PlaybackPlan::build(PlayRequest {
+            sweep_start_hz: 100.0,
+            ..PlayRequest::default()
+        })
+        .unwrap();
+        assert_eq!(plan.sweep_fade_in_samples(), 960);
+    }
+
+    #[test]
+    fn explicit_zero_sweep_fade_stays_unfaded() {
+        let plan = PlaybackPlan::build(PlayRequest {
+            sweep_fade_sec: 0.0,
+            ..PlayRequest::default()
+        })
+        .unwrap();
+        assert_eq!(plan.sweep_fade_in_samples(), 0);
+    }
+
+    #[test]
+    fn generator_matches_reference_sweep_sample_for_sample() {
+        let requests = [
+            PlayRequest::default(),
+            // 40 Hz start: the fade-in is one 25 ms cycle, longer than the fade-out.
+            PlayRequest {
+                sweep_start_hz: 40.0,
+                sweep_end_hz: 60.0,
+                sweep_duration_sec: 1.0,
+                ..PlayRequest::default()
+            },
+            // Fades longer than half the sweep are clamped to half on both paths.
+            PlayRequest {
+                sweep_start_hz: 100.0,
+                sweep_duration_sec: 0.05,
+                sweep_fade_sec: 0.04,
+                ..PlayRequest::default()
+            },
+            PlayRequest {
+                sweep_fade_sec: 0.0,
+                ..PlayRequest::default()
+            },
+        ];
+        for request in requests {
+            let plan = PlaybackPlan::build(PlayRequest {
+                marker_before: false,
+                marker_after: false,
+                ..request
+            })
+            .unwrap();
+            let offsets = plan.offsets();
+            let mut generator = plan.generator();
+            let mut pcm = vec![0u8; offsets.total_samples * 4];
+            generator.fill_pcm_bytes(&mut pcm);
+            let mut worst = (0.0f32, 0);
+            for index in 0..plan.sweep_samples {
+                let at = (offsets.sweep_offset_samples + index) * 4;
+                let left = i16::from_le_bytes([pcm[at], pcm[at + 1]]) as f32 / i16::MAX as f32;
+                let diff = (left - sweep_sample(index, &plan)).abs();
+                if diff > worst.0 {
+                    worst = (diff, index);
+                }
+            }
+            // The generator's f32 phase recurrence ends the 400 Hz default ~2
+            // degrees from the closed form (0.034); an envelope mismatch is
+            // far larger.
+            assert!(
+                worst.0 < 0.05,
+                "{:?}: generator differs from the reference by {} at sweep sample {} of {}",
+                plan.request.resolved_sweep,
+                worst.0,
+                worst.1,
+                plan.sweep_samples
+            );
+        }
+    }
+
+    #[test]
     fn diagnostic_tail_marker_starts_at_zero_without_sweep() {
         let plan = PlaybackPlan::diagnostic_tail_marker(
             ToneBurstParams {
@@ -1528,5 +1778,149 @@ mod tests {
             plan.tail_tone_burst_samples + plan.decay_samples
         );
         assert_ne!(plan.sample_at(1), 0.0);
+    }
+
+    /// Run the generator through the sweep and return the instantaneous
+    /// frequency it reaches on the last log-section sample.
+    fn generated_sweep_end_hz(plan: &PlaybackPlan) -> f32 {
+        let mut generator = plan.generator();
+        for index in 0..plan.raw_sweep_samples - 1 {
+            generator.next_sweep_sample(index);
+        }
+        generator.sweep_phase_delta / (2.0 * PI) * plan.request.sample_rate as f32
+    }
+
+    #[test]
+    fn generated_sweep_reaches_requested_end_frequency() {
+        for (start, end) in [(5.0, 400.0), (20.0, 20_000.0), (100.0, 110.0)] {
+            let plan = PlaybackPlan::build(PlayRequest {
+                sweep_start_hz: start,
+                sweep_end_hz: end,
+                ..PlayRequest::default()
+            })
+            .unwrap();
+            let end_hz = generated_sweep_end_hz(&plan);
+            assert!(
+                (end_hz - end).abs() / end < 1e-3,
+                "{start}-{end} Hz sweep ended at {end_hz} Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_sweep_is_not_silent() {
+        let plan = PlaybackPlan::build(PlayRequest {
+            sweep_start_hz: 100.0,
+            sweep_end_hz: 100.001,
+            ..PlayRequest::default()
+        })
+        .unwrap();
+        let end_hz = generated_sweep_end_hz(&plan);
+        assert!((end_hz - 100.0).abs() < 0.01, "ended at {end_hz} Hz");
+    }
+
+    #[test]
+    fn sweep_truncation_lands_on_a_zero_crossing_at_every_rate() {
+        for sample_rate in [44_100, 48_000, 96_000] {
+            let plan = PlaybackPlan::build(PlayRequest {
+                sample_rate,
+                ..PlayRequest::default()
+            })
+            .unwrap();
+            let last = hybrid_sweep_sample(plan.sweep_samples - 1, &plan);
+            let next = hybrid_sweep_sample(plan.sweep_samples, &plan);
+            assert!(
+                last * next <= 0.0,
+                "{sample_rate} Hz sweep truncated off a zero crossing ({last}, {next})"
+            );
+        }
+    }
+
+    #[test]
+    fn unrepresentable_durations_are_rejected() {
+        for request in [
+            PlayRequest {
+                decay_sec: 1e20,
+                ..PlayRequest::default()
+            },
+            PlayRequest {
+                sweep_duration_sec: f32::NAN,
+                ..PlayRequest::default()
+            },
+            PlayRequest {
+                marker_frequency_hz: 1e-30,
+                ..PlayRequest::default()
+            },
+            PlayRequest {
+                sample_rate: u32::MAX,
+                ..PlayRequest::default()
+            },
+        ] {
+            assert!(
+                matches!(
+                    PlaybackPlan::build(request.clone()),
+                    Err(PlaybackError::InvalidRequest(_))
+                ),
+                "accepted {request:?}"
+            );
+        }
+        assert!(
+            PlaybackPlan::diagnostic_tail_marker(
+                ToneBurstParams::default(),
+                48_000,
+                BitDepth::Pcm16,
+                1e20,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn playback_status_serializes_camel_case_contract() {
+        let mut run = PlaybackRunStatus::started(&PlayResponse {
+            started_at_us: 42,
+            tone_burst_offset_samples: 0,
+            sweep_offset_samples: 0,
+            tail_tone_burst_offset_samples: None,
+            total_samples: 480,
+            sample_rate: 48_000,
+            source_changed: false,
+            previous_source: None,
+        });
+        let playing = serde_json::to_value(PlaybackStatus {
+            playing: true,
+            last: Some(run.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            playing,
+            serde_json::json!({
+                "playing": true,
+                "last": {
+                    "startedAtUs": 42,
+                    "totalSamples": 480,
+                    "sampleRate": 48000,
+                    "state": "playing"
+                }
+            })
+        );
+
+        run.finish(Some("unplugged".into()));
+        run.source_restore_error = Some("restore failed".into());
+        assert_eq!(
+            serde_json::to_value(&run).unwrap(),
+            serde_json::json!({
+                "startedAtUs": 42,
+                "totalSamples": 480,
+                "sampleRate": 48000,
+                "state": "failed",
+                "error": "unplugged",
+                "sourceRestoreError": "restore failed"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(PlaybackStatus::default()).unwrap(),
+            serde_json::json!({ "playing": false })
+        );
     }
 }

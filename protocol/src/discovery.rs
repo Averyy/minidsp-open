@@ -47,6 +47,8 @@ pub struct DiscoveryPacket {
 
 impl DiscoveryPacket {
     /// Build a discovery packet from fully-resolved device identity.
+    // Preserve the public constructor; a params struct would duplicate DiscoveryPacket.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_device(
         mac: [u8; 6],
         ip: [u8; 4],

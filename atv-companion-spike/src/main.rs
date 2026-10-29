@@ -321,7 +321,7 @@ async fn run_watch(
         )
         .await?;
 
-        if iteration == 1 || iteration % 10 == 0 {
+        if iteration == 1 || iteration.is_multiple_of(10) {
             let up_next_started = Instant::now();
             match client.fetch_up_next().await {
                 Ok(up_next) => {
@@ -360,6 +360,8 @@ async fn run_watch(
     Ok(())
 }
 
+// Called once with the CLI fields; a separate options type would duplicate them.
+#[allow(clippy::too_many_arguments)]
 fn run_match(
     paths: &ScratchPaths,
     catalogue: Option<PathBuf>,

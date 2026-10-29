@@ -1,5 +1,8 @@
 use super::*;
 
+type CommandBatch = Vec<Vec<u8>>;
+type MeasurementRestoreBatches = (CommandBatch, CommandBatch, CommandBatch);
+
 pub(super) async fn execute_peq_batch(
     queue: &Arc<CommandQueue>,
     dialect: &minidsp_protocol::dialect::Dialect,
@@ -45,7 +48,7 @@ pub(super) fn build_measurement_restore_batches(
     current_shadow: &HashMap<u16, PeqShadow>,
     saved: &[(u16, [f32; 5], bool)],
     dialect: &minidsp_protocol::dialect::Dialect,
-) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+) -> MeasurementRestoreBatches {
     let mut phase1_cmds = Vec::new();
     let mut phase2_cmds = Vec::new();
     let mut phase3_cmds = Vec::new();
@@ -101,9 +104,7 @@ fn merge_trusted_snapshot(
     mut existing: PresetShadowState,
     captured: PresetShadowState,
 ) -> PresetShadowState {
-    for (addr, entry) in captured.peq {
-        existing.peq.entry(addr).or_insert(entry);
-    }
+    existing.peq.extend(captured.peq);
     existing.selector.extend(captured.selector);
     existing.scalar.extend(captured.scalar);
     existing.fir_blocks.extend(captured.fir_blocks);
@@ -197,8 +198,7 @@ pub(super) async fn mirror_raw_command_to_shadow<F>(
     scalar_shadow: &Arc<Mutex<HashMap<u16, u32>>>,
     selector_shadow: &Arc<Mutex<HashMap<u16, u16>>>,
     prefer_scalar_shadow_for_addr: F,
-)
-where
+) where
     F: Fn(u16) -> bool,
 {
     if let Some((addr, coeffs)) = parse_raw_write_biquad(payload, dialect) {
@@ -387,6 +387,15 @@ impl MiniDspClient {
         }
     }
 
+    pub(super) async fn note_preset_mutation(&self) {
+        if let Some(preset) = *self.active_preset.lock().await {
+            self.skip_trusted_shadow_capture_once
+                .lock()
+                .await
+                .remove(&preset);
+        }
+    }
+
     /// Mirror the side effects of a successful raw-bridge write into the
     /// client's shadow state so `/config` can reflect raw WS/TCP activity.
     pub async fn mirror_raw_command_if_success(&self, payload: &[u8], raw_response: &[u8]) {
@@ -396,6 +405,14 @@ impl MiniDspClient {
             parsed,
             Response::Ack | Response::PresetComplete | Response::ResetComplete
         ) {
+            if matches!(
+                payload.first(),
+                Some(&commands::CMD_WRITE_DSP)
+                    | Some(&commands::CMD_WRITE_BIQUAD)
+                    | Some(&commands::CMD_BYPASS_FILTER)
+            ) {
+                self.note_preset_mutation().await;
+            }
             mirror_raw_command_to_shadow(
                 payload,
                 &self.profile.dialect,
@@ -530,6 +547,31 @@ impl MiniDspClient {
         for (slot, chunk) in data.chunks(4).enumerate() {
             if chunk.len() == 4 {
                 tokens.insert(slot as u8, [chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        let previous = self.preset_tokens.lock().await.clone();
+        let changed: Vec<u8> = self
+            .trusted_snapshot_presets
+            .lock()
+            .await
+            .iter()
+            .copied()
+            .filter(|slot| !previous.contains_key(slot) || previous.get(slot) != tokens.get(slot))
+            .collect();
+        for slot in changed {
+            self.trusted_snapshot_presets.lock().await.remove(&slot);
+            self.preset_shadows.lock().await.remove(&slot);
+            if *self.active_preset.lock().await == Some(slot) {
+                self.apply_active_shadow_snapshot(None).await;
+                self.skip_trusted_shadow_capture_once
+                    .lock()
+                    .await
+                    .insert(slot);
+            } else {
+                self.skip_trusted_shadow_capture_once
+                    .lock()
+                    .await
+                    .remove(&slot);
             }
         }
         *self.preset_tokens.lock().await = tokens;

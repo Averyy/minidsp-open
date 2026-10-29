@@ -1,10 +1,10 @@
 //! TCP bridge server (port 5333) — frame-level forwarding for Device Console
 //! compatibility.
 //!
-//! Wi-DG behavior notes: if the first received chunk is >= 64 bytes, the
-//! client is treated as a Wi-DG-style 64-byte chunked stream; otherwise the
-//! standard length-prefixed framing applies. Non-zero padding between frames
-//! is skipped so the real Wi-DG's wire-level quirks don't drop commands.
+//! Requests are reassembled independently of socket read boundaries. Validated
+//! 64-byte padded requests enable Wi-DG response padding; ordinary coalesced
+//! frames remain length-prefixed. Invalid complete frames are skipped, while
+//! incomplete frames wait for more bytes.
 //!
 //! Socket hygiene: `SO_REUSEADDR` is set before binding so a restarted
 //! daemon doesn't spend 2× MSL stuck on a `TIME_WAIT` port. Each accepted
@@ -89,23 +89,22 @@ async fn handle_client(
     let mut read_buf = Vec::with_capacity(512);
     let mut tmp = [0u8; 512];
     let mut chunked_mode = false;
-    let mut first_read = true;
 
     loop {
         // Try to decode frames from buffered data first.
         loop {
-            if chunked_mode {
-                if read_buf.len() < 64 {
-                    break;
-                }
-                let chunk = read_buf[..64].to_vec();
-                read_buf.drain(..64);
+            let padded_request = is_padded_tcp_chunk(&read_buf);
+            chunked_mode |= padded_request;
+            let decoded = decode_tcp_frame_skip_padding(&read_buf);
+            match decoded {
+                Some((payload, consumed)) => {
+                    read_buf.drain(..if padded_request { 64 } else { consumed });
 
-                let frame_start = chunk.iter().position(|&b| b > 0 && b < 64);
-                let payload = frame_start.and_then(|start| packet::decode_frame(&chunk[start..]));
-
-                if let Some(payload) = payload {
+                    if payload.is_empty() {
+                        continue;
+                    }
                     if let Some(client) = state.get_device(0).await {
+                        let tcp_request = payload.clone();
                         let result = {
                             let _guard = bridge_mutex.lock().await;
                             crate::bridge::execute_raw_bridge_command(&state, &client, payload)
@@ -113,11 +112,18 @@ async fn handle_client(
                         };
                         match result {
                             Ok(raw_resp) => {
-                                let frame = packet::encode_frame(&raw_resp);
-                                let mut padded = vec![0u8; 64];
-                                let copy_len = frame.len().min(64);
-                                padded[..copy_len].copy_from_slice(&frame[..copy_len]);
-                                if let Err(e) = stream.write_all(&padded).await {
+                                let frame = if chunked_mode {
+                                    let mut frame = packet::encode_frame(&raw_resp);
+                                    frame.resize(64.max(frame.len()), 0);
+                                    frame
+                                } else {
+                                    packet::encode_device_console_tcp_response(
+                                        &tcp_request,
+                                        &raw_resp,
+                                        &client.profile().dialect,
+                                    )
+                                };
+                                if let Err(e) = stream.write_all(&frame).await {
                                     tracing::warn!("TCP bridge write error ({peer}): {e}");
                                     return;
                                 }
@@ -128,39 +134,7 @@ async fn handle_client(
                         }
                     }
                 }
-            } else {
-                let decoded = decode_tcp_frame_skip_padding(&read_buf);
-                match decoded {
-                    Some((payload, consumed)) => {
-                        read_buf.drain(..consumed);
-
-                        if let Some(client) = state.get_device(0).await {
-                            let tcp_request = payload.clone();
-                            let result = {
-                                let _guard = bridge_mutex.lock().await;
-                                crate::bridge::execute_raw_bridge_command(&state, &client, payload)
-                                    .await
-                            };
-                            match result {
-                                Ok(raw_resp) => {
-                                    let frame = packet::encode_device_console_tcp_response(
-                                        &tcp_request,
-                                        &raw_resp,
-                                        &client.profile().dialect,
-                                    );
-                                    if let Err(e) = stream.write_all(&frame).await {
-                                        tracing::warn!("TCP bridge write error ({peer}): {e}");
-                                        return;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("TCP bridge command error ({peer}): {e}");
-                                }
-                            }
-                        }
-                    }
-                    None => break,
-                }
+                None => break,
             }
         }
 
@@ -173,12 +147,9 @@ async fn handle_client(
             }
         };
 
-        if first_read {
-            first_read = false;
-            if n >= 64 {
-                chunked_mode = true;
-                tracing::info!("TCP bridge ({peer}): Wi-DG 64-byte chunking mode detected");
-            }
+        if read_buf.len() + n > 1024 {
+            tracing::warn!("TCP bridge ({peer}): request buffer limit exceeded");
+            return;
         }
 
         read_buf.extend_from_slice(&tmp[..n]);
@@ -213,22 +184,144 @@ fn enable_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
     sock.set_tcp_keepalive(&keepalive)
 }
 
-/// Decode a TCP frame, skipping any non-zero padding bytes that don't form valid frames.
-/// This handles WI-DG devices that may insert non-zero bytes between frames.
+const MAX_HID_FRAME_LEN: usize = 64;
+
+/// Recognize padding by frame shape, never by the size of a socket read.
+fn is_padded_tcp_chunk(data: &[u8]) -> bool {
+    if data.len() < 64 {
+        return false;
+    }
+    decode_tcp_frame_skip_padding(&data[..64]).is_some_and(|(payload, consumed)| {
+        !payload.is_empty()
+            && consumed < 64
+            && data[consumed..64]
+                .iter()
+                .all(|&byte| byte == 0 || byte == 0xff)
+    })
+}
+
+/// Empty payloads indicate discarded padding. An incomplete candidate must
+/// stay buffered so a checksum-valid sequence inside its payload cannot run.
 fn decode_tcp_frame_skip_padding(data: &[u8]) -> Option<(Vec<u8>, usize)> {
-    if data.is_empty() {
-        return None;
-    }
-
-    if let Some(result) = packet::decode_tcp_frame(data) {
-        return Some(result);
-    }
-
-    for offset in 1..data.len() {
+    let mut offset = 0;
+    while offset < data.len() {
+        let len = data[offset] as usize;
+        // A request frame (length + payload + checksum) must fit one 64-byte
+        // HID report, so any other length byte is padding (0x00 or 0xFF), not
+        // a frame start worth waiting for.
+        if !(2..MAX_HID_FRAME_LEN).contains(&len) {
+            offset += 1;
+            continue;
+        }
+        if data.len() - offset < len + 1 {
+            return (offset > 0).then(|| (vec![], offset));
+        }
         if let Some((payload, consumed)) = packet::decode_tcp_frame(&data[offset..]) {
             return Some((payload, offset + consumed));
         }
+        offset += 1;
+    }
+    (offset > 0).then(|| (vec![], offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesced_frames_are_not_mistaken_for_padded_chunks() {
+        let mut data = packet::encode_frame(&[0x31]).repeat(22);
+        assert_eq!(data.len(), 66);
+        assert!(!is_padded_tcp_chunk(&data));
+        for _ in 0..22 {
+            let (payload, consumed) = decode_tcp_frame_skip_padding(&data).unwrap();
+            assert_eq!(payload, vec![0x31]);
+            data.drain(..consumed);
+        }
+        assert!(data.is_empty());
     }
 
-    None
+    #[test]
+    fn padded_chunks_and_unknown_commands_preserve_frame_boundaries() {
+        let mut data = packet::encode_frame(&[0x31]);
+        data.resize(64, 0);
+        data.extend_from_slice(&packet::encode_frame(&[0xe9, 4, 3, 2]));
+        assert!(is_padded_tcp_chunk(&data));
+        let (payload, consumed) = decode_tcp_frame_skip_padding(&data).unwrap();
+        assert_eq!(payload, vec![0x31]);
+        data.drain(..consumed);
+        assert_eq!(
+            decode_tcp_frame_skip_padding(&data),
+            Some((vec![0xe9, 4, 3, 2], data.len()))
+        );
+    }
+
+    #[test]
+    fn padded_chunk_can_have_a_leading_zero_report_id() {
+        let mut data = vec![0];
+        data.extend_from_slice(&packet::encode_frame(&[0x31]));
+        data.resize(64, 0xff);
+        assert!(is_padded_tcp_chunk(&data));
+        assert_eq!(decode_tcp_frame_skip_padding(&data), Some((vec![0x31], 4)));
+    }
+
+    #[test]
+    fn padding_stream_is_consumed_without_growing_buffer() {
+        for padding in [0, 0xff] {
+            let mut data = Vec::new();
+            for _ in 0..100 {
+                data.extend_from_slice(&[padding; 512]);
+                let (payload, consumed) = decode_tcp_frame_skip_padding(&data).unwrap();
+                assert!(payload.is_empty());
+                data.drain(..consumed);
+                assert!(data.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_frame_waits_at_every_boundary() {
+        let data = packet::encode_frame(&[0xe9, 4, 3, 2, 0x31, 0x33]);
+        for split in 1..data.len() {
+            assert_eq!(decode_tcp_frame_skip_padding(&data[..split]), None);
+        }
+        assert_eq!(
+            decode_tcp_frame_skip_padding(&data).unwrap().0,
+            data[1..data.len() - 1]
+        );
+    }
+
+    #[test]
+    fn maximum_length_hid_frame_waits_for_all_bytes() {
+        let payload = vec![0xe9; 62];
+        let data = packet::encode_frame(&payload);
+        assert_eq!(data.len(), 64);
+        for split in 1..data.len() {
+            assert_eq!(decode_tcp_frame_skip_padding(&data[..split]), None);
+        }
+        assert_eq!(decode_tcp_frame_skip_padding(&data), Some((payload, 64)));
+    }
+
+    #[test]
+    fn short_ff_padding_ahead_of_a_frame_does_not_stall() {
+        let mut data = vec![0xff; 20];
+        data.extend_from_slice(&packet::encode_frame(&[0x31]));
+        assert_eq!(
+            decode_tcp_frame_skip_padding(&data),
+            Some((vec![0x31], data.len()))
+        );
+        // A lone run of 0xFF padding is consumed rather than awaited.
+        data.truncate(20);
+        assert_eq!(decode_tcp_frame_skip_padding(&data), Some((vec![], 20)));
+    }
+
+    #[test]
+    fn incomplete_frame_does_not_execute_embedded_frame() {
+        let data = [0x07, 0x04, 0xff, 0xc8, 0x02, 0x31, 0x33, 0x38];
+        assert_eq!(decode_tcp_frame_skip_padding(&data[..7]), None);
+        assert_eq!(
+            decode_tcp_frame_skip_padding(&data),
+            Some((vec![0x04, 0xff, 0xc8, 0x02, 0x31, 0x33], 8))
+        );
+    }
 }

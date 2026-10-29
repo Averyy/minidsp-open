@@ -1,8 +1,11 @@
 # Compatibility Verification Master Checklist
 
+Device identifiers, board roles, and network endpoints below are synthetic
+examples substituted for local validation hardware; technical results are retained.
+
 This file is the master verification plan for finishing compatibility testing.
 
-It replaces the earlier compatibility and ESP32/MiniDSP investigation TODOs. Any useful content from those temporary docs should be preserved here, in `PROGRESS.md`, or in the permanent `ref-*` docs.
+It replaces the earlier compatibility and ESP32/MiniDSP investigation TODOs. Keep current open items here or in `PROGRESS.md`, completed changes in [CHANGELOG.md](../CHANGELOG.md), and stable technical detail in the permanent `ref-*` docs.
 
 Current planning note:
 - the project now uses the physical 2x4 HD as the live regression case for shared behavior
@@ -374,7 +377,7 @@ This section is mandatory before deleting the compatibility todo.
 - [x] `POST /devices/0/config` applies master status fields correctly.
   Re-verified on 2026-04-14 on the physical 2x4 HD: bare compatibility master-status bodies such as `{"volume":-22.5}` belong on `POST /devices/0`, while `POST /devices/0/config` applies the same fields through the structured `{"master_status":{...}}` shape. Both paths updated live master state correctly on the board.
 - [x] `POST /devices/0/config` applies input PEQ/gain/mute correctly.
-  Covered by the real-device ESP32 retest recorded in `PROGRESS.md`: config read/write for PEQ/gains/routing/delay/polarity/mute was live-verified on the physical 2x4 HD.
+  Covered by the real-device ESP32 retest summarized in [CHANGELOG.md](../CHANGELOG.md): config read/write for PEQ/gains/routing/delay/polarity/mute was live-verified on the physical 2x4 HD.
 - [x] `POST /devices/0/config` applies output PEQ/gain/mute/delay/invert correctly.
   Covered by the same real-device ESP32 retest on the physical 2x4 HD.
 - [x] If routing/crossover/compressor/FIR fields are part of the compatibility shape, they are implemented and tested.
@@ -534,9 +537,10 @@ This section must be completed after the technical tests.
 
 ### 10.5 `PROGRESS.md`
 
-- [ ] Checked items remain checked only if verified.
+- [ ] Current status distinguishes implementation from hardware verification.
 - [ ] Any failed verification is added as a concrete open item.
-- [ ] Known issues / deferred section reflects the post-test reality.
+- [ ] Open verification, deferred work, and next steps reflect the post-test reality.
+- [ ] User-visible changes are in [CHANGELOG.md](../CHANGELOG.md) under Unreleased; `PROGRESS.md` has no dated history.
 
 ---
 

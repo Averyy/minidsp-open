@@ -77,7 +77,7 @@ pub fn decode_frame(data: &[u8]) -> Option<Vec<u8>> {
     }
     let len = data[0] as usize; // self-inclusive
     let total = len + 1; // +1 for checksum
-    if data.len() < total {
+    if len < 2 || data.len() < total {
         return None;
     }
     // Verify checksum
@@ -116,6 +116,20 @@ pub fn decode_hid_response(data: &[u8]) -> Option<Vec<u8>> {
     // logical MiniDSP response still begins at the next byte.
     match data.first().copied() {
         Some(0x00) => {
+            // A length byte can also be an opcode. Prefer a validated read
+            // frame, but keep unframed write echoes and event reports intact.
+            if let Some((payload, _)) = decode_response_frame(&data[1..]) {
+                let valid_read = match payload.first().copied() {
+                    Some(crate::commands::CMD_READ_HARDWARE_ID) => payload.len() >= 4,
+                    Some(crate::commands::CMD_READ_FLOATS) => payload.len() >= 5,
+                    Some(crate::commands::CMD_READ_FLASH) => payload.len() >= 3,
+                    Some(crate::commands::CMD_READ_FLASH_FULL_ADDR) => payload.len() >= 4,
+                    _ => false,
+                };
+                if valid_read && !crate::commands::is_write_command(data[1]) {
+                    return Some(payload);
+                }
+            }
             if matches!(
                 data.get(1).copied(),
                 Some(crate::commands::CMD_READ_HARDWARE_ID)
@@ -275,7 +289,10 @@ pub fn encode_device_console_tcp_response(
 /// Returns `(payload, bytes_consumed)` or None if insufficient data.
 pub fn decode_tcp_response(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     // RESP_ERROR is zero-valued, so an exact single-byte error must be
-    // recognized before we strip WI-DG-style leading zero padding.
+    // recognized before we strip WI-DG-style leading zero padding. A zero
+    // followed by more bytes stays padding: Wi-DG forwards whole 64-byte HID
+    // reports, so a leftover zero ahead of a `[0x01][echo]` write ack is
+    // routine, while a coalesced error-then-ack is not.
     if data == [crate::commands::RESP_ERROR] {
         return Some((vec![crate::commands::RESP_ERROR], 1));
     }
@@ -300,6 +317,32 @@ pub fn decode_tcp_response(data: &[u8]) -> Option<(Vec<u8>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_frames_without_an_opcode() {
+        assert_eq!(decode_frame(&[0]), None);
+        assert_eq!(decode_frame(&[1, 1]), None);
+    }
+
+    #[test]
+    fn hid_framed_hardware_id_with_opcode_sized_length() {
+        assert_eq!(
+            decode_hid_response(&[0, 5, 0x31, 1, 2, 10]),
+            Some(vec![0x31, 1, 2, 10])
+        );
+    }
+
+    #[test]
+    fn hid_unframed_write_echo_is_not_reinterpreted_as_a_read_frame() {
+        let report = [0, 6, 5, 0xff, 0xa3, 3, 1, 0, 0];
+        assert_eq!(decode_hid_response(&report), Some(report[1..].to_vec()));
+    }
+
+    #[test]
+    fn tcp_leftover_zero_before_write_ack_is_padding() {
+        assert_eq!(decode_tcp_response(&[0, 1]), Some((vec![1], 2)));
+        assert_eq!(decode_tcp_response(&[0]), Some((vec![0], 1)));
+    }
 
     #[test]
     fn frame_roundtrip() {

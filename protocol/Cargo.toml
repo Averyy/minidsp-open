@@ -1,6 +1,6 @@
 [package]
 name = "minidsp-protocol"
-description = "MiniDSP wire protocol — encoding, commands, device definitions. Pure Rust, no_std compatible."
+description = "MiniDSP wire protocol — encoding, commands, device definitions. Pure Rust, shared by desktop and ESP32."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

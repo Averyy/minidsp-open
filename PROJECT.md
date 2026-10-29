@@ -17,9 +17,9 @@ minidsp-open adds:
 - Fixes for every actionable open issue
 
 
-## Goal: Fix Everything Wrong With minidsp-rs
+## Compatibility and Reliability Goals
 
-minidsp-rs is an upstream protocol reference (one maintainer, 10 stale dependabot PRs, 9 unresolved device requests). We fix all of it:
+The minidsp-rs issue tracker provides useful interoperability and reliability cases. This project targets the following behaviors:
 
 | minidsp-rs issue | Problem | Our fix |
 |-----------------|---------|---------|
@@ -156,7 +156,9 @@ Platform splits use `cfg(target_os = "espidf")`. Proven pattern in esp-rs ecosys
 | 12V trigger | N/A | GPIO + MOSFET (future) |
 | WiFi provisioning | N/A | Captive portal (DNS hijack + DHCP Option 114) |
 
-**ESP32 is std-on-ESP-IDF, not no_std.** Blocking architecture — each HTTP request runs in an EspHttpServer FreeRTOS task. esp-idf-svc (std) provides WiFi, mDNS, NVS, and HTTP server. The protocol crate is the only true no_std crate (pure Rust, no platform deps). Device tables are all `&'static` / `const` — they live in flash (.rodata), not heap.
+**ESP32 is std-on-ESP-IDF, not no_std.** Blocking architecture — each HTTP request runs in an EspHttpServer FreeRTOS task. esp-idf-svc (std) provides WiFi, mDNS, NVS, and HTTP server. The protocol crate is the shared one: pure Rust with no platform deps, built with std on both targets. Device tables are all `&'static` / `const` — they live in flash (.rodata), not heap.
+
+The firmware baseline is ESP-IDF v6.0.3 with `esp-idf-sys` 0.38, `esp-idf-svc` 0.53, and `esp-idf-hal` 0.47. `sdkconfig.defaults` selects Newlib instead of IDF 6.0's default PicolibC and keeps FreeRTOS and ring-buffer functions in IRAM. The USB Host Library comes from the `espressif/usb` registry component. Firmware SHA-256 checks use the pure-Rust `sha2` crate instead of legacy mbedTLS APIs.
 
 Original plan used picoserve (zero-alloc) and embassy-executor (async). Switched to EspHttpServer + blocking std after picoserve had compatibility issues with ESP-IDF httpd. serde_json works fine on ESP32 — 167KB heap free at steady state with 13 open sockets.
 
@@ -436,7 +438,8 @@ Canonical compatibility reference:
 
 ## Phase Overview
 
-See `PROGRESS.md` for the full task checklist. High-level phasing:
+See [PROGRESS.md](PROGRESS.md) for current status and open work, and
+[CHANGELOG.md](CHANGELOG.md) for changes and earlier milestones. High-level phasing:
 
 **Phase 1 — Desktop + ESP32 core (ship first, verify it works):**
 Protocol crate, all device definitions (7 SHARC + 6 legacy), command queue, config read-back, measurement mode, connection resilience, USB/TCP transports, HTTP API (axum + EspHttpServer), CLI, ESP32 USB host HID, WiFi provisioning, mDNS, WebSocket compat, level meters, diagnostics, testing.
@@ -557,7 +560,7 @@ From comprehensive GitHub issue review (34 open, 10 dependabot PRs, last release
 | #625 | Negative PEQ coefficients parsed as CLI flags | Low | Trivial |
 | #571 | No CORS headers for REST API | Medium | Trivial |
 | #569 | nanoAVR HDA (hw_id 8) partially broken | Low | 1 day |
-| #245 | PWR-ICE125/250 — deferred, see `docs/TODO4-pwr-ice-compatibility.md` | — | Transport (70-byte frames) included; full support needs user packet captures |
+| #245 | PWR-ICE125/250 (deferred), see `docs/TODO4-pwr-ice-compatibility.md` | - | Transport/basic control unverified; DSP tables need owner-supplied plugin/XML or captures |
 | #229 | MiniDSP 2x4 non-HD (legacy dialect, VID 0x04D8) | Medium | 2 days |
 
 Also: minidsp-rs serves ReDoc at `/api` and OpenAPI schema at `/openapi.json`. We serve the same plus `llms.txt` at webapp root for AI/LLM discoverability.
@@ -644,14 +647,14 @@ No safe Rust wrapper exists. Use `esp-idf-sys` FFI to the ESP-IDF HID Host class
 - Our biquad index must support both
 
 ### ezBEQ license: MIT (both ezbeq and beqcatalogue)
-Full permission to redistribute UI build artifacts and reprocess catalogue data, including commercially. Must include MIT copyright notice.
+ezBEQ and beqcatalogue publish MIT licenses. Preserve their copyright and permission notices in downloaded/generated distributions; see `NOTICE`.
 
 ### ezBEQ UI build: No separate release artifact
 UI static files are bundled inside the Python wheel on PyPI (in `ezbeq/ui/`). Our GitHub Action must either extract from the wheel or build from source (`cd ui && yarn install && yarn build`).
 
 ## License
 
-MIT. 100% our code, not a fork. Credit minidsp-rs in README as protocol reference and inspiration.
+Original code is MIT licensed and independently implemented, not a fork. Protocol knowledge is informed by minidsp-rs (Apache-2.0). Included vendor XML and generated vendor-data tables/reset payloads are covered by the provenance notices in `NOTICE` and the asset READMEs, and are excluded from this repository's MIT license. Downloaded ezBEQ UI and beqcatalogue data retain their upstream MIT notices.
 
 ## Legacy Device Support
 
@@ -660,7 +663,7 @@ Canonical source:
 
 That file owns:
 - launch inventory
-- clean-room source-data notes
+- vendor source-data provenance notes
 - probe mapping
 - deferred legacy devices
 - rough effort estimates

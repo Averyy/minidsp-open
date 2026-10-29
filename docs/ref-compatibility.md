@@ -71,6 +71,13 @@ Desktop compatibility should preserve that behavior when feasible.
 | `minidsp probe` | Enumerate connected devices |
 | `minidsp server` | Compatibility-relevant command; upstream marks it deprecated in favor of `minidspd` packaging/service flow |
 | `minidsp --force-kind <type>` | Backward-compatible override |
+| `minidsp -V` | Print `minidsp <semver>`; the last token must parse as semver **greater than `0.1.12`** |
+
+`-V` is load-bearing: ezBEQ ≥ 2.7.0 runs `minidsp -V`, parses the last token
+with `semver`, and only targets Flex HTx **input** PEQs when it is above
+`0.1.12` (the last official minidsp-rs release). A lower version silently
+moves HTx BEQ filters to the outputs. The workspace version therefore stays
+above `0.1.12`, and `app-desktop` has a test enforcing it.
 
 ### Required command families
 
@@ -536,6 +543,14 @@ ignore_advertisements = false
 
 These are allowed, but they are not part of the compatibility contract unless later promoted here:
 
+- minidsp-open rattle-finder extensions (desktop daemon and ESP32 HTTP API):
+  `minidsp --daemon-url http://host:5380 rattle` accepts optional `--tones`,
+  `--start-hz`/`--end-hz`/`--count`, `--hold`, `--gap`, `--cycles`, and
+  `--volume` flags; `MINIDSPD_URL`, `--device-index`, and `-o json`/`jsonline`
+  are supported. Ctrl-C requests a fade-out and waits for restoration.
+  `POST /devices/{id}/rattle` starts, `GET /devices/{id}/rattle` reports status,
+  and `POST /devices/{id}/rattle/stop` stops. See [ref-playback.md](ref-playback.md#rattle-finder)
+  for the shared contract. Existing CLI and HTTP behavior stays compatible.
 - `GET /devices/{id}/config` full config read-back
 - extended `/devices/{id}/config` fields beyond the compatibility request body documented above (including the optional `polarity_inverted` per routing entry on families whose `RoutingMatrix.polarity_base` is populated — DSP_110 Flex Eight, DSP_113 / DSP_115 Flex HT/HTx, legacy DDRC-88BM)
 - controller-side snapshot backup / restore routes:
@@ -575,7 +590,7 @@ Additive rule:
 - additive features should prefer new routes over behavior changes on compatibility routes
 
 Current verification note:
-- TCP bridge write-ack framing is fixed and wire-verified on the physical 2x4 HD (2026-04-10) via Python TCP client against the live daemon: `WriteDSP` shrank from 64 bytes to 9 bytes, `SetVolume` from 64 to 3 bytes, `SetMute` from 64 to 3 bytes, and read responses are unchanged at 12 bytes each. The follow-up live official-app check on 2026-04-13 also proved the stock macOS Device Console can now complete the network-device `Initialize to Default Settings` flow over the ESP32 bridge without the previous parser/reload failure. Remaining official-app work is the broader interactive surface: status reads, volume/mute/preset/source writes, routing edits, and PEQ edits. Tracked in `PROGRESS.md` Active Work and `docs/todo-checker.md` Section 4.2.
+- TCP bridge write-ack framing is fixed and wire-verified on the physical 2x4 HD (2026-04-10) via Python TCP client against the live daemon: `WriteDSP` shrank from 64 bytes to 9 bytes, `SetVolume` from 64 to 3 bytes, `SetMute` from 64 to 3 bytes, and read responses are unchanged at 12 bytes each. The follow-up live official-app check on 2026-04-13 also proved the stock macOS Device Console can now complete the network-device `Initialize to Default Settings` flow over the ESP32 bridge without the previous parser/reload failure. Remaining official-app work is the broader interactive surface: status reads, volume/mute/preset/source writes, routing edits, and PEQ edits. Tracked in [PROGRESS.md](../PROGRESS.md#device-control-and-compatibility) and `docs/todo-checker.md` Section 4.2.
 - Desktop `GET /devices/{id}` is live-verified on the physical 2x4 HD after the 2026-04-10 meter fallback fix: malformed DSP100 meter replies now degrade to `-140 dB` silence instead of stalling compatibility status.
 - Desktop config read-back is implemented, but on DSP100 / 2x4 HD some fields still rely on verified shadow state rather than authoritative live hardware readback. Fresh-daemon `/devices/{id}/config` now clamps bogus low-address DSP100 scalar/tap reads to verified shadow or conservative zero instead of surfacing garbage values.
 - Desktop daemon preset-content writes now also mirror the official app's explicit modification-token save model on the physical 2x4 HD, so `/devices/{id}/config` shadow restore is keyed by a real active-preset freshness marker rather than by raw runtime writes that never touched `0xFFC8`.

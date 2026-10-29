@@ -24,7 +24,7 @@ ESP-IDF exposes `esp_log_set_vprintf()` to redirect all log output to a custom f
 
 ### Rust `log` crate integration via esp-idf-svc
 
-`esp-idf-svc` (v0.52, current) provides `EspIdfLogger` which implements the Rust `log::Log` trait:
+`esp-idf-svc` (v0.53) provides `EspIdfLogger` which implements the Rust `log::Log` trait:
 
 - Writes directly to stdout (same output as native ESP-IDF logging, with matching format and colors)
 - `EspIdfLogFilter` backend respects ESP-IDF's per-tag log level configuration
@@ -197,31 +197,56 @@ These are point-in-time metrics, not log events. Serve at `GET /debug/info`:
 
 ```json
 {
-  "firmware": "0.1.0",
-  "uptime_secs": 86400,
-  "heap_free": 145000,
-  "heap_min_free": 98000,
+  "firmware": "0.2.0",
+  "uptime_secs": 883,
+  "heap_free": 4047663,
+  "heap_min": 3966155,
+  "internal_heap": { "free": 37571, "min": 33499, "largest_block": 19456 },
+  "task_stacks": [{ "name": "httpd", "free_bytes": 5208 }, "..."],
   "wifi": {
     "connected": true,
     "ssid": "HomeNetwork",
     "rssi": -52,
     "ip": "192.168.1.100",
-    "channel": 6
+    "channel": 6,
+    "lastWifiDisconnectReason": 0
   },
-  "usb": {
-    "connected": true,
-    "device": "MiniDSP 2x4HD",
-    "hw_id": 10,
-    "serial": "900123",
-    "reconnects": 2,
-    "last_error": null,
-    "last_cmd_ms": 3
-  },
+  "usb": { "connected": true, "device": "2x4HD", "hw_id": 10, "serial": 900123 },
   "log_level": "info",
   "log_buffer_used": 2847,
   "log_buffer_size": 4096
 }
 ```
+
+`heap_*` covers all heaps, PSRAM included. `internal_heap` is internal RAM
+only. That's the number to watch: WiFi, lwIP and DMA need it, and
+`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` sends every allocation of 16 KB or less
+there first. `task_stacks` gives each FreeRTOS task's stack high-water mark
+(bytes never touched).
+
+`POST /debug/heap/reset-min` restarts the internal `min`, so the cost of one
+request shows up on its own: reset, make the request, then read
+`/debug/info`. At debug log level, the ezBEQ `/ws` handler also logs internal
+RAM at each step of a new connection.
+
+Leaks are found with the heap-tracing profile:
+
+```bash
+CARGO_TARGET_DIR=target-heaptrace \
+ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.heaptrace.defaults" \
+tools/esp-cargo build --release
+```
+
+The separate target directory keeps the normal build from a full rebuild, and
+it has to sit directly in `app-esp32/`. esp-idf-sys treats the target
+directory's parent as the project: it runs `cargo metadata` there to find the
+extra components, and resolves the sdkconfig defaults and `partitions.csv`
+against it. Anywhere else, the build loses LittleFS, USB host and the
+WebSocket server. The profile
+adds `POST /debug/heaptrace/start` and `POST /debug/heaptrace/stop`. Stop logs
+each internal allocation still held since start, with its call stack, to the
+console and `/debug/log`. Decode the addresses with
+`xtensa-esp32s3-elf-addr2line -pfiaC -e <elf>`.
 
 For updater-specific diagnostics, the ESP32 also exposes `GET /debug/updater` with:
 

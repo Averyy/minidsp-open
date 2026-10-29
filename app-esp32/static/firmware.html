@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>miniDSP-Open Firmware</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;
+background:#0B0B10;color:#E8E8ED;display:flex;justify-content:center;padding:1.5rem;min-height:100vh}
+.card{background:rgba(28,20,40,0.35);border:1px solid rgba(180,180,255,0.07);border-radius:16px;
+padding:2rem;width:100%;max-width:420px;align-self:flex-start}
+h1{font-size:1.25rem;font-weight:600;margin-bottom:0.25rem}
+.subtitle{font-size:0.8rem;color:#A1A1A6;margin-bottom:1.5rem}
+h2{font-size:0.8rem;font-weight:600;color:#A1A1A6;text-transform:uppercase;letter-spacing:0.04em;margin:1.5rem 0 0.5rem}
+dl{display:grid;grid-template-columns:auto 1fr;gap:0.35rem 1rem;font-size:0.9rem}
+dt{color:#A1A1A6}dd{overflow-wrap:anywhere}
+p{font-size:0.9rem;line-height:1.4;margin-bottom:0.75rem}
+input[type=file]{width:100%;font-size:0.85rem;color:#A1A1A6;margin-bottom:0.75rem}
+button{width:100%;height:44px;background:rgba(59,138,255,0.15);color:#6BA7FF;
+border:1px solid rgba(59,138,255,0.2);border-radius:10px;font-size:0.95rem;font-weight:500;
+cursor:pointer;margin-bottom:0.5rem}
+button:hover{background:rgba(59,138,255,0.25)}
+button:disabled{opacity:0.4;cursor:default}
+progress{width:100%;height:8px;margin:0.5rem 0}
+.err{color:#FF6B6B}.ok{color:#5FD38D}
+a{color:#6BA7FF}
+</style></head><body>
+<div class="card">
+<h1>miniDSP-Open Firmware</h1>
+<p><a href="/status">Device status &amp; rattle finder</a></p>
+<p class="subtitle">Install a release from GitHub, or upload a build.</p>
+<dl>
+<dt>Running</dt><dd id="version">…</dd>
+<dt>Build</dt><dd id="build">…</dd>
+<dt>Slot</dt><dd id="slot">…</dd>
+</dl>
+
+<h2>GitHub release</h2>
+<p id="latest">Not checked yet.</p>
+<button id="check">Check for update</button>
+<button id="install" disabled>Install update</button>
+
+<h2>Upload</h2>
+<p>Choose the app image (<code>minidsp-open-esp32-*.bin</code>, not the <code>-full</code> image).</p>
+<input type="file" id="file" accept=".bin">
+<button id="upload" disabled>Upload and install</button>
+
+<progress id="bar" max="1" value="0" hidden></progress>
+<p id="msg"></p>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let waitingForReboot = null;
+let lastCheck = null;
+
+function message(text, cls) { $('msg').textContent = text; $('msg').className = cls || ''; }
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch('/firmware', {cache: 'no-store'})).json(); }
+  catch (e) { if (waitingForReboot) message('Rebooting…'); return; }
+  $('version').textContent = s.version;
+  $('build').textContent = s.build;
+  $('slot').textContent = s.runningSlot + (s.slotState === 'pendingVerify' ? ' (verifying)' : '');
+  if (waitingForReboot && (s.build !== waitingForReboot || s.version !== $('version').dataset.before)) {
+    waitingForReboot = null;
+    message('Updated to ' + s.version + ' (' + s.build + ').', 'ok');
+  }
+  const l = s.latest;
+  if (l) {
+    if (l.error) $('latest').textContent = 'Check failed: ' + l.error;
+    else if (l.updateAvailable) {
+      $('latest').innerHTML = 'Version <b></b> is available. ';
+      $('latest').querySelector('b').textContent = l.version;
+      if (l.releaseNotesUrl) {
+        const a = document.createElement('a');
+        a.href = l.releaseNotesUrl; a.target = '_blank'; a.textContent = 'Release notes';
+        $('latest').appendChild(a);
+      }
+    } else $('latest').textContent = 'Up to date (latest release ' + (l.version || '?') + ').';
+    $('install').disabled = !l.updateAvailable;
+    if (lastCheck !== null && l.checkedAtUptimeSec !== lastCheck) $('check').disabled = false;
+    lastCheck = l.checkedAtUptimeSec;
+  }
+  const p = s.progress;
+  if (p && p.state === 'writing') {
+    $('bar').hidden = false; $('bar').max = p.totalBytes; $('bar').value = p.bytesWritten;
+    message('Writing ' + Math.round(100 * p.bytesWritten / p.totalBytes) + '%…');
+  } else if (p && p.state === 'failed' && !waitingForReboot) {
+    $('bar').hidden = true; message('Update failed: ' + p.error, 'err');
+  } else if (p && p.state === 'rebooting') {
+    $('bar').hidden = true;
+    if (!waitingForReboot) { waitingForReboot = s.build; $('version').dataset.before = s.version; }
+    message('Rebooting into the new firmware…');
+  }
+}
+
+$('check').onclick = async () => {
+  $('check').disabled = true;
+  await fetch('/firmware/check', {method: 'POST'});
+  setTimeout(() => { $('check').disabled = false; }, 20000);
+};
+
+$('install').onclick = async () => {
+  $('install').disabled = true;
+  const r = await fetch('/firmware/update', {method: 'POST'});
+  if (!r.ok) message((await r.json()).error || 'Install failed', 'err');
+};
+
+$('file').onchange = () => { $('upload').disabled = !$('file').files.length; };
+
+$('upload').onclick = () => {
+  const file = $('file').files[0];
+  if (!file) return;
+  $('upload').disabled = true;
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/firmware');
+  xhr.upload.onprogress = e => {
+    $('bar').hidden = false; $('bar').max = e.total; $('bar').value = e.loaded;
+    message('Uploading ' + Math.round(100 * e.loaded / e.total) + '%…');
+  };
+  xhr.onload = () => {
+    $('bar').hidden = true;
+    if (xhr.status === 200) {
+      waitingForReboot = $('build').textContent; $('version').dataset.before = $('version').textContent;
+      message('Installed. Rebooting…');
+    } else {
+      let err = xhr.responseText;
+      try { err = JSON.parse(err).error; } catch (e) {}
+      message('Upload failed: ' + err, 'err'); $('upload').disabled = false;
+    }
+  };
+  xhr.onerror = () => { message('Upload failed: connection lost', 'err'); $('upload').disabled = false; };
+  xhr.send(file);
+};
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body></html>

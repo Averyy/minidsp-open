@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# An activated ESP-IDF environment can select tools for the wrong IDF version.
+# Pin esptool to match the IDF installed by esp-idf-sys, independently of it.
+set -euo pipefail
+
+exec uvx --from esptool==5.6.0 esptool "$@"

@@ -1,0 +1,57 @@
+Third-party provenance and attribution
+======================================
+
+minidsp-open's original implementation is licensed under the root MIT LICENSE.
+That license does not cover the vendor data described below. Product names and
+trademarks remain the property of their respective owners; inclusion does not
+imply endorsement.
+
+MiniDSP vendor data
+-------------------
+protocol/assets/audio_firmware/*/DSP_default_parameters.xml are MiniDSP Device
+Console application resources, extracted from
+Contents/Resources/device_support_package/DSP_Structures/.
+third_party/legacy-configs/*/config.xml are manufacturer-derived SigmaStudio
+exports obtained through minidsp-rs's devtools/src/codegen source-data corpus.
+These XML files are retained for device interoperability: register definitions,
+configuration interpretation, and default-preset generation. MiniDSP and any
+other original rights holders retain their rights. These files are excluded
+from this repository's MIT license; no MiniDSP redistribution license is granted
+by this notice or inferred from their availability in minidsp-rs.
+
+Generated data in docs/generated/device-support-matrix.json,
+protocol/src/device/generated_official.rs, and build-generated default/reset
+payloads derives from these vendor resources and other Device Console metadata.
+The original extraction/generation code is MIT licensed; generating data does
+not relicense the underlying vendor material. Preserve this provenance notice
+with distributions containing the vendor data or generated descendants.
+
+minidsp-rs
+-----------
+https://github.com/mrene/minidsp-rs (dev branch)
+Credit to Mathieu Rene and the minidsp-rs contributors for protocol knowledge,
+reference packet examples, and the legacy SigmaStudio export corpus from
+devtools/src/codegen. minidsp-rs is licensed under Apache License, Version 2.0;
+a copy is included at third_party/licenses/minidsp-rs-Apache-2.0.txt.
+The retained upstream packet examples in docs/ref-compatibility.md are credited
+to that project. Our parsers, code generators, and controller implementation
+are original code. The Apache license does not establish rights to MiniDSP's
+underlying vendor data.
+
+ezBEQ and beqcatalogue
+----------------------
+The ESP32 site bundle downloads the ezBEQ hosted UI and beqcatalogue catalogue
+data, then packages them for local serving. They are separate upstream works:
+
+ezBEQ: https://github.com/3ll3d00d/ezbeq
+Copyright (c) 2021 Matt Khan. MIT License.
+Full copyright, permission, and warranty notice: third_party/licenses/ezbeq-MIT.txt
+
+beqcatalogue: https://github.com/3ll3d00d/beqcatalogue
+Copyright (c) 2020 Matt Khan. MIT License.
+Full copyright, permission, and warranty notice:
+third_party/licenses/beqcatalogue-MIT.txt
+
+Distributions of downloaded/generated UI and catalogue bundles must retain
+these upstream copyright and license notices, along with any additional
+notices supplied by the downloaded packages and catalogue sources.

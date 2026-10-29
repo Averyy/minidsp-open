@@ -20,6 +20,9 @@ pub enum TransportError {
     Busy,
 }
 
+pub type ReconnectFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn Transport>, TransportError>> + Send + 'a>>;
+
 /// Async transport trait — abstracts USB HID and TCP connections.
 ///
 /// The `send_frame` and `recv_frame` methods operate on raw command payloads
@@ -46,6 +49,14 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Close the transport.
     fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
+
+    /// Reopen this connection after an ambiguous exchange or disconnect.
+    fn reconnect(&self) -> ReconnectFuture<'_> {
+        Box::pin(async move {
+            let _ = self.close().await;
+            crate::queue::open_transport(&self.url()).await
+        })
+    }
 
     /// Transport description (for probe output).
     fn url(&self) -> String;

@@ -107,7 +107,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atv-companion-spike"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1223,7 +1223,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "minidsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "minidsp-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "minidsp-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "cpal",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "minidsp-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",

@@ -8,12 +8,15 @@
 //!   GET  /debug/log   — ring buffer log snapshot
 //!   POST /debug/level — change runtime log level
 
+#[path = "playback_cleanup.rs"]
+mod playback_cleanup;
+
 use crate::device::DeviceState;
 use crate::diagnostics;
 use crate::snapshot::DeviceSnapshot;
+use crate::threads::Worker;
 use crate::usb_audio;
 use crate::usb_hid::UsbHidError;
-use esp_idf_hal::task::thread::{MallocCap, ThreadSpawnConfiguration};
 use esp_idf_svc::http::client::{Configuration as HttpClientConfiguration, EspHttpConnection};
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
@@ -24,6 +27,7 @@ use minidsp_protocol::commands;
 use minidsp_protocol::playback::{
     BitDepth, PlayRequest, PlayResponse, PlaybackPlan, SyncRequest, SyncResponse, ToneBurstParams,
 };
+use minidsp_protocol::rattle::{RattlePlan, RattleRequest, RattleResponse};
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::{BmChannelPatch, BmMixerCellPatch, DeviceConfig, StatusSummary};
 use serde_json::json;
@@ -50,6 +54,8 @@ pub(crate) const DEVICE_BUSY: &str = "device busy";
 pub(crate) const HID_BUSY_DURING_PLAYBACK: &str = "device busy during playback";
 static PLAYBACK_STREAM_BUF: Mutex<[u8; 2880]> = Mutex::new([0u8; 2880]);
 const EZBEQ_SHIM_JS: &str = include_str!("../static/ezbeq-shim.js");
+const STATUS_PAGE_HTML: &str = include_str!("../static/status.html");
+const FIRMWARE_PAGE_HTML: &str = include_str!("../static/firmware.html");
 
 macro_rules! try_device_operation_or_409 {
     ($req:expr, $dev:expr) => {
@@ -77,11 +83,13 @@ pub fn start(
 ) -> Result<EspHttpServer<'static>, Box<dyn std::error::Error>> {
     let config = Configuration {
         http_port: port,
-        // STA mode with ezBEQ enabled now registers into the 70s:
-        // core device routes, debug routes, WS endpoints, ezBEQ API, UI/static
-        // routes, and CORS/catch-all handlers. Keep real headroom so small
-        // diagnostics additions don't tear down the entire HTTP server at boot.
-        max_uri_handlers: 88,
+        // STA mode with WebSockets and ezBEQ registers ~90 handlers: core
+        // device routes, debug routes, firmware/OTA, WS endpoints, the ezBEQ
+        // API, UI/static routes, and CORS/catch-all handlers. One more than
+        // this limit fails registration and takes the whole HTTP server down
+        // (and makes a fresh OTA image roll back). Each slot is just a table
+        // entry, so keep generous headroom.
+        max_uri_handlers: 128,
         // `/devices/0/play` does request parsing, source switching, and
         // playback-thread orchestration before handing back the response.
         // The default 16 KiB httpd task stack is not enough on real hardware.
@@ -244,6 +252,9 @@ pub fn start(
     register_source_routes(&mut server, state.clone(), audio_state.clone())?;
     register_preset_routes(&mut server, state.clone(), audio_state.clone())?;
 
+    register_firmware_routes(&mut server, audio_state.clone())?;
+    register_rattle_routes(&mut server, state.clone(), audio_state.clone())?;
+
     {
         server.fn_handler("/sync", Method::Post, move |mut req| {
             let body = match read_request_body(&mut req, 512) {
@@ -284,14 +295,20 @@ pub fn start(
             if !dev.profile().has_usb_audio {
                 return send_error(req, 400, "device does not support USB audio playback");
             }
-            let audio_device =
-                match ensure_audio_device_available(&audio, "play request needs USB audio") {
-                    Ok(device) => device,
-                    Err(message) => return send_error(req, 503, &message),
-                };
+            // Claim playback before touching the audio interface: a running
+            // playback may be mid-recovery with the interface closed, and
+            // reopening it here would race that recovery.
             if !audio.try_begin_playback() {
                 return send_error(req, 409, "playback already in progress");
             }
+            let audio_device =
+                match ensure_audio_device_available(&audio, "play request needs USB audio") {
+                    Ok(device) => device,
+                    Err(message) => {
+                        audio.finish_playback();
+                        return send_error(req, 503, &message);
+                    }
+                };
 
             let test_mode = parse_query_param(&uri, "test");
 
@@ -347,7 +364,7 @@ pub fn start(
             };
 
             let (dev_for_thread, source_changed, previous_source, restore_source) =
-                match switch_to_usb_source(&st, &dev) {
+                match switch_to_usb_source(&st, &audio, &dev) {
                     Ok(result) => result,
                     Err((code, msg)) => {
                         audio.finish_playback();
@@ -358,18 +375,18 @@ pub fn start(
             let (tx, rx) = mpsc::sync_channel(1);
             let audio_for_thread = audio.clone();
             let restore_source_for_error = restore_source;
-            if let Err(err) = spawn_playback_thread(
-                st.clone(),
-                dev_for_thread.clone(),
-                audio_for_thread,
+            if let Err(err) = spawn_playback_thread(PlaybackThreadParams {
+                state: st.clone(),
+                dev: dev_for_thread.clone(),
+                audio_state: audio_for_thread,
                 audio_device,
-                Box::new(plan),
+                plan: Box::new(plan),
                 total_bytes,
                 source_changed,
                 previous_source,
                 restore_source,
-                tx,
-            ) {
+                started_tx: tx,
+            }) {
                 if let Err(restore_err) = restore_source_after_playback(
                     &st,
                     &audio,
@@ -383,21 +400,29 @@ pub fn start(
                 return send_error(req, 500, &format!("spawn playback thread: {err}"));
             }
 
+            // From here the playback thread owns the busy flag: it clears it
+            // after restoring the source, even on a start failure.
             match rx.recv() {
                 Ok(Ok(response)) => match serde_json::to_string(&response) {
                     Ok(json) => send_json(req, 200, &json),
                     Err(_) => send_error(req, 500, "failed to serialize response"),
                 },
-                Ok(Err(message)) => {
-                    audio.finish_playback();
-                    send_error(req, 500, &message)
-                }
-                Err(_) => {
-                    audio.finish_playback();
-                    send_error(req, 500, "playback thread ended unexpectedly")
-                }
+                Ok(Err(message)) => send_error(req, 500, &message),
+                Err(_) => send_error(req, 500, "playback thread ended unexpectedly"),
             }
         })?;
+    }
+
+    {
+        let audio = audio_state.clone();
+        server.fn_handler(
+            "/devices/0/play",
+            Method::Get,
+            move |req| match serde_json::to_string(&audio.playback_status()) {
+                Ok(json) => send_json(req, 200, &json),
+                Err(_) => send_error(req, 500, "failed to serialize response"),
+            },
+        )?;
     }
 
     // GET /devices/0/config — full config read-back
@@ -977,7 +1002,11 @@ pub fn start(
             match dev.learn_device_snapshot() {
                 Ok(snapshot) => match serde_json::to_string_pretty(&snapshot) {
                     Ok(body) => {
-                        let status = if snapshot.is_strict_complete() { 200 } else { 409 };
+                        let status = if snapshot.is_strict_complete() {
+                            200
+                        } else {
+                            409
+                        };
                         send_json(req, status, &body)
                     }
                     Err(_) => send_error(req, 500, "failed to serialize snapshot"),
@@ -1032,7 +1061,12 @@ pub fn start(
     })?;
 
     server.fn_handler("/ezbeq-shim.js", Method::Get, |req| {
-        send_javascript(req, EZBEQ_SHIM_JS)
+        let path = crate::storage::full_path("ui/ezbeq-shim.js");
+        if std::path::Path::new(&path).exists() {
+            send_static_file(req, &path)
+        } else {
+            send_javascript(req, EZBEQ_SHIM_JS)
+        }
     })?;
 
     // GET /database.json — same-origin browser catalogue for the hosted ezBEQ UI.
@@ -1052,6 +1086,8 @@ pub fn start(
     }
 
     // CORS preflight handler — responds to OPTIONS on any path
+    // The closure supplies the higher-ranked request lifetimes required by fn_handler.
+    #[allow(clippy::redundant_closure)]
     server.fn_handler("/*", Method::Options, |req| send_cors_preflight(req))?;
 
     // Root page — provisioning in SoftAP mode, serve UI or redirect in STA mode
@@ -1232,7 +1268,7 @@ fn get_sta_ip_string() -> Option<String> {
     };
 
     unsafe {
-        let netif = esp_netif_get_handle_from_ifkey(b"WIFI_STA_DEF\0".as_ptr() as _);
+        let netif = esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr());
         if netif.is_null() {
             return None;
         }
@@ -1410,6 +1446,34 @@ fn register_debug_routes(
         }
     })?;
 
+    // POST /debug/heap/reset-min — restart minimum-free tracking from now
+    server.fn_handler("/debug/heap/reset-min", Method::Post, |req| {
+        let restarted = diagnostics::restart_heap_minimum();
+        let body = serde_json::to_string(&serde_json::json!({
+            "restarted": restarted,
+            "internal_heap": diagnostics::internal_heap(),
+        }))
+        .unwrap_or_default();
+        send_json(req, 200, &body)
+    })?;
+
+    // POST /debug/heaptrace/{start,stop} — leak tracing (heap-trace builds only)
+    #[cfg(esp_idf_heap_tracing_standalone)]
+    {
+        server.fn_handler("/debug/heaptrace/start", Method::Post, |req| {
+            match diagnostics::heap_trace::start() {
+                Ok(()) => send_json(req, 200, r#"{"tracing":true}"#),
+                Err(msg) => send_error(req, 500, &msg),
+            }
+        })?;
+        server.fn_handler("/debug/heaptrace/stop", Method::Post, |req| {
+            match diagnostics::heap_trace::stop_and_dump() {
+                Ok(()) => send_json(req, 200, r#"{"tracing":false,"dump":"console"}"#),
+                Err(msg) => send_error(req, 500, &msg),
+            }
+        })?;
+    }
+
     // GET /debug/updater — current updater config/status
     {
         let nvs = nvs.clone();
@@ -1506,6 +1570,94 @@ fn register_debug_routes(
 // ---------------------------------------------------------------------------
 // Device control routes
 // ---------------------------------------------------------------------------
+
+fn register_firmware_routes(
+    server: &mut EspHttpServer<'static>,
+    audio_state: usb_audio::SharedAudioState,
+) -> Result<(), esp_idf_svc::sys::EspError> {
+    const FIRMWARE_TASK_STACK_BYTES: usize = 12 * 1024;
+
+    server.fn_handler("/firmware", Method::Get, |req| match serde_json::to_string(
+        &crate::ota::status(),
+    ) {
+        Ok(json) => send_json(req, 200, &json),
+        Err(_) => send_error(req, 500, "failed to serialize response"),
+    })?;
+
+    server.fn_handler("/update", Method::Get, |req| {
+        send_html(req, FIRMWARE_PAGE_HTML)
+    })?;
+
+    // Raw app image upload: `curl --data-binary @app.bin
+    // 'http://BOARD/firmware?sha256=<hex>'`. The image streams straight into
+    // the inactive slot; the board reboots into it once ESP-IDF verifies it.
+    {
+        let audio = audio_state.clone();
+        server.fn_handler("/firmware", Method::Post, move |mut req| {
+            if audio.is_playing() {
+                return send_error(req, 409, "playback in progress; retry when it finishes");
+            }
+            let Some(total) = req
+                .header("Content-Length")
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                return send_error(req, 411, "Content-Length required");
+            };
+            let sha256 = parse_query_param(req.uri(), "sha256")
+                .or_else(|| req.header("X-Firmware-SHA256").map(str::to_string));
+            let result = crate::ota::write_image("upload", total, sha256.as_deref(), |buf| {
+                req.read(buf).map_err(|e| format!("read upload: {e:?}"))
+            });
+            match result {
+                Ok(()) => {
+                    crate::ota::schedule_reboot();
+                    send_json(
+                        req,
+                        200,
+                        &json!({ "status": "rebooting", "from": crate::ota::FIRMWARE_VERSION })
+                            .to_string(),
+                    )
+                }
+                Err(err @ crate::ota::OtaError::Busy) => send_error(req, 409, &err.to_string()),
+                Err(err @ crate::ota::OtaError::Rejected(_)) => {
+                    send_error(req, 400, &err.to_string())
+                }
+                Err(err) => send_error(req, 500, &err.to_string()),
+            }
+        })?;
+    }
+
+    // Ask GitHub for the latest release; poll GET /firmware for `latest`.
+    server.fn_handler("/firmware/check", Method::Post, |req| {
+        let spawned = std::thread::Builder::new()
+            .name("fw_check_now".into())
+            .stack_size(FIRMWARE_TASK_STACK_BYTES)
+            .spawn(|| {
+                crate::ota::check_for_update();
+            });
+        match spawned {
+            Ok(_) => send_json(req, 202, r#"{"status":"checking"}"#),
+            Err(e) => send_error(req, 500, &format!("spawn check: {e}")),
+        }
+    })?;
+
+    // Install the latest GitHub release; poll GET /firmware for `progress`.
+    {
+        let audio = audio_state;
+        server.fn_handler("/firmware/update", Method::Post, move |req| {
+            if audio.is_playing() {
+                return send_error(req, 409, "playback in progress; retry when it finishes");
+            }
+            match crate::ota::spawn_release_install(FIRMWARE_TASK_STACK_BYTES) {
+                Ok(()) => send_json(req, 202, r#"{"status":"installing"}"#),
+                Err(err @ crate::ota::OtaError::Busy) => send_error(req, 409, &err.to_string()),
+                Err(err) => send_error(req, 500, &err.to_string()),
+            }
+        })?;
+    }
+
+    Ok(())
+}
 
 fn register_volume_routes(
     server: &mut EspHttpServer<'static>,
@@ -2546,7 +2698,7 @@ fn openapi_json() -> String {
         "info": {
             "title": "minidsp-open ESP32 API",
             "description": "MiniDSP controller HTTP API served by the ESP32 firmware.",
-            "version": "0.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "license": { "name": "MIT" }
         },
         "paths": {
@@ -2626,6 +2778,9 @@ fn openapi_json() -> String {
                 "post": { "summary": "Patch one bass-management mixer cell" }
             },
             "/devices/{id}/play": openapi_play_path(),
+            "/devices/0/rattle": openapi_rattle_path(),
+            "/devices/0/rattle/stop": {"post": {"summary": "Request a fade-out; poll until restoration finishes", "responses": {"200": {"description": "RattleStatus"}, "409": {"description": "No rattle session running"}}}},
+            "/status": {"get": {"summary": "Offline device status and rattle finder page", "responses": {"200": {"description": "HTML status page"}}}},
             "/sync": openapi_sync_path(),
             "/openapi.json": {
                 "get": { "summary": "This OpenAPI specification" }
@@ -2638,8 +2793,44 @@ fn openapi_json() -> String {
     .unwrap_or_else(|_| "{}".into())
 }
 
+fn openapi_rattle_path() -> serde_json::Value {
+    json!({
+        "get": { "summary": "RattleStatus: playing, current clock-mapped tone and last run, including stream and restore errors", "responses": {"200": {"description": "RattleStatus"}} },
+        "post": {
+            "summary": "Start streaming rattle tones; empty body selects defaults",
+            "requestBody": {"content": {"application/json": {"schema": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "frequenciesHz": {"type": "array", "maxItems": 64, "items": {"type": "number"}},
+                    "startHz": {"type": "number"}, "endHz": {"type": "number"}, "count": {"type": "integer"},
+                    "toneSec": {"type": "number", "default": 4}, "gapSec": {"type": "number", "default": 1},
+                    "cycles": {"type": "integer", "default": 1},
+                    "volumesDb": {"type": "array", "default": [-35], "items": {"type": "number", "minimum": -127, "maximum": 0}},
+                    "sampleRate": {"type": "integer", "default": 48000}, "bitDepth": {"type": "integer", "enum": [16, 24], "default": 16}
+                }
+            }}}},
+            "responses": {
+                "200": {"description": "RattleResponse: startedAtUs, compact schedule, previousVolumeDb, sourceChanged, previousSource"},
+                "400": {"description": "Invalid rattle plan"}, "409": {"description": "Playback busy"},
+                "413": {"description": "Body exceeds 4 KiB"}, "503": {"description": "No device or USB audio"},
+                "500": {"description": "Start failed; volume/source restoration attempted"}
+            }
+        }
+    })
+}
+
 fn openapi_play_path() -> serde_json::Value {
     json!({
+        "get": {
+            "summary": "Playback status: whether playback is busy and how the last started run ended",
+            "operationId": "playbackStatus",
+            "parameters": [
+                { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }
+            ],
+            "responses": {
+                "200": { "description": "{playing, last?: {startedAtUs, totalSamples, sampleRate, state: playing|completed|failed, error?, sourceRestoreError?}}. POST /play answers once streaming starts; poll this until playing is false to learn whether the whole signal played and the source was restored." }
+            }
+        },
         "post": {
             "summary": "Play the shared measurement sweep and optional acoustic markers",
             "operationId": "playDevice",
@@ -2654,17 +2845,17 @@ fn openapi_play_path() -> serde_json::Value {
                             "type": "object",
                             "description": "Canonical playback request. The signal always includes the fixed 2 s low-level preamble. By default it also includes one 80 Hz marker before the sweep, a 50 ms gap, the sweep, another 50 ms gap, one 80 Hz marker after the sweep, and 2 s of post-silence. Setting markerCycles to 0 disables both marker sections and removes their gaps.",
                             "properties": {
-                                "sweepDurationSec": { "type": "number", "default": 5.46, "exclusiveMinimum": 0.0 },
+                                "sweepDurationSec": { "type": "number", "default": 5.46, "exclusiveMinimum": 0.0, "maximum": 600.0 },
                                 "sweepStartHz": { "type": "number", "default": 5.0, "exclusiveMinimum": 0.0 },
                                 "sweepEndHz": { "type": "number", "default": 400.0, "exclusiveMinimum": 0.0 },
-                                "sweepFadeSec": { "type": "number", "default": 0.02, "minimum": 0.0 },
+                                "sweepFadeSec": { "type": "number", "default": 0.02, "minimum": 0.0, "maximum": 600.0 },
                                 "markerBefore": { "type": "boolean", "default": true },
                                 "markerAfter": { "type": "boolean", "default": true },
                                 "markerGapMs": { "type": "integer", "default": 50, "minimum": 0, "maximum": 2000 },
                                 "markerFrequencyHz": { "type": "number", "default": 80.0, "exclusiveMinimum": 0.0 },
                                 "markerCycles": { "type": "number", "default": 1.0, "minimum": 0.0 },
-                                "decaySec": { "type": "number", "default": 2.0, "minimum": 0.0 },
-                                "sampleRate": { "type": "integer", "default": 48000, "minimum": 1 },
+                                "decaySec": { "type": "number", "default": 2.0, "minimum": 0.0, "maximum": 600.0 },
+                                "sampleRate": { "type": "integer", "default": 48000, "minimum": 1, "maximum": 384000 },
                                 "bitDepth": { "type": "string", "enum": ["16", "24"], "default": "16" }
                             },
                             "additionalProperties": false
@@ -2677,7 +2868,9 @@ fn openapi_play_path() -> serde_json::Value {
                 "400": { "description": "Invalid playback request" },
                 "404": { "description": "Device not found" },
                 "409": { "description": "Playback already in progress" },
-                "413": { "description": "Playback request exceeds the ESP32 pre-generation buffer limit" }
+                "413": { "description": "Playback request exceeds the ESP32 pre-generation buffer limit" },
+                "500": { "description": "Playback could not start (USB audio failure, no stream start time, or out of memory); the previous source is restored first" },
+                "503": { "description": "USB audio interface not connected" }
             }
         }
     })
@@ -2738,7 +2931,7 @@ fn device_busy_json() -> String {
 }
 
 fn maybe_yield_large_response(chunks_written: usize) {
-    if chunks_written % LARGE_RESPONSE_STREAM_YIELD_EVERY_CHUNKS == 0 {
+    if chunks_written.is_multiple_of(LARGE_RESPONSE_STREAM_YIELD_EVERY_CHUNKS) {
         // Cross a FreeRTOS tick so large streamed responses yield often enough
         // for the WiFi stack and IDLE task to run on the ESP32.
         std::thread::sleep(Duration::from_millis(LARGE_RESPONSE_STREAM_YIELD_MS));
@@ -3041,12 +3234,16 @@ fn master_status_json(status: &StatusSummary) -> String {
     serde_json::to_string(&map).unwrap_or_default()
 }
 
+type SourceSwitchResult =
+    Result<(Arc<DeviceState>, bool, Option<String>, Option<Source>), (u16, String)>;
+
 /// Switch the device source to USB for playback, returning the previous source
 /// info needed to restore it after playback completes.
 fn switch_to_usb_source(
     state: &SharedDeviceState,
+    audio: &usb_audio::SharedAudioState,
     dev: &Arc<DeviceState>,
-) -> Result<(Arc<DeviceState>, bool, Option<String>, Option<Source>), (u16, String)> {
+) -> SourceSwitchResult {
     let usb_index = dev
         .profile()
         .sources
@@ -3065,14 +3262,29 @@ fn switch_to_usb_source(
         return Ok((dev.clone(), false, None, None));
     }
 
-    let (recovered, _) = set_source_index_with_recovery(
+    let (recovered, _) = match set_source_index_with_recovery(
         state,
         dev,
         usb_index,
         Source::Usb,
         SOURCE_SWITCH_RECOVERY_TIMEOUT,
-    )
-    .map_err(|err| (500, err))?;
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            // The switch command may have landed even though confirmation
+            // failed; don't leave the device on USB behind a 500.
+            if let Err(restore_err) = restore_source_after_playback(
+                state,
+                audio,
+                dev,
+                Some(current_source),
+                "failed playback source switch",
+            ) {
+                warn!("{restore_err}");
+            }
+            return Err((500, err));
+        }
+    };
 
     Ok((
         recovered,
@@ -3209,8 +3421,42 @@ fn settle_audio_device_after_recovery(reason: &str) {
     // The UAC2 driver can report the interface opened a little before the
     // controller has fully quiesced after close/reopen or root-port recovery.
     // Give the host stack one short settle window before the next start attempt.
-    debug!("waiting {:?} after audio recovery ({reason})", AUDIO_RECOVERY_SETTLE);
+    debug!(
+        "waiting {:?} after audio recovery ({reason})",
+        AUDIO_RECOVERY_SETTLE
+    );
     std::thread::sleep(AUDIO_RECOVERY_SETTLE);
+}
+
+/// Close the playback interface and wait for the cleanup worker to finish
+/// closing it. Leaves the open gate paused; callers resume it.
+fn close_audio_device_for_recovery(
+    audio: &usb_audio::SharedAudioState,
+    current_device: &mut Option<Arc<usb_audio::Uac2Device>>,
+    reason: &str,
+) -> Result<(), String> {
+    audio.pause_and_close_current(reason);
+    drop(current_device.take());
+    if audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
+        Ok(())
+    } else {
+        Err(format!(
+            "timed out waiting for USB audio teardown before {reason}"
+        ))
+    }
+}
+
+fn reopen_audio_device_after_recovery(
+    audio: &usb_audio::SharedAudioState,
+    reason: &str,
+) -> Result<Arc<usb_audio::Uac2Device>, String> {
+    audio.resume_opening(reason);
+    let _ = audio.reopen_last_known(reason);
+    let device = audio
+        .wait_for_current_device(AUDIO_REOPEN_TIMEOUT)
+        .ok_or_else(|| format!("USB audio interface did not recover after {reason}"))?;
+    settle_audio_device_after_recovery(reason);
+    Ok(device)
 }
 
 fn refresh_audio_device_for_playback(
@@ -3218,24 +3464,11 @@ fn refresh_audio_device_for_playback(
     current_device: &mut Option<Arc<usb_audio::Uac2Device>>,
     reason: &str,
 ) -> Result<Arc<usb_audio::Uac2Device>, String> {
-    audio.pause_and_close_current(reason);
-    // The playback thread keeps its own Arc to the UAC2 handle. Drop that
-    // local reference before waiting/reopening so the deferred cleanup can
-    // actually close the interface instead of leaving it "already open".
-    drop(current_device.take());
-    if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
-        return Err(format!(
-            "timed out waiting for USB audio teardown before {reason}"
-        ));
+    if let Err(err) = close_audio_device_for_recovery(audio, current_device, reason) {
+        audio.resume_opening(reason);
+        return Err(err);
     }
-
-    audio.resume_opening(reason);
-    let _ = audio.reopen_last_known(reason);
-    let device = audio
-        .wait_for_current_device(AUDIO_REOPEN_TIMEOUT)
-        .ok_or_else(|| format!("USB audio interface did not recover after {reason}"))?;
-    settle_audio_device_after_recovery(reason);
-    Ok(device)
+    reopen_audio_device_after_recovery(audio, reason)
 }
 
 fn restart_audio_driver_for_playback(
@@ -3243,22 +3476,17 @@ fn restart_audio_driver_for_playback(
     current_device: &mut Option<Arc<usb_audio::Uac2Device>>,
     reason: &str,
 ) -> Result<Arc<usb_audio::Uac2Device>, String> {
-    audio.pause_and_close_current(reason);
-    drop(current_device.take());
-    if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
-        return Err(format!(
-            "timed out waiting for USB audio teardown before {reason}"
-        ));
+    let hold = audio.hold_opening(reason);
+    let restarted = close_audio_device_for_recovery(audio, current_device, reason)
+        .and_then(|()| usb_audio::restart(audio.clone(), reason).map_err(|err| err.to_string()));
+    drop(hold);
+    if let Err(err) = restarted {
+        // Leave the gate open so a later TX_CONNECTED or reopen can still
+        // bring the interface back.
+        audio.resume_opening(reason);
+        return Err(err);
     }
-
-    usb_audio::restart(audio.clone(), reason).map_err(|err| err.to_string())?;
-    audio.resume_opening(reason);
-    let _ = audio.reopen_last_known(reason);
-    let device = audio
-        .wait_for_current_device(AUDIO_REOPEN_TIMEOUT)
-        .ok_or_else(|| format!("USB audio interface did not recover after {reason}"))?;
-    settle_audio_device_after_recovery(reason);
-    Ok(device)
+    reopen_audio_device_after_recovery(audio, reason)
 }
 
 fn recycle_root_port_for_playback(
@@ -3268,20 +3496,29 @@ fn recycle_root_port_for_playback(
     current_device: &mut Option<Arc<usb_audio::Uac2Device>>,
     reason: &str,
 ) -> Result<Arc<usb_audio::Uac2Device>, String> {
-    audio.pause_and_close_current(reason);
-    drop(current_device.take());
-    if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
-        return Err(format!(
-            "timed out waiting for USB audio teardown before {reason}"
-        ));
+    // HID reactivation after the recycle calls resume_opening(); the hold
+    // keeps the interface closed until the driver restart below is done.
+    let hold = audio.hold_opening(reason);
+    if let Err(err) = close_audio_device_for_recovery(audio, current_device, reason) {
+        // A close stuck behind a hung device only completes once the device
+        // disconnects, which is exactly what the recycle forces.
+        warn!("{err}; recycling the USB root port anyway");
     }
 
-    crate::usb_hid::recycle_root_port_global(reason).map_err(|err| err.to_string())?;
-    wait_for_rebooted_device(state, dev, REBOOT_RECOVERY_TIMEOUT)?;
-    usb_audio::restart(audio.clone(), reason).map_err(|err| err.to_string())?;
-    let device = ensure_audio_device_available(audio, reason)?;
-    settle_audio_device_after_recovery(reason);
-    Ok(device)
+    let recycled = (|| {
+        crate::usb_hid::recycle_root_port_global(reason).map_err(|err| err.to_string())?;
+        wait_for_rebooted_device(state, dev, REBOOT_RECOVERY_TIMEOUT)?;
+        if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
+            return Err(format!("USB audio teardown still pending after {reason}"));
+        }
+        usb_audio::restart(audio.clone(), reason).map_err(|err| err.to_string())
+    })();
+    drop(hold);
+    if let Err(err) = recycled {
+        audio.resume_opening(reason);
+        return Err(err);
+    }
+    reopen_audio_device_after_recovery(audio, reason)
 }
 
 fn set_source_with_audio_coordination(
@@ -3409,10 +3646,16 @@ fn restore_source_after_playback(
         return Ok(());
     };
 
+    // Playback recovery can recycle the root port, which replaces the HID
+    // DeviceState; restore through the current one for the same unit.
+    let dev = get_device(state)
+        .filter(|current| same_device_identity(current, dev))
+        .unwrap_or_else(|| dev.clone());
+
     match set_source_with_audio_coordination(
         state,
         audio,
-        dev,
+        &dev,
         source,
         SOURCE_SWITCH_RECOVERY_TIMEOUT,
         context,
@@ -3470,130 +3713,785 @@ impl Drop for WifiPsGuard {
     }
 }
 
-fn copy_thread_spawn_configuration(conf: &ThreadSpawnConfiguration) -> ThreadSpawnConfiguration {
-    ThreadSpawnConfiguration {
-        name: conf.name,
-        stack_size: conf.stack_size,
-        priority: conf.priority,
-        inherit: conf.inherit,
-        pin_to_core: conf.pin_to_core,
-        stack_alloc_caps: conf.stack_alloc_caps,
+static PLAYBACK_WORKER: Worker = Worker::new(c"playback", "playback", PLAYBACK_THREAD_STACK_BYTES);
+static WS_COMPAT_WORKER: Worker =
+    Worker::new(c"ws_compat", "ws_compat", WS_COMPAT_THREAD_STACK_BYTES);
+static EZBEQ_LEVELS_WORKER: Worker =
+    Worker::new(c"beq_lvl", "beq_lvl", EZBEQ_LEVELS_THREAD_STACK_BYTES);
+
+/// Register the additive rattle/status surface before wildcard UI routes.
+fn register_rattle_routes(
+    server: &mut EspHttpServer<'static>,
+    state: SharedDeviceState,
+    audio_state: usb_audio::SharedAudioState,
+) -> Result<(), esp_idf_svc::sys::EspError> {
+    server.fn_handler("/status", Method::Get, |req| {
+        send_html(req, STATUS_PAGE_HTML)
+    })?;
+    {
+        let audio = audio_state.clone();
+        server.fn_handler(
+            "/devices/0/rattle",
+            Method::Get,
+            move |req| match serde_json::to_string(&audio.rattle_status()) {
+                Ok(json) => send_json(req, 200, &json),
+                Err(_) => send_error(req, 500, "failed to serialize response"),
+            },
+        )?;
+    }
+    {
+        let audio = audio_state.clone();
+        server.fn_handler("/devices/0/rattle/stop", Method::Post, move |req| {
+            if !audio.request_rattle_stop() {
+                return send_error(req, 409, "no rattle session running");
+            }
+            info!("rattle stop requested");
+            match serde_json::to_string(&audio.rattle_status()) {
+                Ok(json) => send_json(req, 200, &json),
+                Err(_) => send_error(req, 500, "failed to serialize response"),
+            }
+        })?;
+    }
+    server.fn_handler("/devices/0/rattle", Method::Post, move |mut req| {
+        let dev = match get_device(&state) {
+            Some(dev) if dev.profile().has_usb_audio => dev,
+            Some(_) => return send_error(req, 503, "device does not support USB audio playback"),
+            None => return send_error(req, 503, "no device"),
+        };
+        if !audio_state.try_begin_playback() {
+            return send_error(req, 409, "playback already in progress");
+        }
+        // The handler owns this until the worker accepts the job.
+        let mut busy = PlaybackBusyGuard(audio_state.clone(), true);
+        let body = match read_request_body(&mut req, 4096) {
+            Ok(body) => body,
+            Err(message) => return send_error(req, 413, message),
+        };
+        let request = if body.is_empty() {
+            RattleRequest::default()
+        } else {
+            match serde_json::from_slice::<RattleRequest>(&body) {
+                Ok(request) => request,
+                Err(err) => return send_error(req, 400, &format!("invalid rattle request: {err}")),
+            }
+        };
+        let plan = match RattlePlan::build(request) {
+            Ok(plan) => plan,
+            Err(err) => return send_error(req, 400, &err.to_string()),
+        };
+        let device = match ensure_audio_device_available(&audio_state, "rattle needs USB audio") {
+            Ok(device) => device,
+            Err(err) => return send_error(req, 503, &err),
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        let st = state.clone();
+        let audio = audio_state.clone();
+        if let Err(err) = PLAYBACK_WORKER.run(move || {
+            run_rattle_thread(st, dev, audio, device, plan, tx);
+        }) {
+            return send_error(req, 500, &format!("start rattle worker: {err}"));
+        }
+        // Transfer ownership without clearing the busy flag. The worker's
+        // guard releases it after volume and source restoration.
+        busy.1 = false;
+        drop(busy);
+        match rx.recv() {
+            Ok(Ok(response)) => match serde_json::to_string(&response) {
+                Ok(json) => send_json(req, 200, &json),
+                Err(_) => send_error(req, 500, "failed to serialize response"),
+            },
+            Ok(Err(err)) => match serde_json::to_string(&err) {
+                Ok(json) => send_json(req, 500, &json),
+                Err(_) => send_error(req, 500, "failed to serialize start error"),
+            },
+            Err(_) => send_error(req, 500, "rattle worker ended unexpectedly"),
+        }
+    })?;
+    Ok(())
+}
+
+fn restore_rattle_volume(
+    state: &SharedDeviceState,
+    dev: &Arc<DeviceState>,
+    previous_volume_db: Option<f32>,
+) -> Option<String> {
+    let volume = previous_volume_db?;
+    let dev = get_device(state)
+        .filter(|current| same_device_identity(current, dev))
+        .unwrap_or_else(|| dev.clone());
+    let result = (|| {
+        let _op = try_begin_operation_or_busy(&dev)?;
+        dev.set_volume_db(volume).map_err(|err| err.to_string())
+    })();
+    match result {
+        Ok(()) => {
+            info!("rattle restored volume to {volume} dB");
+            None
+        }
+        Err(err) => Some(format!(
+            "failed to restore rattle volume to {volume} dB: {err}"
+        )),
     }
 }
 
-fn spawn_psram_thread<F>(
-    conf_name: &'static std::ffi::CStr,
-    builder_name: &str,
-    stack_size: usize,
-    f: F,
-) -> Result<std::thread::JoinHandle<()>, String>
-where
-    F: FnOnce() + Send + 'static,
-{
-    let previous_conf = ThreadSpawnConfiguration::get();
-    let mut spawn_conf = previous_conf
-        .as_ref()
-        .map(copy_thread_spawn_configuration)
-        .unwrap_or_default();
-    spawn_conf.name = Some(conf_name);
-    spawn_conf.stack_size = stack_size;
-    spawn_conf.stack_alloc_caps = MallocCap::Spiram | MallocCap::Cap8bit;
-    spawn_conf
-        .set()
-        .map_err(|err| format!("set {builder_name} thread config: {err}"))?;
-
-    let spawn_result = std::thread::Builder::new()
-        .name(builder_name.into())
-        .stack_size(stack_size)
-        .spawn(f);
-
-    let restore_result = previous_conf
-        .as_ref()
-        .map(ThreadSpawnConfiguration::set)
-        .unwrap_or_else(|| ThreadSpawnConfiguration::default().set());
-    if let Err(err) = restore_result {
-        warn!("failed to restore pthread config after {builder_name} spawn: {err}");
-    }
-
-    spawn_result.map_err(|err| err.to_string())
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RattleStartError {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_restore_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_restore_error: Option<String>,
 }
 
-fn spawn_playback_thread(
+#[derive(Clone)]
+struct RattleCleanup {
     state: SharedDeviceState,
     dev: Arc<DeviceState>,
     audio_state: usb_audio::SharedAudioState,
-    audio_device: Arc<usb_audio::Uac2Device>,
-    plan: Box<PlaybackPlan>,
-    total_bytes: usize,
-    source_changed: bool,
-    previous_source: Option<String>,
+    audio_device: Option<Arc<usb_audio::Uac2Device>>,
+    previous_volume_db: Option<f32>,
     restore_source: Option<Source>,
-    started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
-) -> Result<(), String> {
-    let previous_conf = ThreadSpawnConfiguration::get();
-    let mut playback_conf = previous_conf
-        .as_ref()
-        .map(copy_thread_spawn_configuration)
-        .unwrap_or_default();
-    playback_conf.name = Some(c"playback");
-    playback_conf.stack_size = PLAYBACK_THREAD_STACK_BYTES;
-    playback_conf.stack_alloc_caps = MallocCap::Spiram | MallocCap::Cap8bit;
-    playback_conf
-        .set()
-        .map_err(|err| format!("set playback thread config: {err}"))?;
-
-    let spawn_result = std::thread::Builder::new()
-        .name("playback".into())
-        .stack_size(PLAYBACK_THREAD_STACK_BYTES)
-        .spawn(move || {
-            run_playback_thread(
-                state,
-                dev,
-                audio_state,
-                audio_device,
-                plan,
-                total_bytes,
-                source_changed,
-                previous_source,
-                restore_source,
-                started_tx,
-            );
-        });
-
-    let restore_result = previous_conf
-        .as_ref()
-        .map(ThreadSpawnConfiguration::set)
-        .unwrap_or_else(|| ThreadSpawnConfiguration::default().set());
-    if let Err(err) = restore_result {
-        warn!("failed to restore pthread config after playback spawn: {err}");
-    }
-
-    spawn_result.map(|_| ()).map_err(|err| err.to_string())
+    stream_stopped: bool,
+    recorded: Arc<std::sync::atomic::AtomicBool>,
+    start_error: Option<String>,
+    started_tx: mpsc::SyncSender<Result<RattleResponse, RattleStartError>>,
 }
 
-fn run_playback_thread(
+impl playback_cleanup::Cleanup for RattleCleanup {
+    fn stop(&mut self) -> bool {
+        if !self.stream_stopped {
+            let device = self
+                .audio_device
+                .clone()
+                .or_else(|| self.audio_state.current_device());
+            let stopped = device.as_ref().is_some_and(|device| {
+                stop_audio_stream_if_connected(device, "rattle exit cleanup")
+            });
+            drop(device);
+            // A missing device can mean a close is still pending, not that it stopped.
+            self.stream_stopped = stopped
+                || close_audio_device_for_recovery(
+                    &self.audio_state,
+                    &mut self.audio_device,
+                    "rattle exit cleanup",
+                )
+                .is_ok();
+            if !stopped {
+                self.audio_state.resume_opening("rattle exit cleanup");
+            }
+        }
+        self.stream_stopped
+    }
+
+    fn restore_volume(&mut self) -> Option<String> {
+        restore_rattle_volume(&self.state, &self.dev, self.previous_volume_db)
+    }
+
+    fn restore_source(&mut self) -> Option<String> {
+        drop(self.audio_device.take());
+        restore_source_after_playback(
+            &self.state,
+            &self.audio_state,
+            &self.dev,
+            self.restore_source,
+            "rattle",
+        )
+        .err()
+    }
+
+    fn report(&mut self, volume: Option<String>, source: Option<String>) {
+        for error in [&volume, &source].into_iter().flatten() {
+            warn!("{error}");
+        }
+        let error = self
+            .start_error
+            .take()
+            .or_else(|| std::thread::panicking().then(|| "rattle worker panicked".to_string()));
+        if self.recorded.load(std::sync::atomic::Ordering::SeqCst) {
+            if error.is_some() {
+                self.audio_state.finish_rattle_run(error, false);
+            }
+            self.audio_state.set_rattle_restore_errors(volume, source);
+        } else if let Some(error) = error {
+            let _ = self.started_tx.send(Err(RattleStartError {
+                error,
+                volume_restore_error: volume,
+                source_restore_error: source,
+            }));
+        }
+    }
+}
+
+fn run_rattle_thread(
     state: SharedDeviceState,
     dev: Arc<DeviceState>,
     audio_state: usb_audio::SharedAudioState,
-    audio_device: Arc<usb_audio::Uac2Device>,
-    plan: Box<PlaybackPlan>,
-    total_bytes: usize,
-    source_changed: bool,
-    previous_source: Option<String>,
-    restore_source: Option<Source>,
-    started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
+    device: Arc<usb_audio::Uac2Device>,
+    plan: RattlePlan,
+    started_tx: mpsc::SyncSender<Result<RattleResponse, RattleStartError>>,
 ) {
+    let _busy = PlaybackBusyGuard(audio_state.clone(), true);
+    let _wifi_ps = WifiPsGuard::disable_ps();
+    let mut cleanup = playback_cleanup::CleanupGuard::new(RattleCleanup {
+        state: state.clone(),
+        dev,
+        audio_state: audio_state.clone(),
+        audio_device: Some(device),
+        previous_volume_db: None,
+        restore_source: None,
+        stream_stopped: true,
+        recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        start_error: None,
+        started_tx: started_tx.clone(),
+    });
+    let format = StreamFormat {
+        sample_rate: plan.sample_rate(),
+        bit_depth: plan.layout().bit_depth,
+        frame_bytes: plan.layout().frame_bytes(),
+    };
+    let schedule = plan.schedule();
+    info!("rattle session: tones={}, tone_samples={}, gap_samples={}, cycles={}, volumes={:?}, master={} dB, rate={} Hz, depth={}",
+        schedule.frequencies_hz.len(), schedule.tone_samples, schedule.gap_samples,
+        schedule.cycles, schedule.volumes_db, plan.master_volume_db(), format.sample_rate, format.bit_depth.bits());
+    let panic_token = cleanup.token();
+    let mut panic_cleanup = None;
+    let result: Result<(), String> = (|| {
+        let context = &mut cleanup.context;
+        let master = {
+            let _op = try_begin_operation_or_busy(&context.dev)?;
+            context
+                .dev
+                .get_master_status()
+                .map_err(|err| format!("read rattle volume: {err}"))?
+        };
+        context.previous_volume_db = Some(master.volume_db());
+        // Remember this before switching: the shared source helper attempts
+        // its own restore on a failed switch, and we retry on our cleanup
+        // path so any remaining failure is reported alongside volume restore.
+        context.restore_source = context
+            .dev
+            .profile()
+            .sources
+            .source_for_index(master.source)
+            .filter(|source| *source != Source::Usb);
+        let (current, source_changed, previous_source, source) =
+            switch_to_usb_source(&state, &audio_state, &context.dev).map_err(|(_, err)| err)?;
+        context.dev = current;
+        context.restore_source = source;
+        // Snapshot owns independent Arcs and shares the once token. It can
+        // close the current interface even if recovery replaced our handle.
+        let mut panic_context = context.clone();
+        panic_context.audio_device = None;
+        panic_context.stream_stopped = false;
+        panic_context.start_error = Some("rattle worker panicked".into());
+        panic_cleanup = Some(panic_token.arm_on_panic(panic_context));
+        {
+            let _op = try_begin_operation_or_busy(&context.dev)?;
+            context
+                .dev
+                .set_volume_db(plan.master_volume_db())
+                .map_err(|err| format!("set rattle volume: {err}"))?;
+        }
+        info!(
+            "rattle volume: previous={:?} dB, session={} dB",
+            context.previous_volume_db,
+            plan.master_volume_db()
+        );
+        let mut generator = plan.generator();
+        // Arm before start: even a failed prefill or a panic may leave audio queued.
+        context.stream_stopped = false;
+        let start = start_playback_with_recovery(
+            &state,
+            &audio_state,
+            &context.dev,
+            &mut context.audio_device,
+            format,
+            &mut |pos, out| {
+                // Each recovery attempt starts from sample zero, including
+                // the lead-in; only startup retries clone the shared plan.
+                if pos == 0 && generator.cursor() != 0 {
+                    generator = plan.generator();
+                }
+                generator.fill_pcm_bytes(out)
+            },
+        )?;
+        let response = RattleResponse {
+            started_at_us: start.started_at_us,
+            schedule,
+            previous_volume_db: context.previous_volume_db,
+            source_changed,
+            previous_source,
+        };
+        audio_state.record_rattle_started(&response, start.first_write_time_us);
+        context
+            .recorded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = started_tx.send(Ok(response));
+        info!("rattle streaming started: {} samples", plan.total_samples());
+        let mut last_tone = None;
+        let outcome = stream_playback(
+            &state,
+            &context.dev,
+            &audio_state,
+            &mut context.audio_device,
+            &start,
+            StreamPlaybackConfig {
+                format,
+                total_bytes: plan.total_samples() as u64 * format.frame_bytes as u64,
+                gen_elapsed_ms: 0,
+                rattle: true,
+            },
+            |out| {
+                if audio_state.rattle_stop_requested() {
+                    generator.request_stop();
+                }
+                if !generator.is_finished() {
+                    if let Some((index, minidsp_protocol::rattle::RattlePhase::Tone { .. })) =
+                        plan.step_index_at(generator.cursor())
+                    {
+                        if last_tone != Some(index) {
+                            let step = plan.step(index).expect("validated rattle tone");
+                            info!(
+                                "rattle tone {}/{} cycle {}: {}",
+                                step.index + 1,
+                                plan.step_count(),
+                                step.cycle + 1,
+                                step.label
+                            );
+                            last_tone = Some(step.index);
+                        }
+                    }
+                }
+                generator.fill_pcm_bytes(out)
+            },
+        );
+        context.stream_stopped = outcome.stopped;
+        audio_state.finish_rattle_run(outcome.error, generator.was_stopped());
+        Ok(())
+    })();
+    cleanup.context.start_error = result.err();
+    cleanup.finish();
+    drop(panic_cleanup);
+}
+
+// /play retains exact percentiles. Long rattle sessions use constant space:
+// 100-us histogram bins through 25.5 ms, with overflow represented by max.
+struct WriteLatencyStats {
+    exact: Option<Vec<i64>>,
+    bins: [u32; 256],
+    count: usize,
+    sum: i64,
+    min: i64,
+    max: i64,
+}
+
+impl WriteLatencyStats {
+    fn new(bounded: bool, first: i64) -> Self {
+        let mut stats = Self {
+            exact: (!bounded).then(Vec::new),
+            bins: [0; 256],
+            count: 0,
+            sum: 0,
+            min: i64::MAX,
+            max: 0,
+        };
+        stats.push(first);
+        stats
+    }
+    fn push(&mut self, value: i64) {
+        if let Some(exact) = self.exact.as_mut() {
+            exact.push(value);
+        }
+        self.bins[(value.max(0) as usize / 100).min(255)] += 1;
+        self.count += 1;
+        self.sum += value;
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+    }
+    fn len(&self) -> usize {
+        self.count
+    }
+    fn summary(&self) -> (i64, i64, i64, i64, i64, i64) {
+        if let Some(exact) = &self.exact {
+            return summarize_write_latencies(exact);
+        }
+        let percentile = |percent: usize| {
+            let index = (self.count - 1) * percent / 100;
+            let mut count = 0;
+            for (bin, &n) in self.bins.iter().enumerate() {
+                count += n as usize;
+                if count > index {
+                    return if bin == 255 {
+                        self.max
+                    } else {
+                        (bin as i64 * 100 + 50).clamp(self.min, self.max)
+                    };
+                }
+            }
+            self.max
+        };
+        (
+            self.min,
+            self.max,
+            self.sum / self.count as i64,
+            percentile(50),
+            percentile(95),
+            percentile(99),
+        )
+    }
+}
+
+struct PlaybackThreadParams {
+    state: SharedDeviceState,
+    dev: Arc<DeviceState>,
+    audio_state: usb_audio::SharedAudioState,
+    audio_device: Arc<usb_audio::Uac2Device>,
+    plan: Box<PlaybackPlan>,
+    total_bytes: usize,
+    source_changed: bool,
+    previous_source: Option<String>,
+    restore_source: Option<Source>,
+    started_tx: mpsc::SyncSender<Result<PlayResponse, String>>,
+}
+
+fn spawn_playback_thread(params: PlaybackThreadParams) -> Result<(), String> {
+    PLAYBACK_WORKER.run(move || run_playback_thread(params))
+}
+
+/// Clears the playback-busy flag however the playback thread exits, so a
+/// panic or early return cannot leave every later `/play` stuck on `409`.
+struct PlaybackBusyGuard(usb_audio::SharedAudioState, bool);
+
+impl Drop for PlaybackBusyGuard {
+    fn drop(&mut self) {
+        if self.1 {
+            self.0.finish_playback();
+        }
+    }
+}
+
+fn run_playback_thread(params: PlaybackThreadParams) {
+    let PlaybackThreadParams {
+        state,
+        dev,
+        audio_state,
+        audio_device,
+        plan,
+        total_bytes,
+        source_changed,
+        previous_source,
+        restore_source,
+        started_tx,
+    } = params;
+    let _busy = PlaybackBusyGuard(audio_state.clone(), true);
     let mut audio_device = Some(audio_device);
 
     // Disable WiFi power save during playback — beacon wakeups cause
     // ~1-2 ms CPU stalls that can disrupt USB isochronous timing.
     let _wifi_ps = WifiPsGuard::disable_ps();
 
-    // Pre-generate the entire sweep into memory before starting the USB
-    // audio stream. ESP32 float math (sin/cos/ln) is too slow to keep up
-    // with real-time 48 kHz playback, so we generate everything upfront
-    // into PSRAM (~1.8 MB for a 9.5 s sweep) and then just blast bytes
-    // to the ring buffer during playback.
+    let format = StreamFormat {
+        sample_rate: plan.request.sample_rate,
+        bit_depth: plan.request.bit_depth,
+        frame_bytes: plan.layout().frame_bytes(),
+    };
+    let pcm_buffer = pregenerate_playback_pcm(&plan, total_bytes);
+    let pcm_data: &[u8] = pcm_buffer
+        .as_ref()
+        .map(|(pcm, _)| pcm.as_slice())
+        .unwrap_or_default();
+    let gen_elapsed_ms = pcm_buffer.as_ref().map_or(0, |(_, elapsed_ms)| *elapsed_ms);
+
+    // Start the USB audio stream and write the pre-generated data.
+    let start_result = match &pcm_buffer {
+        Ok(_) => start_playback_with_recovery(
+            &state,
+            &audio_state,
+            &dev,
+            &mut audio_device,
+            format,
+            &mut |pos, out| {
+                let len = out.len().min(pcm_data.len() - pos);
+                out[..len].copy_from_slice(&pcm_data[pos..pos + len]);
+                len
+            },
+        ),
+        Err(err) => Err(err.clone()),
+    };
+    let allow_source_restore;
+    let mut run_recorded = false;
+
+    match start_result {
+        Ok(start) => {
+            let response = PlayResponse {
+                started_at_us: start.started_at_us,
+                tone_burst_offset_samples: plan.offsets().tone_burst_offset_samples,
+                sweep_offset_samples: plan.offsets().sweep_offset_samples,
+                tail_tone_burst_offset_samples: plan.offsets().tail_tone_burst_offset_samples,
+                total_samples: plan.offsets().total_samples,
+                sample_rate: plan.request.sample_rate,
+                source_changed,
+                previous_source,
+            };
+            info!(
+                "playback streaming started: {} bytes pre-generated",
+                pcm_data.len()
+            );
+            // Record the run before answering so a status poll right after
+            // the 200 already sees it.
+            audio_state.record_run_started(&response);
+            run_recorded = true;
+            let _ = started_tx.send(Ok(response));
+            let mut pos = start.first_write_bytes;
+            let run_error = stream_playback(
+                &state,
+                &dev,
+                &audio_state,
+                &mut audio_device,
+                &start,
+                StreamPlaybackConfig {
+                    format,
+                    total_bytes: total_bytes as u64,
+                    gen_elapsed_ms,
+                    rattle: false,
+                },
+                |out| {
+                    let len = out.len().min(pcm_data.len() - pos);
+                    out[..len].copy_from_slice(&pcm_data[pos..pos + len]);
+                    pos += len;
+                    len
+                },
+            );
+            allow_source_restore = run_error.error.is_none();
+        }
+        Err(err) => {
+            // Playback never started, but we may already have switched the
+            // MiniDSP to USB in preparation for it. Try to restore the
+            // previous source on the same cleanup path before returning 500.
+            allow_source_restore = true;
+            let _ = started_tx.send(Err(err));
+        }
+    }
+
+    if allow_source_restore && restore_source.is_some() {
+        // Source restoration may switch away from USB and tear down the UAC2
+        // interface. Release the playback thread's Arc first so that close
+        // completion really means the interface is gone.
+        drop(audio_device.take());
+    }
+
+    let restore_error = if allow_source_restore {
+        restore_source_after_playback(&state, &audio_state, &dev, restore_source, "playback").err()
+    } else {
+        restore_source.map(|source| {
+            format!(
+                "skipped restoring source {} after interrupted or disconnected playback",
+                source.pascal_case()
+            )
+        })
+    };
+    if let Some(err) = restore_error {
+        warn!("{err}");
+        if run_recorded {
+            audio_state.set_last_run_source_restore_error(err);
+        }
+    }
+    // _busy clears the playback flag; _wifi_ps restores WiFi PS on drop
+}
+
+// Shared write, drain, error detection, stop/recovery and timing path for
+// pre-generated /play and streaming rattle PCM. No per-chunk PCM allocation.
+struct StreamPlaybackOutcome {
+    error: Option<String>,
+    stopped: bool,
+}
+
+struct StreamPlaybackConfig {
+    format: StreamFormat,
+    total_bytes: u64,
+    gen_elapsed_ms: i64,
+    rattle: bool,
+}
+
+fn stream_playback(
+    state: &SharedDeviceState,
+    dev: &Arc<DeviceState>,
+    audio_state: &usb_audio::SharedAudioState,
+    audio_device: &mut Option<Arc<usb_audio::Uac2Device>>,
+    start: &PlaybackStart,
+    config: StreamPlaybackConfig,
+    mut fill: impl FnMut(&mut [u8]) -> usize,
+) -> StreamPlaybackOutcome {
+    let StreamPlaybackConfig {
+        format,
+        total_bytes,
+        gen_elapsed_ms,
+        rattle,
+    } = config;
+    let device = audio_device.clone().expect("started stream has a device");
+    let playback_started_us = usb_audio::server_time_us();
+    let mut write_time_us = start.first_write_time_us;
+    let mut gen_time_us = gen_elapsed_ms * 1000;
+    let mut total_bytes_written = start.first_write_bytes as u64;
+    let mut last_write_bytes = start.first_write_bytes;
+    let mut last_write_return_us = start.first_write_return_us;
+    let mut write_latencies_us = WriteLatencyStats::new(rattle, start.first_write_time_us);
+
+    let chunk_bytes = start.chunk_bytes;
+    // /play copies from PSRAM; rattle generates directly into SRAM.
+    // xRingbufferSend holds a critical section during memcpy, so PSRAM
+    // latency there can block the USB host task. Keep the scratch buffer
+    // off the worker's PSRAM stack and reuse it without allocating.
+    let mut sram_buf = PLAYBACK_STREAM_BUF
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut stream_error = None;
+    loop {
+        let gen_started_us = rattle.then(usb_audio::server_time_us);
+        let len = fill(&mut sram_buf[..chunk_bytes]);
+        if let Some(started) = gen_started_us {
+            gen_time_us += usb_audio::server_time_us() - started;
+        }
+        if len == 0 {
+            break;
+        }
+        let write_started_us = usb_audio::server_time_us();
+        if let Err(err) = device.write(&sram_buf[..len], 250) {
+            warn!("playback stream failed: {err}");
+            stream_error = Some(err.to_string());
+            break;
+        }
+        let write_elapsed_us = usb_audio::server_time_us() - write_started_us;
+        write_time_us += write_elapsed_us;
+        write_latencies_us.push(write_elapsed_us);
+        let written = len;
+        total_bytes_written += written as u64;
+        last_write_bytes = written;
+        last_write_return_us = usb_audio::server_time_us();
+        if write_latencies_us
+            .len()
+            .is_multiple_of(PLAYBACK_PROGRESS_LOG_EVERY_WRITES)
+        {
+            info!(
+                "playback progress: {} / {} bytes, write={} ms",
+                total_bytes_written,
+                total_bytes,
+                write_time_us / 1000
+            );
+        }
+    }
+    drop(sram_buf);
+
+    if stream_error.is_none() {
+        wait_for_queued_audio_to_play(&device, format.sample_rate as usize * format.frame_bytes);
+    }
+    let stream_connected = device.is_connected();
+    let (stream_errors, transfer_errors) = device.error_counts();
+    let mut run_error = match stream_error {
+        Some(err) => Some(format!(
+            "playback stopped after {} of {} bytes: {err}",
+            total_bytes_written, total_bytes
+        )),
+        None if !stream_connected => {
+            Some("USB audio device disconnected during playback".to_string())
+        }
+        None if stream_errors > 0 => {
+            Some("USB audio driver reported a stream error during playback".to_string())
+        }
+        // Each failed isochronous transfer drops the audio it carried,
+        // so the measurement has a gap even though every write landed.
+        None if transfer_errors > 0 => Some(format!(
+            "{transfer_errors} USB audio transfer error(s) during playback; audio dropped out"
+        )),
+        None => None,
+    };
+    log_audio_feedback_if_connected(&device, "playback");
+    let stop_started_us = usb_audio::server_time_us();
+    let mut stopped = stop_audio_stream_if_connected(&device, "playback");
+    let stop_finished_us = usb_audio::server_time_us();
+    drop(device);
+    if rattle {
+        // Hide current as soon as audio ends, even if USB recovery or HID
+        // restoration keeps the overall session busy for longer.
+        audio_state.mark_rattle_audio_ended();
+    }
+    if !stopped {
+        // A stream left running makes the next start fail with
+        // "stream already active"; close and reopen the interface
+        // (close stops the stream) before releasing playback.
+        let recovered = refresh_audio_device_for_playback(
+            audio_state,
+            audio_device,
+            "playback stop failure recovery",
+        )
+        .or_else(|err| {
+            // A close stuck behind a hung device blocks every later
+            // open; only a disconnect clears it.
+            warn!("{err}; recycling the USB root port");
+            recycle_root_port_for_playback(
+                state,
+                audio_state,
+                dev,
+                audio_device,
+                "playback stop failure root-port recovery",
+            )
+        });
+        match recovered {
+            Ok(device) => {
+                *audio_device = Some(device);
+                stopped = true;
+            }
+            Err(err) => {
+                warn!("{err}");
+                run_error = playback_cleanup::teardown_error(run_error, err);
+                // Failed reopen can still follow a confirmed close. Never
+                // infer closure just from a missing Option or is_connected.
+                stopped = audio_state.wait_for_cleanup_complete(Duration::ZERO);
+            }
+        }
+    }
+    let (write_min_us, write_max_us, write_avg_us, write_p50_us, write_p95_us, write_p99_us) =
+        write_latencies_us.summary();
+    info!(
+                "playback completed in {} ms (gen={} ms, write={} ms, expected_bytes={}, actual_bytes={}, writes={}, last_write_bytes={}, tx_need_data={}, transfer_errors={}, stream_errors={}, last_write_after_start={} ms, stop_time={} ms, write_min={} us, write_max={} us, write_avg={} us, write_p50={} us, write_p95={} us, write_p99={} us)",
+                (usb_audio::server_time_us() - playback_started_us) / 1000,
+                gen_time_us / 1000,
+                write_time_us / 1000,
+                total_bytes,
+                total_bytes_written,
+                write_latencies_us.len(),
+                last_write_bytes,
+                usb_audio::tx_need_data_count(),
+                transfer_errors,
+                stream_errors,
+                (last_write_return_us - playback_started_us) / 1000,
+                (stop_finished_us - stop_started_us) / 1000,
+                write_min_us,
+                write_max_us,
+                write_avg_us,
+                write_p50_us,
+                write_p95_us,
+                write_p99_us,
+            );
+    if !rattle {
+        audio_state.finish_last_run(run_error.clone());
+    }
+    StreamPlaybackOutcome {
+        error: run_error,
+        stopped,
+    }
+}
+
+/// Pre-generate the whole /play signal in PSRAM; returns PCM and generation ms.
+fn pregenerate_playback_pcm(
+    plan: &PlaybackPlan,
+    total_bytes: usize,
+) -> Result<(Vec<u8>, i64), String> {
+    // ESP32 float math (sin/cos/ln) is too slow to keep up with real-time
+    // 48 kHz playback, so we generate everything upfront into PSRAM
+    // (~1.8 MB for a 9.5 s sweep) and then just blast bytes to the ring
+    // buffer during playback.
     info!(
         "pre-generating {} samples ({} bytes) at {} Hz {}-bit",
         plan.offsets().total_samples,
@@ -3602,7 +4500,13 @@ fn run_playback_thread(
         plan.request.bit_depth.bits()
     );
     let gen_started_us = usb_audio::server_time_us();
-    let mut pcm_data = vec![0u8; total_bytes];
+    // The size cap does not guarantee a contiguous block on a fragmented
+    // PSRAM heap; an infallible allocation would abort the firmware.
+    let mut pcm_data = Vec::new();
+    pcm_data
+        .try_reserve_exact(total_bytes)
+        .map_err(|_| format!("not enough memory for {total_bytes} bytes of playback audio"))?;
+    pcm_data.resize(total_bytes, 0u8);
     let mut generator = Box::new(plan.generator());
     let mut offset = 0;
     // Generate in 10ms slices so fill_pcm_bytes returns after each chunk
@@ -3624,233 +4528,161 @@ fn run_playback_thread(
         }
         offset += written;
         yield_counter += 1;
-        if yield_counter % PREGEN_YIELD_INTERVAL_CHUNKS == 0 {
+        if yield_counter.is_multiple_of(PREGEN_YIELD_INTERVAL_CHUNKS) {
             // 10ms minimum to cross one FreeRTOS tick boundary and
             // actually call vTaskDelay — sub-tick sleeps busy-wait.
             std::thread::sleep(std::time::Duration::from_millis(PREGEN_YIELD_DURATION_MS));
         }
     }
-    let pcm_data = &pcm_data[..offset];
+    pcm_data.truncate(offset);
     let gen_elapsed_ms = (usb_audio::server_time_us() - gen_started_us) / 1000;
     info!(
         "pre-generation complete: {} bytes in {} ms",
         pcm_data.len(),
         gen_elapsed_ms
     );
+    Ok((pcm_data, gen_elapsed_ms))
+}
 
-    // Start the USB audio stream and write the pre-generated data.
-    let start_result = match start_playback_pregenerated(
+/// Recovery for a failed stream start, from least to most disruptive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AudioRecoveryStep {
+    ReopenInterface,
+    RestartDriver,
+    RecycleRootPort,
+}
+
+impl AudioRecoveryStep {
+    fn for_error(err: &usb_audio::UsbAudioError) -> &'static [Self] {
+        match err.esp_code() {
+            // The driver could not allocate stream resources; a fresh
+            // interface or driver usually frees them.
+            Some(code) if code == esp_idf_sys::ESP_ERR_NO_MEM as esp_idf_sys::esp_err_t => &[
+                Self::ReopenInterface,
+                Self::RestartDriver,
+                Self::RecycleRootPort,
+            ],
+            // A control request the miniDSP never answered, or a stream it
+            // stopped consuming. The driver refuses to reopen the interface
+            // or uninstall until the pending request completes, which only a
+            // disconnect forces, so skip straight to the root-port recycle.
+            Some(code) if code == esp_idf_sys::ESP_ERR_TIMEOUT as esp_idf_sys::esp_err_t => {
+                &[Self::RecycleRootPort]
+            }
+            // start() refuses while a stream from an earlier run whose stop
+            // failed is still active; closing the interface stops it.
+            Some(code)
+                if code == esp_idf_sys::ESP_ERR_INVALID_STATE as esp_idf_sys::esp_err_t
+                    && err.driver_call() == Some("uac2_host_device_start") =>
+            {
+                &[Self::ReopenInterface]
+            }
+            _ => &[],
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ReopenInterface => "playback start reopen recovery",
+            Self::RestartDriver => "playback start driver restart recovery",
+            Self::RecycleRootPort => "playback start root-port recovery",
+        }
+    }
+}
+
+fn start_playback_with_recovery(
+    state: &SharedDeviceState,
+    audio_state: &usb_audio::SharedAudioState,
+    dev: &Arc<DeviceState>,
+    audio_device: &mut Option<Arc<usb_audio::Uac2Device>>,
+    format: StreamFormat,
+    prefill: &mut impl FnMut(usize, &mut [u8]) -> usize,
+) -> Result<PlaybackStart, String> {
+    let mut result = start_playback_pregenerated(
         audio_device
             .as_ref()
             .expect("playback thread should hold an audio device"),
-        &plan,
-        pcm_data,
-    ) {
-        Ok(start) => Ok(start),
-        Err(err) if err.contains("ESP_ERR_NO_MEM") => {
-            warn!("playback start hit {err}; refreshing UAC2 device and retrying");
-            match refresh_audio_device_for_playback(
-                &audio_state,
-                &mut audio_device,
-                "playback start no-mem recovery",
-            ) {
-                Ok(device) => {
-                    audio_device = Some(device);
-                    match start_playback_pregenerated(
-                        audio_device
-                            .as_ref()
-                            .expect("recovered playback device should be present"),
-                        &plan,
-                        pcm_data,
-                    ) {
-                        Ok(start) => Ok(start),
-                        Err(retry_err) if retry_err.contains("ESP_ERR_NO_MEM") => {
-                            warn!(
-                                "playback retry after UAC2 reopen still hit {retry_err}; restarting UAC2 driver"
-                            );
-                            match restart_audio_driver_for_playback(
-                                &audio_state,
-                                &mut audio_device,
-                                "playback start driver restart recovery",
-                            ) {
-                                Ok(device) => {
-                                    audio_device = Some(device);
-                                    start_playback_pregenerated(
-                                        audio_device
-                                            .as_ref()
-                                            .expect("driver-restarted playback device should be present"),
-                                        &plan,
-                                        pcm_data,
-                                    )
-                                }
-                                Err(restart_err) => Err(format!(
-                                    "{retry_err}; driver restart recovery failed: {restart_err}"
-                                )),
-                            }
-                        }
-                        Err(retry_err) => Err(retry_err),
-                    }
-                }
-                Err(recover_err) => Err(format!("{err}; recovery failed: {recover_err}")),
-            }
-        }
-        Err(err) => Err(err),
+        format,
+        prefill,
+    );
+    let mut last_step: Option<AudioRecoveryStep> = None;
+    let mut history = Vec::new();
+    if let Err(err) = &result {
+        history.push(err.to_string());
     }
-    .or_else(|err| {
-        if !err.contains("ESP_ERR_NO_MEM") {
-            return Err(err);
-        }
 
-        warn!("playback start still hit {err}; recycling USB root port");
-        match recycle_root_port_for_playback(
-            &state,
-            &audio_state,
-            &dev,
-            &mut audio_device,
-            "playback start root-port recovery",
-        ) {
+    loop {
+        let err = match result {
+            Ok(start) => return Ok(start),
+            Err(err) => err,
+        };
+
+        let next_step = AudioRecoveryStep::for_error(&err)
+            .iter()
+            .copied()
+            .find(|step| last_step.is_none_or(|last| *step > last));
+        let Some(step) = next_step else {
+            return Err(history.join("; "));
+        };
+        last_step = Some(step);
+        warn!("playback start failed: {err}; trying {}", step.reason());
+
+        let recovered = match step {
+            AudioRecoveryStep::ReopenInterface => {
+                refresh_audio_device_for_playback(audio_state, audio_device, step.reason())
+            }
+            AudioRecoveryStep::RestartDriver => {
+                restart_audio_driver_for_playback(audio_state, audio_device, step.reason())
+            }
+            AudioRecoveryStep::RecycleRootPort => {
+                recycle_root_port_for_playback(state, audio_state, dev, audio_device, step.reason())
+            }
+        };
+        result = match recovered {
             Ok(device) => {
-                audio_device = Some(device);
-                start_playback_pregenerated(
-                    audio_device
-                        .as_ref()
-                        .expect("root-port-recovered playback device should be present"),
-                    &plan,
-                    pcm_data,
-                )
-            }
-            Err(recover_err) => Err(format!("{err}; root-port recovery failed: {recover_err}")),
-        }
-    })
-    .map(|mut start| {
-        start.response.source_changed = source_changed;
-        start.response.previous_source = previous_source.clone();
-        start
-    });
-    let allow_source_restore;
-
-    match start_result {
-        Ok(start) => {
-            let audio_device = audio_device
-                .as_ref()
-                .expect("playback device should remain available after start");
-            let playback_started_us = usb_audio::server_time_us();
-            info!(
-                "playback streaming started: {} bytes pre-generated",
-                pcm_data.len()
-            );
-            let _ = started_tx.send(Ok(start.response.clone()));
-            let mut write_time_us = start.first_write_time_us;
-            let mut total_bytes_written = start.first_write_bytes;
-            let mut last_write_bytes = start.first_write_bytes;
-            let mut last_write_return_us = start.first_write_return_us;
-            let mut write_latencies_us = vec![start.first_write_time_us];
-
-            // Stream remaining pre-generated data in chunks
-            let chunk_bytes = start.chunk_bytes;
-            // Copy each chunk from PSRAM to a fixed internal-SRAM buffer
-            // before writing to the ring buffer. xRingbufferSend holds a
-            // critical section during memcpy — PSRAM SPI latency inside
-            // that section can block the USB host task. This buffer stays
-            // off the playback thread stack so the thread can run with a
-            // smaller stack budget on the constrained ESP32 pthread pool.
-            // Keep the shared SRAM scratch buffer larger than the current
-            // streaming chunk so future 24-bit or higher-rate paths still fit.
-            let mut sram_buf = PLAYBACK_STREAM_BUF
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut pos = start.first_write_bytes;
-            let mut stream_failed = false;
-            while pos < pcm_data.len() {
-                let end = (pos + chunk_bytes).min(pcm_data.len());
-                let len = end - pos;
-                sram_buf[..len].copy_from_slice(&pcm_data[pos..end]);
-                let write_started_us = usb_audio::server_time_us();
-                if let Err(err) = audio_device.write(&sram_buf[..len], 250) {
-                    warn!("playback stream failed: {err}");
-                    stream_failed = true;
-                    break;
+                let start = start_playback_pregenerated(&device, format, prefill);
+                if let Err(retry_err) = &start {
+                    history.push(format!("after {}: {retry_err}", step.reason()));
                 }
-                let write_elapsed_us = usb_audio::server_time_us() - write_started_us;
-                write_time_us += write_elapsed_us;
-                write_latencies_us.push(write_elapsed_us);
-                let written = end - pos;
-                total_bytes_written += written;
-                last_write_bytes = written;
-                last_write_return_us = usb_audio::server_time_us();
-                pos = end;
-                if write_latencies_us.len() % PLAYBACK_PROGRESS_LOG_EVERY_WRITES == 0 {
-                    info!(
-                        "playback progress: {} / {} bytes, write={} ms",
-                        total_bytes_written,
-                        pcm_data.len(),
-                        write_time_us / 1000
-                    );
-                }
+                *audio_device = Some(device);
+                start
             }
-
-            let stream_connected = audio_device.is_connected();
-            allow_source_restore = !stream_failed && stream_connected;
-            log_audio_feedback_if_connected(&audio_device, "playback");
-            let stop_started_us = usb_audio::server_time_us();
-            stop_audio_stream_if_connected(&audio_device, "playback");
-            let stop_finished_us = usb_audio::server_time_us();
-            let (
-                write_min_us,
-                write_max_us,
-                write_avg_us,
-                write_p50_us,
-                write_p95_us,
-                write_p99_us,
-            ) = summarize_write_latencies(&write_latencies_us);
-            info!(
-                "playback completed in {} ms (gen={} ms, write={} ms, expected_bytes={}, actual_bytes={}, writes={}, last_write_bytes={}, tx_need_data={}, last_write_after_start={} ms, stop_time={} ms, write_min={} us, write_max={} us, write_avg={} us, write_p50={} us, write_p95={} us, write_p99={} us)",
-                (usb_audio::server_time_us() - playback_started_us) / 1000,
-                gen_elapsed_ms,
-                write_time_us / 1000,
-                total_bytes,
-                total_bytes_written,
-                write_latencies_us.len(),
-                last_write_bytes,
-                usb_audio::tx_need_data_count(),
-                (last_write_return_us - playback_started_us) / 1000,
-                (stop_finished_us - stop_started_us) / 1000,
-                write_min_us,
-                write_max_us,
-                write_avg_us,
-                write_p50_us,
-                write_p95_us,
-                write_p99_us,
-            );
-        }
-        Err(err) => {
-            // Playback never started, but we may already have switched the
-            // MiniDSP to USB in preparation for it. Try to restore the
-            // previous source on the same cleanup path before returning 500.
-            allow_source_restore = true;
-            let _ = started_tx.send(Err(err));
-        }
+            Err(recover_err) => {
+                history.push(format!("{} failed: {recover_err}", step.reason()));
+                // Escalate to the next step on the same start error; each
+                // step reacquires its own interface.
+                Err(err)
+            }
+        };
     }
+}
 
-    if allow_source_restore && restore_source.is_some() {
-        // Source restoration may switch away from USB and tear down the UAC2
-        // interface. Release the playback thread's Arc first so that close
-        // completion really means the interface is gone.
-        drop(audio_device.take());
-    }
-
-    if allow_source_restore {
-        if let Err(err) =
-            restore_source_after_playback(&state, &audio_state, &dev, restore_source, "playback")
-        {
-            warn!("{err}");
+/// Let audio already accepted by `write()` play out. `write()` returns once
+/// data is queued, and `stop_stream()` discards whatever is still queued, so
+/// stopping right after the last write cuts the tail marker and decay.
+fn wait_for_queued_audio_to_play(audio_device: &usb_audio::Uac2Device, byte_rate: usize) {
+    const POLL: Duration = Duration::from_millis(20);
+    let deadline = Instant::now() + usb_audio::tx_drain_time(byte_rate);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || !audio_device.is_connected() {
+            return;
         }
-    } else if restore_source.is_some() {
-        warn!("skipping source restore after interrupted or disconnected playback");
+        std::thread::sleep(remaining.min(POLL));
     }
+}
 
-    audio_state.finish_playback();
-    // _wifi_ps guard restores WiFi PS on drop
+/// Poll for the driver's first-URB timestamp. Returns 0 if the stream
+/// stopped or the device went away before one was reported.
+fn wait_for_stream_start_time(audio_device: &usb_audio::Uac2Device) -> i64 {
+    for _ in 0..20 {
+        let started_at_us = audio_device.start_time_us();
+        if started_at_us != 0 || !audio_device.is_connected() {
+            return started_at_us;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    audio_device.start_time_us()
 }
 
 fn log_audio_feedback_if_connected(audio_device: &usb_audio::Uac2Device, context: &str) {
@@ -3859,20 +4691,34 @@ fn log_audio_feedback_if_connected(audio_device: &usb_audio::Uac2Device, context
         return;
     }
 
+    // 16.16 fixed point, in samples per 1 ms USB frame (48.0000 at 48 kHz).
     let fb_raw = audio_device.feedback_raw();
-    let fb_hz = fb_raw >> 16;
+    let fb_whole = fb_raw >> 16;
     let fb_frac = ((fb_raw & 0xFFFF) as u64 * 10000) / 65536;
-    info!("USB feedback at end of {context}: raw=0x{fb_raw:08x} ({fb_hz}.{fb_frac:04} Hz)");
+    info!(
+        "USB feedback at end of {context}: raw=0x{fb_raw:08x} ({fb_whole}.{fb_frac:04} samples/ms)"
+    );
 }
 
-fn stop_audio_stream_if_connected(audio_device: &usb_audio::Uac2Device, context: &str) {
+/// Returns false if the stream may still be running: the device is
+/// connected but `stop_stream()` failed.
+fn stop_audio_stream_if_connected(audio_device: &usb_audio::Uac2Device, context: &str) -> bool {
+    if audio_device.is_closed_or_gone() {
+        return true;
+    }
     if !audio_device.is_connected() {
-        warn!("{context}: skipping UAC2 stop after disconnect");
-        return;
+        // A queued/failed close also clears is_connected. Wait for actual
+        // close completion instead of treating that as a physical unplug.
+        warn!("{context}: UAC2 close is pending; stream stop is unconfirmed");
+        return false;
     }
 
-    if let Err(err) = audio_device.stop_stream() {
-        warn!("UAC2 stop failed after {context}: {err}");
+    match audio_device.stop_stream() {
+        Ok(()) => true,
+        Err(err) => {
+            warn!("UAC2 stop failed after {context}: {err}");
+            false
+        }
     }
 }
 
@@ -3880,7 +4726,8 @@ fn stop_audio_stream_if_connected(audio_device: &usb_audio::Uac2Device, context:
 /// in a tight loop, identical to the standalone driver test harness.
 /// No PSRAM, no PlaybackGenerator, no pre-generation — isolates whether
 /// blips come from the data pipeline or the system environment.
-#[allow(dead_code)]
+// Standalone diagnostic helper keeps the same playback/source inputs as the worker.
+#[allow(dead_code, clippy::too_many_arguments)]
 fn run_inline_sine_test(
     state: SharedDeviceState,
     dev: Arc<DeviceState>,
@@ -3950,35 +4797,21 @@ fn run_inline_sine_test(
     }
 
     // Wait for stream to actually start (first SOF)
-    let mut started_at_us = if audio_device
-        .as_ref()
-        .expect("inline sine start should hold an audio device")
-        .is_connected()
-    {
+    let started_at_us = wait_for_stream_start_time(
         audio_device
             .as_ref()
-            .expect("inline sine start should hold an audio device")
-            .start_time_us()
-    } else {
-        0
-    };
-    for _ in 0..20 {
-        if started_at_us != 0
-            || !audio_device
-                .as_ref()
-                .expect("inline sine start wait should hold an audio device")
-                .is_connected()
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        started_at_us = audio_device
-            .as_ref()
-            .expect("inline sine start wait should hold an audio device")
-            .start_time_us();
-    }
+            .expect("inline sine start should hold an audio device"),
+    );
     if started_at_us == 0 {
-        started_at_us = usb_audio::server_time_us();
+        stop_audio_stream_if_connected(
+            audio_device
+                .as_ref()
+                .expect("inline sine start should hold an audio device"),
+            "inline sine start",
+        );
+        let _ = started_tx.send(Err(usb_audio::UsbAudioError::NoStartTime.to_string()));
+        audio_state.finish_playback();
+        return;
     }
 
     let _ = started_tx.send(Ok(PlayResponse {
@@ -4015,6 +4848,14 @@ fn run_inline_sine_test(
                 break;
             }
         }
+    }
+    if !stream_failed {
+        wait_for_queued_audio_to_play(
+            audio_device
+                .as_ref()
+                .expect("inline sine drain should hold an audio device"),
+            SAMPLE_RATE as usize * FRAME_BYTES,
+        );
     }
     let stream_elapsed_ms = (usb_audio::server_time_us() - stream_start_us) / 1000;
 
@@ -4109,8 +4950,15 @@ fn write_audio_chunk_with_retry(
     Err(last_error.unwrap_or_else(|| "unknown write failure".into()))
 }
 
+#[derive(Clone, Copy)]
+struct StreamFormat {
+    sample_rate: u32,
+    bit_depth: BitDepth,
+    frame_bytes: usize,
+}
+
 struct PlaybackStart {
-    response: PlayResponse,
+    started_at_us: i64,
     chunk_bytes: usize,
     first_write_bytes: usize,
     first_write_time_us: i64,
@@ -4119,39 +4967,43 @@ struct PlaybackStart {
 
 fn start_playback_pregenerated(
     audio_device: &usb_audio::Uac2Device,
-    plan: &PlaybackPlan,
-    pcm_data: &[u8],
-) -> Result<PlaybackStart, String> {
+    format: StreamFormat,
+    prefill: &mut impl FnMut(usize, &mut [u8]) -> usize,
+) -> Result<PlaybackStart, usb_audio::UsbAudioError> {
     const PREFILL_MS: usize = 150;
 
     usb_audio::reset_tx_need_data_count();
-    audio_device
-        .start_stream(plan.request.sample_rate, plan.request.bit_depth)
-        .map_err(|e| e.to_string())?;
+    audio_device.start_stream(format.sample_rate, format.bit_depth)?;
 
     // Stream in ~2 ms chunks (96 frames at 48 kHz), matching the cadence
     // used by the standalone UAC2 playback harness when it sounds clean.
-    let frames_per_chunk = playback_stream_chunk_frames(plan.request.sample_rate);
-    let chunk_bytes = frames_per_chunk * plan.layout().frame_bytes();
+    let frames_per_chunk = playback_stream_chunk_frames(format.sample_rate);
+    // Keep complete frames within the existing internal-SRAM scratch buffer,
+    // including higher-rate / 24-bit formats.
+    let chunk_bytes =
+        (frames_per_chunk * format.frame_bytes).min(2880 / format.frame_bytes * format.frame_bytes);
 
     // Pre-fill well past the ring buffer's half-full low-watermark so
     // playback starts with enough slack to absorb WiFi/USB jitter across
     // repeated runs. At 48 KiB this keeps the buffer comfortably above the
     // default threshold while still leaving headroom for immediate writes.
     let prefill_chunks = PREFILL_MS.div_ceil(PLAYBACK_STREAM_TARGET_CHUNK_MS).max(1);
-    let prefill_end = (chunk_bytes * prefill_chunks).min(pcm_data.len());
+    let prefill_end = chunk_bytes * prefill_chunks;
     let mut prefill_pos = 0;
-    let mut prefill_sram = [0u8; 2880];
+    let mut prefill_sram = PLAYBACK_STREAM_BUF
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let first_write_started_us = usb_audio::server_time_us();
     while prefill_pos < prefill_end {
-        let end = (prefill_pos + chunk_bytes).min(prefill_end);
-        let len = end - prefill_pos;
-        prefill_sram[..len].copy_from_slice(&pcm_data[prefill_pos..end]);
+        let len = prefill(prefill_pos, &mut prefill_sram[..chunk_bytes]);
+        if len == 0 {
+            break;
+        }
         if let Err(err) = audio_device.write(&prefill_sram[..len], 500) {
             let _ = audio_device.stop_stream();
-            return Err(err.to_string());
+            return Err(err);
         }
-        prefill_pos = end;
+        prefill_pos += len;
     }
     let first_write_return_us = usb_audio::server_time_us();
     info!(
@@ -4160,29 +5012,18 @@ fn start_playback_pregenerated(
         (first_write_return_us - first_write_started_us) / 1000
     );
 
-    let mut started_at_us = audio_device.start_time_us();
-    for _ in 0..20 {
-        if started_at_us != 0 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        started_at_us = audio_device.start_time_us();
-    }
+    // startedAtUs is the client's alignment anchor; a substitute clock
+    // reading would silently misalign the whole capture.
+    let started_at_us = wait_for_stream_start_time(audio_device);
     if started_at_us == 0 {
-        started_at_us = usb_audio::server_time_us();
+        // A stream left running here is picked up by the next start, which
+        // fails with INVALID_STATE and reopens the interface.
+        stop_audio_stream_if_connected(audio_device, "playback start without start time");
+        return Err(usb_audio::UsbAudioError::NoStartTime);
     }
 
     Ok(PlaybackStart {
-        response: PlayResponse {
-            started_at_us,
-            tone_burst_offset_samples: plan.offsets().tone_burst_offset_samples,
-            sweep_offset_samples: plan.offsets().sweep_offset_samples,
-            tail_tone_burst_offset_samples: plan.offsets().tail_tone_burst_offset_samples,
-            total_samples: plan.offsets().total_samples,
-            sample_rate: plan.request.sample_rate,
-            source_changed: false,
-            previous_source: None,
-        },
+        started_at_us,
         chunk_bytes,
         first_write_bytes: prefill_pos,
         first_write_time_us: first_write_return_us - first_write_started_us,
@@ -4220,6 +5061,38 @@ fn summarize_write_latencies(samples: &[i64]) -> (i64, i64, i64, i64, i64, i64) 
 // ---------------------------------------------------------------------------
 // WebSocket support (status streaming)
 // ---------------------------------------------------------------------------
+
+/// Preserve svc 0.53's connection-time callback on IDF >=6.0.1, where the
+/// normal URI handler is only called for data frames after a WS upgrade.
+/// This is "Option 2" from Espressif's 6.0 HTTP server migration guide
+/// (`ws_post_handshake_cb = handler`), applied at link time (`--wrap`, see
+/// build.rs) because esp-idf-svc 0.53 builds the `httpd_uri_t` itself and
+/// leaves the field unset; without it the `New` connection event never fires.
+/// Remove this, the `--wrap` flag and CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+/// once esp-idf-svc sets `ws_post_handshake_cb` for WebSocket handlers.
+/// IDF copies the registration, so the adapted value need only live for this call.
+#[cfg(esp_idf_httpd_ws_support)]
+#[no_mangle]
+unsafe extern "C" fn __wrap_httpd_register_uri_handler(
+    handle: esp_idf_svc::sys::httpd_handle_t,
+    registration: *const esp_idf_svc::sys::httpd_uri_t,
+) -> esp_idf_svc::sys::esp_err_t {
+    extern "C" {
+        fn __real_httpd_register_uri_handler(
+            handle: esp_idf_svc::sys::httpd_handle_t,
+            registration: *const esp_idf_svc::sys::httpd_uri_t,
+        ) -> esp_idf_svc::sys::esp_err_t;
+    }
+
+    if registration.is_null() {
+        return __real_httpd_register_uri_handler(handle, registration);
+    }
+    let mut adapted = *registration;
+    if adapted.is_websocket && adapted.ws_post_handshake_cb.is_none() {
+        adapted.ws_post_handshake_cb = adapted.handler;
+    }
+    __real_httpd_register_uri_handler(handle, &adapted)
+}
 
 #[cfg(esp_idf_httpd_ws_support)]
 fn register_ws_routes(
@@ -4316,14 +5189,11 @@ fn register_ws_routes(
 
                             let dev_state = st.clone();
                             let audio_state = audio.clone();
-                            if let Err(e) = spawn_psram_thread(
-                                c"ws_compat",
-                                "ws_compat",
-                                WS_COMPAT_THREAD_STACK_BYTES,
-                                move || {
-                                    ws_poll_loop(sender, dev_state, audio_state, stop, interval_ms);
-                                },
-                            ) {
+                            // One poller at a time: the previous one was told to
+                            // stop above and ends within one poll interval.
+                            if let Err(e) = WS_COMPAT_WORKER.run(move || {
+                                ws_poll_loop(sender, dev_state, audio_state, stop, interval_ms);
+                            }) {
                                 log::warn!("WebSocket compat: failed to spawn poll thread: {e}");
                             }
                         }
@@ -4491,7 +5361,7 @@ fn register_ws_routes(
 /// is NOT performed and this returns false.
 #[cfg(esp_idf_httpd_ws_support)]
 unsafe fn ws_is_upgrade(raw_req: *mut esp_idf_svc::sys::httpd_req_t) -> bool {
-    esp_idf_svc::sys::httpd_req_get_hdr_value_len(raw_req, b"Sec-WebSocket-Key\0".as_ptr()) > 0
+    esp_idf_svc::sys::httpd_req_get_hdr_value_len(raw_req, c"Sec-WebSocket-Key".as_ptr()) > 0
 }
 
 /// Parse query parameters from the request URI for WebSocket poll configuration.
@@ -4509,11 +5379,11 @@ unsafe fn ws_parse_query(raw_req: *mut esp_idf_svc::sys::httpd_req_t) -> (bool, 
 unsafe fn ws_send_http_json(raw_req: *mut esp_idf_svc::sys::httpd_req_t, status: u16, json: &str) {
     use esp_idf_svc::sys::*;
 
-    httpd_resp_set_type(raw_req, b"application/json\0".as_ptr());
+    httpd_resp_set_type(raw_req, c"application/json".as_ptr());
     httpd_resp_set_hdr(
         raw_req,
-        b"Access-Control-Allow-Origin\0".as_ptr(),
-        b"*\0".as_ptr(),
+        c"Access-Control-Allow-Origin".as_ptr(),
+        c"*".as_ptr(),
     );
 
     let status_text = match status {
@@ -4697,206 +5567,162 @@ fn register_ezbeq_ws(
     use esp_idf_svc::ws::FrameType;
     use std::sync::atomic::Ordering;
 
-    let active_ws: Arc<Mutex<Option<ActiveWsBeq>>> = Arc::new(Mutex::new(None));
-
-    let st = state.clone();
-    let audio = audio_state.clone();
-    let beq = beq_state.clone();
-    let ws_ref = active_ws.clone();
+    let active_ws: Arc<Mutex<Vec<ActiveWsBeq>>> = Arc::new(Mutex::new(Vec::new()));
+    let levels_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let next_token = Mutex::new(0u64);
 
     server.ws_handler("/ws", None, move |ws| {
-        if ws.is_new() {
-            // Stop any previous session
-            if let Ok(mut guard) = ws_ref.lock() {
-                if let Some(prev) = guard.take() {
-                    prev.stop.store(true, Ordering::Relaxed);
-                }
-            }
-
-            // Send initial Catalogue meta
-            let catalogue_meta = build_catalogue_meta();
-            ws_send_logged(
-                ws,
-                "ezBEQ WS",
-                FrameType::Text(false),
-                catalogue_meta.as_bytes(),
-            )?;
-
-            // Send initial DeviceState
-            if audio.is_playing() {
-                log::info!("ezBEQ WS: deferring initial DeviceState while playback is active");
-            } else if let Some(dev) = get_device(&st) {
-                let state_json = if let Some(_op) = dev.try_begin_operation() {
-                    let beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
-                    crate::ezbeq::device_state_json(&dev, &beq_guard)
-                } else {
-                    serde_json::to_string(&json!({
-                        "message": "DeviceState",
-                        "data": {
-                            "error": DEVICE_BUSY,
-                        }
-                    }))
-                    .unwrap_or_default()
-                };
-                ws_send_logged(
-                    ws,
-                    "ezBEQ WS",
-                    FrameType::Text(false),
-                    state_json.as_bytes(),
-                )?;
-            }
-
-            // Store a detached sender for REST → WS broadcasts
-            let fd = ws.session();
-            match ws.create_detached_sender() {
-                Ok(sender) => {
-                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    log::info!("ezBEQ WS: detached sender created (fd={fd})");
-                    if let Ok(mut beq_guard) = beq.lock() {
-                        beq_guard.ws_sender = Some(sender.clone());
-                    }
-                    // Record fd so is_closed() can match and clean up even without subscribe
-                    if let Ok(mut guard) = ws_ref.lock() {
-                        *guard = Some(ActiveWsBeq {
-                            stop,
-                            fd,
-                            levels_running: false,
-                        });
-                    }
-                }
-                Err(e) => log::warn!("ezBEQ WS: create_detached_sender failed: {e:?}"),
-            }
-
-            return Ok::<(), esp_idf_svc::sys::EspError>(());
-        }
-
+        let fd = ws.session();
         if ws.is_closed() {
-            let closing_fd = ws.session();
-            if let Ok(mut guard) = ws_ref.lock() {
-                if guard.as_ref().is_some_and(|a| a.fd == closing_fd) {
-                    if let Some(active) = guard.take() {
-                        active.stop.store(true, Ordering::Relaxed);
-                    }
-                    // Only clear ws_sender if this is the active session's fd
-                    if let Ok(mut beq_guard) = beq.lock() {
-                        beq_guard.ws_sender = None;
-                    }
-                }
+            let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(idx) = clients.iter().position(|client| client.fd == fd) {
+                let client = clients.remove(idx);
+                crate::ezbeq::remove_ws_sender(
+                    &mut beq_state.lock().unwrap_or_else(|e| e.into_inner()),
+                    client.token,
+                );
             }
             return Ok(());
         }
+        if ws.is_new() {
+            // Four ezBEQ sockets leave room within httpd's 13-socket budget.
+            // Queue closure of the oldest session without a detached send on
+            // this single httpd task (detached sends would deadlock here).
+            let evicted = {
+                let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
+                if clients.len() >= 4 {
+                    Some(clients.remove(0))
+                } else {
+                    None
+                }
+            };
+            if let Some(client) = evicted {
+                crate::ezbeq::remove_ws_sender(
+                    &mut beq_state.lock().unwrap_or_else(|e| e.into_inner()),
+                    client.token,
+                );
+                if let esp_idf_svc::http::server::ws::EspHttpWsConnection::New(handle, _) = ws {
+                    unsafe {
+                        esp_idf_svc::sys::httpd_sess_trigger_close(*handle, client.fd);
+                    }
+                }
+            }
+            // Keep registration and its initial snapshot in the same registry
+            // critical section as the worker's recipient/pending-state snapshot.
+            let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
+            diagnostics::trace_internal_heap("ezBEQ WS new");
+            let meta = build_catalogue_meta();
+            ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), meta.as_bytes())?;
+            diagnostics::trace_internal_heap("ezBEQ WS catalogue sent");
+            if !audio_state.is_playing() {
+                if let Some(dev) = get_device(&state) {
+                    if let Some(_op) = dev.try_begin_operation() {
+                        let json = crate::ezbeq::device_state_json(
+                            &dev,
+                            &beq_state.lock().unwrap_or_else(|e| e.into_inner()),
+                        );
+                        diagnostics::trace_internal_heap("ezBEQ WS state built");
+                        ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), json.as_bytes())?;
+                        diagnostics::trace_internal_heap("ezBEQ WS state sent");
+                    }
+                }
+            }
+            let sender = ws.create_detached_sender()?;
+            diagnostics::trace_internal_heap("ezBEQ WS sender created");
+            let token = {
+                let mut token = next_token.lock().unwrap_or_else(|e| e.into_inner());
+                *token += 1;
+                *token
+            };
+            let server_handle = match ws {
+                esp_idf_svc::http::server::ws::EspHttpWsConnection::New(handle, _) => {
+                    *handle as usize
+                }
+                _ => unreachable!("new WebSocket session"),
+            };
+            clients.push(ActiveWsBeq {
+                fd,
+                server_handle,
+                token,
+                sender: sender.clone(),
+                levels: false,
+            });
+            {
+                let mut beq = beq_state.lock().unwrap_or_else(|e| e.into_inner());
+                beq.ws_senders.push((token, sender));
+                beq.ws_sender = beq.ws_senders.first().map(|(_, sender)| sender.clone());
+            }
+            // Hold clients while changing running: the retiring worker uses the
+            // same lock, so a new session cannot lose its worker in that race.
+            if !levels_running.swap(true, Ordering::Relaxed) {
+                let st = state.clone();
+                let audio = audio_state.clone();
+                let active = active_ws.clone();
+                let running = levels_running.clone();
+                let beq = beq_state.clone();
+                if let Err(e) =
+                    EZBEQ_LEVELS_WORKER.run(move || push_levels(st, audio, active, running, beq))
+                {
+                    levels_running.store(false, Ordering::Relaxed);
+                    log::warn!("failed to spawn ezBEQ WS worker: {e}");
+                    return Err(esp_idf_svc::sys::EspError::from_infallible::<
+                        { esp_idf_svc::sys::ESP_ERR_NO_MEM },
+                    >());
+                }
+            }
+            drop(clients);
+            return Ok::<(), esp_idf_svc::sys::EspError>(());
+        }
 
-        // Handle incoming messages
-        match ws_recv_frame(ws, "ezBEQ WS", 512)? {
-            Some((ft, frame)) => {
-                let msg = std::str::from_utf8(&frame)
-                    .unwrap_or("")
-                    .trim_end_matches('\0')
-                    .trim();
-                log::info!("ezBEQ WS: ft={ft:?} len={} msg='{msg}'", frame.len());
-
-                if msg == "load catalogue" {
-                    // Browser JS shim handles catalogue loading from our Pages mirror.
-                    // Send empty response as safety fallback (shim intercepts before this fires).
-                    log::info!("load catalogue: handled by browser shim");
-                    let empty = r#"{"message":"CatalogueEntries","data":[]}"#;
-                    ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), empty.as_bytes())?;
-                } else if msg.starts_with("subscribe levels") {
-                    let fd = ws.session();
-                    let stop = match ws_ref.lock() {
-                        Ok(mut guard) => match guard.as_mut() {
-                            Some(active) if active.fd == fd => {
-                                if active.levels_running {
-                                    log::debug!(
-                                        "ezBEQ WS: duplicate levels subscribe ignored for fd={fd}"
-                                    );
-                                    None
-                                } else {
-                                    active.levels_running = true;
-                                    Some(active.stop.clone())
-                                }
-                            }
-                            Some(active) => {
-                                log::warn!(
-                                    "ezBEQ WS: ignoring levels subscribe for stale fd={} active_fd={}",
-                                    fd,
-                                    active.fd
-                                );
-                                None
-                            }
-                            None => {
-                                log::warn!(
-                                    "ezBEQ WS: levels subscribe received without active session"
-                                );
-                                None
-                            }
-                        },
-                        Err(err) => {
-                            log::warn!("ezBEQ WS: levels subscribe lock poisoned: {err}");
-                            None
-                        }
-                    };
-
-                    if let Some(stop) = stop {
-                        let sender = beq
-                            .lock()
-                            .ok()
-                            .and_then(|guard| guard.ws_sender.as_ref().cloned());
-                        if let Some(sender) = sender {
-                            let dev_state = st.clone();
-                            let audio_state = audio.clone();
-                            let beq_clone = beq.clone();
-                            let ws_ref_clone = ws_ref.clone();
-                            if let Err(e) = spawn_psram_thread(
-                                c"beq_lvl",
-                                "beq_lvl",
-                                EZBEQ_LEVELS_THREAD_STACK_BYTES,
-                                move || {
-                                    push_levels(
-                                        sender,
-                                        dev_state,
-                                        audio_state,
-                                        stop,
-                                        beq_clone,
-                                        fd,
-                                        ws_ref_clone,
-                                    );
-                                },
-                            ) {
-                                if let Ok(mut guard) = ws_ref.lock() {
-                                    if guard.as_ref().is_some_and(|active| active.fd == fd) {
-                                        if let Some(active) = guard.as_mut() {
-                                            active.levels_running = false;
-                                        }
-                                    }
-                                }
-                                log::warn!("failed to spawn levels thread: {e}");
-                            }
-                        } else {
-                            if let Ok(mut guard) = ws_ref.lock() {
-                                if guard.as_ref().is_some_and(|active| active.fd == fd) {
-                                    if let Some(active) = guard.as_mut() {
-                                        active.levels_running = false;
-                                    }
-                                }
-                            }
-                            log::warn!("ezBEQ WS: no detached sender available for levels");
+        if let Some((ft, frame)) = ws_recv_frame(ws, "ezBEQ WS", 512)? {
+            match ft {
+                FrameType::Ping => {
+                    ws_send_logged(ws, "ezBEQ WS", FrameType::Pong, &frame)?;
+                }
+                FrameType::Close => {
+                    let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(idx) = clients.iter().position(|client| client.fd == fd) {
+                        let client = clients.remove(idx);
+                        crate::ezbeq::remove_ws_sender(
+                            &mut beq_state.lock().unwrap_or_else(|e| e.into_inner()),
+                            client.token,
+                        );
+                    }
+                    ws_send_logged(ws, "ezBEQ WS", FrameType::Close, &[])?;
+                }
+                FrameType::Text(_) => {
+                    let msg = std::str::from_utf8(&frame)
+                        .unwrap_or("")
+                        .trim_end_matches('\0')
+                        .trim();
+                    if msg == "ping" {
+                        ws_send_logged(
+                            ws,
+                            "ezBEQ WS",
+                            FrameType::Text(false),
+                            br#"{"message":"Pong"}"#,
+                        )?;
+                    } else if msg == "load catalogue" {
+                        // The shim supplies the listing; metadata remains a server broadcast.
+                        let meta = build_catalogue_meta();
+                        ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), meta.as_bytes())?;
+                    } else if msg == "subscribe levels master" {
+                        let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(client) = clients.iter_mut().find(|client| client.fd == fd) {
+                            client.levels = true;
+                            crate::ezbeq::remove_ws_sender(
+                                &mut beq_state.lock().unwrap_or_else(|e| e.into_inner()),
+                                client.token,
+                            );
                         }
                     }
                 }
-
-                if matches!(ft, FrameType::Close) {
-                    ws_send_logged(ws, "ezBEQ WS", FrameType::Close, &[])?;
-                } else if matches!(ft, FrameType::Ping) {
-                    ws_send_logged(ws, "ezBEQ WS", FrameType::Pong, &[])?;
-                }
+                _ => {}
             }
-            None => {}
         }
         Ok(())
     })?;
-
-    info!("ezBEQ WebSocket registered: /ws");
+    info!("ezBEQ WebSocket registered: /ws (4 clients)");
     Ok(())
 }
 
@@ -4913,7 +5739,8 @@ fn build_catalogue_meta() -> String {
     let count = match std::fs::File::open(crate::storage::full_path("catalogue.bin")) {
         Ok(mut f) => {
             let mut header = [0u8; 12];
-            if std::io::Read::read_exact(&mut f, &mut header).is_ok() && &header[0..4] == b"BEQ\x02"
+            if std::io::Read::read_exact(&mut f, &mut header).is_ok()
+                && (&header[0..4] == b"BEQ\x02" || &header[0..4] == b"BEQ\x03")
             {
                 u32::from_le_bytes(header[4..8].try_into().unwrap())
             } else {
@@ -4923,11 +5750,15 @@ fn build_catalogue_meta() -> String {
         Err(_) => 0,
     };
 
+    let loaded = crate::storage::read_file("catalogue-built-at.txt")
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
     serde_json::to_string(&serde_json::json!({
         "message": "Catalogue",
         "data": {
             "version": version,
-            "loaded": 0,
+            "loaded": loaded,
             "count": count,
         }
     }))
@@ -4937,106 +5768,119 @@ fn build_catalogue_meta() -> String {
 /// Active WebSocket session tracker for ezBEQ (module-level for push_levels access).
 #[cfg(esp_idf_httpd_ws_support)]
 struct ActiveWsBeq {
-    stop: Arc<std::sync::atomic::AtomicBool>,
     fd: i32,
-    levels_running: bool,
+    // Store the httpd handle as an integer so the registry remains Send.
+    server_handle: usize,
+    token: u64,
+    sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
+    levels: bool,
 }
 
-/// Push level meter data over WebSocket at ~4Hz for the active ezBEQ session.
+/// One shared 4 Hz worker for state, catalogue metadata and Levels.
+/// Detached sends happen here, never on the single httpd task.
 #[cfg(esp_idf_httpd_ws_support)]
 fn push_levels(
-    mut sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
     state: SharedDeviceState,
     audio_state: usb_audio::SharedAudioState,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    active_ws: Arc<Mutex<Vec<ActiveWsBeq>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
     beq_state: crate::ezbeq::SharedEzBeqState,
-    session_fd: i32,
-    active_ws: Arc<Mutex<Option<ActiveWsBeq>>>,
 ) {
     use esp_idf_svc::ws::FrameType;
     use std::sync::atomic::Ordering;
-
-    log::info!("levels push thread started");
-    let mut connection_lost = false;
-
-    while !stop.load(Ordering::Relaxed) {
+    let mut previous_meta = String::new();
+    let mut ticks = 0u8;
+    loop {
         std::thread::sleep(std::time::Duration::from_millis(250));
-
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        if audio_state.is_playing() {
-            continue;
-        }
-
-        let json = match get_device(&state) {
-            Some(dev) => {
-                if let Some(_op) = dev.try_begin_operation() {
-                    match dev.get_status_summary() {
-                        Ok(status) => {
-                            let mut levels = serde_json::Map::new();
-                            for (i, &v) in status.input_levels.iter().enumerate() {
-                                levels.insert(format!("I{i}"), serde_json::Value::from(v));
-                            }
-                            for (i, &v) in status.output_levels.iter().enumerate() {
-                                levels.insert(format!("O{i}"), serde_json::Value::from(v));
-                            }
-                            let ts =
-                                (unsafe { esp_idf_sys::esp_timer_get_time() } as f64) / 1_000_000.0;
-                            serde_json::to_string(&serde_json::json!({
-                                "message": "Levels",
-                                "data": {
-                                    "name": "master",
-                                    "ts": ts,
-                                    "levels": levels,
-                                }
-                            }))
-                            .unwrap_or_default()
-                        }
-                        Err(_) => continue,
-                    }
-                } else {
-                    continue;
-                }
+        diagnostics::trace_internal_heap("ezBEQ levels tick");
+        let (clients, pending) = {
+            let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
+            clients.retain(|client| !client.sender.is_closed());
+            if clients.is_empty() {
+                let mut beq = beq_state.lock().unwrap_or_else(|e| e.into_inner());
+                beq.ws_senders.clear();
+                beq.ws_sender = None;
+                running.store(false, Ordering::Relaxed);
+                return;
             }
-            None => continue,
+            let recipients: Vec<_> = clients
+                .iter()
+                .map(|c| (c.token, c.sender.clone(), c.levels))
+                .collect();
+            let mut beq = beq_state.lock().unwrap_or_else(|e| e.into_inner());
+            // Device reprobe replaces EzBeqState; rebuild notification senders
+            // from live sessions rather than losing them across a USB reconnect.
+            beq.ws_senders = recipients
+                .iter()
+                .filter(|(_, _, levels)| !levels)
+                .map(|(token, sender, _)| (*token, sender.clone()))
+                .collect();
+            beq.ws_sender = beq.ws_senders.first().map(|(_, sender)| sender.clone());
+            (recipients, beq.pending_state.take())
         };
-
-        if sender
-            .send(FrameType::Text(false), json.as_bytes())
-            .is_err()
-        {
-            connection_lost = true;
-            break;
-        }
-    }
-
-    log::info!("levels push thread stopped");
-
-    let still_active = if let Ok(mut guard) = active_ws.lock() {
-        if let Some(active) = guard.as_mut() {
-            if active.fd == session_fd {
-                active.levels_running = false;
-                true
+        ticks = (ticks + 1) % 20;
+        let meta = if ticks == 0 {
+            let meta = build_catalogue_meta();
+            if meta != previous_meta {
+                previous_meta = meta.clone();
+                Some(meta)
             } else {
-                false
+                None
             }
         } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    if connection_lost && still_active {
-        if let Ok(mut beq_guard) = beq_state.lock() {
-            if beq_guard.ws_sender.as_ref().map(|active| active.session()) == Some(session_fd) {
-                beq_guard.ws_sender = None;
+            None
+        };
+        let levels = if clients.iter().any(|(_, _, levels)| *levels) && !audio_state.is_playing() {
+            get_device(&state).and_then(|dev| {
+                let _op = dev.try_begin_operation()?;
+                let status = dev.get_status_summary().ok()?;
+                Some(format!(
+                    "{{\"message\":\"Levels\",\"data\":{}}}",
+                    crate::ezbeq::levels_json("master", &status)
+                ))
+            })
+        } else {
+            None
+        };
+        for (token, mut sender, subscriber) in clients {
+            let messages = if subscriber {
+                [levels.as_ref(), None]
+            } else {
+                [meta.as_ref(), pending.as_ref()]
+            };
+            for json in messages.into_iter().flatten() {
+                if sender
+                    .send(FrameType::Text(false), json.as_bytes())
+                    .is_err()
+                {
+                    let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(index) = clients.iter().position(|c| c.token == token) {
+                        let client = &clients[index];
+                        // A failed send does not necessarily close httpd's socket.
+                        // Close it before forgetting the session, while the token
+                        // still identifies this fd. Retain failed close requests
+                        // in the bounded registry so they remain evictable.
+                        let closed = client.sender.is_closed()
+                            || unsafe {
+                                esp_idf_svc::sys::httpd_sess_trigger_close(
+                                    client.server_handle as esp_idf_svc::sys::httpd_handle_t,
+                                    client.fd,
+                                ) == esp_idf_svc::sys::ESP_OK
+                            };
+                        if closed {
+                            clients.remove(index);
+                            crate::ezbeq::remove_ws_sender(
+                                &mut beq_state.lock().unwrap_or_else(|e| e.into_inner()),
+                                token,
+                            );
+                        } else {
+                            log::warn!("failed to queue closure of ezBEQ WS session {}", client.fd);
+                        }
+                    }
+                    break;
+                }
             }
         }
-    } else {
-        let _ = sender;
     }
 }
 
@@ -5194,22 +6038,34 @@ fn proxy_catalogue_file<C: esp_idf_svc::http::server::Connection>(
 
 /// Simple percent-decoding for form values.
 fn urldecode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        match b {
-            b'+' => result.push(' '),
+    // Decode to bytes first: a non-ASCII SSID or password arrives as several
+    // %XX escapes that together form one UTF-8 character.
+    let bytes = s.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => decoded.push(b' '),
             b'%' => {
-                let hi = chars.next().and_then(|c| (c as char).to_digit(16));
-                let lo = chars.next().and_then(|c| (c as char).to_digit(16));
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    result.push((h * 16 + l) as u8 as char);
+                let hex = bytes
+                    .get(i + 1..i + 3)
+                    .filter(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+                    .and_then(|pair| std::str::from_utf8(pair).ok())
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+                match hex {
+                    Some(byte) => {
+                        decoded.push(byte);
+                        i += 2;
+                    }
+                    // Not an escape; keep the '%' literally.
+                    None => decoded.push(b'%'),
                 }
             }
-            _ => result.push(b as char),
+            byte => decoded.push(byte),
         }
+        i += 1;
     }
-    result
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 #[cfg(test)]
@@ -5217,8 +6073,15 @@ mod tests {
     use super::{
         format_previous_source, openapi_json, parse_bm_channel_path, parse_bm_mixer_path,
         parse_device_index, parse_play_path, parse_query_param, parse_source_path,
-        parse_volume_path, validate_esp32_playback_size,
+        parse_volume_path, urldecode, validate_esp32_playback_size,
     };
+
+    #[test]
+    fn urldecode_reassembles_multibyte_utf8() {
+        assert_eq!(urldecode("Caf%C3%A9+5G"), "Café 5G");
+        assert_eq!(urldecode("100%25"), "100%");
+        assert_eq!(urldecode("50%+off%2"), "50%+off%2".replace('+', " "));
+    }
     use minidsp_protocol::playback::{PlayRequest, PlaybackPlan};
     use minidsp_protocol::source::Source;
 

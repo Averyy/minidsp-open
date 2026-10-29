@@ -172,9 +172,17 @@ Notes:
   - timing uncertainty for direct Infuse scrobble
   - hourly if using Plex Sync instead of webhook/scrobble
 
+## Implementation status
+
+The first Companion matcher exists in
+[atv-companion-spike/src/matcher.rs](../atv-companion-spike/src/matcher.rs) and
+is recorded in [CHANGELOG.md](../CHANGELOG.md). It emits candidate variants;
+movie-level product grouping and the Plex/Trakt work below remain open.
+There are no Plex webhook or Trakt scrobble handlers in the desktop or ESP32
+HTTP services.
+
 ## Implementation TODOs
 
-- [ ] Implement the first matcher on top of Companion metadata before revisiting Plex or Trakt enrichment.
 - [ ] Group Companion hits at the movie level and surface candidate BEQ variants instead of pretending one digest is automatically safe.
 - [ ] Validate current Plex real-time endpoints beyond `GET /status/sessions`, especially the exact WebSocket notifications path.
 - [ ] Capture one real Plex webhook payload from an Apple TV client and document the fields we actually receive for movies and episodes.

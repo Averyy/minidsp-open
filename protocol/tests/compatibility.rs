@@ -120,8 +120,8 @@ fn hid_report_format() {
     assert_eq!(report[2], 0x31); // payload
     assert_eq!(report[3], 0x33); // checksum
     // Rest is 0xFF padding
-    for i in 4..64 {
-        assert_eq!(report[i], 0xFF, "byte {i} should be 0xFF padding");
+    for (i, &byte) in report.iter().enumerate().take(64).skip(4) {
+        assert_eq!(byte, 0xFF, "byte {i} should be 0xFF padding");
     }
     assert_eq!(report.len(), 64);
 }

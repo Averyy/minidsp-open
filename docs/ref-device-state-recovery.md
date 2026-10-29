@@ -35,8 +35,8 @@ Current proven paths:
 
 The shared artifact is `DeviceSnapshot` in:
 
-- [minidsp/src/snapshot.rs](./minidsp/src/snapshot.rs:13)
-- [app-esp32/src/snapshot.rs](./app-esp32/src/snapshot.rs:14)
+- [minidsp/src/snapshot.rs](../minidsp/src/snapshot.rs#L13)
+- [app-esp32/src/snapshot.rs](../app-esp32/src/snapshot.rs#L14)
 
 The current schema version is `formatVersion = 1`.
 
@@ -104,7 +104,7 @@ ESP32 HTTP:
 ### Validation
 
 The destructive validation workflow is documented in
-[docs/ref-live-validation.md](./docs/ref-live-validation.md:1).
+[docs/ref-live-validation.md](ref-live-validation.md#L1).
 
 Current live sign-off:
 
@@ -136,7 +136,7 @@ Console for normal recovery work.
 
 The checked-in modern SHARC reset corpus lives under:
 
-- [protocol/assets/audio_firmware](./protocol/assets/audio_firmware/README.md:1)
+- [protocol/assets/audio_firmware](../protocol/assets/audio_firmware/README.md#L1)
 
 Build-time behavior:
 

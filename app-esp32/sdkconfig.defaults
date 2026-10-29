@@ -1,14 +1,28 @@
 # ESP32-S3 target
 CONFIG_IDF_TARGET="esp32s3"
 
+# Rust's xtensa ESP-IDF target and std use the Newlib ABI, not PicolibC.
+CONFIG_LIBC_NEWLIB=y
+
+# Keep USB audio's RTOS/ring-buffer path available while flash cache is off.
+CONFIG_FREERTOS_IN_IRAM=y
+CONFIG_RINGBUF_IN_IRAM=y
+
 # Flash size (DevKitC-1 N8R8 = 8MB flash, but our boards have 16MB)
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
-# Custom partition table (4MB app + 11.94MB LittleFS data on 16MB flash)
+# Custom partition table (two 3 MB OTA app slots + 9.9 MB LittleFS data).
+# ESP-IDF resolves a relative path against the generated CMake project, which
+# esp-idf-sys places in its OUT_DIR, six levels below app-esp32/. That only
+# holds with the default target dir: don't set CARGO_TARGET_DIR for this crate.
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions.csv"
 
-# USB Host support
+# OTA rollback: a new image boots as pending-verify and the bootloader falls
+# back to the previous slot unless the app marks itself valid (see ota.rs).
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# USB Host support (espressif/usb managed component on IDF 6)
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512
 CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y
 
@@ -18,8 +32,9 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 # LwIP — phones open many simultaneous connections during captive portal detection
 CONFIG_LWIP_MAX_SOCKETS=16
 
-# Stack sizes for blocking I/O
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
+# Stack sizes for blocking I/O. Main peaked at 6.7 KB through boot, HID
+# attach and protocol probe (task stack high-water mark).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 
 # Stack overflow detection (hardware watchpoint at end of stack)
@@ -30,12 +45,30 @@ CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# Internal RAM is the scarce pool: task stacks, USB DMA and FreeRTOS objects
+# need it. With WiFi and lwIP buffers internal too, startup left ~21 KB, and
+# HTTP traffic then failed lwIP allocations and panicked.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# That option also switches WiFi to throughput defaults whose static buffers
+# are internal (16 TX, 16 RX, BA window 16: +29 KB measured). TX buffers must
+# be static with it; 8 bound internal use at ~13 KB, and packets beyond that
+# queue in PSRAM cache buffers. RX keeps the previous sizes.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+
+# Per-task stack high-water marks for GET /debug/info
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 
 # Heap — disable memory protection for full PSRAM access
-CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+CONFIG_ESP_SYSTEM_MEMPROT=n
 
 # HTTP server WebSocket support
 CONFIG_HTTPD_WS_SUPPORT=y
+# IDF >=6.0.1 uses a separate callback for connection-time WS initialization.
+CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
 
 # mDNS
 CONFIG_MDNS_MAX_SERVICES=4

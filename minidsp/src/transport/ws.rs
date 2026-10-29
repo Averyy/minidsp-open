@@ -15,11 +15,15 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+type WsStream = WebSocketStream<Box<dyn AsyncRw>>;
+type SharedWsSink = Arc<Mutex<SplitSink<WsStream, Message>>>;
+type SharedWsStream = Arc<Mutex<SplitStream<WsStream>>>;
+
 /// WebSocket transport that connects to the daemon's raw frame bridge.
 /// Uses type-erased async IO so it works over both TCP and Unix sockets.
 pub struct WsTransport {
-    sink: Arc<Mutex<SplitSink<WebSocketStream<Box<dyn AsyncRw>>, Message>>>,
-    stream: Arc<Mutex<SplitStream<WebSocketStream<Box<dyn AsyncRw>>>>>,
+    sink: SharedWsSink,
+    stream: SharedWsStream,
     url: String,
 }
 
@@ -143,7 +147,7 @@ impl Transport for WsTransport {
         tracing::trace!("WS OUT frame: {:02x?}", frame);
         Box::pin(async move {
             let mut sink = sink.lock().await;
-            sink.send(Message::Binary(frame.into()))
+            sink.send(Message::Binary(frame))
                 .await
                 .map_err(map_ws_error)?;
             Ok(())

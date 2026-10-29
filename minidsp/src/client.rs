@@ -146,7 +146,7 @@ fn build_preset_bypass_block(bypass: &[u8]) -> Vec<u8> {
 
 fn default_bypass_map(image: &DefaultPresetImage) -> HashMap<u16, bool> {
     let mut map = HashMap::new();
-    for chunk in image.bypass.chunks_exact(3) {
+    for chunk in image.bypass.as_chunks::<3>().0.iter() {
         let addr = u16::from_be_bytes([chunk[1], chunk[2]]);
         map.insert(addr, chunk[0] & 0x80 != 0);
     }
@@ -372,7 +372,7 @@ pub struct MiniDspClient {
     active_preset: Mutex<Option<u8>>,
     /// Serializes state transitions so overlapping preset/reset calls cannot
     /// race against stale status while the device is still applying one.
-    state_transition_lock: Mutex<()>,
+    pub(crate) state_transition_lock: Mutex<()>,
 }
 
 fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
@@ -436,8 +436,19 @@ impl MiniDspClient {
         priority: Priority,
         context: &str,
     ) -> Result<(), ClientError> {
+        let mutates_preset = matches!(
+            payload.first(),
+            Some(&commands::CMD_WRITE_DSP)
+                | Some(&commands::CMD_WRITE_BIQUAD)
+                | Some(&commands::CMD_BYPASS_FILTER)
+                | Some(&commands::CMD_FIR_LOAD_DATA)
+        );
         let resp = self.queue.execute(payload, priority).await?;
-        Self::ensure_write_response(resp, context)
+        Self::ensure_write_response(resp, context)?;
+        if mutates_preset {
+            self.note_preset_mutation().await;
+        }
+        Ok(())
     }
 
     async fn execute_write_with_timeout(
@@ -670,7 +681,7 @@ impl MiniDspClient {
     async fn wait_for_reset_recovery_until(
         &self,
         timeout: Duration,
-        initial_reconnect_epoch: u64,
+        initial_disconnect_epoch: u64,
     ) -> Result<eeprom::MasterStatusRaw, ClientError> {
         let deadline = Instant::now() + timeout;
         let mut outage_started: Option<Instant> = None;
@@ -693,7 +704,7 @@ impl MiniDspClient {
                 .await
             {
                 Ok(master) => {
-                    if self.queue.reconnect_epoch() != initial_reconnect_epoch {
+                    if self.queue.disconnect_epoch() != initial_disconnect_epoch {
                         return Ok(master);
                     }
 
@@ -751,10 +762,10 @@ impl MiniDspClient {
         // Read level meters if available
         let (input_levels, output_levels) = if let Some(table) = self.profile.dsp_table {
             let input_levels = self
-                .read_status_meters_with_priority(&table.meters.input, priority)
+                .read_status_meters_with_priority(table.meters.input, priority)
                 .await;
             let output_levels = self
-                .read_status_meters_with_priority(&table.meters.output, priority)
+                .read_status_meters_with_priority(table.meters.output, priority)
                 .await;
             (input_levels, output_levels)
         } else {
@@ -865,7 +876,7 @@ impl MiniDspClient {
             .await
     }
 
-    async fn set_config_with_mode_locked(
+    pub(crate) async fn set_config_with_mode_locked(
         &self,
         preset: u8,
         reset_mode: u8,
@@ -881,8 +892,9 @@ impl MiniDspClient {
         if before.preset == preset && reset_mode != commands::PRESET_CHANGE_RELOAD_SAME_SLOT {
             return Ok(before);
         }
-        self.queue.pause_levels();
-        let result = async {
+        let _levels = self.queue.pause_levels();
+
+        async {
             match self
                 .execute_write_with_timeout(
                     commands::set_config(preset, reset_mode),
@@ -918,9 +930,7 @@ impl MiniDspClient {
                 )))
             }
         }
-        .await;
-        self.queue.resume_levels();
-        result
+        .await
     }
 
     /// Switch preset (0-3) using an explicit device reset mode.
@@ -936,9 +946,10 @@ impl MiniDspClient {
     /// Reset the device and verify that it becomes temporarily unavailable and
     /// then responsive again when the hardware does not return `ResetComplete`.
     async fn reset_with_verification_locked(&self) -> Result<(), ClientError> {
-        self.queue.pause_levels();
-        let reconnect_epoch = self.queue.reconnect_epoch();
-        let result = async {
+        let _levels = self.queue.pause_levels();
+        let disconnect_epoch = self.queue.disconnect_epoch();
+
+        async {
             match self
                 .execute_write_with_timeout(
                     commands::reset(),
@@ -949,14 +960,15 @@ impl MiniDspClient {
                 .await
             {
                 Ok(()) => Ok(()),
-                Err(ClientError::Transport(TransportError::Timeout))
+                Err(ClientError::Transport(TransportError::Disconnected))
+                | Err(ClientError::Transport(TransportError::Timeout))
                 | Err(ClientError::Transport(TransportError::Hid(_)))
                 | Err(ClientError::Transport(TransportError::Io(_)))
                 | Err(ClientError::Timeout) => {
                     tracing::debug!(
                         "reset response dropped during device reset; verifying via master-status recovery"
                     );
-                    self.wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT, reconnect_epoch)
+                    self.wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT, disconnect_epoch)
                         .await?;
                     Ok(())
                 }
@@ -966,18 +978,17 @@ impl MiniDspClient {
                 }
             }
         }
-        .await;
-        self.queue.resume_levels();
-        result
+        .await
     }
 
     /// Reboot the device using the official initialize-all flow semantics:
     /// `EnterBootloader (0x3E)` followed by an expected temporary outage and
     /// master-status recovery.
     async fn reboot_with_verification_locked(&self) -> Result<(), ClientError> {
-        self.queue.pause_levels();
-        let reconnect_epoch = self.queue.reconnect_epoch();
-        let result = async {
+        let _levels = self.queue.pause_levels();
+        let disconnect_epoch = self.queue.disconnect_epoch();
+
+        async {
             match self
                 .execute_write_with_timeout(
                     commands::enter_bootloader(),
@@ -1008,7 +1019,7 @@ impl MiniDspClient {
             }
 
             if let Err(err) = self
-                .wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT, reconnect_epoch)
+                .wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT, disconnect_epoch)
                 .await
             {
                 tracing::warn!("reboot recovery verification failed: {err}");
@@ -1016,9 +1027,7 @@ impl MiniDspClient {
             }
             Ok(())
         }
-        .await;
-        self.queue.resume_levels();
-        result
+        .await
     }
 
     /// Reset the device and verify that it becomes temporarily unavailable and
@@ -1035,8 +1044,9 @@ impl MiniDspClient {
             return Ok(());
         }
 
-        self.queue.pause_levels();
-        let result = async {
+        let _levels = self.queue.pause_levels();
+
+        async {
             self.execute_write(commands::set_source(source), Priority::High, "set source")
                 .await?;
             let after = self
@@ -1054,9 +1064,7 @@ impl MiniDspClient {
                 )))
             }
         }
-        .await;
-        self.queue.resume_levels();
-        result
+        .await
     }
 
     /// Set Dirac bypass state.
@@ -1801,7 +1809,7 @@ impl MiniDspClient {
         let req = commands::read_floats(addr, count, &self.profile.dialect);
         let raw = self
             .queue
-            .execute_raw_with_timeout(req.clone(), Priority::Normal, DSP_READ_TIMEOUT)
+            .execute_typed_raw_with_timeout(req.clone(), Priority::Normal, DSP_READ_TIMEOUT)
             .await?;
         commands::parse_param_words_response_for_request(&req, &raw).ok_or_else(|| {
             ClientError::Protocol("unexpected raw response to typed ReadFloats".into())
@@ -1812,7 +1820,7 @@ impl MiniDspClient {
         let req = commands::read_floats(addr, count, &self.profile.dialect);
         let raw = self
             .queue
-            .execute_raw_with_timeout(req.clone(), Priority::Normal, DSP_READ_TIMEOUT)
+            .execute_typed_raw_with_timeout(req.clone(), Priority::Normal, DSP_READ_TIMEOUT)
             .await?;
         commands::parse_param_words_be_response_for_request(&req, &raw).ok_or_else(|| {
             ClientError::Protocol("unexpected raw response to big-endian ReadFloats".into())
@@ -2131,16 +2139,16 @@ impl MiniDspClient {
     async fn read_config_gain_db(&self, addr: u16) -> Result<f32, ClientError> {
         match self.profile.dialect.value_format {
             ValueFormat::Float32 => {
-                if self.prefers_scalar_shadow_for_addr(addr) {
-                    if let Some(raw) = self.scalar_shadow.lock().await.get(&addr).copied() {
-                        return Ok(f32::from_bits(raw));
-                    }
+                if self.prefers_scalar_shadow_for_addr(addr)
+                    && let Some(raw) = self.scalar_shadow.lock().await.get(&addr).copied()
+                {
+                    return Ok(f32::from_bits(raw));
                 }
                 let raw = self.read_param_word(addr).await?;
-                if self.prefers_scalar_shadow_for_addr(addr) {
-                    if let Some(value) = sanitize_shadow_preferred_scalar(raw) {
-                        return Ok(value);
-                    }
+                if self.prefers_scalar_shadow_for_addr(addr)
+                    && let Some(value) = sanitize_shadow_preferred_scalar(raw)
+                {
+                    return Ok(value);
                 }
                 Ok(f32::from_bits(raw))
             }
@@ -2180,12 +2188,11 @@ impl MiniDspClient {
 
     async fn read_selector_word(&self, addr: u16) -> Result<u16, ClientError> {
         let raw = self.read_param_word(addr).await? as u16;
-        if raw == 1 {
-            if let Some(&shadow) = self.selector_shadow.lock().await.get(&addr) {
-                if shadow != 1 {
-                    return Ok(shadow);
-                }
-            }
+        if raw == 1
+            && let Some(&shadow) = self.selector_shadow.lock().await.get(&addr)
+            && shadow != 1
+        {
+            return Ok(shadow);
         }
         Ok(raw)
     }
@@ -2258,12 +2265,61 @@ impl MiniDspClient {
         }
 
         let master = self.get_master_status().await?;
-        self.execute_write(
-            commands::write_dsp_int(fir.taps_count, coeffs.len() as u16),
-            Priority::Critical,
-            "set fir tap count",
-        )
-        .await?;
+        let mut result = Ok(());
+        for attempt in 0..2 {
+            result = self.load_fir_transfer(fir, coeffs).await;
+            if attempt == 0
+                && matches!(
+                    result,
+                    Err(ClientError::Transport(
+                        TransportError::Disconnected | TransportError::Timeout
+                    ))
+                )
+            {
+                // Data packets append without an offset. Recover at Start, never
+                // by replaying an individual packet with uncertain delivery.
+                continue;
+            }
+            break;
+        }
+        if result.is_err() {
+            self.fir_shadow.lock().await.remove(&fir.data_start);
+            if let Some(preset) = *self.active_preset.lock().await {
+                self.trusted_snapshot_presets.lock().await.remove(&preset);
+                self.preset_shadows.lock().await.remove(&preset);
+            }
+            if let Err(err) = self
+                .execute_write_with_timeout(
+                    commands::fir_load_end(),
+                    Priority::Critical,
+                    FIR_LOAD_END_TIMEOUT,
+                    "abort fir load",
+                )
+                .await
+            {
+                tracing::warn!("failed to end FIR transfer after error: {err}");
+            }
+        }
+        if result.is_ok() {
+            self.selector_shadow
+                .lock()
+                .await
+                .insert(fir.taps_count, coeffs.len() as u16);
+            self.fir_shadow
+                .lock()
+                .await
+                .insert(fir.data_start, coeffs.to_vec());
+        }
+        let mute_result = self.set_mute(master.is_muted()).await;
+        if let Err(err) = &mute_result {
+            tracing::warn!("failed to restore mute after FIR transfer: {err}");
+        }
+        result?;
+        mute_result?;
+        Ok(())
+    }
+
+    async fn load_fir_transfer(&self, fir: FirFilter, coeffs: &[f32]) -> Result<(), ClientError> {
         let max_coeffs = match self
             .raw_command(commands::fir_load_start(fir.index), Priority::Critical)
             .await?
@@ -2284,9 +2340,15 @@ impl MiniDspClient {
             return Err(ClientError::Protocol(format!(
                 "FIR has {} taps but device reported runtime maximum {}",
                 coeffs.len(),
-                max_coeffs
+                max_coeffs,
             )));
         }
+        self.execute_write(
+            commands::write_dsp_int(fir.taps_count, coeffs.len() as u16),
+            Priority::Critical,
+            "set fir tap count",
+        )
+        .await?;
         for chunk in coeffs.chunks(14) {
             self.execute_write(
                 commands::fir_load_data(fir.index, chunk),
@@ -2301,17 +2363,7 @@ impl MiniDspClient {
             FIR_LOAD_END_TIMEOUT,
             "fir load end",
         )
-        .await?;
-        self.selector_shadow
-            .lock()
-            .await
-            .insert(fir.taps_count, coeffs.len() as u16);
-        self.fir_shadow
-            .lock()
-            .await
-            .insert(fir.data_start, coeffs.to_vec());
-        self.set_mute(master.is_muted()).await?;
-        Ok(())
+        .await
     }
 
     /// Reset every PEQ band on every input and output channel to the
@@ -2585,6 +2637,7 @@ impl MiniDspClient {
         }
 
         *self.pending_write.lock().await = None;
+        self.note_preset_mutation().await;
         Ok(())
     }
 
@@ -2962,9 +3015,7 @@ fn sanitize_meter_values(values: &[f32]) -> Vec<f32> {
     values
         .iter()
         .map(|&v| {
-            if !v.is_finite() {
-                SILENT_METER_DB
-            } else if v <= SILENT_METER_DB || v.abs() < 1e-10 {
+            if !v.is_finite() || v <= SILENT_METER_DB || v.abs() < 1e-10 {
                 SILENT_METER_DB
             } else {
                 v
@@ -3111,6 +3162,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct TimeoutingPresetTransport {
         current_preset: Arc<AtomicU8>,
         last_payload: Arc<Mutex<Vec<u8>>>,
@@ -3192,14 +3244,29 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn reconnect(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Box<dyn crate::transport::Transport>, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let transport = self.clone();
+            Box::pin(async move { Ok(Box::new(transport) as Box<dyn crate::transport::Transport>) })
+        }
+
         fn url(&self) -> String {
             "mock://preset-timeout".into()
         }
     }
 
+    #[derive(Clone)]
     struct RecoveringResetTransport {
         last_payload: Arc<Mutex<Vec<u8>>>,
         read_timeouts_remaining: Arc<AtomicUsize>,
+        status_unavailable: Arc<AtomicBool>,
     }
 
     impl RecoveringResetTransport {
@@ -3207,6 +3274,7 @@ mod tests {
             Self {
                 last_payload: Arc::new(Mutex::new(Vec::new())),
                 read_timeouts_remaining: Arc::new(AtomicUsize::new(read_timeouts_remaining)),
+                status_unavailable: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -3218,8 +3286,18 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
             let payload = payload.to_vec();
             let last_payload = self.last_payload.clone();
+            let status_unavailable = self.status_unavailable.clone();
+            let read_timeouts_remaining = self.read_timeouts_remaining.clone();
 
             Box::pin(async move {
+                if payload.first() == Some(&commands::CMD_READ_FLASH) {
+                    let unavailable = read_timeouts_remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok();
+                    status_unavailable.store(unavailable, Ordering::SeqCst);
+                }
                 *last_payload.lock().await = payload;
                 Ok(())
             })
@@ -3230,7 +3308,7 @@ mod tests {
             timeout_ms: u64,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
             let last_payload = self.last_payload.clone();
-            let read_timeouts_remaining = self.read_timeouts_remaining.clone();
+            let status_unavailable = self.status_unavailable.clone();
 
             Box::pin(async move {
                 let payload = last_payload.lock().await.clone();
@@ -3244,8 +3322,7 @@ mod tests {
                             && payload[1] == eeprom::MASTER_STATUS_ADDR.0
                             && payload[2] == eeprom::MASTER_STATUS_ADDR.1 =>
                     {
-                        if read_timeouts_remaining.load(Ordering::SeqCst) > 0 {
-                            read_timeouts_remaining.fetch_sub(1, Ordering::SeqCst);
+                        if status_unavailable.load(Ordering::SeqCst) {
                             tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
                             Err(TransportError::Timeout)
                         } else {
@@ -3268,14 +3345,29 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn reconnect(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Box<dyn crate::transport::Transport>, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let transport = self.clone();
+            Box::pin(async move { Ok(Box::new(transport) as Box<dyn crate::transport::Transport>) })
+        }
+
         fn url(&self) -> String {
             "mock://reset-timeout".into()
         }
     }
 
+    #[derive(Clone)]
     struct RebootCommandDropTransport {
         last_payload: Arc<Mutex<Vec<u8>>>,
         drop_reboot_send_once: Arc<AtomicBool>,
+        reopen_failures_remaining: Arc<AtomicUsize>,
     }
 
     impl RebootCommandDropTransport {
@@ -3283,6 +3375,7 @@ mod tests {
             Self {
                 last_payload: Arc::new(Mutex::new(Vec::new())),
                 drop_reboot_send_once: Arc::new(AtomicBool::new(true)),
+                reopen_failures_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -3298,8 +3391,10 @@ mod tests {
 
             Box::pin(async move {
                 *last_payload.lock().await = payload.clone();
-                if payload.first().copied() == Some(commands::CMD_ENTER_BOOTLOADER)
-                    && drop_reboot_send_once.swap(false, Ordering::SeqCst)
+                if matches!(
+                    payload.first().copied(),
+                    Some(commands::CMD_ENTER_BOOTLOADER | commands::CMD_RESET)
+                ) && drop_reboot_send_once.swap(false, Ordering::SeqCst)
                 {
                     return Err(TransportError::Hid(
                         "device vanished while reboot command was in flight".into(),
@@ -3341,9 +3436,475 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn reconnect(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Box<dyn crate::transport::Transport>, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let transport = self.clone();
+            Box::pin(async move {
+                if transport
+                    .reopen_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(TransportError::NotFound);
+                }
+                Ok(Box::new(transport) as Box<dyn crate::transport::Transport>)
+            })
+        }
+
         fn url(&self) -> String {
             "mock://reboot-command-drop".into()
         }
+    }
+
+    fn scripted_client(transport: Box<dyn crate::transport::Transport>) -> MiniDspClient {
+        MiniDspClient {
+            queue: Arc::new(CommandQueue::new(transport)),
+            transport_url: "mock://shadow".into(),
+            profile: probe::identify(10, 100),
+            hw_id: HardwareId {
+                fw_major: 1,
+                fw_minor: 0,
+                hw_id: 10,
+            },
+            dsp_version: 100,
+            serial: 912345,
+            saved_peq: Mutex::new(None),
+            pending_write: Arc::new(Mutex::new(None)),
+            peq_shadow: Arc::new(Mutex::new(HashMap::new())),
+            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
+            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
+            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
+            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
+            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
+            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
+            active_preset: Mutex::new(Some(0)),
+            state_transition_lock: Mutex::new(()),
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptTransport {
+        responses: Arc<Mutex<std::collections::VecDeque<Vec<u8>>>>,
+        disconnect_data_once: Option<Arc<AtomicBool>>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl crate::transport::Transport for ScriptTransport {
+        fn send_frame(
+            &self,
+            payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            let payload = payload.to_vec();
+            Box::pin(async move {
+                self.sent.lock().await.push(payload.clone());
+                Ok(())
+            })
+        }
+        fn recv_frame(
+            &self,
+            _: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            Box::pin(async move {
+                if self
+                    .sent
+                    .lock()
+                    .await
+                    .last()
+                    .and_then(|payload| payload.first())
+                    == Some(&commands::CMD_FIR_LOAD_DATA)
+                    && self
+                        .disconnect_data_once
+                        .as_ref()
+                        .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
+                {
+                    return Err(TransportError::Disconnected);
+                }
+                self.responses
+                    .lock()
+                    .await
+                    .pop_front()
+                    .ok_or_else(|| TransportError::Io("script exhausted".into()))
+            })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn reconnect(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Box<dyn crate::transport::Transport>, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let transport = self.clone();
+            Box::pin(async move { Ok(Box::new(transport) as Box<dyn crate::transport::Transport>) })
+        }
+        fn url(&self) -> String {
+            "script://client".into()
+        }
+    }
+
+    struct BlockingRestoreTransport {
+        opcode: AtomicU8,
+        writing: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl crate::transport::Transport for BlockingRestoreTransport {
+        fn send_frame(
+            &self,
+            payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            self.opcode.store(payload[0], Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+        fn recv_frame(
+            &self,
+            _: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            Box::pin(async move {
+                if self.opcode.load(Ordering::SeqCst) == commands::CMD_WRITE_BIQUAD {
+                    self.writing.notify_one();
+                    self.release.notified().await;
+                    Ok(vec![commands::RESP_ERROR, 1])
+                } else {
+                    Ok(vec![commands::CMD_READ_FLASH, 0, 0, 0, 0])
+                }
+            })
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn url(&self) -> String {
+            "script://restore".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_holds_transition_lock_during_payload_replay() {
+        let writing = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let client = Arc::new(scripted_client(Box::new(BlockingRestoreTransport {
+            opcode: AtomicU8::new(0),
+            writing: writing.clone(),
+            release: release.clone(),
+        })));
+        let addr = client.profile.dsp_table.unwrap().inputs[0].peq[0].addr;
+        let preset = crate::snapshot::PresetSnapshot {
+            slot: 0,
+            token: None,
+            complete: false,
+            provenance: Vec::new(),
+            completeness: crate::snapshot::SnapshotCompleteness::default(),
+            shadow: Some(PresetShadowState {
+                peq: HashMap::from([(
+                    addr,
+                    CachedPeqShadow {
+                        coeffs: [1.0; 5],
+                        bypass: false,
+                    },
+                )]),
+                ..PresetShadowState::default()
+            }),
+            fir_blocks: Vec::new(),
+        };
+        let worker = client.clone();
+        let restore =
+            tokio::spawn(async move { worker.restore_preset_snapshot(&preset, None).await });
+        tokio::time::timeout(Duration::from_secs(1), writing.notified())
+            .await
+            .unwrap();
+        assert!(client.state_transition_lock.try_lock().is_err());
+        release.notify_one();
+        assert!(restore.await.unwrap().is_err());
+        assert!(client.state_transition_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn token_refresh_invalidates_changed_trusted_presets() {
+        let transport = ScriptTransport {
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([vec![
+                commands::CMD_READ_FLASH,
+                2,
+                2,
+                2,
+                2,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ]]))),
+            disconnect_data_once: None,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        };
+        let client = scripted_client(Box::new(transport));
+        for preset in 0..4 {
+            client.set_preset_token(preset, [1; 4]).await;
+            client
+                .store_preset_shadow_snapshot(preset, PresetShadowState::default())
+                .await;
+            client.mark_snapshot_trusted(preset).await;
+        }
+        client
+            .scalar_shadow
+            .lock()
+            .await
+            .insert(42, 9.5f32.to_bits());
+        client.refresh_modification_tokens().await.unwrap();
+        let state = client.export_shadow_state().await;
+        assert!(!state.trusted_snapshot_presets.contains(&0));
+        assert!(state.trusted_snapshot_presets.contains(&1));
+        assert!(!state.scalar.contains_key(&42));
+        client.update_active_preset(1).await;
+        assert!(!client.preset_shadows.lock().await.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_fir_data_restarts_from_start_without_replaying_chunk() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let client = scripted_client(Box::new(ScriptTransport {
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
+                vec![commands::CMD_FIR_LOAD_START, 0, 32],
+                vec![commands::RESP_OK],
+                vec![commands::CMD_FIR_LOAD_START, 0, 32],
+                vec![commands::RESP_OK],
+                vec![commands::RESP_OK],
+                vec![commands::RESP_OK],
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
+            ]))),
+            sent: sent.clone(),
+            disconnect_data_once: Some(Arc::new(AtomicBool::new(true))),
+        }));
+        let fir = client
+            .profile
+            .dsp_table
+            .unwrap()
+            .outputs
+            .iter()
+            .find_map(|output| output.fir)
+            .unwrap();
+        client
+            .load_fir_coefficients(fir, &[0.0, 1.0])
+            .await
+            .unwrap();
+        let opcodes: Vec<u8> = sent.lock().await.iter().map(|payload| payload[0]).collect();
+        assert_eq!(
+            &opcodes[1..8],
+            &[
+                commands::CMD_FIR_LOAD_START,
+                commands::CMD_WRITE_DSP,
+                commands::CMD_FIR_LOAD_DATA,
+                commands::CMD_FIR_LOAD_START,
+                commands::CMD_WRITE_DSP,
+                commands::CMD_FIR_LOAD_DATA,
+                commands::CMD_RELOAD_DSP_PARAM,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_fir_transfer_updates_trusted_shadow_when_mute_restore_fails() {
+        let client = scripted_client(Box::new(ScriptTransport {
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
+                vec![commands::CMD_FIR_LOAD_START, 0, 32],
+                vec![commands::RESP_OK],
+                vec![commands::RESP_OK],
+                vec![commands::RESP_OK],
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 1],
+                vec![commands::RESP_ERROR, 1],
+            ]))),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            disconnect_data_once: None,
+        }));
+        let fir = client
+            .profile
+            .dsp_table
+            .unwrap()
+            .outputs
+            .iter()
+            .find_map(|output| output.fir)
+            .unwrap();
+        client
+            .store_preset_shadow_snapshot(
+                0,
+                PresetShadowState {
+                    selector: HashMap::from([(fir.taps_count, 1)]),
+                    fir_blocks: HashMap::from([(fir.data_start, vec![0.5])]),
+                    ..PresetShadowState::default()
+                },
+            )
+            .await;
+        client.mark_snapshot_trusted(0).await;
+        let err = client
+            .load_fir_coefficients(fir, &[0.0, 1.0])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClientError::Protocol(message) if message.contains("set mute")));
+        assert_eq!(client.selector_shadow.lock().await[&fir.taps_count], 2);
+        assert_eq!(
+            client.fir_shadow.lock().await[&fir.data_start],
+            vec![0.0, 1.0]
+        );
+        client.update_active_preset(1).await;
+        client.update_active_preset(0).await;
+        let state = client.export_shadow_state().await;
+        assert!(state.trusted_snapshot_presets.contains(&0));
+        assert_eq!(state.selector[&fir.taps_count], 2);
+        assert_eq!(
+            state.presets[&0].fir_blocks[&fir.data_start],
+            vec![0.0, 1.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn fir_data_and_end_errors_clean_up_and_restore_mute() {
+        for fail_at_end in [false, true] {
+            let mut responses = vec![
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
+                vec![commands::CMD_FIR_LOAD_START, 0, 32],
+                vec![commands::RESP_OK],
+            ];
+            if fail_at_end {
+                responses.push(vec![commands::RESP_OK]);
+            }
+            responses.extend([
+                vec![commands::RESP_ERROR, 1],
+                vec![commands::RESP_OK],
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 1],
+                vec![commands::RESP_OK],
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
+            ]);
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let client = scripted_client(Box::new(ScriptTransport {
+                responses: Arc::new(Mutex::new(responses.into())),
+                sent: sent.clone(),
+                disconnect_data_once: None,
+            }));
+            let fir = client
+                .profile
+                .dsp_table
+                .unwrap()
+                .outputs
+                .iter()
+                .find_map(|output| output.fir)
+                .unwrap();
+            assert!(matches!(
+                client.load_fir_coefficients(fir, &[1.0]).await,
+                Err(ClientError::Protocol(_))
+            ));
+            let sent = sent.lock().await;
+            assert_eq!(
+                sent.iter()
+                    .filter(|payload| *payload == &commands::fir_load_end())
+                    .count(),
+                if fail_at_end { 2 } else { 1 }
+            );
+            assert!(
+                sent.iter()
+                    .any(|payload| payload == &commands::set_mute(false))
+            );
+            assert!(!client.fir_shadow.lock().await.contains_key(&fir.data_start));
+        }
+    }
+
+    #[tokio::test]
+    async fn fir_runtime_capacity_failure_ends_transfer_and_restores_mute() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptTransport {
+            disconnect_data_once: None,
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
+                vec![commands::CMD_FIR_LOAD_START, 0, 1],
+                vec![commands::RESP_OK],
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 1],
+                vec![commands::RESP_OK],
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
+            ]))),
+            sent: sent.clone(),
+        };
+        let client = scripted_client(Box::new(transport));
+        let fir = client
+            .profile
+            .dsp_table
+            .unwrap()
+            .outputs
+            .iter()
+            .find_map(|output| output.fir)
+            .unwrap();
+        assert!(
+            client
+                .load_fir_coefficients(fir, &[0.0, 1.0])
+                .await
+                .is_err()
+        );
+        let sent = sent.lock().await;
+        assert!(
+            sent.iter()
+                .any(|payload| payload == &commands::fir_load_end())
+        );
+        assert!(
+            sent.iter()
+                .any(|payload| payload == &commands::set_mute(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_peq_edits_survive_switch_away_and_back() {
+        let client = scripted_client(Box::new(ScriptTransport {
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                vec![commands::RESP_OK],
+                vec![commands::RESP_OK],
+            ]))),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            disconnect_data_once: None,
+        }));
+        let original = PresetShadowState {
+            peq: HashMap::from([(
+                8480,
+                CachedPeqShadow {
+                    coeffs: [1.0; 5],
+                    bypass: false,
+                },
+            )]),
+            ..PresetShadowState::default()
+        };
+        client.store_preset_shadow_snapshot(0, original).await;
+        client.mark_snapshot_trusted(0).await;
+        client.write_biquad(8480, &[2.0; 5]).await.unwrap();
+        client.bypass_filter(8480, true).await.unwrap();
+        client.update_active_preset(1).await;
+        client.update_active_preset(0).await;
+        let exported = client.export_shadow_state().await;
+        assert_eq!(exported.peq[&8480].coeffs, [2.0; 5]);
+        assert!(exported.peq[&8480].bypass);
     }
 
     #[tokio::test]
@@ -3974,79 +4535,57 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_reset_recovery_rejects_single_status_blip() {
-        let client = MiniDspClient {
-            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(
-                1,
-            )))),
-            transport_url: "mock://reset-single-blip".into(),
-            profile: probe::identify(10, 100),
-            hw_id: HardwareId {
-                fw_major: 1,
-                fw_minor: 0,
-                hw_id: 10,
-            },
-            dsp_version: 100,
-            serial: 912345,
-            saved_peq: Mutex::new(None),
-            pending_write: Arc::new(Mutex::new(None)),
-            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
-            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
-            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
-            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
-            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
-            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
-            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
-            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
-            active_preset: Mutex::new(Some(0)),
-            state_transition_lock: Mutex::new(()),
-        };
+        let mut responses = std::collections::VecDeque::from([vec![commands::RESP_ERROR, 1]]);
+        responses.extend((0..16).map(|_| vec![commands::CMD_READ_FLASH, 0, 0, 0, 0]));
+        let client = scripted_client(Box::new(ScriptTransport {
+            responses: Arc::new(Mutex::new(responses)),
+            disconnect_data_once: None,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        }));
 
         let err = client
-            .wait_for_reset_recovery_until(Duration::from_millis(700), client.queue.reconnect_epoch())
+            .wait_for_reset_recovery_until(
+                Duration::from_millis(700),
+                client.queue.reconnect_epoch(),
+            )
             .await
             .expect_err("single transient read failure should not verify reset");
         assert!(matches!(err, ClientError::Protocol(_)));
     }
 
     #[tokio::test]
-    async fn wait_for_reset_recovery_accepts_hidden_reconnect_epoch_advance() {
-        let client = Arc::new(MiniDspClient {
-            queue: Arc::new(CommandQueue::new(Box::new(RecoveringResetTransport::new(
-                0,
-            )))),
-            transport_url: "mock://reset-epoch".into(),
-            profile: probe::identify(10, 100),
-            hw_id: HardwareId {
-                fw_major: 1,
-                fw_minor: 0,
-                hw_id: 10,
-            },
-            dsp_version: 100,
-            serial: 912345,
-            saved_peq: Mutex::new(None),
-            pending_write: Arc::new(Mutex::new(None)),
-            peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
-            selector_shadow: Arc::new(Mutex::new(HashMap::new())),
-            scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
-            fir_shadow: Arc::new(Mutex::new(HashMap::new())),
-            preset_shadows: Arc::new(Mutex::new(HashMap::new())),
-            preset_tokens: Arc::new(Mutex::new(HashMap::new())),
-            trusted_snapshot_presets: Arc::new(Mutex::new(HashSet::new())),
-            skip_trusted_shadow_capture_once: Arc::new(Mutex::new(HashSet::new())),
-            active_preset: Mutex::new(Some(0)),
-            state_transition_lock: Mutex::new(()),
-        });
-        let initial_reconnect_epoch = client.queue.reconnect_epoch();
-        let queue = client.queue.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            queue.note_reconnect_for_test();
-        });
-
+    async fn wait_for_reset_recovery_accepts_timeout_reconnect() {
+        let client = scripted_client(Box::new(RecoveringResetTransport::new(1)));
+        let initial_epoch = client.queue.disconnect_epoch();
         client
-            .wait_for_reset_recovery_until(Duration::from_millis(700), initial_reconnect_epoch)
+            .wait_for_reset_recovery_until(Duration::from_millis(700), initial_epoch)
             .await
-            .expect("reconnect epoch advance should verify hidden reset recovery");
+            .expect(
+                "timeout recovery must record an outage before the first successful status read",
+            );
+        assert!(client.queue.disconnect_epoch() > initial_epoch);
+    }
+
+    #[tokio::test]
+    async fn reboot_and_reset_recover_after_hid_error_and_failed_reopen() {
+        for reboot in [false, true] {
+            let transport = RebootCommandDropTransport::new();
+            transport
+                .reopen_failures_remaining
+                .store(1, Ordering::SeqCst);
+            let client = scripted_client(Box::new(transport));
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                if reboot {
+                    client.reboot_device().await
+                } else {
+                    client.reset_with_verification().await
+                }
+            })
+            .await
+            .expect("recovery should finish on the first successful status read");
+            result.unwrap();
+            assert!(client.queue.disconnect_epoch() > 0);
+        }
     }
 
     #[tokio::test]
@@ -4087,7 +4626,9 @@ mod tests {
     #[tokio::test]
     async fn reboot_succeeds_when_command_stage_hid_drop_is_followed_by_reconnect() {
         let client = Arc::new(MiniDspClient {
-            queue: Arc::new(CommandQueue::new(Box::new(RebootCommandDropTransport::new()))),
+            queue: Arc::new(CommandQueue::new(Box::new(
+                RebootCommandDropTransport::new(),
+            ))),
             transport_url: "mock://reboot-command-drop".into(),
             profile: probe::identify(10, 100),
             hw_id: HardwareId {
@@ -4110,16 +4651,10 @@ mod tests {
             active_preset: Mutex::new(Some(0)),
             state_transition_lock: Mutex::new(()),
         });
-        let queue = client.queue.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            queue.note_reconnect_for_test();
-        });
 
-        client
-            .reboot_device()
-            .await
-            .expect("reboot recovery should accept a command-stage HID drop once the device recovers");
+        client.reboot_device().await.expect(
+            "reboot recovery should accept a command-stage HID drop once the device recovers",
+        );
     }
 
     #[test]

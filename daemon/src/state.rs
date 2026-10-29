@@ -4,13 +4,17 @@ use minidsp::client::{
     CachedPeqShadow, DeviceShadowState, MiniDspClient, PresetShadowState, SavedPeqState,
 };
 use minidsp_protocol::device::DeviceProfile;
+use minidsp_protocol::playback::{PlayResponse, PlaybackRunStatus, PlaybackStatus};
+use minidsp_protocol::rattle::{
+    RattleGenerator, RattleResponse, RattleRunStatus, RattleStatus, elapsed_samples,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,7 +29,23 @@ pub struct DaemonState {
     shadow_cache: RwLock<HashMap<u32, DeviceShadowState>>,
     shadow_cache_path: PathBuf,
     playback_active: AtomicBool,
+    last_playback_run: StdMutex<Option<PlaybackRunStatus>>,
+    rattle: StdMutex<RattleState>,
     busy_devices: StdMutex<HashSet<usize>>,
+}
+
+#[derive(Default)]
+struct RattleState {
+    active: Option<ActiveRattle>,
+    last: Option<RattleRunStatus>,
+}
+
+struct ActiveRattle {
+    device_id: usize,
+    generator: Arc<StdMutex<RattleGenerator>>,
+    output_latency_us: Arc<AtomicI64>,
+    started: bool,
+    audio_finished: bool,
 }
 
 impl DaemonState {
@@ -38,6 +58,8 @@ impl DaemonState {
             shadow_cache: RwLock::new(shadow_cache),
             shadow_cache_path,
             playback_active: AtomicBool::new(false),
+            last_playback_run: StdMutex::new(None),
+            rattle: StdMutex::new(RattleState::default()),
             busy_devices: StdMutex::new(HashSet::new()),
         }
     }
@@ -110,14 +132,145 @@ impl DaemonState {
         self.persist_device_shadow(client).await;
     }
 
+    // The busy flag only changes under the last-run lock, so a status
+    // snapshot never pairs one run's flag with another run's record.
     pub fn try_begin_playback(&self) -> bool {
+        let _last_run = self.last_playback_run();
         self.playback_active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
     pub fn finish_playback(&self) {
+        let _last_run = self.last_playback_run();
         self.playback_active.store(false, Ordering::SeqCst);
+    }
+
+    pub fn playback_status(&self) -> PlaybackStatus {
+        let last_run = self.last_playback_run();
+        PlaybackStatus {
+            playing: self.playback_active.load(Ordering::SeqCst),
+            last: last_run.clone(),
+        }
+    }
+
+    pub fn record_playback_run_started(&self, response: &PlayResponse) {
+        *self.last_playback_run() = Some(PlaybackRunStatus::started(response));
+    }
+
+    /// Settle the run recorded by `record_playback_run_started()`.
+    pub fn finish_last_playback_run(&self, error: Option<String>) {
+        if let Some(run) = self.last_playback_run().as_mut() {
+            run.finish(error);
+        }
+    }
+
+    pub fn set_last_playback_run_source_restore_error(&self, error: String) {
+        if let Some(run) = self.last_playback_run().as_mut() {
+            run.source_restore_error = Some(error);
+        }
+    }
+
+    fn last_playback_run(&self) -> std::sync::MutexGuard<'_, Option<PlaybackRunStatus>> {
+        self.last_playback_run
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn prepare_rattle(
+        &self,
+        device_id: usize,
+        generator: Arc<StdMutex<RattleGenerator>>,
+        output_latency_us: Arc<AtomicI64>,
+    ) {
+        self.rattle.lock().unwrap_or_else(|e| e.into_inner()).active = Some(ActiveRattle {
+            device_id,
+            generator,
+            output_latency_us,
+            started: false,
+            audio_finished: false,
+        });
+    }
+
+    pub fn record_rattle_run_started(&self, response: &RattleResponse) {
+        let mut rattle = self.rattle.lock().unwrap_or_else(|e| e.into_inner());
+        rattle.last = Some(RattleRunStatus::started(response));
+        if let Some(active) = &mut rattle.active {
+            active.started = true;
+        }
+    }
+
+    pub fn rattle_status(&self, id: usize) -> RattleStatus {
+        let rattle = self.rattle.lock().unwrap_or_else(|e| e.into_inner());
+        let active = rattle.active.as_ref().filter(|run| run.device_id == id);
+        let current = active
+            .filter(|run| run.started && !run.audio_finished)
+            .and_then(|active| {
+                let run = rattle.last.as_ref()?;
+                let sample = elapsed_samples(
+                    run.started_at_us,
+                    crate::playback::server_time_us(),
+                    run.schedule.sample_rate,
+                    active.output_latency_us.load(Ordering::SeqCst),
+                );
+                // A stopped generator can end well before the planned schedule.
+                let generator = active.generator.lock().unwrap_or_else(|e| e.into_inner());
+                if generator.is_finished() && sample >= generator.cursor() {
+                    return None;
+                }
+                run.schedule.current_at(sample)
+            });
+        RattleStatus {
+            playing: active.is_some(),
+            current,
+            last: rattle.last.clone(),
+        }
+    }
+
+    pub fn request_rattle_stop(&self, id: usize) -> bool {
+        let rattle = self.rattle.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = rattle.active.as_ref().filter(|run| run.device_id == id) else {
+            return false;
+        };
+        active
+            .generator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_stop();
+        true
+    }
+
+    pub fn finish_rattle_audio(&self, error: Option<String>) {
+        let mut rattle = self.rattle.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = &mut rattle.active else {
+            return;
+        };
+        active.audio_finished = true;
+        let started = active.started;
+        let stopped = active
+            .generator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .was_stopped();
+        if started && let Some(run) = &mut rattle.last {
+            if error.is_none() && stopped {
+                run.stopped();
+            } else {
+                run.finish(error);
+            }
+        }
+    }
+
+    pub fn finish_rattle(&self, volume_error: Option<String>, source_error: Option<String>) {
+        let mut rattle = self.rattle.lock().unwrap_or_else(|e| e.into_inner());
+        if rattle.active.as_ref().is_some_and(|active| active.started)
+            && let Some(run) = &mut rattle.last
+        {
+            run.set_restore_errors(volume_error, source_error);
+        }
+        rattle.active = None;
+        drop(rattle);
+        self.finish_playback();
     }
 
     pub fn try_begin_device_operation(&self, id: usize) -> bool {
@@ -241,6 +394,13 @@ fn filter_shadow_state_by_tokens(
     filtered
         .trusted_snapshot_presets
         .retain(|slot| state.preset_tokens.get(slot) == current_tokens.get(slot));
+    if state.preset_tokens != *current_tokens {
+        // Legacy copies have no preset identity and cannot be trusted after
+        // any token changes; matching per-preset entries remain available.
+        filtered.peq.clear();
+        filtered.selector.clear();
+        filtered.scalar.clear();
+    }
     filtered.preset_tokens = current_tokens.clone();
     filtered
 }
@@ -618,6 +778,15 @@ mod tests {
                 (0, PresetShadowState::default()),
                 (1, PresetShadowState::default()),
             ]),
+            peq: HashMap::from([(
+                1,
+                minidsp::client::CachedPeqShadow {
+                    coeffs: [1.0, 0.0, 0.0, 0.0, 0.0],
+                    bypass: false,
+                },
+            )]),
+            selector: HashMap::from([(2, 3)]),
+            scalar: HashMap::from([(4, 5)]),
             preset_tokens: HashMap::from([
                 (0, [0x11, 0x22, 0x33, 0x44]),
                 (1, [0xaa, 0xbb, 0xcc, 0xdd]),
@@ -628,9 +797,26 @@ mod tests {
             &state,
             &HashMap::from([(0, [0x11, 0x22, 0x33, 0x44]), (1, [1, 2, 3, 4])]),
         );
+        assert!(filtered.peq.is_empty());
+        assert!(filtered.selector.is_empty());
+        assert!(filtered.scalar.is_empty());
         assert!(filtered.presets.contains_key(&0));
         assert!(!filtered.presets.contains_key(&1));
         assert_eq!(filtered.preset_tokens.get(&1), Some(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn filter_shadow_state_preserves_legacy_values_when_tokens_match() {
+        let state = DeviceShadowState {
+            selector: HashMap::from([(2, 3)]),
+            scalar: HashMap::from([(4, 5)]),
+            preset_tokens: HashMap::from([(0, [1, 2, 3, 4])]),
+            ..DeviceShadowState::default()
+        };
+        assert_eq!(
+            filter_shadow_state_by_tokens(&state, &state.preset_tokens),
+            state
+        );
     }
 
     #[test]

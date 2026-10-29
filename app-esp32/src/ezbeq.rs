@@ -3,28 +3,18 @@
 //! Reads biquad coefficients from the binary catalogue index on LittleFS,
 //! writes them to MiniDSP input PEQ bands via USB HID.
 //!
-//! Entry lookup uses digest-based binary search (BEQ\x02 format).
+//! Entry lookup uses digest-based binary search (BEQ v3; v2 read compatibility).
 //! The browser fetches the full catalogue through the board's same-origin
-//! `/database.json` proxy; the ESP32 only stores `catalogue.bin` for
-//! biquad coefficient lookup.
+//! `/database.json` endpoint. The board stores a compressed metadata listing
+//! and a binary coefficient index, plus a sorted feed used for slot metadata.
 
 use crate::device::DeviceState;
 use crate::http_server::SharedDeviceState;
 use crate::storage;
 use log::info;
 use minidsp_protocol::status::StatusSummary;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
-
-// Binary index constants (must match build-catalogue.py v2)
-const BIN_MAGIC: &[u8; 4] = b"BEQ\x02";
-const DIGEST_PREFIX_SIZE: usize = 8;
-const MAX_FILTERS: usize = 10;
-const COEFFS_PER_FILTER: usize = 5;
-/// Per-entry record: 8 bytes digest_prefix + 1 byte filter_count + 4 bytes mv_adjust + 10*5*4 bytes coefficients
-const RECORD_SIZE: usize = DIGEST_PREFIX_SIZE + 1 + 4 + MAX_FILTERS * COEFFS_PER_FILTER * 4; // 213
-/// Header: 4 bytes magic + 4 bytes entry_count + 4 bytes sample_rate
-const HEADER_SIZE: usize = 12;
 
 /// Number of ezBEQ slots (matches MiniDSP presets 1-4).
 const NUM_SLOTS: usize = 4;
@@ -33,7 +23,7 @@ const NUM_SLOTS: usize = 4;
 const BYPASS_COEFFS: [f32; 5] = [1.0, 0.0, 0.0, 0.0, 0.0];
 
 /// Per-slot state tracking.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Default)]
 pub struct SlotState {
     pub id: String,
     pub last: String,
@@ -41,10 +31,49 @@ pub struct SlotState {
     pub author: Option<String>,
     pub gains: Vec<ChannelValue<f32>>,
     pub mutes: Vec<ChannelValue<bool>>,
-    #[serde(rename = "canActivate")]
     pub can_activate: bool,
     pub inputs: u8,
     pub outputs: u8,
+    pub optimise: bool,
+    pub coefficients: Option<String>,
+    pub profile: Option<String>,
+    pub output_gains: Vec<ChannelValue<f32>>,
+    pub output_mutes: Vec<ChannelValue<bool>>,
+}
+
+/// Writes the ezBEQ slot shape straight to the output. A `serde_json::Value`
+/// tree of the four slots took ~60 KB of small allocations, which drained
+/// internal RAM on every state push.
+impl serde::Serialize for SlotState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // An empty slot carries no coefficient provenance, whatever was last loaded.
+        let loaded = self.last != "Empty";
+        let coefficients = self.coefficients.as_ref().filter(|_| loaded);
+        let profile = self.profile.as_ref().filter(|_| loaded);
+        let mut slot = serializer.serialize_struct("SlotState", 14)?;
+        slot.serialize_field("id", &self.id)?;
+        slot.serialize_field("last", &self.last)?;
+        slot.serialize_field("active", &self.active)?;
+        slot.serialize_field("author", &self.author)?;
+        slot.serialize_field("gains", &self.gains)?;
+        slot.serialize_field("mutes", &self.mutes)?;
+        slot.serialize_field("canActivate", &self.can_activate)?;
+        slot.serialize_field("inputs", &self.inputs)?;
+        slot.serialize_field("outputs", &self.outputs)?;
+        slot.serialize_field("optimise", &self.optimise)?;
+        match coefficients {
+            Some(coefficients) => slot.serialize_field("coefficients", coefficients)?,
+            None => slot.skip_field("coefficients")?,
+        }
+        match profile {
+            Some(profile) => slot.serialize_field("profile", profile)?,
+            None => slot.skip_field("profile")?,
+        }
+        slot.serialize_field("outputGains", &self.output_gains)?;
+        slot.serialize_field("outputMutes", &self.output_mutes)?;
+        slot.end()
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -56,9 +85,14 @@ pub struct ChannelValue<T: Clone> {
 /// Shared ezBEQ state.
 pub struct EzBeqState {
     pub slots: [SlotState; NUM_SLOTS],
-    /// Detached WS sender for pushing state updates to the connected /ws client.
+    /// Compatibility notification trigger used by the shared HTTP control paths.
+    /// Always aliases the first state sender; broadcasts use the full list below.
     #[cfg(esp_idf_httpd_ws_support)]
     pub ws_sender: Option<esp_idf_svc::http::server::ws::EspHttpWsDetachedSender>,
+    #[cfg(esp_idf_httpd_ws_support)]
+    pub ws_senders: Vec<(u64, esp_idf_svc::http::server::ws::EspHttpWsDetachedSender)>,
+    #[cfg(esp_idf_httpd_ws_support)]
+    pub pending_state: Option<String>,
 }
 
 pub type SharedEzBeqState = Arc<Mutex<EzBeqState>>;
@@ -85,138 +119,106 @@ impl EzBeqState {
             can_activate: true,
             inputs,
             outputs,
+            optimise: true,
+            coefficients: None,
+            profile: None,
+            output_gains: (0..outputs)
+                .map(|ch| ChannelValue {
+                    id: (ch + 1).to_string(),
+                    value: 0.0,
+                })
+                .collect(),
+            output_mutes: (0..outputs)
+                .map(|ch| ChannelValue {
+                    id: (ch + 1).to_string(),
+                    value: false,
+                })
+                .collect(),
         });
         Self {
             slots,
             #[cfg(esp_idf_httpd_ws_support)]
             ws_sender: None,
+            #[cfg(esp_idf_httpd_ws_support)]
+            ws_senders: Vec::new(),
+            #[cfg(esp_idf_httpd_ws_support)]
+            pending_state: None,
         }
     }
 }
 
-/// Parse the first 8 bytes of a hex digest string into a byte array for binary search.
-fn parse_digest_prefix(
-    digest_hex: &str,
-) -> Result<[u8; DIGEST_PREFIX_SIZE], Box<dyn std::error::Error>> {
-    if digest_hex.len() < DIGEST_PREFIX_SIZE * 2 {
-        return Err(format!(
-            "digest too short: '{}' (need {} hex chars)",
-            digest_hex,
-            DIGEST_PREFIX_SIZE * 2
-        )
-        .into());
-    }
-    let mut prefix = [0u8; DIGEST_PREFIX_SIZE];
-    for i in 0..DIGEST_PREFIX_SIZE {
-        prefix[i] = u8::from_str_radix(&digest_hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| format!("invalid hex in digest: '{}'", digest_hex))?;
-    }
-    Ok(prefix)
+#[path = "service_input.rs"]
+mod input;
+use input::{parse_digest_prefix, truncate_utf8};
+
+fn read_request_body<C: esp_idf_svc::http::server::Connection>(
+    req: &mut esp_idf_svc::http::server::Request<C>,
+    max_len: usize,
+) -> Result<Vec<u8>, (u16, &'static str)> {
+    let declared_len = req
+        .header("Content-Length")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| (400, "invalid Content-Length"))?;
+    input::read_body(declared_len, max_len, |buf| req.read(buf))
 }
+
+type EntryBiquads = (u8, f32, Vec<[f32; 5]>, bool);
 
 /// Read biquad coefficients for an entry by digest hash (binary search).
 ///
 /// Returns (filter_count, mv_adjust, coefficients[filter_count][5]).
 pub fn read_entry_biquads_by_digest(
     digest_hex: &str,
-) -> Result<(u8, f32, Vec<[f32; 5]>), Box<dyn std::error::Error>> {
+    expected_rate: u32,
+) -> Result<EntryBiquads, Box<dyn std::error::Error>> {
     let target = parse_digest_prefix(digest_hex)?;
 
-    let path = storage::full_path("catalogue.bin");
-    let mut file = std::fs::File::open(&path)?;
-
-    // Read and verify header
-    let mut header = [0u8; HEADER_SIZE];
-    file.read_exact(&mut header)?;
-    if &header[0..4] != BIN_MAGIC {
-        return Err("bad catalogue.bin magic (expected BEQ\\x02)".into());
-    }
-    let entry_count = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if entry_count == 0 {
-        return Err("catalogue is empty".into());
-    }
-
-    // Binary search on sorted digest prefixes
-    let mut lo: usize = 0;
-    let mut hi: usize = entry_count - 1;
-    let mut prefix_buf = [0u8; DIGEST_PREFIX_SIZE];
-
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        let offset = HEADER_SIZE + mid * RECORD_SIZE;
-        file.seek(SeekFrom::Start(offset as u64))?;
-        file.read_exact(&mut prefix_buf)?;
-
-        match prefix_buf.cmp(&target) {
-            std::cmp::Ordering::Equal => {
-                // Found — read the rest of the record
-                let mut record = [0u8; RECORD_SIZE - DIGEST_PREFIX_SIZE];
-                file.read_exact(&mut record)?;
-                return parse_biquad_record(&record);
-            }
-            std::cmp::Ordering::Less => {
-                lo = mid + 1;
-            }
-            std::cmp::Ordering::Greater => {
-                if mid == 0 {
-                    break;
-                }
-                hi = mid - 1;
-            }
-        }
-    }
-
-    Err("entry not found in catalogue".into())
+    let mut file = std::fs::File::open(storage::full_path("catalogue.bin"))?;
+    let entry = command_text::read_entry(&mut file, &target, Some(expected_rate))?;
+    Ok((
+        entry.coefficients.len() as u8,
+        entry.mv,
+        entry.coefficients,
+        entry.optimised,
+    ))
 }
 
-/// Parse the biquad portion of a record (after digest prefix).
-fn parse_biquad_record(
-    record: &[u8],
-) -> Result<(u8, f32, Vec<[f32; 5]>), Box<dyn std::error::Error>> {
-    if record.len() < 5 {
-        return Err(format!("record too short: {} bytes", record.len()).into());
+/// Resolve display metadata on the board, using the same binary index as the
+/// coefficients. The record points into the existing sorted feed, avoiding a
+/// second copy of every title/author in flash and all browser request rewriting.
+fn entry_metadata(digest: &str) -> Result<(String, String), String> {
+    let target = parse_digest_prefix(digest)?;
+    let mut file =
+        std::fs::File::open(storage::full_path("catalogue.bin")).map_err(|e| e.to_string())?;
+    let entry = command_text::read_entry(&mut file, &target, None)?;
+    let Some(offset) = entry.metadata_offset else {
+        // Compatibility with old BEQ v2 bundles until their next data update.
+        return Ok((digest.to_string(), String::new()));
+    };
+    let mut feed = std::io::BufReader::new(
+        std::fs::File::open(storage::full_path("entry-metadata.jsonl"))
+            .map_err(|e| e.to_string())?,
+    );
+    feed.seek(SeekFrom::Start(offset as u64))
+        .map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    feed.take(4096)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    let row: Vec<serde_json::Value> = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    if row.first().and_then(|v| v.as_str()) != Some(digest) {
+        return Err("catalogue metadata/index mismatch; update the bundle".into());
     }
-    let filter_count = record[0];
-    if filter_count as usize > MAX_FILTERS {
-        return Err(format!(
-            "filter_count {} exceeds MAX_FILTERS {}",
-            filter_count, MAX_FILTERS
-        )
-        .into());
-    }
-    let mv_adjust = f32::from_le_bytes([record[1], record[2], record[3], record[4]]);
-    if !mv_adjust.is_finite() || mv_adjust.abs() > 40.0 {
-        return Err(
-            format!("mv_adjust {mv_adjust} out of range (must be finite, |mv| <= 40)").into(),
-        );
-    }
-
-    let needed = 5 + filter_count as usize * COEFFS_PER_FILTER * 4;
-    if record.len() < needed {
-        return Err(format!(
-            "record too short for {filter_count} filters: have {}, need {needed}",
-            record.len()
-        )
-        .into());
-    }
-
-    let mut coeffs = Vec::with_capacity(filter_count as usize);
-    for i in 0..filter_count as usize {
-        let base = 5 + i * COEFFS_PER_FILTER * 4;
-        let mut c = [0f32; 5];
-        for j in 0..5 {
-            let offset = base + j * 4;
-            c[j] = f32::from_le_bytes([
-                record[offset],
-                record[offset + 1],
-                record[offset + 2],
-                record[offset + 3],
-            ]);
-        }
-        coeffs.push(c);
-    }
-
-    Ok((filter_count, mv_adjust, coeffs))
+    let title = row
+        .get(1)
+        .and_then(|v| v.as_str())
+        .ok_or("missing entry title")?;
+    let author = row.get(2).and_then(|v| v.as_str()).unwrap_or("");
+    Ok((
+        truncate_utf8(title, 256).to_string(),
+        truncate_utf8(author, 256).to_string(),
+    ))
 }
 
 /// Load an ezBEQ filter into the device's input PEQ bands.
@@ -228,14 +230,28 @@ pub fn load_filter(
     digest: &str,
     title: &str,
     _author: &str,
-) -> Result<f32, String> {
-    let (filter_count, mv_adjust, coeffs) =
-        read_entry_biquads_by_digest(digest).map_err(|e| e.to_string())?;
+) -> Result<(f32, bool), String> {
+    let (filter_count, mv_adjust, coeffs, optimised) =
+        read_entry_biquads_by_digest(digest, device.profile().sample_rate)
+            .map_err(|e| e.to_string())?;
     let table = device
         .profile()
         .dsp_table
         .ok_or("device has no DSP table")?;
 
+    if table.inputs.is_empty()
+        || table
+            .inputs
+            .iter()
+            .any(|ch| ch.peq.len() < filter_count as usize)
+    {
+        return Err("device has insufficient input PEQ bands for this catalogue entry".into());
+    }
+    if optimised
+        && device.profile().dialect.value_format != minidsp_protocol::dialect::ValueFormat::Float32
+    {
+        return Err("optimised catalogue coefficients require a float32 DSP".into());
+    }
     info!("loading BEQ: {title} ({filter_count} filters, mv={mv_adjust:+.1}dB)");
 
     // Write filters to input PEQ bands on ALL input channels
@@ -264,7 +280,7 @@ pub fn load_filter(
         );
     }
 
-    Ok(mv_adjust)
+    Ok((mv_adjust, optimised))
 }
 
 /// Clear all input PEQ bands (set to bypass).
@@ -283,10 +299,15 @@ pub fn clear_filter(device: &DeviceState) -> Result<(), String> {
                 .bypass_filter(band.addr, true)
                 .map_err(|e| e.to_string())?;
         }
-        // Reset input gain to 0dB (linear 1.0)
+        // Match ezBEQ clear: reset input gain and mute.
         if let Some(gain_addr) = input.gain {
             device
-                .write_dsp(gain_addr, 1.0, true)
+                .set_channel_gain(gain_addr, 0.0)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(mute_addr) = input.mute {
+            device
+                .set_channel_mute(mute_addr, false)
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -315,7 +336,7 @@ fn set_input_gain_mute_state(
         .ok_or("device has no DSP table")?;
 
     for gain in gains {
-        if !gain.value.is_finite() || gain.value.abs() > 120.0 {
+        if !gain.value.is_finite() || !(-72.0..=12.0).contains(&gain.value) {
             return Err(format!(
                 "gain for input {} out of range (must be finite, |gain| <= 120 dB)",
                 gain.id
@@ -327,7 +348,7 @@ fn set_input_gain_mute_state(
             .map_err(|_| format!("invalid gain channel id '{}'", gain.id))?;
         let input = table
             .inputs
-            .get(ch.saturating_sub(1))
+            .get(ch.checked_sub(1).ok_or("channel ids start at 1")?)
             .ok_or_else(|| format!("gain channel {} out of range", gain.id))?;
         let addr = input
             .gain
@@ -344,7 +365,7 @@ fn set_input_gain_mute_state(
             .map_err(|_| format!("invalid mute channel id '{}'", mute.id))?;
         let input = table
             .inputs
-            .get(ch.saturating_sub(1))
+            .get(ch.checked_sub(1).ok_or("channel ids start at 1")?)
             .ok_or_else(|| format!("mute channel {} out of range", mute.id))?;
         let addr = input
             .mute
@@ -356,6 +377,183 @@ fn set_input_gain_mute_state(
 
     Ok(())
 }
+
+fn set_provenance(slot: &mut SlotState, optimised: bool) {
+    slot.coefficients = Some(if optimised { "optimised" } else { "standard" }.into());
+    slot.profile = optimised.then(|| "float32-96k".into());
+}
+
+fn set_output_gain_mute_state(
+    device: &DeviceState,
+    gains: &[ChannelValue<f32>],
+    mutes: &[ChannelValue<bool>],
+) -> Result<(), String> {
+    let table = device
+        .profile()
+        .dsp_table
+        .ok_or("device has no DSP table")?;
+    for gain in gains {
+        let ch = gain
+            .id
+            .parse::<usize>()
+            .map_err(|_| "invalid output channel")?;
+        let output = table
+            .outputs
+            .get(ch.checked_sub(1).ok_or("channel ids start at 1")?)
+            .ok_or("output channel out of range")?;
+        device
+            .set_channel_gain(output.gain, gain.value)
+            .map_err(|e| e.to_string())?;
+    }
+    for mute in mutes {
+        let ch = mute
+            .id
+            .parse::<usize>()
+            .map_err(|_| "invalid output channel")?;
+        let output = table
+            .outputs
+            .get(ch.checked_sub(1).ok_or("channel ids start at 1")?)
+            .ok_or("output channel out of range")?;
+        device
+            .set_channel_mute(output.mute, mute.value)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Validate advertised PATCH fields before changing the active preset or DSP.
+fn validate_patch(device: &DeviceState, json: &serde_json::Value) -> Result<(), String> {
+    let fields = json.as_object().ok_or("device patch must be an object")?;
+    for key in fields.keys() {
+        if !["masterVolume", "mute", "slots"].contains(&key.as_str()) {
+            return Err(format!("unsupported device patch field {key}"));
+        }
+    }
+    if let Some(vol) = json.get("masterVolume") {
+        let vol = vol.as_f64().ok_or("masterVolume must be a number")?;
+        if !vol.is_finite() || !(-127.0..=0.0).contains(&vol) {
+            return Err("masterVolume must be between -127 and 0 dB".into());
+        }
+    }
+    if json.get("mute").is_some_and(|v| !v.is_boolean()) {
+        return Err("mute must be a boolean".into());
+    }
+    let Some(slots) = json.get("slots") else {
+        return Ok(());
+    };
+    let table = device
+        .profile()
+        .dsp_table
+        .ok_or("device has no DSP table")?;
+    for slot in slots.as_array().ok_or("slots must be an array")? {
+        let fields = slot.as_object().ok_or("slot must be an object")?;
+        parse_slot_index(
+            slot.get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("slot patch missing id")?,
+        )?;
+        for key in fields.keys() {
+            if ![
+                "id",
+                "entry",
+                "title",
+                "author",
+                "gains",
+                "mutes",
+                "outputGains",
+                "outputMutes",
+                "optimise",
+                "active",
+            ]
+            .contains(&key.as_str())
+            {
+                return Err(format!("unsupported slot patch field {key}"));
+            }
+        }
+        command_text::slot_steps(slot)?;
+        if let Some(value) = slot.get("optimise") {
+            if value.as_bool() != Some(true) {
+                return Err("this bundle always selects published optimised coefficients; disabling optimisation is unsupported".into());
+            }
+        }
+        if let Some(entry) = slot.get("entry") {
+            let digest = entry.as_str().ok_or("slot entry must be a string")?;
+            if !digest.is_empty() {
+                entry_metadata(digest)?;
+                let (count, _, _, optimised) =
+                    read_entry_biquads_by_digest(digest, device.profile().sample_rate)
+                        .map_err(|e| e.to_string())?;
+                if table.inputs.is_empty()
+                    || table.inputs.iter().any(|ch| ch.peq.len() < count as usize)
+                {
+                    return Err(
+                        "device has insufficient input PEQ bands for this catalogue entry".into(),
+                    );
+                }
+                if optimised
+                    && device.profile().dialect.value_format
+                        != minidsp_protocol::dialect::ValueFormat::Float32
+                {
+                    return Err("optimised catalogue coefficients require a float32 DSP".into());
+                }
+            }
+        }
+        for key in ["title", "author"] {
+            if slot
+                .get(key)
+                .is_some_and(|v| !v.is_string() || v.as_str().unwrap().len() > 256)
+            {
+                return Err(format!("{key} must be a string of at most 256 bytes"));
+            }
+        }
+        for (key, output, gain) in [
+            ("gains", false, true),
+            ("mutes", false, false),
+            ("outputGains", true, true),
+            ("outputMutes", true, false),
+        ] {
+            if let Some(values) = slot.get(key) {
+                for value in values
+                    .as_array()
+                    .ok_or_else(|| format!("{key} must be an array"))?
+                {
+                    let ch = value
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or("channel id must be a string")?
+                        .parse::<usize>()
+                        .map_err(|_| "invalid channel id")?;
+                    let idx = ch.checked_sub(1).ok_or("channel ids start at 1")?;
+                    if output {
+                        if table.outputs.get(idx).is_none() {
+                            return Err("output channel out of range".into());
+                        }
+                    } else {
+                        let input = table.inputs.get(idx).ok_or("input channel out of range")?;
+                        if (gain && input.gain.is_none()) || (!gain && input.mute.is_none()) {
+                            return Err("input has no requested control".into());
+                        }
+                    }
+                    if gain {
+                        let number = value
+                            .get("value")
+                            .and_then(|v| v.as_f64())
+                            .ok_or("gain must be a number")?;
+                        if !number.is_finite() || !(-72.0..=12.0).contains(&number) {
+                            return Err("gain out of range".into());
+                        }
+                    } else if !value.get("value").is_some_and(|v| v.is_boolean()) {
+                        return Err("mute must be a boolean".into());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[path = "ezbeq_contract.rs"]
+mod command_text;
 
 fn sync_slot_state(
     slot: &mut SlotState,
@@ -391,80 +589,216 @@ fn sync_slot_state(
     }
 }
 
-/// Push a DeviceState update to the connected /ws client (if any).
+/// Keep the legacy notification trigger in sync with the bounded state-client list.
+#[cfg(esp_idf_httpd_ws_support)]
+pub fn remove_ws_sender(state: &mut EzBeqState, token: u64) {
+    state.ws_senders.retain(|(id, _)| *id != token);
+    state.ws_sender = state.ws_senders.first().map(|(_, sender)| sender.clone());
+}
+
+/// Detached sends wait for httpd work: never call them on the single httpd task.
+/// The shared WS worker broadcasts the latest update to at most four state clients.
 #[cfg(esp_idf_httpd_ws_support)]
 pub fn broadcast_state(
     beq_state: SharedEzBeqState,
-    sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
+    _sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
     json: String,
 ) {
-    let session_fd = sender.session();
-    let beq_state_for_send = beq_state.clone();
-    if let Err(e) = std::thread::Builder::new()
-        .name("beq_ws_tx".into())
-        .stack_size(4096)
-        .spawn(move || {
-            let mut sender = sender;
-            if let Err(err) = sender.send(esp_idf_svc::ws::FrameType::Text(false), json.as_bytes())
-            {
-                log::warn!("ezBEQ WS send failed for fd {session_fd}: {err:?}");
-                let mut guard = beq_state_for_send
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if guard.ws_sender.as_ref().map(|active| active.session()) == Some(session_fd) {
-                    guard.ws_sender = None;
-                }
-            }
-        })
-    {
-        log::warn!("failed to spawn ezBEQ WS send thread for fd {session_fd}: {e}");
-        let mut guard = beq_state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if guard.ws_sender.as_ref().map(|active| active.session()) == Some(session_fd) {
-            guard.ws_sender = None;
-        }
+    // Coalesce updates into the latest complete state. The shared WS worker
+    // performs detached sends off httpd, with a fixed thread/stack budget.
+    beq_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_state = Some(json);
+}
+
+/// The ezBEQ device object, borrowed from the slot state and serialized directly.
+#[derive(serde::Serialize)]
+struct DeviceStateBody<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    name: &'static str,
+    #[serde(rename = "masterVolume")]
+    master_volume: f32,
+    mute: bool,
+    connected: bool,
+    // Null is understood by 2.12.4: hide the sticky toggle and profile
+    // comparisons, while still rendering each loaded slot's provenance chip.
+    optimisation: (),
+    slots: &'a [SlotState],
+}
+
+fn device_state_body<'a>(device: &DeviceState, beq_state: &'a EzBeqState) -> DeviceStateBody<'a> {
+    // Single USB round-trip instead of two
+    let ms = device.get_master_status().ok();
+    DeviceStateBody {
+        kind: "minidsp",
+        name: "master",
+        master_volume: ms.as_ref().map(|m| m.volume_db()).unwrap_or(-10.0),
+        mute: ms.as_ref().map(|m| m.is_muted()).unwrap_or(false),
+        connected: ms.is_some(),
+        optimisation: (),
+        slots: &beq_state.slots,
     }
 }
 
 /// Build the DeviceState JSON for the ezBEQ WebSocket protocol.
-fn device_state_value(device: &DeviceState, beq_state: &EzBeqState) -> serde_json::Value {
-    let slots_json: Vec<serde_json::Value> = beq_state
-        .slots
-        .iter()
-        .map(|s| serde_json::to_value(s).unwrap_or_default())
-        .collect();
-
-    // Single USB round-trip instead of two
-    let ms = device.get_master_status().ok();
-    let volume = ms.as_ref().map(|m| m.volume_db()).unwrap_or(-10.0);
-    let mute = ms.as_ref().map(|m| m.is_muted()).unwrap_or(false);
-
-    serde_json::json!({
-        "type": "minidsp",
-        "name": "master",
-        "masterVolume": volume,
-        "mute": mute,
-        "slots": slots_json,
-    })
-}
-
 pub fn device_state_json(device: &DeviceState, beq_state: &EzBeqState) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "message": "DeviceState",
-        "data": device_state_value(device, beq_state),
-    }))
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        message: &'static str,
+        data: DeviceStateBody<'a>,
+    }
+    serde_json::to_string(&Envelope {
+        message: "DeviceState",
+        data: device_state_body(device, beq_state),
+    })
     .unwrap_or_default()
 }
 
 fn device_state_json_plain(device: &DeviceState, beq_state: &EzBeqState) -> String {
-    serde_json::to_string(&device_state_value(device, beq_state)).unwrap_or_default()
+    serde_json::to_string(&device_state_body(device, beq_state)).unwrap_or_default()
 }
 
 fn storage_json_or_default(path: &str, default: &str) -> String {
     storage::read_file(path)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Stream compact, build-time-sorted rows with bounded RAM, including arbitrary
+/// since/limit queries. The browser receives the upstream object representation.
+fn send_recent_changes<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+) -> Result<(), C::Error> {
+    use esp_idf_svc::io::Write;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    // ESP32 may boot without a synchronised wall clock. The feed/listing are
+    // built at the same instant; use that snapshot time until a real clock exists.
+    let now = if now >= 1_600_000_000 {
+        now
+    } else {
+        storage::read_file("catalogue-built-at.txt")
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(now)
+    };
+    let mut since = now - 14 * 24 * 60 * 60;
+    let mut limit = 50i64;
+    if let Some((_, query)) = req.uri().split_once('?') {
+        for pair in query.split('&') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if key == "since" || key == "limit" {
+                let number = match value.parse::<i64>() {
+                    Ok(number) => number,
+                    Err(_) => {
+                        return crate::http_server::send_error(
+                            req,
+                            400,
+                            "since and limit must be integers",
+                        )
+                    }
+                };
+                if key == "since" {
+                    since = number;
+                } else {
+                    limit = number;
+                }
+            }
+        }
+    }
+    let file = match std::fs::File::open(storage::full_path("recent-changes.jsonl")) {
+        Ok(file) => file,
+        Err(_) => return crate::http_server::send_json(req, 200, "[]"),
+    };
+    let mut resp = req.into_response(
+        200,
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("Access-Control-Allow-Origin", "*"),
+            ("Cache-Control", "no-store"),
+        ],
+    )?;
+    resp.write_all(b"[")?;
+    let mut count = 0i64;
+    for (idx, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let row = line
+            .ok()
+            .and_then(|line| serde_json::from_str::<Vec<serde_json::Value>>(&line).ok());
+        let Some(row) = row.filter(|row| row.len() == 10) else {
+            log::warn!("invalid recent-changes row");
+            continue;
+        };
+        let created = row[7].as_i64().unwrap_or(0);
+        let updated = row[8].as_i64().unwrap_or(0);
+        if created.max(updated) < since {
+            break;
+        }
+        let mut entry = serde_json::Map::new();
+        for (key, value) in [
+            "id",
+            "formattedTitle",
+            "year",
+            "author",
+            "content_type",
+            "audioTypes",
+            "language",
+            "created_at",
+            "updated_at",
+            "freshness",
+        ]
+        .into_iter()
+        .zip(row)
+        {
+            if !value.is_null() && value != "" && value != 0 && value != serde_json::json!([]) {
+                entry.insert(key.into(), value);
+            }
+        }
+        if let Some(content) = entry.get("content_type").cloned() {
+            entry.insert("contentType".into(), content);
+        }
+        if count > 0 {
+            resp.write_all(b",")?;
+        }
+        resp.write_all(serde_json::Value::Object(entry).to_string().as_bytes())?;
+        count += 1;
+        if limit > 0 && count >= limit {
+            break;
+        }
+        if idx % 32 == 31 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    resp.write_all(b"]")?;
+    Ok(())
+}
+
+/// The stock UI reports HTTP status but discards error bodies. Its state socket
+/// already understands Error messages, so surface the explanation there without
+/// rewriting browser fetch() or changing upstream UI code.
+fn send_beq_error<C: esp_idf_svc::http::server::Connection>(
+    _beq: &SharedEzBeqState,
+    req: esp_idf_svc::http::server::Request<C>,
+    status: u16,
+    message: &str,
+) -> Result<(), C::Error> {
+    #[cfg(esp_idf_httpd_ws_support)]
+    if let Ok(mut state) = _beq.try_lock() {
+        // Some hardware-error paths already hold the slot-state lock. Never
+        // recursively lock it from the httpd task; HTTP still carries the error
+        // if an explanatory WS notification cannot be queued in that case.
+        state.pending_state = Some(
+            serde_json::json!({"message": "Error", "data": message, "persistent": false})
+                .to_string(),
+        );
+    }
+    crate::http_server::send_error(req, status, message)
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +826,7 @@ pub fn register_routes(
     // Catalogue filter metadata endpoints — served from the flashed/updater-managed bundle.
     for (path, storage_path) in [
         ("/api/1/authors", "authors.json"),
+        ("/api/1/filterauthors", "filterauthors.json"),
         ("/api/1/years", "years.json"),
         ("/api/1/audiotypes", "audiotypes.json"),
         ("/api/1/contenttypes", "contenttypes.json"),
@@ -502,6 +837,18 @@ pub fn register_routes(
             send_json(req, 200, &body)
         })?;
     }
+
+    server.fn_handler("/api/1/whats-new", Method::Get, |req| {
+        send_recent_changes(req)
+    })?;
+    // Parameter comparisons require authored filter parameters, which are not stored.
+    server.fn_handler("/api/1/catalogue/filters", Method::Get, |req| {
+        send_error(
+            req,
+            404,
+            "filter parameter comparisons are unavailable on this device",
+        )
+    })?;
 
     // GET /api/2/devices — device list with ezBEQ state
     {
@@ -568,61 +915,78 @@ pub fn register_routes(
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
 
-            // Parse request body: {"entryId": "<digest>", "title": "...", "author": "..."}
-            let mut buf = [0u8; 1024];
-            let len = req.read(&mut buf).unwrap_or(0);
-            let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
+            // Stock UI body: {"entryId": "<digest>"}; metadata resolves locally.
+            let body = match read_request_body(&mut req, 1024) {
+                Ok(body) => body,
+                Err((status, message)) => return send_beq_error(&beq, req, status, message),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
-                Err(_) => return send_error(req, 400, "invalid JSON"),
+                Err(_) => return send_beq_error(&beq, req, 400, "invalid JSON"),
             };
 
             let digest = match json.get("entryId").and_then(|v| v.as_str()) {
                 Some(id) => id,
-                None => return send_error(req, 400, "missing entryId"),
+                None => return send_beq_error(&beq, req, 400, "missing entryId"),
             };
 
-            // Title and author are enriched by the JS shim (truncate to prevent heap bloat)
-            let raw_title = json
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown");
-            let raw_author = json
-                .get("author")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown");
-            let title = if raw_title.len() > 256 {
-                &raw_title[..256]
-            } else {
-                raw_title
+            let (title, author) = match entry_metadata(digest) {
+                Ok(metadata) => metadata,
+                Err(e) if e.contains("not found") => {
+                    let started = crate::updater::trigger_background_refresh(
+                        nvs.clone(),
+                        "catalogue entry missing during metadata lookup",
+                    );
+                    return send_json(
+                        req,
+                        404,
+                        &serde_json::json!({
+                            "error": e, "refreshStarted": started,
+                        })
+                        .to_string(),
+                    );
+                }
+                Err(e) => return send_beq_error(&beq, req, 400, &e),
             };
-            let author = if raw_author.len() > 256 {
-                &raw_author[..256]
-            } else {
-                raw_author
-            };
+            if let Err(e) = parse_digest_prefix(digest) {
+                return send_beq_error(&beq, req, 400, &e);
+            }
             let _op = match dev.try_begin_operation() {
                 Some(op) => op,
-                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+                None => return send_beq_error(&beq, req, 409, crate::http_server::DEVICE_BUSY),
             };
+            if let Err(e) = read_entry_biquads_by_digest(digest, dev.profile().sample_rate) {
+                let message = e.to_string();
+                if message.contains("not found") {
+                    let started = crate::updater::trigger_background_refresh(
+                        nvs.clone(),
+                        "catalogue entry missing during filter load",
+                    );
+                    return send_json(
+                        req,
+                        404,
+                        &serde_json::json!({
+                            "error": message, "refreshStarted": started,
+                        })
+                        .to_string(),
+                    );
+                }
+                return send_beq_error(&beq, req, 400, &message);
+            }
             if let Err(e) = dev.set_preset(slot_idx as u8) {
-                return send_error(req, 500, &format!("set_preset: {e}"));
+                return send_beq_error(&beq, req, 500, &format!("set_preset: {e}"));
             }
 
-            match load_filter(&dev, digest, title, author) {
-                Ok(_) => {
+            match load_filter(&dev, digest, &title, &author) {
+                Ok((_, optimised)) => {
                     dev.save_peq_shadow_to_nvs(&nvs);
                     let mut beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
+                    set_provenance(&mut beq_guard.slots[slot_idx], optimised);
                     beq_guard.slots[slot_idx].last = title.to_string();
                     beq_guard.slots[slot_idx].author = Some(author.to_string());
                     // Mark this slot as active, all others inactive
                     for (i, slot) in beq_guard.slots.iter_mut().enumerate() {
                         slot.active = i == slot_idx;
-                    }
-                    for gain in &mut beq_guard.slots[slot_idx].gains {
-                        gain.value = 0.0;
-                    }
-                    for mute in &mut beq_guard.slots[slot_idx].mutes {
-                        mute.value = false;
                     }
                     #[cfg(esp_idf_httpd_ws_support)]
                     let ws_update = beq_guard
@@ -650,7 +1014,7 @@ pub fn register_routes(
                         });
                         send_json(req, 404, &serde_json::to_string(&body).unwrap_or_default())
                     } else {
-                        send_error(req, 500, &e)
+                        send_beq_error(&beq, req, 500, &e)
                     }
                 }
             }
@@ -675,10 +1039,10 @@ pub fn register_routes(
             };
             let _op = match dev.try_begin_operation() {
                 Some(op) => op,
-                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+                None => return send_beq_error(&beq, req, 409, crate::http_server::DEVICE_BUSY),
             };
             if let Err(e) = dev.set_preset(slot_idx as u8) {
-                return send_error(req, 500, &format!("set_preset: {e}"));
+                return send_beq_error(&beq, req, 500, &format!("set_preset: {e}"));
             }
 
             match clear_filter(&dev) {
@@ -687,6 +1051,8 @@ pub fn register_routes(
                     let mut beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
                     beq_guard.slots[slot_idx].last = "Empty".into();
                     beq_guard.slots[slot_idx].author = None;
+                    beq_guard.slots[slot_idx].coefficients = None;
+                    beq_guard.slots[slot_idx].profile = None;
                     for gain in &mut beq_guard.slots[slot_idx].gains {
                         gain.value = 0.0;
                     }
@@ -710,7 +1076,7 @@ pub fn register_routes(
                     }
                     send_json(req, 200, &body)
                 }
-                Err(e) => send_error(req, 500, &e.to_string()),
+                Err(e) => send_beq_error(&beq, req, 500, &e.to_string()),
             }
         })?;
     }
@@ -730,26 +1096,31 @@ pub fn register_routes(
                 Some(d) => d,
                 None => return send_json(req, 503, r#"{"error":"no device"}"#),
             };
-            let mut buf = [0u8; 4096];
-            let len = req.read(&mut buf).unwrap_or(0);
-            let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
+            let body = match read_request_body(&mut req, 4096) {
+                Ok(body) => body,
+                Err((status, message)) => return send_beq_error(&beq, req, status, message),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
-                Err(_) => return send_error(req, 400, "invalid JSON"),
+                Err(_) => return send_beq_error(&beq, req, 400, "invalid JSON"),
             };
             let _op = match dev.try_begin_operation() {
                 Some(op) => op,
-                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+                None => return send_beq_error(&beq, req, 409, crate::http_server::DEVICE_BUSY),
             };
+            if let Err(e) = validate_patch(&dev, &json) {
+                return send_beq_error(&beq, req, 400, &e);
+            }
             let mut beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Some(vol) = json.get("masterVolume").and_then(|v| v.as_f64()) {
                 if let Err(e) = dev.set_volume_db(vol as f32) {
-                    return send_error(req, 500, &format!("set_volume: {e}"));
+                    return send_beq_error(&beq, req, 500, &format!("set_volume: {e}"));
                 }
             }
             if let Some(mute) = json.get("mute").and_then(|v| v.as_bool()) {
                 if let Err(e) = dev.set_mute(mute) {
-                    return send_error(req, 500, &format!("set_mute: {e}"));
+                    return send_beq_error(&beq, req, 500, &format!("set_mute: {e}"));
                 }
             }
 
@@ -757,69 +1128,164 @@ pub fn register_routes(
                 for slot in slots {
                     let slot_id = match slot.get("id").and_then(|v| v.as_str()) {
                         Some(id) => id,
-                        None => return send_error(req, 400, "slot patch missing id"),
+                        None => return send_beq_error(&beq, req, 400, "slot patch missing id"),
                     };
                     let slot_idx = match parse_slot_index(slot_id) {
                         Ok(idx) => idx,
-                        Err(e) => return send_error(req, 400, &e),
+                        Err(e) => return send_beq_error(&beq, req, 400, &e),
                     };
 
-                    if let Err(e) = dev.set_preset(slot_idx as u8) {
-                        return send_error(req, 500, &format!("set_preset: {e}"));
-                    }
-
-                    if let Some(entry) = slot.get("entry") {
-                        let digest = match entry.as_str() {
-                            Some(digest) => digest,
-                            None => return send_error(req, 400, "slot entry must be a string"),
-                        };
-                        if digest.is_empty() {
-                            if let Err(e) = clear_filter(&dev) {
-                                return send_error(req, 500, &e);
-                            }
-                            beq_guard.slots[slot_idx].last = "Empty".into();
-                            beq_guard.slots[slot_idx].author = None;
-                        } else {
-                            let title =
-                                slot.get("title").and_then(|v| v.as_str()).unwrap_or(digest);
-                            let author = slot.get("author").and_then(|v| v.as_str()).unwrap_or("");
-                            if let Err(e) = load_filter(&dev, digest, title, author) {
-                                return send_error(req, 500, &e);
-                            }
-                            beq_guard.slots[slot_idx].last = title.to_string();
-                            beq_guard.slots[slot_idx].author = if author.is_empty() {
-                                None
-                            } else {
-                                Some(author.to_string())
-                            };
+                    let steps = command_text::slot_steps(slot).unwrap(); // validated above
+                    if !steps.is_empty() {
+                        if let Err(e) = dev.set_preset(slot_idx as u8) {
+                            return send_beq_error(&beq, req, 500, &format!("set_preset: {e}"));
                         }
                     }
+                    for step in &steps {
+                        match step {
+                            command_text::SlotStep::Inputs => {
+                                let gains = match slot.get("gains") {
+                                    Some(value) => {
+                                        match serde_json::from_value::<Vec<ChannelValue<f32>>>(
+                                            value.clone(),
+                                        ) {
+                                            Ok(gains) => gains,
+                                            Err(_) => {
+                                                return send_beq_error(
+                                                    &beq,
+                                                    req,
+                                                    400,
+                                                    "invalid slot gains",
+                                                )
+                                            }
+                                        }
+                                    }
+                                    None => Vec::new(),
+                                };
+                                let mutes = match slot.get("mutes") {
+                                    Some(value) => {
+                                        match serde_json::from_value::<Vec<ChannelValue<bool>>>(
+                                            value.clone(),
+                                        ) {
+                                            Ok(mutes) => mutes,
+                                            Err(_) => {
+                                                return send_beq_error(
+                                                    &beq,
+                                                    req,
+                                                    400,
+                                                    "invalid slot mutes",
+                                                )
+                                            }
+                                        }
+                                    }
+                                    None => Vec::new(),
+                                };
 
-                    let gains = match slot.get("gains") {
-                        Some(value) => {
-                            match serde_json::from_value::<Vec<ChannelValue<f32>>>(value.clone()) {
-                                Ok(gains) => gains,
-                                Err(_) => return send_error(req, 400, "invalid slot gains"),
+                                if let Err(e) = set_input_gain_mute_state(&dev, &gains, &mutes) {
+                                    return send_beq_error(&beq, req, 500, &e);
+                                }
+                                sync_slot_state(
+                                    &mut beq_guard.slots[slot_idx],
+                                    None,
+                                    None,
+                                    &gains,
+                                    &mutes,
+                                );
                             }
-                        }
-                        None => Vec::new(),
-                    };
-                    let mutes = match slot.get("mutes") {
-                        Some(value) => {
-                            match serde_json::from_value::<Vec<ChannelValue<bool>>>(value.clone()) {
-                                Ok(mutes) => mutes,
-                                Err(_) => return send_error(req, 400, "invalid slot mutes"),
+                            command_text::SlotStep::Outputs => {
+                                let output_gains: Vec<ChannelValue<f32>> = serde_json::from_value(
+                                    slot.get("outputGains")
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!([])),
+                                )
+                                .unwrap();
+                                let output_mutes: Vec<ChannelValue<bool>> = serde_json::from_value(
+                                    slot.get("outputMutes")
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!([])),
+                                )
+                                .unwrap();
+                                if let Err(e) =
+                                    set_output_gain_mute_state(&dev, &output_gains, &output_mutes)
+                                {
+                                    return send_beq_error(&beq, req, 500, &e);
+                                }
+                                for gain in output_gains {
+                                    if let Some(ch) = beq_guard.slots[slot_idx]
+                                        .output_gains
+                                        .iter_mut()
+                                        .find(|ch| ch.id == gain.id)
+                                    {
+                                        ch.value = gain.value;
+                                    }
+                                }
+                                for mute in output_mutes {
+                                    if let Some(ch) = beq_guard.slots[slot_idx]
+                                        .output_mutes
+                                        .iter_mut()
+                                        .find(|ch| ch.id == mute.id)
+                                    {
+                                        ch.value = mute.value;
+                                    }
+                                }
                             }
+                            command_text::SlotStep::Entry => {
+                                if let Some(entry) = slot.get("entry") {
+                                    let digest = match entry.as_str() {
+                                        Some(digest) => digest,
+                                        None => {
+                                            return send_beq_error(
+                                                &beq,
+                                                req,
+                                                400,
+                                                "slot entry must be a string",
+                                            )
+                                        }
+                                    };
+                                    if digest.is_empty() {
+                                        if let Err(e) = clear_filter(&dev) {
+                                            return send_beq_error(&beq, req, 500, &e);
+                                        }
+                                        beq_guard.slots[slot_idx].last = "Empty".into();
+                                        beq_guard.slots[slot_idx].author = None;
+                                        beq_guard.slots[slot_idx].coefficients = None;
+                                        beq_guard.slots[slot_idx].profile = None;
+                                        for gain in &mut beq_guard.slots[slot_idx].gains {
+                                            gain.value = 0.0;
+                                        }
+                                        for mute in &mut beq_guard.slots[slot_idx].mutes {
+                                            mute.value = false;
+                                        }
+                                    } else {
+                                        let (title, author) = match entry_metadata(digest) {
+                                            Ok(metadata) => metadata,
+                                            Err(e) => return send_beq_error(&beq, req, 400, &e),
+                                        };
+                                        let optimised =
+                                            match load_filter(&dev, digest, &title, &author) {
+                                                Ok((_, optimised)) => optimised,
+                                                Err(e) => {
+                                                    return send_beq_error(&beq, req, 400, &e)
+                                                }
+                                            };
+                                        set_provenance(&mut beq_guard.slots[slot_idx], optimised);
+                                        beq_guard.slots[slot_idx].last = title.to_string();
+                                        beq_guard.slots[slot_idx].author = if author.is_empty() {
+                                            None
+                                        } else {
+                                            Some(author.to_string())
+                                        };
+                                    }
+                                }
+                            }
+                            // Every mutation above already selects this preset.
+                            command_text::SlotStep::Activate => {}
                         }
-                        None => Vec::new(),
-                    };
-
-                    if let Err(e) = set_input_gain_mute_state(&dev, &gains, &mutes) {
-                        return send_error(req, 500, &e);
                     }
-                    sync_slot_state(&mut beq_guard.slots[slot_idx], None, None, &gains, &mutes);
-                    for (i, state_slot) in beq_guard.slots.iter_mut().enumerate() {
-                        state_slot.active = i == slot_idx;
+                    if !steps.is_empty() {
+                        for (i, state_slot) in beq_guard.slots.iter_mut().enumerate() {
+                            state_slot.active = i == slot_idx;
+                        }
                     }
                 }
             }
@@ -841,47 +1307,114 @@ pub fn register_routes(
         })?;
     }
 
-    // PUT /api/1/devices/master/commands — preset save/overwrite (used by React UI)
+    // PUT /commands — upstream coefficient uploads (one-based channels/slot).
     {
         let st = device_state.clone();
         let audio = audio_state.clone();
-        server.fn_handler(
-            "/api/1/devices/master/commands",
-            Method::Put,
-            move |mut req| {
-                req = match reject_hid_during_playback(req, &audio)? {
-                    Some(req) => req,
-                    None => return Ok(()),
+        let beq = beq_state.clone();
+        let nvs = nvs.clone();
+        server.fn_handler("/api/1/devices/master/commands", Method::Put, move |mut req| {
+            req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
+            let dev = match get_device(&st) {
+                Some(d) => d,
+                None => return send_beq_error(&beq, req, 503, "no device"),
+            };
+            let body = match read_request_body(&mut req, 16 * 1024) {
+                Ok(body) => body,
+                Err((status, message)) => return send_beq_error(&beq, req, status, message),
+            };
+            let json: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(_) => return send_beq_error(&beq, req, 400, "invalid JSON"),
+            };
+            if json.get("commandType").and_then(|v| v.as_str()) != Some("bq") {
+                return send_beq_error(&beq, req, 400, "only commandType 'bq' is supported; export miniDSP biquad coefficient text (filt/rs filter design is unavailable)");
+            }
+            let Some(text) = json.get("commands").and_then(|v| v.as_str()) else {
+                return send_beq_error(&beq, req, 400, "commands must contain coefficient text");
+            };
+            let biquads = match command_text::parse_biquads(text) {
+                Ok(biquads) => biquads,
+                Err(e) => return send_beq_error(&beq, req, 400, &e),
+            };
+            let slot_idx = match json.get("slot").and_then(|v| v.as_str()).ok_or("missing slot")
+                .and_then(|id| parse_slot_index(id).map_err(|_| "slot must be 1-4")) {
+                Ok(idx) => idx,
+                Err(e) => return send_beq_error(&beq, req, 400, e),
+            };
+            let Some(overwrite) = json.get("overwrite").and_then(|v| v.as_bool()) else {
+                return send_beq_error(&beq, req, 400, "overwrite must be a boolean");
+            };
+            let Some(table) = dev.profile().dsp_table else {
+                return send_beq_error(&beq, req, 400, "device has no DSP table");
+            };
+            let mut targets = Vec::new();
+            let mut has_inputs = false;
+            for (key, output) in [("inputs", false), ("outputs", true)] {
+                let Some(channels) = json.get(key).and_then(|v| v.as_array()) else {
+                    return send_beq_error(&beq, req, 400, "inputs and outputs must be channel arrays");
                 };
-                let dev = match get_device(&st) {
-                    Some(d) => d,
-                    None => return send_json(req, 503, r#"{"error":"no device"}"#),
-                };
-                let mut buf = [0u8; 512];
-                let len = req.read(&mut buf).unwrap_or(0);
-                let json: serde_json::Value = match serde_json::from_slice(&buf[..len]) {
-                    Ok(v) => v,
-                    Err(_) => return send_error(req, 400, "invalid JSON"),
-                };
-                let _op = match dev.try_begin_operation() {
-                    Some(op) => op,
-                    None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
-                };
-
-                // Handle "overwrite" command (copy current preset to flash)
-                if json
-                    .get("overwrite")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    if let Err(e) = dev.copy_preset() {
-                        return send_error(req, 500, &format!("copy_preset: {e}"));
+                for ch in channels {
+                    let Some(idx) = ch.as_u64().and_then(|ch| ch.checked_sub(1)).and_then(|ch| usize::try_from(ch).ok()) else {
+                        return send_beq_error(&beq, req, 400, "channel ids must be positive integers");
+                    };
+                    let bands = if output { table.outputs.get(idx).map(|ch| ch.peq) }
+                                else { table.inputs.get(idx).map(|ch| ch.peq) };
+                    let Some(bands) = bands else {
+                        return send_beq_error(&beq, req, 400, "channel out of range");
+                    };
+                    if bands.len() < biquads.len() {
+                        return send_beq_error(&beq, req, 400, "too many biquads for selected channel");
+                    }
+                    targets.push(bands);
+                    has_inputs |= !output;
+                }
+            }
+            if targets.is_empty() {
+                return send_beq_error(&beq, req, 400, "select at least one input or output channel");
+            }
+            let _op = match dev.try_begin_operation() {
+                Some(op) => op,
+                None => return send_beq_error(&beq, req, 409, crate::http_server::DEVICE_BUSY),
+            };
+            if let Err(e) = dev.set_preset(slot_idx as u8) {
+                return send_beq_error(&beq, req, 500, &format!("set_preset: {e}"));
+            }
+            for bands in targets {
+                for action in command_text::band_actions(&biquads, overwrite, bands.len()) {
+                    let result = match action {
+                        command_text::BandAction::Write { index, coefficients } => dev
+                            .write_biquad(bands[index].addr, &coefficients)
+                            .and_then(|_| dev.bypass_filter(bands[index].addr, false)),
+                        command_text::BandAction::Bypass { index } =>
+                            dev.bypass_filter(bands[index].addr, true),
+                    };
+                    if let Err(e) = result {
+                        return send_beq_error(&beq, req, 500, &format!("write biquad: {e}"));
                     }
                 }
-
-                send_json(req, 200, r#"{"status":"ok"}"#)
-            },
-        )?;
+            }
+            dev.save_peq_shadow_to_nvs(&nvs);
+            let mut guard = beq.lock().unwrap_or_else(|e| e.into_inner());
+            for (idx, slot) in guard.slots.iter_mut().enumerate() { slot.active = idx == slot_idx; }
+            if has_inputs {
+                let slot = &mut guard.slots[slot_idx];
+                slot.last = "CUSTOM".into();
+                slot.author = None;
+                slot.coefficients = Some("standard".into());
+                slot.profile = None;
+            }
+            let body = device_state_json_plain(&dev, &guard);
+            #[cfg(esp_idf_httpd_ws_support)]
+            let update = guard.ws_sender.clone().map(|sender| (sender, device_state_json(&dev, &guard)));
+            drop(guard);
+            #[cfg(esp_idf_httpd_ws_support)]
+            if let Some((sender, json)) = update { broadcast_state(beq.clone(), sender, json); }
+            send_json(req, 200, &body)
+        })?;
     }
 
     // PUT /api/1/devices/master/config/{slot}/active — activate a slot
@@ -901,10 +1434,10 @@ pub fn register_routes(
             };
             let _op = match dev.try_begin_operation() {
                 Some(op) => op,
-                None => return send_error(req, 409, crate::http_server::DEVICE_BUSY),
+                None => return send_beq_error(&beq, req, 409, crate::http_server::DEVICE_BUSY),
             };
             if let Err(e) = dev.set_preset(slot_idx as u8) {
-                return send_error(req, 500, &format!("set_preset: {e}"));
+                return send_beq_error(&beq, req, 500, &format!("set_preset: {e}"));
             }
             let mut beq_guard = beq.lock().unwrap_or_else(|e| e.into_inner());
             for (i, slot) in beq_guard.slots.iter_mut().enumerate() {
@@ -937,13 +1470,17 @@ pub fn register_routes(
 
 /// Build REST response for GET /api/2/devices (different envelope than WS).
 fn device_state_json_rest(device: &DeviceState, beq_state: &EzBeqState) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "master": device_state_value(device, beq_state)
-    }))
+    #[derive(serde::Serialize)]
+    struct Devices<'a> {
+        master: DeviceStateBody<'a>,
+    }
+    serde_json::to_string(&Devices {
+        master: device_state_body(device, beq_state),
+    })
     .unwrap_or_default()
 }
 
-fn levels_json(name: &str, status: &StatusSummary) -> String {
+pub(crate) fn levels_json(name: &str, status: &StatusSummary) -> String {
     let mut levels = serde_json::Map::new();
     for (i, &v) in status.input_levels.iter().enumerate() {
         levels.insert(format!("I{i}"), serde_json::Value::from(v));

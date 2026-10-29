@@ -10,8 +10,8 @@ it would a real Wi-DG.
 **This plan is a compatibility / discovery fix, not a control-surface fix.**
 
 It does NOT directly fix any of the DSP control gaps tracked in
-`PROGRESS.md` Active Work (DSP100 compressor drift, FIR tap readback,
-selector-word authoritative readback, `/play` compatibility edges). Those
+[PROGRESS.md](../PROGRESS.md#device-control-and-compatibility)
+(device-control and playback verification). Those
 gaps are in our own HTTP 5380 + CLI + ezBEQ control surface, and they're
 addressed by a separate ongoing workstream that talks directly to the DSP
 over USB HID.
@@ -533,8 +533,8 @@ hostname constant. P3 is independent of everything.
 ## Relationship to the control-surface workstream
 
 This plan is orthogonal to the DSP control-surface work tracked in
-`PROGRESS.md` Active Work (DSP100 compressor drift, FIR tap readback,
-selector-word authoritative readback, `/play` compatibility edges). Those
+[PROGRESS.md](../PROGRESS.md#device-control-and-compatibility)
+(device-control and playback verification). Those
 items affect our own HTTP 5380 / CLI / ezBEQ API and are unblocked by
 direct DSP-over-USB protocol work, not by Wi-DG compatibility.
 
@@ -543,7 +543,7 @@ Running in parallel:
 | Workstream                           | Touches                              | Fixes                                           |
 |--------------------------------------|--------------------------------------|-------------------------------------------------|
 | This plan (Wi-DG parity)             | UDP 3999, TCP 5333, WiFi, mDNS       | Device Console compat, zero-config discovery    |
-| `PROGRESS.md` Active Work (DSP)      | Our own HTTP/CLI/ezBEQ, shadow cache | Our own API feature coverage                    |
+| [PROGRESS.md](../PROGRESS.md#device-control-and-compatibility)      | Our own HTTP/CLI/ezBEQ, shadow cache | Our own API feature coverage                    |
 
 **Side benefit:** after this plan ships, any feature the DSP control-surface
 workstream hasn't closed yet has a supported fallback — users can open

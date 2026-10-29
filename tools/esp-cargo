@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# An activated ESP-IDF environment overrides Cargo's pinned IDF version.
+# Use only espup's Rust environment; let esp-idf-sys install the matching IDF.
+set -euo pipefail
+
+ROOT_DIR="$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null # espup writes it outside the repo
+source "${ESP_EXPORT_SCRIPT:-$HOME/export-esp.sh}"
+export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/esp/bin:$PATH"
+unset IDF_PATH IDF_PYTHON_ENV_PATH IDF_TOOLS_PATH ESP_IDF_VERSION
+cd "$ROOT_DIR/app-esp32"
+exec cargo "$@"

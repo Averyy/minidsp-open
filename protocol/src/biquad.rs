@@ -73,11 +73,11 @@ mod tests {
     #[test]
     fn round_tripped_device_biquad_is_stable_in_alternate_convention() {
         let coeffs = [
-            0.0000106448014776106,
-            0.0000212896029552212,
-            0.0000106448014776106,
-            1.9879366159439087,
-            -0.9879792332649231,
+            0.000_010_644_801_5,
+            0.000_021_289_603,
+            0.000_010_644_801_5,
+            1.987_936_6,
+            -0.987_979_23,
         ];
         assert!(!is_stable(&coeffs));
         assert!(is_stable_any_convention(&coeffs));

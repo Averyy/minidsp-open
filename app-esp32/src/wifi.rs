@@ -301,7 +301,7 @@ fn apply_softap_ip_config() {
         esp_netif_get_handle_from_ifkey, esp_netif_ip_info_t, esp_netif_set_ip_info, ESP_OK,
     };
     unsafe {
-        let netif = esp_netif_get_handle_from_ifkey(b"WIFI_AP_DEF\0".as_ptr() as *const _);
+        let netif = esp_netif_get_handle_from_ifkey(c"WIFI_AP_DEF".as_ptr());
         if netif.is_null() {
             warn!("SoftAP IP config: netif WIFI_AP_DEF not found");
             return;
@@ -559,7 +559,7 @@ fn captive_dns_loop(ip: std::net::Ipv4Addr) {
         };
 
         query_count += 1;
-        if query_count <= 20 || query_count % 100 == 0 {
+        if query_count <= 20 || query_count.is_multiple_of(100) {
             info!("DNS #{query_count} from {src} (len={len}) → {ip}");
         }
 
@@ -622,6 +622,12 @@ fn captive_dns_loop(ip: std::net::Ipv4Addr) {
 // ---------------------------------------------------------------------------
 
 /// Read WiFi credentials from NVS.
+/// True if STA credentials are saved, i.e. SoftAP mode means STA failed
+/// rather than that the board was never provisioned.
+pub fn has_saved_credentials(nvs: &EspDefaultNvsPartition) -> bool {
+    read_credentials(nvs).is_some()
+}
+
 fn read_credentials(nvs: &EspDefaultNvsPartition) -> Option<(String, String)> {
     let nvs = EspNvs::<NvsDefault>::new(nvs.clone(), NVS_NAMESPACE, false).ok()?;
 
@@ -672,12 +678,11 @@ pub fn clear_credentials(nvs: &EspDefaultNvsPartition) -> Result<(), WifiError> 
 /// Falls back to [`SOFTAP_LAN_IP`] if the interface isn't available.
 pub fn get_softap_ip() -> std::net::Ipv4Addr {
     unsafe {
-        let netif =
-            esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(b"WIFI_AP_DEF\0".as_ptr() as _);
+        let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(c"WIFI_AP_DEF".as_ptr());
         if !netif.is_null() {
             let mut ip_info: esp_idf_svc::sys::esp_netif_ip_info_t = core::mem::zeroed();
             if esp_idf_svc::sys::esp_netif_get_ip_info(netif, &mut ip_info)
-                == esp_idf_svc::sys::ESP_OK as i32
+                == esp_idf_svc::sys::ESP_OK
             {
                 let ip = ip_info.ip.addr;
                 if ip != 0 {
@@ -704,8 +709,7 @@ pub fn get_softap_ip() -> std::net::Ipv4Addr {
 /// - Option 114 (RFC 8910 captive portal URI) → http://<AP IP>
 pub fn configure_dhcp_for_captive_portal(ip: std::net::Ipv4Addr) {
     unsafe {
-        let netif =
-            esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(b"WIFI_AP_DEF\0".as_ptr() as _);
+        let netif = esp_idf_svc::sys::esp_netif_get_handle_from_ifkey(c"WIFI_AP_DEF".as_ptr());
         if netif.is_null() {
             warn!("DHCP captive portal: netif not found");
             return;
@@ -731,7 +735,7 @@ pub fn configure_dhcp_for_captive_portal(ip: std::net::Ipv4Addr) {
             esp_idf_svc::sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
             &dns_info as *const _ as *mut _,
         );
-        if ret != esp_idf_svc::sys::ESP_OK as i32 {
+        if ret != esp_idf_svc::sys::ESP_OK {
             warn!("set DNS info failed: {ret}");
         } else {
             info!("DNS server set to {ip} for AP interface");
@@ -746,7 +750,7 @@ pub fn configure_dhcp_for_captive_portal(ip: std::net::Ipv4Addr) {
             uri.as_ptr() as *mut _,
             (uri.len() - 1) as u32,
         );
-        if ret != esp_idf_svc::sys::ESP_OK as i32 {
+        if ret != esp_idf_svc::sys::ESP_OK {
             warn!("DHCP Option 114 failed: {ret}");
         } else {
             info!("DHCP Option 114 set: http://{ip}");
@@ -754,7 +758,7 @@ pub fn configure_dhcp_for_captive_portal(ip: std::net::Ipv4Addr) {
 
         // Restart DHCP server
         let ret = esp_idf_svc::sys::esp_netif_dhcps_start(netif);
-        if ret != esp_idf_svc::sys::ESP_OK as i32 {
+        if ret != esp_idf_svc::sys::ESP_OK {
             warn!("DHCP restart failed: {ret}");
         }
     }

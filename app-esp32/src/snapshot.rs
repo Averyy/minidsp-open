@@ -11,6 +11,9 @@ use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+#[path = "snapshot_validation.rs"]
+mod validation;
+
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 const RECOVERY_MODIFICATION_TOKEN: [u8; 4] = [0xFE, 0xEF, 0x8F, 0xCF];
 
@@ -380,7 +383,8 @@ impl DeviceState {
             for slot in 0..profile.presets {
                 self.set_config_with_verify(slot, commands::PRESET_CHANGE_WITHOUT_RESET)?;
                 let (shadow, source) = capture_live_preset_source(self)?;
-                let trust_live = token_map.contains_key(&slot) && !profile.has_unreliable_selector_readback;
+                let trust_live =
+                    token_map.contains_key(&slot) && !profile.has_unreliable_selector_readback;
                 info!(
                     "snapshot learn slot {} trust_live={} issues={:?}",
                     slot, trust_live, source.issues
@@ -410,11 +414,8 @@ impl DeviceState {
 
     fn restore_device_snapshot_locked(&self, snapshot: &DeviceSnapshot) -> Result<(), UsbHidError> {
         validate_snapshot_target(self, snapshot)?;
-        if !snapshot.is_strict_complete() {
-            return Err(UsbHidError::Protocol(
-                "refusing to import an incomplete snapshot".to_string(),
-            ));
-        }
+        validation::validate_snapshot_payload(self.profile(), snapshot)
+            .map_err(UsbHidError::Protocol)?;
 
         let mut presets = snapshot.presets.clone();
         presets.sort_by_key(|preset| preset.slot);
@@ -589,14 +590,18 @@ fn populate_live_fir_blocks(
     for input in table.inputs {
         if let Some(fir) = input.fir {
             if let Some(block) = read_live_fir_block(device, shadow, fir)? {
-                shadow.fir_blocks.insert(block.data_start, block.coefficients);
+                shadow
+                    .fir_blocks
+                    .insert(block.data_start, block.coefficients);
             }
         }
     }
     for output in table.outputs {
         if let Some(fir) = output.fir {
             if let Some(block) = read_live_fir_block(device, shadow, fir)? {
-                shadow.fir_blocks.insert(block.data_start, block.coefficients);
+                shadow
+                    .fir_blocks
+                    .insert(block.data_start, block.coefficients);
             }
         }
     }
@@ -987,7 +992,7 @@ fn shadow_from_device_config(profile: &DeviceProfile, config: &DeviceConfig) -> 
         if let Some(addr) = output.delay {
             shadow
                 .scalar
-                .insert(addr, profile.delay_ms_to_samples(output_cfg.delay) as u32);
+                .insert(addr, profile.delay_ms_to_samples(output_cfg.delay));
         }
         if let Some(addr) = output.polarity {
             shadow.selector.insert(addr, 0);
@@ -1053,7 +1058,11 @@ fn shadow_from_device_config(profile: &DeviceProfile, config: &DeviceConfig) -> 
             shadow.selector.insert(
                 table.routing.status_base + flat_idx,
                 if profile.dialect.value_format == minidsp_protocol::dialect::ValueFormat::Float32 {
-                    if route.enabled { 2 } else { 1 }
+                    if route.enabled {
+                        2
+                    } else {
+                        1
+                    }
                 } else if route.enabled {
                     1
                 } else {

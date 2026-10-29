@@ -6,8 +6,9 @@ use crate::transport::{hid::HidTransport, tcp::TcpTransport, ws::WsTransport};
 use minidsp_protocol::commands::{self, Response};
 use minidsp_protocol::dialect::Dialect;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 
 /// Command priority levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -34,6 +35,7 @@ struct QueuedCommand {
     priority: Priority,
     response_tx: oneshot::Sender<Result<QueueResponse, TransportError>>,
     allow_unknown_response: bool,
+    replay_safe: bool,
     #[allow(dead_code)]
     batch_id: Option<u64>,
     timeout: Duration,
@@ -65,20 +67,45 @@ fn default_timeout_for_payload(payload: &[u8]) -> Duration {
 }
 
 /// Per-device command queue with priority scheduling.
+#[derive(Clone)]
 pub struct CommandQueue {
+    inner: Arc<QueueInner>,
+    // Executors hold only inner, so the last external handle closes this channel.
+    shutdown_tx: watch::Sender<bool>,
+}
+
+struct QueueInner {
     transport: Mutex<Box<dyn Transport>>,
     transport_url: String,
     reconnect_config: ReconnectConfig,
     queues: Mutex<[VecDeque<QueuedCommand>; 4]>,
     #[allow(dead_code)]
     state: Mutex<QueueState>,
-    notify: Notify,
-    levels_paused: std::sync::atomic::AtomicBool,
+    // Outstanding `LevelsPause` guards; polling resumes when this is zero.
+    levels_pauses: std::sync::atomic::AtomicUsize,
     next_batch_id: std::sync::atomic::AtomicU64,
     // We default to new dialect for parsing responses; the client overrides this
     dialect: Mutex<Dialect>,
     reconnect_epoch: std::sync::atomic::AtomicU64,
     processing: Mutex<()>,
+    needs_reconnect: std::sync::atomic::AtomicBool,
+    batch_active: std::sync::atomic::AtomicBool,
+    disconnect_epoch: std::sync::atomic::AtomicU64,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Keeps level polling paused while alive; see `CommandQueue::pause_levels`.
+pub struct LevelsPause {
+    queue: CommandQueue,
+}
+
+impl Drop for LevelsPause {
+    fn drop(&mut self) {
+        self.queue
+            .inner
+            .levels_pauses
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl CommandQueue {
@@ -91,38 +118,47 @@ impl CommandQueue {
         reconnect_config: ReconnectConfig,
     ) -> Self {
         let transport_url = transport.url();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
-            transport: Mutex::new(transport),
-            transport_url,
-            reconnect_config,
-            queues: Mutex::new([
-                VecDeque::new(),
-                VecDeque::new(),
-                VecDeque::new(),
-                VecDeque::new(),
-            ]),
-            state: Mutex::new(QueueState::Idle),
-            notify: Notify::new(),
-            levels_paused: std::sync::atomic::AtomicBool::new(false),
-            next_batch_id: std::sync::atomic::AtomicU64::new(1),
-            dialect: Mutex::new(Dialect::NEW),
-            reconnect_epoch: std::sync::atomic::AtomicU64::new(0),
-            processing: Mutex::new(()),
+            inner: Arc::new(QueueInner {
+                transport: Mutex::new(transport),
+                transport_url,
+                reconnect_config,
+                queues: Mutex::new([
+                    VecDeque::new(),
+                    VecDeque::new(),
+                    VecDeque::new(),
+                    VecDeque::new(),
+                ]),
+                state: Mutex::new(QueueState::Idle),
+                levels_pauses: std::sync::atomic::AtomicUsize::new(0),
+                next_batch_id: std::sync::atomic::AtomicU64::new(1),
+                dialect: Mutex::new(Dialect::NEW),
+                reconnect_epoch: std::sync::atomic::AtomicU64::new(0),
+                processing: Mutex::new(()),
+                needs_reconnect: std::sync::atomic::AtomicBool::new(false),
+                batch_active: std::sync::atomic::AtomicBool::new(false),
+                disconnect_epoch: std::sync::atomic::AtomicU64::new(0),
+                shutdown_rx,
+            }),
+            shutdown_tx,
         }
     }
 
     pub async fn set_dialect(&self, dialect: Dialect) {
-        *self.dialect.lock().await = dialect;
+        *self.inner.dialect.lock().await = dialect;
     }
 
     pub async fn close(&self) -> Result<(), TransportError> {
-        let transport = self.transport.lock().await;
+        self.shutdown_tx.send_replace(true);
+        let _processing = self.inner.processing.lock().await;
+        let transport = self.inner.transport.lock().await;
         transport.close().await
     }
 
     /// Returns the total number of queued commands across all priority levels.
     pub async fn queue_depth(&self) -> usize {
-        let queues = self.queues.lock().await;
+        let queues = self.inner.queues.lock().await;
         queues.iter().map(|q| q.len()).sum()
     }
 
@@ -135,7 +171,7 @@ impl CommandQueue {
     ) -> Result<Response, TransportError> {
         let timeout = default_timeout_for_payload(&payload);
         let qr = self
-            .execute_inner(payload, priority, false, timeout)
+            .execute_inner(payload, priority, false, true, timeout)
             .await?;
         Ok(qr.parsed)
     }
@@ -148,7 +184,7 @@ impl CommandQueue {
         timeout: Duration,
     ) -> Result<Response, TransportError> {
         let qr = self
-            .execute_inner(payload, priority, false, timeout)
+            .execute_inner(payload, priority, false, true, timeout)
             .await?;
         Ok(qr.parsed)
     }
@@ -160,7 +196,9 @@ impl CommandQueue {
         priority: Priority,
     ) -> Result<Vec<u8>, TransportError> {
         let timeout = default_timeout_for_payload(&payload);
-        let qr = self.execute_inner(payload, priority, true, timeout).await?;
+        let qr = self
+            .execute_inner(payload, priority, true, false, timeout)
+            .await?;
         Ok(qr.raw)
     }
 
@@ -171,7 +209,21 @@ impl CommandQueue {
         priority: Priority,
         timeout: Duration,
     ) -> Result<Vec<u8>, TransportError> {
-        let qr = self.execute_inner(payload, priority, true, timeout).await?;
+        let qr = self
+            .execute_inner(payload, priority, true, false, timeout)
+            .await?;
+        Ok(qr.raw)
+    }
+
+    pub(crate) async fn execute_typed_raw_with_timeout(
+        &self,
+        payload: Vec<u8>,
+        priority: Priority,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, TransportError> {
+        let qr = self
+            .execute_inner(payload, priority, true, true, timeout)
+            .await?;
         Ok(qr.raw)
     }
 
@@ -180,11 +232,12 @@ impl CommandQueue {
         payload: Vec<u8>,
         priority: Priority,
         allow_unknown_response: bool,
+        allow_replay: bool,
         timeout: Duration,
     ) -> Result<QueueResponse, TransportError> {
         // Check queue depth before enqueuing
         {
-            let queues = self.queues.lock().await;
+            let queues = self.inner.queues.lock().await;
             let depth: usize = queues.iter().map(|q| q.len()).sum();
             if depth >= MAX_QUEUE_DEPTH {
                 return Err(TransportError::Busy);
@@ -193,8 +246,12 @@ impl CommandQueue {
 
         let (tx, rx) = oneshot::channel();
         {
-            let mut queues = self.queues.lock().await;
+            let mut queues = self.inner.queues.lock().await;
+            if self.inner.is_shutdown() {
+                return Err(TransportError::Disconnected);
+            }
             queues[priority as usize].push_back(QueuedCommand {
+                replay_safe: allow_replay && is_replay_safe(&payload),
                 payload,
                 priority,
                 response_tx: tx,
@@ -203,8 +260,7 @@ impl CommandQueue {
                 timeout,
             });
         }
-        self.notify.notify_one();
-        self.process_next().await;
+        self.start_executor();
         rx.await
             .map_err(|_| TransportError::Io("response channel closed".into()))?
     }
@@ -216,15 +272,20 @@ impl CommandQueue {
         priority: Priority,
     ) -> Result<Vec<Response>, TransportError> {
         let batch_id = self
+            .inner
             .next_batch_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut receivers = Vec::with_capacity(commands.len());
 
         {
-            let mut queues = self.queues.lock().await;
+            let mut queues = self.inner.queues.lock().await;
+            if self.inner.is_shutdown() {
+                return Err(TransportError::Disconnected);
+            }
             for payload in commands {
                 let (tx, rx) = oneshot::channel();
                 queues[priority as usize].push_back(QueuedCommand {
+                    replay_safe: is_replay_safe(&payload),
                     payload,
                     priority,
                     response_tx: tx,
@@ -236,18 +297,7 @@ impl CommandQueue {
             }
         }
 
-        // Pause level polling during batch
-        self.levels_paused
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.notify.notify_one();
-
-        // Process all queued commands
-        for _ in 0..receivers.len() {
-            self.process_next().await;
-        }
-
-        self.levels_paused
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.start_executor();
 
         let mut responses = Vec::with_capacity(receivers.len());
         for rx in receivers {
@@ -261,60 +311,124 @@ impl CommandQueue {
 
     /// Check if level polling is paused.
     pub fn is_levels_paused(&self) -> bool {
-        self.levels_paused
+        self.inner
+            .levels_pauses
             .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+            || self
+                .inner
+                .batch_active
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn pause_levels(&self) {
-        self.levels_paused
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn resume_levels(&self) {
-        self.levels_paused
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+    /// Pause level polling until the returned guard drops. Guards nest, and
+    /// dropping one on cancellation still resumes polling.
+    pub fn pause_levels(&self) -> LevelsPause {
+        self.inner
+            .levels_pauses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LevelsPause {
+            queue: self.clone(),
+        }
     }
 
     pub fn reconnect_epoch(&self) -> u64 {
-        self.reconnect_epoch
+        self.inner
+            .reconnect_epoch
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(crate) fn note_reconnect_for_test(&self) {
-        self.reconnect_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn disconnect_epoch(&self) -> u64 {
+        self.inner
+            .disconnect_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Process the next command in the queue.
+    fn start_executor(&self) {
+        let queue = self.inner.clone();
+        tokio::spawn(async move { queue.process_next().await });
+    }
+}
+
+impl QueueInner {
+    fn is_shutdown(&self) -> bool {
+        *self.shutdown_rx.borrow() || self.shutdown_rx.has_changed().is_err()
+    }
+
+    /// Drain independently of callers so cancellation cannot abandon an exchange.
     async fn process_next(&self) {
         let _processing = self.processing.lock().await;
-        let cmd = {
-            let mut queues = self.queues.lock().await;
-            // Pick highest-priority non-empty queue
-            let cmd = (0..4).rev().find_map(|p| queues[p].pop_front());
-            cmd
-        };
-
-        let Some(cmd) = cmd else { return };
-
-        loop {
-            match self.execute_queued_command(&cmd).await {
-                Ok(response) => {
-                    let _ = cmd.response_tx.send(Ok(response));
-                    return;
-                }
-                Err(TransportError::Disconnected) => {
-                    if let Err(e) = self.reconnect_transport().await {
-                        let _ = cmd.response_tx.send(Err(e));
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let _ = cmd.response_tx.send(Err(e));
-                    return;
-                }
+        let mut shutdown = self.shutdown_rx.clone();
+        if !self.is_shutdown() {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {}
+                _ = self.drain_commands() => return,
             }
+        }
+        self.batch_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for queue in self.queues.lock().await.iter_mut() {
+            for cmd in queue.drain(..) {
+                let _ = cmd.response_tx.send(Err(TransportError::Disconnected));
+            }
+        }
+        if shutdown.has_changed().is_err() {
+            let _ = self.transport.lock().await.close().await;
+        }
+    }
+
+    async fn drain_commands(&self) {
+        let mut active_batch = None;
+        loop {
+            let cmd = {
+                let mut queues = self.queues.lock().await;
+                let batch_priority = active_batch.and_then(|id| {
+                    (0..4).find(|&p| {
+                        queues[p]
+                            .front()
+                            .is_some_and(|cmd| cmd.batch_id == Some(id))
+                    })
+                });
+                let priority =
+                    batch_priority.or_else(|| (0..4).rev().find(|&p| !queues[p].is_empty()));
+                priority.and_then(|p| queues[p].pop_front())
+            };
+            let Some(cmd) = cmd else {
+                self.batch_active
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            };
+            active_batch = cmd.batch_id;
+            self.batch_active
+                .store(active_batch.is_some(), std::sync::atomic::Ordering::Relaxed);
+            let result = loop {
+                if self
+                    .needs_reconnect
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && let Err(err) = self.reconnect_transport().await
+                {
+                    break Err(err);
+                }
+                let result = self.execute_queued_command(&cmd).await;
+                if result.is_err() {
+                    // An ambiguous exchange must be resynchronized before any send.
+                    self.needs_reconnect
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if cmd.replay_safe
+                    && matches!(
+                        result,
+                        Err(TransportError::Disconnected
+                            | TransportError::Hid(_)
+                            | TransportError::Io(_))
+                    )
+                {
+                    continue;
+                }
+                break result;
+            };
+            let _ = cmd.response_tx.send(result);
         }
     }
 
@@ -411,6 +525,8 @@ impl CommandQueue {
     }
 
     async fn reconnect_transport(&self) -> Result<(), TransportError> {
+        self.needs_reconnect
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut attempt = 0u32;
 
         loop {
@@ -429,22 +545,58 @@ impl CommandQueue {
             );
             tokio::time::sleep(delay).await;
 
-            match open_transport(&self.transport_url).await {
+            let reopened = self.transport.lock().await.reconnect().await;
+            match reopened {
                 Ok(new_transport) => {
                     let mut transport = self.transport.lock().await;
                     *transport = new_transport;
+                    self.needs_reconnect
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.disconnect_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.reconnect_epoch
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::info!("transport reconnected via {}", self.transport_url);
                     return Ok(());
                 }
                 Err(e) => {
+                    self.disconnect_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!("transport reconnect attempt {} failed: {}", attempt + 1, e);
                     attempt += 1;
                 }
             }
         }
     }
+}
+
+// Only known reads and absolute-value writes can survive uncertain delivery.
+// FIR staging, reset/persistence operations, and unknown opcodes stay excluded.
+fn is_replay_safe(payload: &[u8]) -> bool {
+    matches!(
+        payload.first().copied(),
+        Some(
+            commands::CMD_READ_HARDWARE_ID
+                | commands::CMD_READ_DSP_VERSION
+                | commands::CMD_READ_FLOATS
+                | commands::CMD_READ_FLASH
+                | commands::CMD_READ_FLASH_FULL_ADDR
+                | commands::CMD_READ_DFLASH_ID
+                | commands::CMD_WRITE_DSP
+                | commands::CMD_WRITE_BIQUAD
+                | commands::CMD_BYPASS_FILTER
+                | commands::CMD_SET_VOLUME
+                | commands::CMD_SET_MUTE
+                | commands::CMD_SET_SOURCE
+                | commands::CMD_SET_CONFIG
+                | commands::CMD_DIRAC_BYPASS
+                | commands::CMD_SET_DISPLAY_BRIGHTNESS
+                | commands::CMD_SET_DISPLAY_IDLE_TIME
+                | commands::CMD_SET_DRE
+                | commands::CMD_WRITE_FLASH
+                | commands::CMD_WRITE_FLASH_FULL_ADDR
+        )
+    ) || matches!(payload, [commands::CMD_DIRAC_DELAY_GAIN, 0xA1, _])
 }
 
 fn remaining_timeout_ms(deadline: Instant) -> Result<u64, TransportError> {
@@ -460,7 +612,7 @@ fn remaining_timeout_ms(deadline: Instant) -> Result<u64, TransportError> {
         .unwrap_or(u64::MAX))
 }
 
-async fn open_transport(url: &str) -> Result<Box<dyn Transport>, TransportError> {
+pub(crate) async fn open_transport(url: &str) -> Result<Box<dyn Transport>, TransportError> {
     if let Some(addr) = url.strip_prefix("tcp://") {
         return Ok(Box::new(TcpTransport::connect(addr).await?));
     }
@@ -486,26 +638,18 @@ async fn open_transport(url: &str) -> Result<Box<dyn Transport>, TransportError>
 
     if let Some(rest) = url.strip_prefix("usb:") {
         let usb = parse_usb_url(rest)?;
-        match HidTransport::open(&usb.path) {
-            Ok(transport) => return Ok(Box::new(transport)),
-            Err(path_err) => {
-                tracing::warn!(
-                    "failed to reopen HID device at {}; re-enumerating vid={:04x} pid={:04x}: {}",
-                    usb.path,
-                    usb.vid,
-                    usb.pid,
-                    path_err
-                );
-                let devices = crate::transport::hid::enumerate()?;
-                if let Some(device) = devices
-                    .into_iter()
-                    .find(|device| device.vendor_id == usb.vid && device.product_id == usb.pid)
-                {
-                    return Ok(Box::new(HidTransport::open(&device.path)?));
-                }
-                return Err(path_err);
-            }
+        // Paths can be reused after hotplug; verify identity even at the old path.
+        let devices = crate::transport::hid::enumerate()?;
+        let device = devices
+            .iter()
+            .find(|device| usb.matches(device))
+            .ok_or(TransportError::NotFound)?;
+        let transport = HidTransport::open(&device.path)?;
+        let opened = parse_usb_url(transport.url().strip_prefix("usb:").unwrap())?;
+        if opened.serial != usb.serial || opened.vid != usb.vid || opened.pid != usb.pid {
+            return Err(TransportError::NotFound);
         }
+        return Ok(Box::new(transport));
     }
 
     Err(TransportError::Io(format!(
@@ -526,9 +670,20 @@ fn parse_ws_unix_url(rest: &str) -> Result<(String, usize), TransportError> {
 }
 
 struct ParsedUsbUrl {
+    #[allow(dead_code)]
     path: String,
     vid: u16,
     pid: u16,
+    serial: Option<String>,
+}
+
+impl ParsedUsbUrl {
+    fn matches(&self, device: &crate::transport::hid::HidDeviceInfo) -> bool {
+        self.serial.is_some()
+            && self.serial == device.serial_number
+            && self.vid == device.vendor_id
+            && self.pid == device.product_id
+    }
 }
 
 fn parse_usb_url(rest: &str) -> Result<ParsedUsbUrl, TransportError> {
@@ -538,6 +693,7 @@ fn parse_usb_url(rest: &str) -> Result<ParsedUsbUrl, TransportError> {
 
     let mut vid = None;
     let mut pid = None;
+    let mut serial = None;
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
@@ -555,12 +711,22 @@ fn parse_usb_url(rest: &str) -> Result<ParsedUsbUrl, TransportError> {
                         .map_err(|e| TransportError::Io(format!("invalid usb pid: {e}")))?,
                 );
             }
+            "serial" if !value.is_empty() => {
+                serial = Some(
+                    urlencoding::decode(value)
+                        .map_err(|e| {
+                            TransportError::Io(format!("invalid usb serial encoding: {e}"))
+                        })?
+                        .into_owned(),
+                );
+            }
             _ => {}
         }
     }
 
     Ok(ParsedUsbUrl {
         path: path.into_owned(),
+        serial,
         vid: vid.ok_or_else(|| TransportError::Io("missing usb vid in transport url".into()))?,
         pid: pid.ok_or_else(|| TransportError::Io("missing usb pid in transport url".into()))?,
     })
@@ -574,10 +740,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
+    type ResponseQueue = Arc<StdMutex<VecDeque<Result<Vec<u8>, TransportError>>>>;
+
+    #[derive(Clone)]
     struct FakeTransport {
         sent: Arc<StdMutex<Vec<Vec<u8>>>>,
-        responses: Arc<StdMutex<VecDeque<Result<Vec<u8>, TransportError>>>>,
+        responses: ResponseQueue,
         recv_calls: Arc<AtomicUsize>,
+        replacement: Arc<StdMutex<Option<Box<dyn Transport>>>>,
     }
 
     impl FakeTransport {
@@ -586,6 +756,7 @@ mod tests {
                 sent: Arc::new(StdMutex::new(Vec::new())),
                 responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
                 recv_calls: Arc::new(AtomicUsize::new(0)),
+                replacement: Arc::new(StdMutex::new(None)),
             }
         }
     }
@@ -615,6 +786,7 @@ mod tests {
             let recv_calls = self.recv_calls.clone();
             Box::pin(async move {
                 recv_calls.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
                 responses
                     .lock()
                     .unwrap()
@@ -635,9 +807,493 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn reconnect(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Box<dyn Transport>, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let replacement = self.replacement.lock().unwrap().take();
+            Box::pin(async move {
+                match replacement {
+                    Some(transport) => Ok(transport),
+                    None => open_transport(&self.url()).await,
+                }
+            })
+        }
+
         fn url(&self) -> String {
             "fake://queue-test".to_string()
         }
+    }
+
+    struct UnavailableTransport {
+        reconnect_calls: Arc<AtomicUsize>,
+        close_calls: Arc<AtomicUsize>,
+        block_reconnect: bool,
+    }
+
+    impl Transport for UnavailableTransport {
+        fn send_frame(
+            &self,
+            _: &[u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>,
+        > {
+            Box::pin(async { Err(TransportError::Timeout) })
+        }
+
+        fn recv_frame(
+            &self,
+            _: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>,
+        > {
+            Box::pin(async { Err(TransportError::Disconnected) })
+        }
+
+        fn is_connected(&self) -> bool {
+            false
+        }
+
+        fn close(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>,
+        > {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn reconnect(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Box<dyn Transport>, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                self.reconnect_calls.fetch_add(1, Ordering::SeqCst);
+                if self.block_reconnect {
+                    std::future::pending::<()>().await;
+                }
+                Err(TransportError::NotFound)
+            })
+        }
+
+        fn url(&self) -> String {
+            "mock://unavailable".into()
+        }
+    }
+
+    fn unavailable_queue(
+        block_reconnect: bool,
+        max_retries: u32,
+    ) -> (CommandQueue, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let reconnect_calls = Arc::new(AtomicUsize::new(0));
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let queue = CommandQueue::with_reconnect(
+            Box::new(UnavailableTransport {
+                reconnect_calls: reconnect_calls.clone(),
+                close_calls: close_calls.clone(),
+                block_reconnect,
+            }),
+            ReconnectConfig {
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                max_retries,
+                ..ReconnectConfig::default()
+            },
+        );
+        (queue, reconnect_calls, close_calls)
+    }
+
+    async fn wait_for_reconnects(calls: &AtomicUsize, count: usize) {
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while calls.load(Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_stops_recovery_and_prevents_reopen() {
+        for block_reconnect in [false, true] {
+            let (queue, reconnect_calls, _) = unavailable_queue(block_reconnect, 0);
+            assert!(
+                queue
+                    .execute(commands::fir_load_start(0), Priority::Critical)
+                    .await
+                    .is_err()
+            );
+            let worker = queue.clone();
+            let request = tokio::spawn(async move {
+                worker
+                    .execute(commands::set_source(1), Priority::High)
+                    .await
+            });
+            wait_for_reconnects(&reconnect_calls, 1).await;
+            tokio::time::timeout(Duration::from_millis(200), queue.close())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(request.await.unwrap().is_err());
+            let calls = reconnect_calls.load(Ordering::SeqCst);
+            assert!(matches!(
+                queue.execute(commands::set_source(2), Priority::High).await,
+                Err(TransportError::Disconnected)
+            ));
+            assert!(
+                queue
+                    .execute_batch(vec![commands::set_source(3)], Priority::High)
+                    .await
+                    .is_err()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(reconnect_calls.load(Ordering::SeqCst), calls);
+            assert!(queue.inner.needs_reconnect.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn last_handle_drop_stops_recovery_and_releases_transport() {
+        for block_reconnect in [false, true] {
+            let (queue, reconnect_calls, close_calls) = unavailable_queue(block_reconnect, 0);
+            let last_handle = queue.clone();
+            let inner = Arc::downgrade(&queue.inner);
+            assert!(
+                queue
+                    .execute(commands::fir_load_start(0), Priority::Critical)
+                    .await
+                    .is_err()
+            );
+            let worker = queue.clone();
+            let request = tokio::spawn(async move {
+                worker
+                    .execute(commands::set_source(1), Priority::High)
+                    .await
+            });
+            wait_for_reconnects(&reconnect_calls, 1).await;
+            request.abort();
+            let _ = request.await;
+            drop(queue);
+            if !block_reconnect {
+                wait_for_reconnects(&reconnect_calls, 2).await;
+            }
+            assert!(inner.upgrade().is_some());
+            drop(last_handle);
+            tokio::time::timeout(Duration::from_millis(200), async {
+                while inner.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("executor must release its transport after the last handle drops");
+            assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+            let calls = reconnect_calls.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(reconnect_calls.load(Ordering::SeqCst), calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_remains_required_before_next_send() {
+        let (queue, reconnect_calls, _) = unavailable_queue(false, 1);
+        assert!(
+            queue
+                .execute(commands::fir_load_start(0), Priority::Critical)
+                .await
+                .is_err()
+        );
+        for count in 1..=2 {
+            assert!(
+                queue
+                    .execute(commands::set_source(1), Priority::High)
+                    .await
+                    .is_err()
+            );
+            assert!(queue.inner.needs_reconnect.load(Ordering::Relaxed));
+            assert_eq!(reconnect_calls.load(Ordering::SeqCst), count);
+            assert!(queue.disconnect_epoch() > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnected_reads_and_absolute_writes_reconnect_and_replay() {
+        let mut float_response = vec![commands::CMD_READ_FLOATS, 0, 0x44];
+        float_response.extend_from_slice(&2.0f32.to_le_bytes());
+        let cases = [
+            (
+                commands::read_hardware_id(),
+                vec![commands::CMD_READ_HARDWARE_ID, 1, 0, 10],
+            ),
+            (
+                commands::read_floats(0x44, 1, &Dialect::NEW),
+                float_response,
+            ),
+            (
+                commands::read_flash(0xff, 0xd8, 4),
+                vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
+            ),
+            (commands::set_volume(20), vec![commands::RESP_OK]),
+            (commands::set_mute(true), vec![commands::RESP_OK]),
+            (commands::set_source(2), vec![commands::RESP_OK]),
+            (
+                commands::set_config(1, commands::PRESET_CHANGE_NORMAL),
+                vec![commands::RESP_PRESET_COMPLETE],
+            ),
+            (
+                commands::write_dsp(0x44, 1.0, true, &Dialect::NEW),
+                vec![commands::RESP_OK],
+            ),
+            (
+                commands::write_biquad(0x44, &[1.0; 5], &Dialect::NEW),
+                vec![commands::RESP_OK],
+            ),
+        ];
+        for (payload, response) in cases {
+            let transport = FakeTransport::new([Err(TransportError::Disconnected)]);
+            let sent = transport.sent.clone();
+            let replacement = FakeTransport::new([Ok(response)]);
+            let replacement_sent = replacement.sent.clone();
+            *transport.replacement.lock().unwrap() = Some(Box::new(replacement));
+            let queue = CommandQueue::with_reconnect(
+                Box::new(transport),
+                ReconnectConfig {
+                    base_delay: Duration::ZERO,
+                    ..ReconnectConfig::default()
+                },
+            );
+            queue
+                .execute(payload.clone(), Priority::Normal)
+                .await
+                .unwrap();
+            assert_eq!(*sent.lock().unwrap(), vec![payload.clone()]);
+            assert_eq!(*replacement_sent.lock().unwrap(), vec![payload]);
+            assert_eq!(queue.disconnect_epoch(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_raw_word_read_reconnects_and_replays() {
+        let payload = commands::read_floats(0x44, 1, &Dialect::NEW);
+        let response = vec![commands::CMD_READ_FLOATS, 0, 0x44, 1, 0, 0, 0];
+        let transport = FakeTransport::new([Err(TransportError::Io("bridge dropped".into()))]);
+        *transport.replacement.lock().unwrap() =
+            Some(Box::new(FakeTransport::new([Ok(response.clone())])));
+        let queue = CommandQueue::new(Box::new(transport));
+        assert_eq!(
+            queue
+                .execute_typed_raw_with_timeout(payload, Priority::Normal, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn stateful_unknown_and_bridge_commands_are_never_replayed() {
+        for (payload, raw) in [
+            (commands::fir_load_start(0), false),
+            (commands::fir_load_data(0, &[1.0]), false),
+            (commands::fir_load_end(), false),
+            (commands::reset(), false),
+            (commands::enter_bootloader(), false),
+            (commands::copy_preset(true), false),
+            (commands::write_flash_block(0, &[1], false), false),
+            (commands::finish_flash_block(0), false),
+            (vec![commands::CMD_ERASE_FLASH], false),
+            (vec![0xfe, 1], false),
+            (commands::set_source(1), true),
+            (commands::read_hardware_id(), true),
+        ] {
+            let transport = FakeTransport::new([Err(TransportError::Disconnected)]);
+            let replacement = FakeTransport::new([Ok(vec![commands::RESP_OK])]);
+            let replacement_sent = replacement.sent.clone();
+            *transport.replacement.lock().unwrap() = Some(Box::new(replacement));
+            let queue = CommandQueue::new(Box::new(transport));
+            if raw {
+                assert!(matches!(
+                    queue.execute_raw(payload, Priority::Normal).await,
+                    Err(TransportError::Disconnected)
+                ));
+            } else {
+                assert!(matches!(
+                    queue.execute(payload, Priority::Normal).await,
+                    Err(TransportError::Disconnected)
+                ));
+            }
+            queue
+                .execute(commands::set_source(2), Priority::High)
+                .await
+                .unwrap();
+            assert_eq!(
+                *replacement_sent.lock().unwrap(),
+                vec![commands::set_source(2)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnected_fir_data_is_not_replayed_by_queue() {
+        let transport = FakeTransport::new([Err(TransportError::Disconnected)]);
+        let sent = transport.sent.clone();
+        let replacement = FakeTransport::new([Ok(vec![commands::RESP_OK])]);
+        let replacement_sent = replacement.sent.clone();
+        *transport.replacement.lock().unwrap() = Some(Box::new(replacement));
+        let queue = CommandQueue::new(Box::new(transport));
+        assert!(matches!(
+            queue
+                .execute(commands::fir_load_data(0, &[1.0]), Priority::Critical)
+                .await,
+            Err(TransportError::Disconnected)
+        ));
+        queue
+            .execute(commands::set_source(2), Priority::High)
+            .await
+            .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(
+            *replacement_sent.lock().unwrap(),
+            vec![commands::set_source(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_reconnect_discards_same_address_stale_read() {
+        let response = |value: f32| {
+            let mut raw = vec![commands::CMD_READ_FLOATS, 0, 0x44];
+            raw.extend_from_slice(&value.to_le_bytes());
+            raw
+        };
+        let transport = FakeTransport::new([Ok(response(1.0))]);
+        let old_reads = transport.recv_calls.clone();
+        *transport.replacement.lock().unwrap() =
+            Some(Box::new(FakeTransport::new([Ok(response(2.0))])));
+        let queue = CommandQueue::new(Box::new(transport));
+        let request = commands::read_floats(0x44, 1, &Dialect::NEW);
+        assert!(matches!(
+            queue
+                .execute_with_timeout(request.clone(), Priority::Normal, Duration::ZERO)
+                .await,
+            Err(TransportError::Timeout)
+        ));
+        assert_eq!(
+            queue.execute(request, Priority::Normal).await.unwrap(),
+            Response::Floats(vec![2.0])
+        );
+        assert_eq!(old_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.reconnect_epoch(), 1);
+    }
+
+    #[test]
+    fn usb_reconnect_requires_matching_serial_even_when_path_matches() {
+        let usb = parse_usb_url("old?vid=2752&pid=0011&serial=unit%20A").unwrap();
+        let mut device = crate::transport::hid::HidDeviceInfo {
+            path: "old".into(),
+            vendor_id: 0x2752,
+            product_id: 0x0011,
+            serial_number: Some("unit B".into()),
+            product_string: None,
+        };
+        assert!(!usb.matches(&device));
+        device.path = "new".into();
+        device.serial_number = Some("unit A".into());
+        assert!(usb.matches(&device));
+        let unidentified = parse_usb_url("old?vid=2752&pid=0011").unwrap();
+        assert!(!unidentified.matches(&device));
+    }
+
+    #[tokio::test]
+    async fn level_pauses_nest_and_resume_when_a_paused_caller_is_cancelled() {
+        let queue = CommandQueue::new(Box::new(FakeTransport::new([])));
+        let outer = queue.pause_levels();
+        let inner = queue.pause_levels();
+        drop(inner);
+        assert!(queue.is_levels_paused(), "outer pause still held");
+        drop(outer);
+        assert!(!queue.is_levels_paused());
+
+        // A caller cancelled mid-operation (e.g. a dropped HTTP request) must
+        // not leave polling paused.
+        let paused = queue.clone();
+        let task = tokio::spawn(async move {
+            let _levels = paused.pause_levels();
+            std::future::pending::<()>().await;
+        });
+        while !queue.is_levels_paused() {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert!(!queue.is_levels_paused());
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_does_not_strand_next_caller() {
+        let transport = FakeTransport::new([]);
+        let responses = transport.responses.clone();
+        let recv_calls = transport.recv_calls.clone();
+        let queue = Arc::new(CommandQueue::new(Box::new(transport)));
+        let worker = queue.clone();
+        let batch = tokio::spawn(async move {
+            worker
+                .execute_batch(
+                    vec![commands::set_source(1), commands::set_source(2)],
+                    Priority::High,
+                )
+                .await
+        });
+        while recv_calls.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        batch.abort();
+        let _ = batch.await;
+        responses
+            .lock()
+            .unwrap()
+            .extend((0..3).map(|_| Ok(vec![commands::RESP_OK])));
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            queue.execute(commands::set_source(3), Priority::High),
+        )
+        .await;
+        assert!(matches!(response, Ok(Ok(Response::Ack))));
+        assert!(!queue.is_levels_paused());
+    }
+
+    #[tokio::test]
+    async fn timeout_requires_recovery_before_another_send() {
+        let transport = FakeTransport::new([Ok(vec![commands::RESP_OK])]);
+        let sent = transport.sent.clone();
+        let queue = CommandQueue::with_reconnect(
+            Box::new(transport),
+            ReconnectConfig {
+                base_delay: Duration::ZERO,
+                max_retries: 1,
+                ..ReconnectConfig::default()
+            },
+        );
+        assert!(matches!(
+            queue
+                .execute_with_timeout(commands::set_source(1), Priority::High, Duration::ZERO)
+                .await,
+            Err(TransportError::Timeout)
+        ));
+        assert!(
+            queue
+                .execute(commands::set_source(2), Priority::High)
+                .await
+                .is_err()
+        );
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -863,12 +1519,13 @@ mod tests {
         let (tx2, rx2) = oneshot::channel();
 
         {
-            let mut queues = queue.queues.lock().await;
+            let mut queues = queue.inner.queues.lock().await;
             queues[Priority::High as usize].push_back(QueuedCommand {
                 payload: commands::set_source(1),
                 priority: Priority::High,
                 response_tx: tx1,
                 allow_unknown_response: false,
+                replay_safe: true,
                 batch_id: None,
                 timeout: Duration::from_millis(5),
             });
@@ -877,6 +1534,7 @@ mod tests {
                 priority: Priority::High,
                 response_tx: tx2,
                 allow_unknown_response: false,
+                replay_safe: true,
                 batch_id: None,
                 timeout: Duration::from_millis(5),
             });
@@ -884,8 +1542,8 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(20));
 
-        queue.process_next().await;
-        queue.process_next().await;
+        queue.inner.process_next().await;
+        queue.inner.process_next().await;
 
         let first = rx1.await.expect("first response channel");
         let second = rx2.await.expect("second response channel");
@@ -959,7 +1617,7 @@ mod tests {
         let mut oversized_response = request.clone();
         // Append 55 bytes of garbage (0x01-prefix stripped, 63-byte buffer → 63 bytes;
         // but we test the trim logic directly, so just append enough garbage).
-        oversized_response.extend(std::iter::repeat(0xed).take(55));
+        oversized_response.extend(std::iter::repeat_n(0xed, 55));
         assert_eq!(oversized_response.len(), 63);
 
         let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(oversized_response)])));
@@ -993,7 +1651,7 @@ mod tests {
     async fn write_flash_block_response_trimmed_to_request_length() {
         let request = vec![0x06u8, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00];
         let mut oversized_response = request.clone();
-        oversized_response.extend(std::iter::repeat(0xed).take(54));
+        oversized_response.extend(std::iter::repeat_n(0xed, 54));
         assert_eq!(oversized_response.len(), 63);
 
         let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(oversized_response)])));
@@ -1025,7 +1683,7 @@ mod tests {
     async fn finish_flash_block_response_trimmed_to_request_length() {
         let request = vec![0x07u8, 0x02];
         let mut oversized_response = request.clone();
-        oversized_response.extend(std::iter::repeat(0xed).take(61));
+        oversized_response.extend(std::iter::repeat_n(0xed, 61));
         assert_eq!(oversized_response.len(), 63);
 
         let queue = CommandQueue::new(Box::new(FakeTransport::new([Ok(oversized_response)])));
@@ -1067,11 +1725,11 @@ mod tests {
     async fn device_console_preset_pipeline_replay_matches_expected_responses() {
         let write_flash_block = vec![0x06u8, 0x01, 0x04, 0x88, 0x97, 0x13, 0x0f, 0x00, 0x00];
         let mut write_flash_block_resp = write_flash_block.clone();
-        write_flash_block_resp.extend(std::iter::repeat(0xed).take(54));
+        write_flash_block_resp.extend(std::iter::repeat_n(0xed, 54));
 
         let finish_flash_block = vec![0x07u8, 0x02];
         let mut finish_flash_block_resp = finish_flash_block.clone();
-        finish_flash_block_resp.extend(std::iter::repeat(0xed).take(61));
+        finish_flash_block_resp.extend(std::iter::repeat_n(0xed, 61));
 
         let verify_program_req = commands::read_flash(0xff, 0xa3, 1);
         let verify_program_resp = vec![commands::CMD_READ_FLASH, 0xff, 0xa3, 0x03];

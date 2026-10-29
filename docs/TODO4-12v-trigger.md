@@ -2,6 +2,14 @@
 
 ESP32 GPIO-controlled power switching for MiniDSP devices. Solves minidsp-rs #663 (no standby/power control).
 
+## Current status
+
+The trigger API, CLI commands, NVS pin/state settings, and switching hardware
+validation remain unimplemented. [PROJECT.md](../PROJECT.md) lists the routes
+as planned; neither [the CLI](../app-desktop/src/cli.rs) nor
+[ESP32 HTTP routes](../app-esp32/src/http_server.rs) implements them. Keep the
+wiring and behavior design below for that future work.
+
 ## Why
 
 MiniDSP devices have no standby control via USB/TCP. The Flex standby is IR-only. USB drops off the bus in standby. The 2x4 HD has no standby at all. The only way to power-cycle a MiniDSP remotely is to switch its DC power supply.

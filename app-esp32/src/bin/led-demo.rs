@@ -4,6 +4,9 @@ mod led;
 #[path = "../led_demo.rs"]
 #[allow(dead_code)]
 mod led_demo;
+#[path = "../threads.rs"]
+#[allow(dead_code)]
+mod threads;
 
 fn main() {
     esp_idf_svc::sys::link_patches();

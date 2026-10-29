@@ -725,26 +725,42 @@ pub fn parse_response_for_request(request: &[u8], data: &[u8], dialect: &Dialect
         return Response::Unknown(data.to_vec());
     }
 
-    if request.first() == Some(&CMD_READ_FLASH) && data.first() == Some(&CMD_READ_FLASH) {
-        if request.len() >= 4 && data.len() >= 2 {
-            let addr_hi = request[1];
-            let addr_lo = request[2];
-            let count = request[3] as usize;
-            let body = &data[1..];
+    if request.first() == Some(&CMD_READ_FLASH)
+        && data.first() == Some(&CMD_READ_FLASH)
+        && request.len() >= 4
+        && data.len() >= 2
+    {
+        let addr_hi = request[1];
+        let addr_lo = request[2];
+        let count = request[3] as usize;
+        let body = &data[1..];
 
-            if body.len() >= count + 2 && body[0] == addr_hi && body[1] == addr_lo {
-                return Response::FlashData(body[2..2 + count].to_vec());
-            }
-
-            if body.len() == count {
-                return Response::FlashData(body[..count].to_vec());
-            }
-
-            return Response::Unknown(data.to_vec());
+        if body.len() >= count + 2 && body[0] == addr_hi && body[1] == addr_lo {
+            return Response::FlashData(body[2..2 + count].to_vec());
         }
+
+        if body.len() == count {
+            return Response::FlashData(body[..count].to_vec());
+        }
+
+        return Response::Unknown(data.to_vec());
     }
 
     if request.first() == Some(&CMD_READ_FLOATS) && data.first() == Some(&CMD_READ_FLOATS) {
+        // The 2x4 HD answers `[op, addr_hi, addr_lo, values...]` with no count
+        // echo. When the first value byte equals the count, that also looks
+        // like the count-echo forms below, which then come up one byte short.
+        // Exactly 3 + 4*count bytes can only be the plain form.
+        if request.len() >= 4
+            && data.len() == 3 + (request[3] as usize) * 4
+            && data[1] == request[1]
+            && data[2] == request[2]
+            && let Some(values) =
+                decode_float_block_with_offset(&data[3..], request[3] as usize, dialect, request)
+        {
+            return Response::Floats(values);
+        }
+
         if request.len() >= 4
             && data.len() >= 5
             && data[1] == request[1]
@@ -847,7 +863,7 @@ fn parse_floats_response(data: &[u8], dialect: &Dialect) -> Response {
 
     if data.len() >= 3 {
         let float_data = &data[3..];
-        if float_data.len() % 4 == 0 {
+        if float_data.len().is_multiple_of(4) {
             let floats = decode_float_chunks(float_data, float_data.len() / 4, dialect);
             return Response::Floats(floats);
         }
@@ -981,6 +997,11 @@ fn decode_float_block_with_offset(
         }
 
         if let Some(score) = score_float_candidate(&values, offset, data, request) {
+            // The caller already matched the request header. A plausible block
+            // at its boundary takes precedence over trailing HID padding.
+            if offset == 0 {
+                return Some(values);
+            }
             let replace = match &best {
                 Some((best_score, best_offset, _)) => {
                     score > *best_score || (score == *best_score && offset < *best_offset)
@@ -1014,9 +1035,7 @@ fn score_float_candidate(
         if abs == 0.0 {
             zero_count += 1;
             score += 5;
-        } else if abs < 1e-8 {
-            return None;
-        } else if !value.is_normal() {
+        } else if abs < 1e-8 || !value.is_normal() {
             return None;
         } else if abs <= 10.0 {
             score += 4;
@@ -1029,16 +1048,16 @@ fn score_float_candidate(
         }
     }
 
-    if values.len() == 1 && zero_count == 1 {
-        if raw_data.len() >= 2
-            && raw_data[0] == 0x16
-            && raw_data[1] == 0x01
-            && raw_data.len() > 6
-            && offset <= 4
-            && request.first() == Some(&CMD_READ_FLOATS)
-        {
-            return None;
-        }
+    if values.len() == 1
+        && zero_count == 1
+        && raw_data.len() >= 2
+        && raw_data[0] == 0x16
+        && raw_data[1] == 0x01
+        && raw_data.len() > 6
+        && offset <= 4
+        && request.first() == Some(&CMD_READ_FLOATS)
+    {
+        return None;
     }
 
     // Prefer immediately aligned float blocks when multiple candidate decodes
@@ -1047,7 +1066,7 @@ fn score_float_candidate(
     // the leading bytes clearly are not float payload.
     if offset == 0 {
         score += 3;
-    } else if offset % 4 == 0 {
+    } else if offset.is_multiple_of(4) {
         score += 1;
     }
 
@@ -1518,6 +1537,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_read_floats_echoed_prefix_before_zero_padding() {
+        let request = [0x14, 0, 0x1c, 2];
+        let mut data = request.to_vec();
+        data.extend_from_slice(&(-60.0f32).to_le_bytes());
+        data.extend_from_slice(&(-60.0f32).to_le_bytes());
+        data.extend_from_slice(&[0; 8]);
+        match parse_response_for_request(&request, &data, &Dialect::NEW) {
+            Response::Floats(values) => assert_eq!(values, vec![-60.0, -60.0]),
+            other => panic!("expected Floats, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_read_floats_for_request_with_echoed_prefix() {
         let req = read_floats(0x0FC8, 1, &Dialect::NEW);
         let mut data = req.clone();
@@ -1546,6 +1578,27 @@ mod tests {
                 assert!((values[1] + 106.66).abs() < 0.05);
             }
             _ => panic!("expected Floats response"),
+        }
+    }
+
+    #[test]
+    fn parse_read_floats_when_first_value_byte_equals_the_count() {
+        // Captured on a 2x4 HD (output meters at 0x4A): the first value's low
+        // byte is 0x04, the same as the requested count.
+        let req = read_floats(0x004A, 4, &Dialect::NEW);
+        let data = [
+            0x14, 0x00, 0x4A, 0x04, 0xAC, 0x23, 0xC3, 0x04, 0xAC, 0x23, 0xC3, 0x00, 0x00, 0xF0,
+            0xC2, 0x00, 0x00, 0xF0, 0xC2,
+        ];
+        match parse_response_for_request(&req, &data, &Dialect::NEW) {
+            Response::Floats(values) => {
+                assert_eq!(values.len(), 4);
+                assert!((values[0] + 163.67).abs() < 0.01, "{values:?}");
+                assert!((values[1] + 163.67).abs() < 0.01, "{values:?}");
+                assert_eq!(values[2], -120.0);
+                assert_eq!(values[3], -120.0);
+            }
+            other => panic!("expected Floats, got {other:?}"),
         }
     }
 

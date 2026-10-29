@@ -342,8 +342,7 @@ There is now a dedicated demo binary for bring-up and visual review:
 Build it with:
 
 ```bash
-cd app-esp32
-esp cargo build --bin led-demo
+tools/esp-cargo build --bin led-demo
 ```
 
 The current `led-demo` binary loops forever through the amber-only breathe tuning pass:
