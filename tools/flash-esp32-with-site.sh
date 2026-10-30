@@ -29,7 +29,7 @@ Options:
   --port DEV           Serial port for esptool flashing (or MINIDSP_ESP32_PORT)
   --site-dir DIR       Existing site bundle directory (skips local site build)
   --http-port N        Local temporary HTTP port for side-load server
-  --skip-build         Skip `tools/esp-cargo build`
+  --skip-build         Skip build (requires firmware with dev-updater-override)
   --skip-flash         Skip esptool flashing
   --skip-site-build    Skip `tools/build-catalogue.py` (requires --site-dir)
   --keep-override      Leave the board updater override pointed at the local site
@@ -194,7 +194,7 @@ main() {
 
   if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "==> Building ESP32 firmware"
-    "$ROOT_DIR/tools/esp-cargo" build
+    "$ROOT_DIR/tools/esp-cargo" build --features dev-updater-override
   fi
 
   if [[ "$SKIP_FLASH" -eq 0 ]]; then

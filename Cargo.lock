@@ -1251,6 +1251,8 @@ dependencies = [
  "minidsp-protocol",
  "serde",
  "serde_json",
+ "shlex",
+ "socket2 0.5.10",
  "tokio",
  "toml",
  "tracing",
@@ -1264,6 +1266,7 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "cpal",
+ "futures-util",
  "if-addrs",
  "mac_address",
  "mdns-sd",
@@ -1274,6 +1277,7 @@ dependencies = [
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tower-http",
  "tracing",
 ]

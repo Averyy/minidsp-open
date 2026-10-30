@@ -346,13 +346,15 @@ pub mod heap_trace {
 /// A FreeRTOS task's unused stack (its high-water mark), in bytes.
 #[derive(serde::Serialize)]
 pub struct TaskStack {
+    pub task_number: u32,
     pub name: String,
     pub free_bytes: u32,
 }
 
-pub fn task_stacks() -> Vec<TaskStack> {
+static BOOT_TASK_NAMES: OnceLock<std::collections::BTreeMap<u32, String>> = OnceLock::new();
+
+fn task_snapshot() -> Vec<TaskStatus_t> {
     unsafe {
-        // Room for tasks created between the count and the snapshot.
         let capacity = uxTaskGetNumberOfTasks() as usize + 4;
         let mut tasks: Vec<TaskStatus_t> = Vec::with_capacity(capacity);
         let filled = uxTaskGetSystemState(
@@ -361,27 +363,49 @@ pub fn task_stacks() -> Vec<TaskStack> {
             core::ptr::null_mut(),
         );
         tasks.set_len(filled as usize);
-        // pcTaskName points into the task's TCB, which a task exiting right
-        // now frees without waiting for us; nothing outside the kernel lock can
-        // hold it. Copy at most the name buffer's length, so a stale TCB yields
-        // a garbled name instead of a scan through freed memory.
-        let mut stacks: Vec<TaskStack> = tasks
+        tasks
+    }
+}
+
+/// Called once at ready, before any transient tasks can exit.
+pub fn capture_boot_task_names() {
+    BOOT_TASK_NAMES.get_or_init(|| {
+        task_snapshot()
             .iter()
             .map(|task| {
-                let name = core::slice::from_raw_parts(
-                    task.pcTaskName.cast::<u8>(),
-                    CONFIG_FREERTOS_MAX_TASK_NAME_LEN as usize,
-                );
+                // pcTaskName points into a TCB freed when its task exits. Only read it
+                // at boot's stable task set; runtime snapshots use copied task numbers.
+                let name = unsafe {
+                    core::slice::from_raw_parts(
+                        task.pcTaskName.cast::<u8>(),
+                        CONFIG_FREERTOS_MAX_TASK_NAME_LEN as usize,
+                    )
+                };
                 let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-                TaskStack {
-                    name: String::from_utf8_lossy(&name[..len]).into_owned(),
-                    free_bytes: task.usStackHighWaterMark,
-                }
+                (
+                    task.xTaskNumber,
+                    String::from_utf8_lossy(&name[..len]).into_owned(),
+                )
             })
-            .collect();
-        stacks.sort_by(|a, b| a.name.cmp(&b.name));
-        stacks
-    }
+            .collect()
+    });
+}
+
+pub fn task_stacks() -> Vec<TaskStack> {
+    let names = BOOT_TASK_NAMES.get();
+    let mut stacks: Vec<TaskStack> = task_snapshot()
+        .iter()
+        .map(|task| TaskStack {
+            task_number: task.xTaskNumber,
+            name: names
+                .and_then(|names| names.get(&task.xTaskNumber))
+                .cloned()
+                .unwrap_or_else(|| format!("task-{}", task.xTaskNumber)),
+            free_bytes: task.usStackHighWaterMark,
+        })
+        .collect();
+    stacks.sort_by_key(|task| task.task_number);
+    stacks
 }
 
 /// Log every task's unused stack, to size the stacks from real numbers.

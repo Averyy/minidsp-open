@@ -178,7 +178,7 @@ Plus UDP discovery on port 3999 and TCP bridge on port 5333.
 
 ### Auto-detection
 
-minidsp-rs requires `device_type` in config. We auto-detect from `hw_id` in the device's master status response. Every hw_id is mapped in our device registry. The `--force-kind` flag exists only as an escape hatch.
+ezBEQ requires `device_type` in its device config. We auto-detect from `hw_id` in the device's master status response. Every hw_id is mapped in our device registry. The `--force-kind` flag exists only as an escape hatch.
 
 ### ezBEQ implementation details for Phase 2
 
@@ -403,3 +403,13 @@ Verified reality today:
 - Desktop status reads also stay compatible on the physical 2x4 HD when DSP100 meter polling misbehaves: the daemon now treats those meter reads as best-effort and clamps failures to `-140 dB` silence instead of breaking `minidsp -o jsonline` / `GET /devices/{id}` consumers.
 - ESP32 uses the same read-back and shadow model for config, snapshot backup/restore and ezBEQ writes; broader device coverage still needs hardware validation.
 - This removes the previous ESP32 config-route parity blocker on the physical 2x4 HD. Broader device-matrix coverage still depends on the importer/codegen work tracked in `PROGRESS.md`, `docs/ref-device-coverage.md`, and the permanent device reference docs.
+
+
+## Current compatibility verification limits
+
+The [offline source/host audit](NOTES-compatibility-audit.md) pins the upstream
+CLI and WebSocket consumers and verifies their JSON shapes with fake devices.
+The actual ezBEQ process has not been rerun against the changes from that audit.
+The current hosted 2.12.4 bundle still needs its browser Levels/upload/reconnect/
+offline-reload check. Recorded physical control-path results cover the 2x4 HD;
+they do not certify other devices or the new desktop-only `/config` aliases.

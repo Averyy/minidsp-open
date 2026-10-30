@@ -74,14 +74,24 @@ So a build that breaks WiFi, the HTTP server, or boot rolls itself back, and you
 | Method | Path | Notes |
 |--------|------|-------|
 | `GET` | `/firmware` | `{version, build, runningSlot, slotState, latest?, progress?}` |
-| `POST` | `/firmware` | raw app image body; `?sha256=`; `200 {"status":"rebooting"}`, then reboots after ~1.5 s |
-| `POST` | `/firmware/check` | `202`; poll `GET /firmware` for `latest` |
+| `POST` | `/firmware` | STA mode only; raw app image body; `?sha256=`; `200 {"status":"rebooting"}`, then reboots after ~1.5 s |
+| `POST` | `/firmware/check` | `202`; poll `GET /firmware` for `latest`; `409` while a check is pending or during the 30 s cooldown |
 | `POST` | `/firmware/update` | `202`; installs the latest release in the background; poll `progress` |
 | `GET` | `/update` | HTML page |
 
 `version` is the Cargo package version. `build` is `MINIDSP_BUILD_REV` (`vX.Y.Z` in release builds) or `git describe --always --dirty` for local builds. `slotState` is `valid` or `pendingVerify`. Uploads and installs answer `409` during `/play` playback or while another update runs, and `400` for an unacceptable image.
 
 These endpoints are unauthenticated, like the rest of the board's API: anything on the LAN that can reach port 5380 can install firmware. Treat the board as a trusted-LAN device.
+
+## Catalogue source overrides for development
+
+Release firmware always uses `https://averyy.github.io/minidsp-open` for the UI/catalogue source and ignores any saved `updaterBaseUrl` NVS override. `POST /debug/updater` is available only in STA mode in builds made with `tools/esp-cargo build --features dev-updater-override`. The feature is off by default and is not enabled by CI or release builds. `tools/flash-esp32-with-site.sh` enables it for its temporary local site workflow; when skipping its build/flash steps, the installed firmware must already have the feature. A development override persists across reboot until cleared, but a release build ignores it.
+
+Provisioning mode does not register firmware uploads or the source-override route. WiFi credentials can only be changed through the provisioning form, not through the STA API. No STA page or API caller uses `/api/wifi/connect`; its only caller is that form. If saved credentials fail at startup, the board starts `miniDSP-Open-XXXXXX` automatically. Repeated credential-related disconnects also clear credentials and restart into provisioning. To move to a different network, make the saved network unavailable and restart the board, join its setup AP, and enter the new credentials at `http://192.168.100.1/` (or the captive portal). Other disconnects keep retrying until restart.
+
+Manual and daily firmware checks share one persistent worker, with at most one outstanding check and a 30 s cooldown after completion (including failures).
+
+See [SECURITY.md](../SECURITY.md) for the LAN trust model and unsigned-OTA limits.
 
 ## Cutting a release
 

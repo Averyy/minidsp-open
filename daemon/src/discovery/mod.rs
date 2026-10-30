@@ -38,7 +38,18 @@ pub async fn broadcast_loop_with_name(
     override_ip: Option<Ipv4Addr>,
     name: Option<String>,
 ) -> std::io::Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    broadcast_loop_for_device(state, override_ip, name, None, None, None).await
+}
+
+pub async fn broadcast_loop_for_device(
+    state: Arc<DaemonState>,
+    override_ip: Option<Ipv4Addr>,
+    name: Option<String>,
+    bind_address: Option<&str>,
+    index: Option<usize>,
+    serial: Option<u32>,
+) -> std::io::Result<()> {
+    let socket = UdpSocket::bind(bind_address.unwrap_or("0.0.0.0:0")).await?;
     socket.set_broadcast(true)?;
 
     let primary_mac = resolve_primary_mac();
@@ -51,7 +62,8 @@ pub async fn broadcast_loop_with_name(
     loop {
         tick.tick().await;
 
-        let beacon = build_beacon(&state, primary_mac, name.as_deref()).await;
+        let beacon =
+            build_beacon_for_device(&state, primary_mac, name.as_deref(), index, serial).await;
 
         let interfaces = if_addrs::get_if_addrs().unwrap_or_default();
         let mut sent_any = false;
@@ -67,6 +79,9 @@ pub async fn broadcast_loop_with_name(
 
             let mut packet = beacon.clone();
             DiscoveryPacket::patch_ip(&mut packet, advertise_ip.octets());
+            if override_ip.is_some() {
+                patch_configured_mac(&mut packet, advertise_ip);
+            }
 
             // Keep directed broadcasts for Wi-DG clients, and also use the
             // global broadcast and Device Console multicast destinations.
@@ -91,6 +106,7 @@ pub async fn broadcast_loop_with_name(
             let mut packet = beacon.clone();
             if let Some(ip) = override_ip {
                 DiscoveryPacket::patch_ip(&mut packet, ip.octets());
+                patch_configured_mac(&mut packet, ip);
             }
             for ip in DISCOVERY_TARGETS {
                 let target = SocketAddrV4::new(ip, discovery::DISCOVERY_PORT);
@@ -100,8 +116,19 @@ pub async fn broadcast_loop_with_name(
     }
 }
 
+#[cfg(test)]
 async fn build_beacon(state: &DaemonState, mac: [u8; 6], name: Option<&str>) -> Vec<u8> {
-    let mut beacon = if let Some(client) = state.get_device(0).await {
+    build_beacon_for_device(state, mac, name, None, None).await
+}
+
+async fn build_beacon_for_device(
+    state: &DaemonState,
+    mac: [u8; 6],
+    name: Option<&str>,
+    index: Option<usize>,
+    serial: Option<u32>,
+) -> Vec<u8> {
+    let mut beacon = if let Some(client) = state.bridge_device(index, serial).await {
         let hw = client.hw_id();
         // bytes 0x13/0x14 are "hw_id sub-bytes" in the Wi-DG beacon. The
         // existing minidsp-open HwId struct carries them as fw_major/fw_minor
@@ -133,6 +160,11 @@ async fn build_beacon(state: &DaemonState, mac: [u8; 6], name: Option<&str>) -> 
     beacon
 }
 
+fn patch_configured_mac(packet: &mut [u8], ip: Ipv4Addr) {
+    let ip = ip.octets();
+    packet[6..12].copy_from_slice(&[0xff, 0xff, ip[0], ip[1], ip[2], ip[3]]);
+}
+
 fn resolve_primary_mac() -> [u8; 6] {
     match mac_address::get_mac_address() {
         Ok(Some(addr)) => addr.bytes(),
@@ -150,6 +182,14 @@ fn format_mac(mac: &[u8; 6]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // minidsp-rs 8e987f9, daemon/src/tcp/mod.rs:98-127.
+    #[test]
+    fn configured_ip_has_unique_upstream_synthetic_mac() {
+        let mut packet = DiscoveryPacket::encode_appliance([1; 6], [0; 4]);
+        patch_configured_mac(&mut packet, Ipv4Addr::new(192, 0, 2, 5));
+        assert_eq!(&packet[6..12], &[0xff, 0xff, 192, 0, 2, 5]);
+    }
 
     #[tokio::test]
     async fn discovery_preserves_configured_name_and_wire_identity() {

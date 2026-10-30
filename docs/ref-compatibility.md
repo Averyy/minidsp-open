@@ -27,6 +27,17 @@ Scope note:
 - coverage progress is tracked in `PROGRESS.md`, with importer/device-matrix detail in `docs/ref-device-coverage.md`, `docs/ref-devices.md`, and `docs/ref-legacy-devices.md`
 - when protocol details differ between `minidsp-rs` and MiniDSP's own extracted app assets, the official app assets are the source of truth
 
+## Offline audit baseline
+
+The source/host audit targets minidsp-rs `dev` at
+[`8e987f9`](https://github.com/mrene/minidsp-rs/tree/8e987f9d16c580482eda1b52692b3238c18d7ab8)
+and ezBEQ at
+[`bd981bf`](https://github.com/3ll3d00d/ezbeq/tree/bd981bf778f76e5ffc7b0ecbfff94c82c4320321).
+The [audit inventory](NOTES-compatibility-audit.md) records all 55 initially
+unchecked checklist items, source citations, fixes, and remaining runtime gates.
+Source and in-memory host verification do not certify Device Console operation,
+LAN discovery reception, or additional physical device families.
+
 ## Surface Areas
 
 Compatibility applies to six public surfaces:
@@ -96,9 +107,22 @@ The compatibility CLI must continue to support the existing command shapes used 
 - `mute {on|off}`
 - `source {name}`
 
+Additional accepted inputs:
+- `--force-kind` accepts all upstream `DeviceKind` spellings, including `m2x4` and `generic`, plus the existing minidsp-open aliases.
+- `--force-device` and `--force-dsp` remain accepted no-ops. They are absent from the audited upstream `dev` CLI; use `--force-kind` for a profile override.
+- `--usb path=...` and percent-encoded probe URLs (`usb:%2Fpath?vid=...&pid=...`) select the decoded HID path; `--tcp host` defaults to port `5333`.
+- `--all-local-devices` fans out only across local USB devices. Explicit remote transports are rejected. Two physical USB devices still need live verification.
+- Local devices are indexed in serial order after successful probing, consistently for direct CLI discovery and initial daemon USB discovery. Runtime attachment of static/network devices appends new daemon indexes; do not assume indexes persist across topology changes. Use `device_serial` for TCP bindings that must identify one unit.
+- Upstream `output N crossover GROUP INDEX set -- b0 b1 b2 a1 a2`, `bypass on|off`, and `clear` are accepted, including `all` targets. Existing whole-group `crossover set GROUP ...` remains accepted.
+- Upstream compressor flags `-b/--bypass`, `-t/--threshold`, `-k/--ratio`, `-a/--attack`, `-r/--release` are accepted alongside the existing `compressor set` and `compressor bypass` commands.
+- Upstream routing `input N routing M gain -- dB` and `enable on|off` are accepted alongside the existing numeric gain/`--off` form.
+- PEQ `clear` writes the identity filter and **removes bypass**, matching upstream. ezBEQ's clear operation instead uses explicit `bypass on` and is unchanged.
+
 ### File execution semantics
 
 `minidsp -f <file>` is compatibility-sensitive:
+- `-f -` reads stdin; shell-style quoting is accepted
+- file commands use the same parser and handlers as direct commands
 - commands execute in the order given
 - no internal reordering for compatibility mode
 - this preserves ezBEQ batch behavior exactly
@@ -288,6 +312,14 @@ Implementation note:
 - the convenience master-status routes above are also part of compatibility
 - additive minidsp-open routes can still exist, but must not replace either compatibility style
 
+Additional `/config` request compatibility:
+- Routing accepts upstream `{"index":2,"mute":true}` and `{"index":2,"gain":-3.5}` entries. Omitted fields leave the other routing control unchanged. Existing `output` / `enabled` / `gain_db` fields remain accepted.
+- Crossover accepts upstream `{"index":1,"coeff":[{"index":2,"b0":1,"b1":0,"b2":0,"a1":0,"a2":0}]}` groups. Existing nested `filters` / `coeff` objects remain accepted.
+- Coefficient objects use upstream identity defaults for omitted numeric fields; malformed numeric values still fail deserialization.
+- These request aliases are desktop changes. ESP32 verification recorded before this audit covers its existing request shapes; the new aliases have not been ported or hardware-verified there.
+
+Error responses retain minidsp-open's existing `{"error":"message"}` envelope and HTTP status distinctions (`400`, `404`, `409`, `503` as applicable). Empty error responses from desktop status-only handlers now also have this JSON envelope. This deliberately differs from upstream `dev`'s HTTP `500` and `{"message":...,"error":{"type":...}}` errors. Upstream `/api` Redoc and `*.schema` metadata routes are not provided; minidsp-open exposes `/openapi.json` instead.
+
 ## WebSocket Contract
 
 ### Canonical compatibility endpoint
@@ -329,8 +361,8 @@ Representative upstream-compatible message shapes:
 ```
 
 Implementation note:
-- `poll=true` enables periodic status polling
-- `levels=true` enables frequent level polling
+- As upstream does, the presence of `poll` or `levels` enables that option, including `poll=false` or another value.
+- Desktop sends complete snapshots rather than upstream's mixture of full state and deltas. Its polling intervals remain `500 ms` with levels, `1 s` with poll only, and `5 s` without either option. Upstream uses `250 ms` levels, `2 s` changed-state polling, and device notifications. Existing ezBEQ consumers accept complete snapshots; polling cadence and unsolicited hardware notifications are not asserted identical.
 - do not repurpose this endpoint for raw binary tunneling
 
 ### Raw WebSocket bridge example
@@ -356,7 +388,9 @@ Compatibility requirement:
 
 The transport may be internally arbitrated and serialized, but wire-level compatibility must remain intact for a normal compatibility client.
 
-Upstream also supports multiple plugin-compatible listeners on one host, mapped by `device_index` or `device_serial`. Desktop compatibility should preserve equivalent multi-device deployment capability.
+Upstream accepts multiple clients; rejecting a second client is not an upstream requirement. Desktop accepts up to eight clients per listener, serialized through the device queue. ESP32 currently services one bridge connection at a time; broader multi-client parity remains open.
+
+Desktop supports multiple `[[tcp_server]]` listeners mapped by `device_index` or `device_serial`; serial takes precedence. Each listener's discovery advertisement uses the same device binding. With neither selector, prefer the first local USB device. Host tests cover two mock devices and concurrent bridge/HTTP traffic; actual socket acceptance and physical multi-device operation remain release gates.
 
 ### TCP response framing requirement
 
@@ -383,7 +417,10 @@ Read responses are not affected — only write-ack responses that arrive as unfr
 Representative behavior:
 - server listens on port `5333`
 - bridge forwards USB HID frames for official-app compatibility
-- detailed framing/chunking rules should only be frozen here once captured from upstream implementation or a packet trace
+- request `02 31 33` is a length-prefixed command plus checksum
+- ordinary TCP replies contain a self-inclusive length and payload **without checksum**; e.g. a fake hardware-ID reply is `05 31 01 0d 0a`
+- a zero-padded 64-byte request selects padded replies on desktop; the reply is the same checksum-free response followed by zeros to 64 bytes
+- source: upstream `minidsp/src/transport/net/codec.rs:10-12,126-172`; in-memory stream regressions also cover fragmentation and concurrent clients
 
 ## UDP Discovery Contract
 
@@ -399,7 +436,20 @@ Representative behavior:
 - Include MAC, IP, hw_id, firmware version, dsp_id, serial, and hostname fields in the expected format
 - Packet byte layout is part of compatibility, not just high-level semantics
 
-### Packet structure (verified from minidsp-rs source + real device captures)
+### Current emitted packet versus upstream
+
+Desktop and ESP32 currently emit the shared Wi-DG-style **72-byte** encoder:
+magic `80 12 05 A0`, tag bytes `14 D5` at offsets `12..14`, `FF` filler,
+and at most 36 hostname bytes. Identity fields and offsets match the upstream
+layout below. No-device appliance identity is an extension; upstream advertises
+only when a selected device is available. Default desktop discovery sends on
+non-loopback interfaces, including multicast `224.0.0.250`, at one-second
+intervals. Explicit `advertise.ip` uses upstream's synthetic MAC
+`FF:FF:<four IPv4 octets>` to distinguish configured listeners. Default automatic
+beacons retain the host MAC. Physical Wi-DG fingerprint parity and LAN receipt
+remain separate verification gates.
+
+### Upstream packet structure (comparison baseline)
 
 Source: minidsp-rs `dev` branch (`minidsp/src/transport/net/discovery/mod.rs`), Wi-DG firmware Alexa client (`d[0] == 0x80 && d[2] == 0x05 && d[3] == 0xA0`), and real device packet captures embedded in the test suite.
 
@@ -411,7 +461,7 @@ Source: minidsp-rs `dev` branch (`minidsp/src/transport/net/discovery/mod.rs`), 
 
 These are the bytes written by minidsp-rs `to_bytes()` on the `dev` branch. Real device packets (WI-DG, PWR-ICE) use `80 12 05 A0` -- byte 1 is `0x12` on hardware. The Wi-DG firmware only checks bytes `[0]`, `[2]`, `[3]` (skips byte 1), so both `0x00` and `0x12` are accepted. The MiniDSP Device Console plugin uses the same check via the Wi-DG's Alexa client code.
 
-We write `80 00 05 A0` to match minidsp-rs behavior. The meaning of byte 1 is unknown but not checked by any known consumer.
+Upstream writes `80 00 05 A0`; minidsp-open currently writes `80 12 05 A0` through its shared Wi-DG encoder. Both forms parse in minidsp-open. Byte-for-byte equality with upstream is not claimed.
 
 #### Field offsets
 
@@ -514,9 +564,11 @@ TOML. The daemon must accept the same config format as minidsp-rs `minidspd`.
 ### Key fields (from minidsp-rs `config.example.toml`)
 
 ```toml
+ignore_advertisements = false
+
 [http_server]
 bind_address = "0.0.0.0:5380"
-allowed_origins = "*"    # Optional CORS
+cors_origin = "https://ui.example.com" # Optional extra browser origin; "*" opts out
 
 [[tcp_server]]
 bind_address = "0.0.0.0:5333"
@@ -526,8 +578,15 @@ advertise = { ip = "192.168.1.100", name = "Example TV" }
 [[static_device]]
 url = "tcp://192.168.1.2:5333"
 
-ignore_advertisements = false
 ```
+
+### Browser origins (intentional security difference)
+
+Both HTTP servers allow native clients that omit `Origin`, including ezBEQ's Python server, Home Assistant, the minidsp CLI, scripts, and driver tools. `Host: nas:5380` works without a hostname allowlist. The board's hosted ezBEQ UI, `/status`, and `/update` remain same-origin.
+
+For POST/PUT/PATCH/DELETE and WebSocket upgrades, a browser `Origin` must be a local UI: `localhost`, a single-label host (`http://nas:5380`), a `*.local`, `.lan`, `.home`, `.home.arpa`, `.internal` or `.localdomain` name, or a loopback/private/link-local IP literal (RFC 1918, `fc00::/7`, `fe80::/10`). An IP-literal origin may also address that same IP literal, so a global IPv6 address works too. Anything else must match the daemon's configured `cors_origin`; other origins, including `null`, get JSON `403`. An explicit `cors_origin = "*"` opts out. GET responses and preflights echo only allowed origins; native GETs remain available.
+
+A page served from a public DNS name is refused even when its Host matches, because that's exactly what DNS rebinding produces: an attacker's name resolving to the board. If you reach the board through your own public-suffix name, use its IP or `.local` name in the browser, or set `cors_origin` (desktop) to that origin. Requests without `Origin` are never checked, so hostname-addressed native clients are unaffected.
 
 ### Compatibility requirements
 
@@ -535,9 +594,14 @@ ignore_advertisements = false
 - Unknown keys should be silently ignored (forward compatibility)
 - Default bind address for HTTP: `0.0.0.0:5380`
 - Default bind address for TCP: `0.0.0.0:5333`
-- `allowed_origins` for CORS support (web-based clients need this)
+- `cors_origin` (also accepted as `allowed_origins`) adds an allowed browser origin; explicit `"*"` allows all origins. Unset uses the safe browser-origin policy above, an intentional difference from upstream's permissive `*`.
 - `advertise.ip` and `advertise.name` used for UDP discovery packets
 - `device_serial` and `device_index` for multi-device TCP server mapping
+- `advertise.bind_address` selects the UDP sender bind address
+- `[[static_device]] url` adds an explicit USB/TCP/WebSocket device at daemon startup
+- `ignore_advertisements` disables remote discovery consumption, not our own outgoing beacons
+- Unknown keys are ignored. The earlier minidsp-open `[tcp_server]` singleton and top-level `[advertise]` remain accepted extensions.
+- Defaults are additive: minidsp-open starts TCP/discovery automatically and applies the browser-origin policy above unless `cors_origin = "*"` is configured. Upstream's default TCP-server list is empty; its CORS middleware is opt-in.
 
 ## Additive Features
 
@@ -561,6 +625,7 @@ These are allowed, but they are not part of the compatibility contract unless la
   - `minidsp snapshot export <file>`
   - `minidsp snapshot import <file>`
   - `snapshot export --allow-partial` writes an explicitly incomplete artifact instead of refusing it
+- `GET /status` — ESP32 status/rattle UI; no upstream counterpart and no desktop page
 - measurement-mode endpoints
 - measurement playback endpoints:
   - `POST /sync` echoes `clientTimeUs` and returns `serverTimeUs` from the same platform clock basis used by `/play.startedAtUs`

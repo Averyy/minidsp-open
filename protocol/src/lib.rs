@@ -15,6 +15,8 @@ pub mod device;
 pub mod dialect;
 pub mod discovery;
 pub mod eeprom;
+#[cfg(feature = "std")]
+pub mod http_origin;
 pub mod packet;
 pub mod playback;
 pub mod rattle;

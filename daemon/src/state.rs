@@ -93,6 +93,28 @@ impl DaemonState {
         self.devices.read().await.get(&id).cloned()
     }
 
+    /// Match the upstream TCP binding precedence: serial, index, then first local device.
+    pub async fn bridge_device(
+        &self,
+        index: Option<usize>,
+        serial: Option<u32>,
+    ) -> Option<Arc<MiniDspClient>> {
+        let devices = self.devices.read().await;
+        if let Some(serial) = serial {
+            devices
+                .values()
+                .find(|client| client.serial() == serial)
+                .cloned()
+        } else if let Some(index) = index {
+            devices.get(&index).cloned()
+        } else {
+            devices
+                .iter()
+                .min_by_key(|(id, client)| (!client.transport_url().starts_with("usb:"), **id))
+                .map(|(_, client)| client.clone())
+        }
+    }
+
     pub async fn device_count(&self) -> usize {
         self.devices.read().await.len()
     }

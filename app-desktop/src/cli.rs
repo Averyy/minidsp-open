@@ -8,15 +8,12 @@ use crate::{
     apply_force_kind, connect, connect_all_local, discover_daemon_tcp, discover_network_devices,
 };
 use minidsp::client::MiniDspClient;
-use minidsp::transport::hid;
 use minidsp::transport::tcp::TcpTransport;
 use minidsp::transport::ws::WsTransport;
 use minidsp_daemon::http::json::{DeviceJson, VersionJson};
-use minidsp_protocol::device::probe;
 use minidsp_protocol::rattle::{
     RattleCurrentPhase, RattlePlan, RattleRequest, RattleResponse, RattleRunState, RattleStatus,
 };
-use minidsp_protocol::source::Source;
 use minidsp_protocol::status::DeviceInfo;
 use tokio::io::AsyncWriteExt;
 
@@ -351,20 +348,53 @@ fn parse_rattle_http_response(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error
 #[serde(default)]
 struct DaemonConfig {
     http_server: Option<HttpServerConfig>,
-    tcp_server: Option<TcpServerConfig>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    tcp_server: Vec<TcpServerConfig>,
+    static_device: Vec<StaticDeviceConfig>,
+    ignore_advertisements: bool,
+    // Retain the original minidsp-open spelling as an extension.
     advertise: Option<AdvertiseConfig>,
+}
+
+fn one_or_many<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Entries<T> {
+        Many(Vec<T>),
+        One(T),
+    }
+    Ok(
+        match <Entries<T> as serde::Deserialize>::deserialize(deserializer)? {
+            Entries::Many(entries) => entries,
+            Entries::One(entry) => vec![entry],
+        },
+    )
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(default)]
 struct HttpServerConfig {
     bind_address: Option<String>,
+    #[serde(alias = "cors_origin")]
+    allowed_origins: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(default)]
 struct TcpServerConfig {
     bind_address: Option<String>,
+    device_index: Option<usize>,
+    device_serial: Option<u32>,
+    advertise: Option<AdvertiseConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StaticDeviceConfig {
+    url: String,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -373,6 +403,7 @@ struct AdvertiseConfig {
     #[serde(alias = "name")]
     hostname: Option<String>,
     ip: Option<String>,
+    bind_address: Option<String>,
 }
 
 fn print_probe_device(
@@ -521,12 +552,17 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             devices_out.extend(discover_daemon_unix(path).await?);
         }
     } else if let Some(addr) = cli.tcp.as_deref().or(env_tcp.as_deref()) {
-        let client = MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
+        let client = MiniDspClient::connect(Box::new(
+            TcpTransport::connect(&crate::tcp_address(addr)).await?,
+        ))
+        .await?;
         devices_out.push(device_json_from_info(&client.device_info()));
     } else if let Some(url) = cli.url.as_deref().or(env_url.as_deref()) {
         if let Some(addr) = url.strip_prefix("tcp://") {
-            let client =
-                MiniDspClient::connect(Box::new(TcpTransport::connect(addr).await?)).await?;
+            let client = MiniDspClient::connect(Box::new(
+                TcpTransport::connect(&crate::tcp_address(addr)).await?,
+            ))
+            .await?;
             devices_out.push(device_json_from_info(&client.device_info()));
         } else if (url.starts_with("http://") || url.starts_with("ws://")) && !url.ends_with("/ws")
         {
@@ -536,48 +572,29 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 MiniDspClient::connect(Box::new(WsTransport::connect(url, 0).await?)).await?;
             devices_out.push(device_json_from_info(&client.device_info()));
         } else if url.starts_with("usb://") || url.starts_with("usb:") {
-            let path = if let Some(rest) = url.strip_prefix("usb://") {
-                urlencoding::decode(rest.split('?').next().unwrap_or(rest))?.into_owned()
-            } else {
-                let rest = &url["usb:".len()..];
-                urlencoding::decode(rest.split('?').next().unwrap_or(rest))?.into_owned()
-            };
-            let transport = hid::HidTransport::open(&path)?;
-            let client = MiniDspClient::connect(Box::new(transport)).await?;
+            let client = crate::connect_transport_url(url, 0).await?;
             devices_out.push(device_json_from_info(&client.device_info()));
         }
     } else if let Some(url) = cli.daemon_url.as_deref().or(env_daemon_url.as_deref()) {
         devices_out.extend(discover_daemon_tcp(url).await?);
     } else if let Some(path) = cli.usb.as_deref().or(env_usb.as_deref()) {
-        let transport = hid::HidTransport::open(path)?;
+        let transport = crate::open_usb_selector(path, 0)?;
         let client = MiniDspClient::connect(Box::new(transport)).await?;
         devices_out.push(device_json_from_info(&client.device_info()));
     } else {
-        let devices = hid::enumerate()?;
-        for (i, dev) in devices.iter().enumerate() {
-            match hid::HidTransport::open(&dev.path) {
-                Ok(transport) => match MiniDspClient::connect(Box::new(transport)).await {
-                    Ok(client) => {
-                        devices_out.push(device_json_from_info(&client.device_info()));
-                    }
-                    Err(e) => {
-                        if cli.output.as_deref() != Some("json")
-                            && cli.output.as_deref() != Some("jsonline")
-                        {
-                            println!("{i}: Device at {} (open failed: {e})", dev.path);
-                        }
-                    }
-                },
-                Err(e) => {
-                    if cli.output.as_deref() != Some("json")
-                        && cli.output.as_deref() != Some("jsonline")
-                    {
-                        println!("{i}: Device at {} (open failed: {e})", dev.path);
-                    }
-                }
+        #[cfg(unix)]
+        if std::path::Path::new("/tmp/minidsp.sock").exists()
+            && let Ok(devices) = discover_daemon_unix("/tmp/minidsp.sock").await
+        {
+            devices_out.extend(devices);
+        }
+        if devices_out.is_empty() {
+            for client in crate::discover_local_clients().await? {
+                devices_out.push(device_json_from_info(&client.device_info()));
             }
         }
     }
+    devices_out.sort_by_key(|device| device.version.serial);
 
     let printed = render_probe_devices(&devices_out, cli.output.as_deref())?;
     if !printed {
@@ -614,7 +631,7 @@ pub async fn server(
     use std::sync::Arc;
 
     // Load optional TOML config
-    let config = if let Some(path) = config_path {
+    let mut config = if let Some(path) = config_path {
         let contents = std::fs::read_to_string(path)?;
         toml::from_str::<DaemonConfig>(&contents)?
     } else {
@@ -627,79 +644,140 @@ pub async fn server(
         .as_ref()
         .and_then(|h| h.bind_address.as_deref())
         .unwrap_or(bind);
-    let tcp_bind = config
-        .tcp_server
-        .as_ref()
-        .and_then(|t| t.bind_address.as_deref())
-        .unwrap_or("0.0.0.0:5333");
-    // CLI --advertise overrides config file hostname
-    let hostname = cli_advertise.or_else(|| {
-        config
-            .advertise
-            .as_ref()
-            .and_then(|a| a.hostname.as_deref())
-    });
+    if config.tcp_server.is_empty() {
+        config.tcp_server.push(TcpServerConfig::default());
+    }
 
     let state = Arc::new(DaemonState::new());
 
-    // Auto-discover and connect USB devices
-    let devices = hid::enumerate().unwrap_or_default();
-    for (i, dev) in devices.iter().enumerate() {
-        match hid::HidTransport::open(&dev.path) {
-            Ok(transport) => match MiniDspClient::connect(Box::new(transport)).await {
-                Ok(client) => {
-                    let name = probe::product_name(client.hw_id().hw_id, client.dsp_version());
-                    tracing::info!("Device {i}: {name} (serial {})", client.serial());
-                    state.add_device(i, Arc::new(client)).await;
-                }
-                Err(e) => tracing::warn!("Device {i}: connect failed: {e}"),
-            },
-            Err(e) => tracing::warn!("Device {i}: open failed: {e}"),
-        }
+    // Upstream indexes successfully probed devices by serial, not HID enumeration order.
+    for (i, client) in crate::discover_local_clients()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        tracing::info!(
+            "Device {i}: {} (serial {})",
+            client.profile().name,
+            client.serial()
+        );
+        state.add_device(i, Arc::new(client)).await;
     }
 
     if state.device_count().await == 0 {
         tracing::warn!("No MiniDSP devices found — starting server anyway");
     }
 
-    let app = routes::router(state.clone());
-
-    // Start TCP bridge
-    let tcp_state = state.clone();
-    let tcp_addr = tcp_bind.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = minidsp_daemon::tcp::serve(&tcp_addr, tcp_state).await {
-            tracing::error!("TCP bridge error: {e}");
+    for device in &config.static_device {
+        match crate::connect_transport_url(&device.url, 0).await {
+            Ok(client) => {
+                let id = state
+                    .devices
+                    .read()
+                    .await
+                    .keys()
+                    .max()
+                    .map_or(0, |id| id + 1);
+                state.add_device(id, Arc::new(client)).await;
+            }
+            Err(error) => tracing::warn!("Static device {}: {error}", device.url),
         }
-    });
+    }
 
-    // Start UDP discovery — runs unconditionally so Device Console can find
-    // the daemon even before a USB DSP is attached. The broadcast loop polls
-    // DaemonState on every tick and switches between full-device and
-    // appliance-mode beacons as devices come and go.
-    // CLI --ip overrides config file ip; advertise_hostname is passed through
-    // so operators can still force a specific instance name via CLI flag.
-    let disc_name = hostname.map(str::to_owned);
-    let disc_override_ip: Option<std::net::Ipv4Addr> =
-        cli_ip.and_then(|s| s.parse().ok()).or_else(|| {
-            config
-                .advertise
-                .as_ref()
-                .and_then(|a| a.ip.as_deref())
-                .and_then(|s| s.parse().ok())
+    // Upstream discovers advertised devices unless explicitly disabled.
+    if !config.ignore_advertisements {
+        let discovery_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let devices = tokio::task::spawn_blocking(|| {
+                    crate::discover_network_devices(std::time::Duration::from_secs(8))
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+                if let Ok(Ok(devices)) = devices {
+                    for device in devices {
+                        if device.hw_id == 0xff {
+                            continue;
+                        }
+                        // Do not connect to our own beacons, or duplicate USB/static devices.
+                        if discovery_state
+                            .devices
+                            .read()
+                            .await
+                            .values()
+                            .any(|client| client.serial() == device.serial)
+                        {
+                            continue;
+                        }
+                        let url = format!("tcp://{}:5333", device.ip);
+                        let client = crate::connect_transport_url(&url, 0).await.ok();
+                        if let Some(client) = client {
+                            let id = discovery_state
+                                .devices
+                                .read()
+                                .await
+                                .keys()
+                                .max()
+                                .map_or(0, |id| id + 1);
+                            discovery_state.add_device(id, Arc::new(client)).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         });
-    let disc_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = minidsp_daemon::discovery::broadcast_loop_with_name(
-            disc_state,
-            disc_override_ip,
-            disc_name,
-        )
-        .await
-        {
-            tracing::error!("UDP discovery error: {e}");
-        }
-    });
+    }
+
+    let app = routes::router_with_origins(
+        state.clone(),
+        config
+            .http_server
+            .as_ref()
+            .and_then(|http| http.allowed_origins.as_deref()),
+    )?;
+
+    for tcp in &config.tcp_server {
+        let tcp_state = state.clone();
+        let tcp_addr = tcp
+            .bind_address
+            .clone()
+            .unwrap_or_else(|| "0.0.0.0:5333".into());
+        let index = tcp.device_index;
+        let serial = tcp.device_serial;
+        tokio::spawn(async move {
+            if let Err(e) =
+                minidsp_daemon::tcp::serve_device(&tcp_addr, tcp_state, index, serial).await
+            {
+                tracing::error!("TCP bridge error: {e}");
+            }
+        });
+
+        let advertise = tcp.advertise.as_ref().or(config.advertise.as_ref());
+        let name = cli_advertise
+            .or_else(|| advertise.and_then(|a| a.hostname.as_deref()))
+            .map(str::to_owned);
+        let ip = cli_ip
+            .or_else(|| advertise.and_then(|a| a.ip.as_deref()))
+            .map(str::parse::<std::net::Ipv4Addr>)
+            .transpose()?;
+        let bind_address = advertise.and_then(|a| a.bind_address.clone());
+        let disc_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = minidsp_daemon::discovery::broadcast_loop_for_device(
+                disc_state,
+                ip,
+                name,
+                bind_address.as_deref(),
+                index,
+                serial,
+            )
+            .await
+            {
+                tracing::error!("UDP discovery error: {e}");
+            }
+        });
+    }
 
     // Start Unix socket listener at /tmp/minidsp.sock
     #[cfg(unix)]
@@ -752,7 +830,12 @@ pub async fn server(
 
     println!("minidsp-open daemon listening on {http_bind}");
     println!("  HTTP API: http://{http_bind}/devices");
-    println!("  TCP bridge: {tcp_bind}");
+    for tcp in &config.tcp_server {
+        println!(
+            "  TCP bridge: {}",
+            tcp.bind_address.as_deref().unwrap_or("0.0.0.0:5333")
+        );
+    }
     println!("  mDNS: _http._tcp.local. (minidsp.local:{mdns_port})");
     #[cfg(unix)]
     println!("  Unix socket: /tmp/minidsp.sock");
@@ -764,7 +847,14 @@ pub async fn server(
 
 /// Execute commands from a file (minidsp -f <file>).
 pub async fn execute_file(path: &str, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let contents = std::fs::read_to_string(path)?;
+    let contents = if path == "-" {
+        use std::io::Read;
+        let mut contents = String::new();
+        std::io::stdin().read_to_string(&mut contents)?;
+        contents
+    } else {
+        std::fs::read_to_string(path)?
+    };
     if cli._all_local_devices {
         let mut clients = connect_all_local(cli).await?;
         for client in &mut clients {
@@ -776,7 +866,7 @@ pub async fn execute_file(path: &str, cli: &Cli) -> Result<(), Box<dyn std::erro
                 continue;
             }
             for client in &clients {
-                if let Err(e) = execute_line(client, line).await {
+                if let Err(e) = execute_line(client, line, cli.output.as_deref()).await {
                     eprintln!("Error on line {}: {e}", line_num + 1);
                     return Err(e);
                 }
@@ -793,7 +883,7 @@ pub async fn execute_file(path: &str, cli: &Cli) -> Result<(), Box<dyn std::erro
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Err(e) = execute_line(&client, line).await {
+        if let Err(e) = execute_line(&client, line, cli.output.as_deref()).await {
             eprintln!("Error on line {}: {e}", line_num + 1);
             return Err(e);
         }
@@ -805,177 +895,61 @@ pub async fn execute_file(path: &str, cli: &Cli) -> Result<(), Box<dyn std::erro
 async fn execute_line(
     client: &MiniDspClient,
     line: &str,
+    output: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.is_empty() {
+    use clap::Parser;
+    let words = shlex::split(line).ok_or("invalid quoting in command file")?;
+    if words.is_empty() {
         return Ok(());
     }
-
-    match parts[0] {
-        "gain" => {
-            // gain -- {dB}
-            let db = parse_gain_value(&parts[1..])?;
-            client.set_volume_db(db).await?;
-        }
-        "mute" => {
-            let state = parse_on_off_str(parts.get(1).unwrap_or(&"on"))?;
-            client.set_mute(state).await?;
-        }
-        "source" => {
-            let name = parts.get(1).ok_or("missing source name")?;
-            let src = Source::from_str_lowercase(name)
-                .ok_or_else(|| format!("unknown source '{name}'"))?;
-            let idx = client
-                .profile()
-                .sources
-                .index_for_source(src)
-                .ok_or_else(|| format!("source '{name}' not available"))?;
-            client.set_source(idx).await?;
-        }
-        "config" => {
-            let preset: u8 = parts.get(1).ok_or("missing preset")?.parse()?;
-            client.set_config(preset).await?;
-        }
-        "input" | "output" => {
-            let is_input = parts[0] == "input";
-            let ch: u8 = parts.get(1).ok_or("missing channel")?.parse()?;
-            let subcmd = parts.get(2).ok_or("missing subcommand")?;
-            match *subcmd {
-                "peq" => {
-                    let band_str = parts.get(3).ok_or("missing PEQ index")?;
-                    let action = parts.get(4).ok_or("missing PEQ action")?;
-
-                    // Get list of bands: "all" → all bands, numeric → single band
-                    let bands: Vec<u16> = if *band_str == "all" {
-                        let table = client
-                            .profile()
-                            .dsp_table
-                            .ok_or("device does not support PEQ")?;
-                        let peq_slice = if is_input {
-                            table
-                                .inputs
-                                .get(ch as usize)
-                                .map(|c| c.peq)
-                                .ok_or_else(|| format!("channel {ch} out of range"))?
-                        } else {
-                            table
-                                .outputs
-                                .get(ch as usize)
-                                .map(|c| c.peq)
-                                .ok_or_else(|| format!("channel {ch} out of range"))?
-                        };
-                        peq_slice.iter().map(|b| b.addr).collect()
-                    } else {
-                        let band: u8 = band_str.parse()?;
-                        vec![get_peq_addr(client, is_input, ch, band)?]
-                    };
-
-                    for addr in bands {
-                        match *action {
-                            "set" => {
-                                // set -- b0 b1 b2 a1 a2
-                                let coeff_start = if parts.get(5) == Some(&"--") { 6 } else { 5 };
-                                if parts.len() < coeff_start + 5 {
-                                    return Err("need 5 biquad coefficients".into());
-                                }
-                                let b0: f32 = parts[coeff_start].parse()?;
-                                let b1: f32 = parts[coeff_start + 1].parse()?;
-                                let b2: f32 = parts[coeff_start + 2].parse()?;
-                                let a1: f32 = parts[coeff_start + 3].parse()?;
-                                let a2: f32 = parts[coeff_start + 4].parse()?;
-                                client.write_biquad(addr, &[b0, b1, b2, a1, a2]).await?;
-                            }
-                            "bypass" => {
-                                let state = parse_on_off_str(parts.get(5).unwrap_or(&"on"))?;
-                                client.bypass_filter(addr, state).await?;
-                            }
-                            "clear" => {
-                                client
-                                    .write_biquad(addr, &[1.0, 0.0, 0.0, 0.0, 0.0])
-                                    .await?;
-                                client.bypass_filter(addr, true).await?;
-                            }
-                            _ => return Err(format!("unknown PEQ action '{action}'").into()),
-                        }
-                    }
-                }
-                "gain" => {
-                    let db = parse_gain_value(&parts[3..])?;
-                    let addr = get_channel_gain_addr(client, is_input, ch)?;
-                    client.set_channel_gain(addr, db).await?;
-                }
-                "mute" => {
-                    let state = parse_on_off_str(parts.get(3).unwrap_or(&"on"))?;
-                    let addr = get_channel_mute_addr(client, is_input, ch)?;
-                    client.set_channel_mute(addr, state).await?;
-                }
-                "delay" => {
-                    if is_input {
-                        return Err("input delay not supported via this command".into());
-                    }
-                    let ms: f32 = parts.get(3).ok_or("missing delay value")?.parse()?;
-                    let samples = client.profile().delay_ms_to_samples(ms);
-                    let table = client
-                        .profile()
-                        .dsp_table
-                        .ok_or("device does not support channel delay")?;
-                    let ch_def = table
-                        .outputs
-                        .get(ch as usize)
-                        .ok_or_else(|| format!("output channel {ch} out of range"))?;
-                    let delay_addr = ch_def
-                        .delay
-                        .ok_or("output channel does not have delay control")?;
-                    client
-                        .set_channel_delay_samples(delay_addr, samples)
-                        .await?;
-                }
-                "invert" => {
-                    if is_input {
-                        return Err("input polarity inversion not supported".into());
-                    }
-                    let state = parse_on_off_str(parts.get(3).unwrap_or(&"on"))?;
-                    let table = client
-                        .profile()
-                        .dsp_table
-                        .ok_or("device does not support polarity inversion")?;
-                    let ch_def = table
-                        .outputs
-                        .get(ch as usize)
-                        .ok_or_else(|| format!("output channel {ch} out of range"))?;
-                    let polarity = ch_def
-                        .polarity
-                        .ok_or("output channel does not have polarity inversion")?;
-                    client.set_invert(polarity, state).await?;
-                }
-                _ => return Err(format!("unknown channel command '{subcmd}'").into()),
-            }
-        }
-        _ => return Err(format!("unknown command '{}'", parts[0]).into()),
+    let mut parsed = Cli::try_parse_from(std::iter::once("minidsp".to_string()).chain(words))?;
+    parsed.output = output.map(str::to_owned);
+    if matches!(
+        parsed.command,
+        Some(
+            crate::Command::Probe { .. }
+                | crate::Command::Server { .. }
+                | crate::Command::Rattle(_)
+        )
+    ) {
+        return Err("command is not supported in a command file".into());
     }
-    Ok(())
+    crate::execute_command(client, &parsed).await
 }
 
-/// Parse gain value, handling the `--` separator for negative values.
-fn parse_gain_value(parts: &[&str]) -> Result<f32, Box<dyn std::error::Error>> {
-    if parts.is_empty() {
-        return Err("missing gain value".into());
-    }
-    if parts[0] == "--" {
-        if parts.len() < 2 {
-            return Err("missing gain value after --".into());
-        }
-        Ok(parts[1].parse()?)
-    } else {
-        Ok(parts[0].parse()?)
-    }
-}
+type CrossoverFilterArgs = (Vec<usize>, Vec<usize>, PeqCommand);
 
-fn parse_on_off_str(s: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    match s.to_lowercase().as_str() {
-        "on" | "true" | "1" => Ok(true),
-        "off" | "false" | "0" => Ok(false),
-        _ => Err(format!("expected on/off, got '{s}'").into()),
+fn crossover_filter_args(
+    args: &[String],
+) -> Result<CrossoverFilterArgs, Box<dyn std::error::Error>> {
+    use clap::Parser;
+    fn targets(value: &str, count: usize) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+        if value.eq_ignore_ascii_case("all") {
+            return Ok((0..count).collect());
+        }
+        let value: usize = value.parse()?;
+        if value >= count {
+            return Err("crossover index out of range".into());
+        }
+        Ok(vec![value])
+    }
+    if args.len() < 3 {
+        return Err("expected crossover <group> <index> <set|bypass|clear>".into());
+    }
+    let groups = targets(&args[0], 2)?;
+    let indices = targets(&args[1], 4)?;
+    let parsed = Cli::try_parse_from(
+        ["minidsp", "output", "0", "peq", "0"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(args[2..].iter().cloned()),
+    )?;
+    match parsed.command {
+        Some(crate::Command::Output {
+            cmd: ChannelCommand::Peq { cmd, .. },
+            ..
+        }) => Ok((groups, indices, cmd)),
+        _ => Err("invalid crossover command".into()),
     }
 }
 
@@ -1239,7 +1213,7 @@ pub async fn channel_command(
                             client
                                 .write_biquad(band.addr, &[1.0, 0.0, 0.0, 0.0, 0.0])
                                 .await?;
-                            client.bypass_filter(band.addr, true).await?;
+                            client.bypass_filter(band.addr, false).await?;
                         }
                     }
                 }
@@ -1261,7 +1235,7 @@ pub async fn channel_command(
                         client
                             .write_biquad(addr, &[1.0, 0.0, 0.0, 0.0, 0.0])
                             .await?;
-                        client.bypass_filter(addr, true).await?;
+                        client.bypass_filter(addr, false).await?;
                     }
                 }
             }
@@ -1282,6 +1256,34 @@ pub async fn channel_command(
                 .crossover
                 .ok_or("output channel does not have crossover")?;
             match cmd {
+                CrossoverCommand::Compatibility(args) => {
+                    let (groups, indices, command) = crossover_filter_args(args)?;
+                    for group in groups {
+                        let base = [xover.lpf_addr, xover.hpf_addr][group];
+                        match command {
+                            PeqCommand::Set { b0, b1, b2, a1, a2 } => {
+                                for index in &indices {
+                                    client
+                                        .write_biquad(
+                                            base + *index as u16 * 5,
+                                            &[b0, b1, b2, a1, a2],
+                                        )
+                                        .await?;
+                                }
+                            }
+                            PeqCommand::Bypass { state } => {
+                                client.bypass_filter(base, state).await?
+                            }
+                            PeqCommand::Clear => {
+                                for index in 0..4 {
+                                    client
+                                        .write_biquad(base + index * 5, &[1.0, 0.0, 0.0, 0.0, 0.0])
+                                        .await?;
+                                }
+                            }
+                        }
+                    }
+                }
                 CrossoverCommand::Set {
                     group,
                     coefficients,
@@ -1319,7 +1321,14 @@ pub async fn channel_command(
                 }
             }
         }
-        ChannelCommand::Compressor { ref cmd } => {
+        ChannelCommand::Compressor {
+            ref cmd,
+            bypass,
+            threshold,
+            ratio,
+            attack,
+            release,
+        } => {
             if is_input {
                 return Err("compressor not available on input channels".into());
             }
@@ -1334,16 +1343,30 @@ pub async fn channel_command(
             let comp = ch_def
                 .compressor
                 .ok_or("output channel does not have compressor")?;
+            if let Some(bypass) = bypass {
+                client.set_status_bypass(comp.bypass, bypass).await?;
+            }
+            for (value, addr) in [
+                (threshold, comp.threshold),
+                (ratio, comp.ratio),
+                (attack, comp.attack),
+                (release, comp.release),
+            ] {
+                if let Some(value) = value {
+                    client.write_dsp(addr, value, true).await?;
+                }
+            }
             match cmd {
-                CompressorCommand::Bypass { state } => {
+                None => {}
+                Some(CompressorCommand::Bypass { state }) => {
                     client.set_status_bypass(comp.bypass, *state).await?;
                 }
-                CompressorCommand::Set {
+                Some(CompressorCommand::Set {
                     threshold,
                     ratio,
                     attack,
                     release,
-                } => {
+                }) => {
                     if *attack <= 0.0 || *release <= 0.0 {
                         return Err("attack and release must be > 0 ms".into());
                     }
@@ -1410,13 +1433,45 @@ pub async fn channel_command(
         ChannelCommand::Routing {
             output,
             gain_db,
+            value,
             off,
             invert,
         } => {
             if !is_input {
                 return Err("routing only available on input channels".into());
             }
-            client.set_routing(channel, output, !off, gain_db).await?;
+            let table = client
+                .profile()
+                .dsp_table
+                .ok_or("device does not support routing")?;
+            let routing = table.routing;
+            if channel >= routing.rows || output >= routing.cols {
+                return Err("routing index out of range".into());
+            }
+            let cell = channel as u16 * routing.cols as u16 + output as u16;
+            match gain_db.as_str() {
+                "gain" => {
+                    client
+                        .set_channel_gain(
+                            routing.gain_base + cell,
+                            value.ok_or("missing routing gain")?.parse()?,
+                        )
+                        .await?
+                }
+                "enable" => {
+                    client
+                        .set_channel_mute(
+                            routing.status_base + cell,
+                            !crate::parse_on_off(&value.ok_or("missing routing state")?)?,
+                        )
+                        .await?
+                }
+                _ => {
+                    client
+                        .set_routing(channel, output, !off, gain_db.parse()?)
+                        .await?
+                }
+            }
             if let Some(inverted) = invert {
                 client
                     .set_routing_polarity(channel, output, inverted)
@@ -1431,6 +1486,226 @@ pub async fn channel_command(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    // minidsp-rs 8e987f9, minidsp/src/bin/minidsp/handlers.rs:240-243:
+    // PEQ clear writes identity and removes bypass. Exercise the command-file path.
+    #[tokio::test]
+    async fn command_file_clear_enables_identity_filter_and_accepts_crossover() {
+        use minidsp::transport::{Transport, TransportError};
+        use std::{
+            collections::VecDeque,
+            future::Future,
+            pin::Pin,
+            sync::{Arc, Mutex},
+        };
+        struct ScriptTransport {
+            responses: Mutex<VecDeque<Vec<u8>>>,
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl Transport for ScriptTransport {
+            fn send_frame(
+                &self,
+                payload: &[u8],
+            ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+                self.sent.lock().unwrap().push(payload.to_vec());
+                Box::pin(async { Ok(()) })
+            }
+            fn recv_frame(
+                &self,
+                _: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>
+            {
+                Box::pin(async {
+                    Ok(self
+                        .responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| vec![1]))
+                })
+            }
+            fn is_connected(&self) -> bool {
+                true
+            }
+            fn close(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn url(&self) -> String {
+                "usb:compatibility-test".into()
+            }
+        }
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let client = MiniDspClient::connect(Box::new(ScriptTransport {
+            responses: Mutex::new(VecDeque::from([
+                vec![0x31, 1, 13, 10],
+                vec![5, 100],
+                vec![5, 0x30, 0x39],
+                vec![5, 0, 0, 40, 0],
+            ])),
+            sent: sent.clone(),
+        }))
+        .await
+        .unwrap();
+        execute_line(&client, "input 0 peq 0 clear", None)
+            .await
+            .unwrap();
+        assert_eq!(sent.lock().unwrap().last().unwrap()[..2], [0x19, 0x00]);
+        execute_line(&client, "output 0 crossover 1 2 set -- 1 0 0 0 0", None)
+            .await
+            .unwrap();
+        assert_eq!(sent.lock().unwrap().last().unwrap()[0], 0x30);
+        execute_line(&client, "output 0 crossover 1 2 bypass off", None)
+            .await
+            .unwrap();
+        assert_eq!(sent.lock().unwrap().last().unwrap()[..2], [0x19, 0x00]);
+    }
+
+    // minidsp-rs 8e987f9, daemon/src/config.rs:5-22, 49-84.
+    #[test]
+    fn upstream_config_arrays_selectors_and_unknown_keys() {
+        let config: DaemonConfig = toml::from_str(
+            r#"
+ignore_advertisements = true
+future_option = 1
+[http_server]
+bind_address = "127.0.0.1:5381"
+allowed_origins = "https://example.com"
+[[tcp_server]]
+bind_address = "127.0.0.1:5334"
+device_index = 1
+advertise = { ip = "192.0.2.1", name = "First", bind_address = "0.0.0.0:0" }
+[[tcp_server]]
+device_serial = 912345
+[[static_device]]
+url = "tcp://192.0.2.2:5333"
+"#,
+        )
+        .unwrap();
+        assert!(config.ignore_advertisements);
+        assert_eq!(config.tcp_server.len(), 2);
+        assert_eq!(config.tcp_server[0].device_index, Some(1));
+        assert_eq!(config.tcp_server[1].device_serial, Some(912345));
+        assert_eq!(
+            config.tcp_server[0]
+                .advertise
+                .as_ref()
+                .unwrap()
+                .hostname
+                .as_deref(),
+            Some("First")
+        );
+        assert_eq!(
+            config.http_server.unwrap().allowed_origins.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(config.static_device[0].url, "tcp://192.0.2.2:5333");
+        assert!(
+            toml::from_str::<DaemonConfig>("[tcp_server]\nbind_address = \"127.0.0.1:5333\"")
+                .is_ok()
+        );
+        let config: DaemonConfig =
+            toml::from_str("[http_server]\ncors_origin = \"https://ui.example\"").unwrap();
+        assert_eq!(
+            config.http_server.unwrap().allowed_origins.as_deref(),
+            Some("https://ui.example")
+        );
+    }
+
+    // ezBEQ bd981bf, ezbeq/minidsp.py:1185-1198 emits this crossover syntax;
+    // minidsp-rs 8e987f9, minidsp/src/bin/minidsp/main.rs:353-384.
+    #[test]
+    fn upstream_crossover_and_compressor_arguments() {
+        let cli = Cli::try_parse_from([
+            "minidsp",
+            "output",
+            "0",
+            "crossover",
+            "1",
+            "2",
+            "set",
+            "--",
+            "1",
+            "0",
+            "0",
+            "0",
+            "0",
+        ])
+        .unwrap();
+        let Some(crate::Command::Output {
+            cmd:
+                ChannelCommand::Crossover {
+                    cmd: CrossoverCommand::Compatibility(args),
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected crossover");
+        };
+        let (groups, indices, command) = crossover_filter_args(&args).unwrap();
+        assert_eq!(groups, vec![1]);
+        assert_eq!(indices, vec![2]);
+        assert!(matches!(command, PeqCommand::Set { b0: 1.0, .. }));
+        let (_, indices, _) =
+            crossover_filter_args(&["all", "all", "bypass", "off"].map(str::to_owned)).unwrap();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+        let cli = Cli::try_parse_from([
+            "minidsp",
+            "output",
+            "0",
+            "compressor",
+            "-b",
+            "off",
+            "-t",
+            "-15",
+            "-k",
+            "4",
+            "-a",
+            "10",
+            "-r",
+            "100",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::Command::Output {
+                cmd: ChannelCommand::Compressor {
+                    bypass: Some(false),
+                    threshold: Some(-15.0),
+                    ratio: Some(4.0),
+                    attack: Some(10.0),
+                    release: Some(100.0),
+                    cmd: None
+                },
+                ..
+            })
+        ));
+        let parsed =
+            Cli::try_parse_from(["minidsp", "input", "0", "routing", "1", "-3.5", "--off"])
+                .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(crate::Command::Input {
+                cmd: ChannelCommand::Routing {
+                    off: true,
+                    value: None,
+                    ..
+                },
+                ..
+            })
+        ));
+        for command in [
+            "input 0 routing 1 gain -- -3.5",
+            "input 0 routing 1 enable off",
+            "input 0 routing 1 -3.5 --off",
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("minidsp").chain(command.split_whitespace()))
+                    .is_ok()
+            );
+        }
+    }
 
     #[test]
     fn rattle_arguments_preserve_defaults_and_parse_negative_volume_lists() {

@@ -26,6 +26,7 @@ const PERIODIC_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// NVS namespace and key for tracking installed catalogue version.
 const NVS_NAMESPACE: &str = "beq";
 const NVS_VERSION_KEY: &str = "cat_ver";
+#[cfg(feature = "dev-updater-override")]
 const NVS_BASE_URL_KEY: &str = "base_url";
 
 /// Chunk size for streaming downloads to flash (4KB).
@@ -605,6 +606,7 @@ fn remote_version_requires_update(installed: Option<&str>, remote: &str) -> bool
     }
 }
 
+#[cfg(feature = "dev-updater-override")]
 fn read_nvs_base_url(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
     use esp_idf_svc::nvs::EspNvs;
 
@@ -626,6 +628,7 @@ fn write_nvs_version(
     Ok(())
 }
 
+#[cfg(feature = "dev-updater-override")]
 fn write_nvs_base_url(
     nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
     url: &str,
@@ -720,13 +723,16 @@ mod tests {
 }
 
 /// Get the configured updater base URL, falling back to the built-in default.
-pub fn base_url(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> String {
-    read_nvs_base_url(nvs)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| BASE_URL.to_string())
+pub fn base_url(_nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> String {
+    #[cfg(feature = "dev-updater-override")]
+    if let Some(url) = read_nvs_base_url(_nvs).filter(|s| !s.trim().is_empty()) {
+        return url;
+    }
+    BASE_URL.to_string()
 }
 
 /// Persist an updater base URL override. Empty string clears the override.
+#[cfg(feature = "dev-updater-override")]
 pub fn set_base_url(
     nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
     url: &str,

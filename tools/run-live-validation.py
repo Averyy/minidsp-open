@@ -21,6 +21,8 @@ The harness supports:
 It intentionally separates audio/destructive flows behind explicit flags:
 - --allow-audio enables /play and playback-busy checks
 - --allow-destructive enables preset-copy / overwrite / other stateful flows
+- --destructive-profile full adds strict rollback, audio, reset/reboot and snapshot busy assertions
+- --plan prints the selected workflow without target access, builds or artifacts
 """
 
 from __future__ import annotations
@@ -31,12 +33,14 @@ import contextlib
 import dataclasses
 import gzip
 import json
+import math
 import os
 import shlex
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -45,9 +49,6 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
-
-import websockets
-
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CLI_BIN = ROOT / "target" / "debug" / "minidsp"
@@ -61,6 +62,10 @@ CATALOGUE_CACHE: dict[str, list[dict[str, Any]]] = {}
 
 class StepFailed(RuntimeError):
     """Raised when a validation step fails."""
+
+
+class SafetyStop(StepFailed):
+    """A failure that must stop the run even with --continue-on-fail."""
 
 
 @dataclasses.dataclass(slots=True)
@@ -173,6 +178,14 @@ class Harness:
         self.args = args
         self.results: list[StepResult] = []
         self.failures = 0
+        self.manual_checkpoints: list[dict[str, Any]] = []
+        self.run_dir: Path | None = None
+        self.baselines: dict[str, dict[str, Any]] = {}
+        self.manual_answers = {}
+        if args.manual_answers and not args.ci:
+            self.manual_answers = json.loads(args.manual_answers.read_text())
+            if not isinstance(self.manual_answers, dict):
+                raise StepFailed("manual answers must be a JSON object keyed by target.checkpoint")
 
     def run_step(
         self,
@@ -181,6 +194,7 @@ class Harness:
         fn: Callable[[], str | None],
         *,
         abort_on_fail: bool = True,
+        hard_stop: bool = False,
     ) -> bool:
         start = time.perf_counter()
         try:
@@ -191,6 +205,7 @@ class Harness:
             detail = str(exc)
             status = "FAIL"
             ok = False
+            hard_stop = hard_stop or isinstance(exc, SafetyStop)
         except Exception as exc:  # pragma: no cover - defensive path
             detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
             status = "FAIL"
@@ -201,9 +216,59 @@ class Harness:
         )
         if not ok:
             self.failures += 1
+            if hard_stop:
+                raise SafetyStop(detail)
             if abort_on_fail and not self.args.continue_on_fail:
                 raise SystemExit(1)
         return ok
+
+    def confirm(self, target: Target, action: str) -> None:
+        if self.args.yes_i_know:
+            return
+        if self.args.non_interactive or self.args.ci or not sys.stdin.isatty():
+            raise SafetyStop(f"{target.label}: {action} requires interactive confirmation or --yes-i-know")
+        try:
+            answer = input(f"{target.label}: confirm {action}; type YES to continue: ")
+        except EOFError as exc:
+            raise SafetyStop("confirmation input ended") from exc
+        if answer.strip() != "YES":
+            raise SafetyStop(f"{target.label}: {action} was not confirmed")
+
+    def checkpoint(self, target: Target, name: str, prompt: str) -> str:
+        key = f"{target.label}.{name}"
+        source = "interactive"
+        if self.args.ci:
+            answer = {"status": "skip", "note": "CI run: operator checkpoint skipped"}
+            source = "ci"
+        elif key in self.manual_answers:
+            answer = self.manual_answers[key]
+            source = "file"
+        elif self.args.non_interactive or not sys.stdin.isatty():
+            answer = {"status": "skip", "note": "no recorded answer in non-interactive run"}
+            source = "non-interactive"
+        else:
+            try:
+                status = input(f"{target.label}: {prompt} [pass/fail/skip]: ").strip().lower()
+                note = input("Note: ").strip()
+                answer = {"status": status, "note": note}
+            except EOFError:
+                answer = {"status": "skip", "note": "operator input ended"}
+        if (not isinstance(answer, dict) or not isinstance(answer.get("status"), str)
+                or answer.get("status") not in {"pass", "fail", "skip"}
+                or not isinstance(answer.get("note"), str)):
+            answer = {"status": "fail", "note": f"invalid answer for {key}; expected status and string note"}
+        record = {"target": target.label, "checkpoint": name, "prompt": prompt,
+                  "status": answer["status"], "note": answer["note"],
+                  "source": source, "recordedAt": datetime.now(timezone.utc).isoformat()}
+        self.manual_checkpoints.append(record)
+        assert self.run_dir is not None
+        json_dump(self.run_dir / "manual-checkpoints.json", self.manual_checkpoints)
+        section = f"{target.label}-manual"
+        if answer["status"] == "skip":
+            self.skip(section, name, answer["note"])
+        else:
+            self.run_step(section, name, lambda: assert_manual_answer(answer))
+        return answer["status"]
 
     def skip(self, section: str, name: str, detail: str) -> None:
         self.results.append(
@@ -241,6 +306,7 @@ class Harness:
         skipped = sum(1 for r in self.results if r.status == "SKIP")
         failed = sum(1 for r in self.results if r.status == "FAIL")
         return {
+            "manualCheckpoints": self.manual_checkpoints,
             "results": [dataclasses.asdict(result) for result in self.results],
             "summary": {
                 "passed": passed,
@@ -255,7 +321,12 @@ class Harness:
         path.write_text(json.dumps(self.summary_payload(), indent=2) + "\n")
 
 
-def parse_args() -> argparse.Namespace:
+def assert_manual_answer(answer: dict[str, Any]) -> str:
+    assert_true(answer["status"] == "pass", answer["note"] or "operator rejected checkpoint")
+    return answer["note"] or "operator approved"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--desktop-url", help="Desktop daemon base URL, e.g. http://127.0.0.1:5380")
     parser.add_argument("--esp32-url", help="ESP32 base URL, e.g. http://192.0.2.251:5380")
@@ -339,7 +410,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to write a markdown report.",
     )
     parser.add_argument(
-        "--artifact-root",
+        "--artifact-root", "--artifacts-dir",
         type=Path,
         default=ROOT / ".scratch" / "live-validation-runs",
         help="Root directory for destructive-run artifacts (default: %(default)s).",
@@ -349,9 +420,40 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Continue running later checks even after a failure.",
     )
-    args = parser.parse_args()
+    parser.add_argument("--destructive-profile", choices=["full"], help="Enable strict snapshot/restore, destructive mutations, audio, reset, reboot and busy assertions.")
+    parser.add_argument("--snapshot-path", type=Path, help="Also save the captured baseline here (one target only; never imports an existing file).")
+    parser.add_argument("--restore-on-exit", action="store_true", help="Capture a strict baseline and restore on success or failure.")
+    parser.add_argument("--require-strict-snapshot", action="store_true", help="Require a strict snapshot and verified restore before any suites.")
+    parser.add_argument("--manual-audio", action="store_true", help="Enable audio and record sweep, marker and combined approval.")
+    parser.add_argument("--manual-reconnect", action="store_true", help="Record physical unplug/replug or power-cycle approval and verify recovery.")
+    parser.add_argument("--manual-device-console", action="store_true", help="Record official Device Console discovery/control approval.")
+    parser.add_argument("--manual-answers", type=Path, help="JSON answers keyed by target.checkpoint, each with status (pass/fail/skip) and note.")
+    parser.add_argument("--non-interactive", action="store_true", help="Read manual answers from file; skip unanswered checkpoints and never prompt.")
+    parser.add_argument("--ci", action="store_true", default=os.environ.get("CI", "").lower() not in {"", "0", "false"}, help="Skip all manual checkpoints, including file answers (also set by CI environment).")
+    parser.add_argument("--yes-i-know", action="store_true", help="Explicitly confirm audio, reset and reboot steps without an interactive prompt.")
+    parser.add_argument("--reconnect-timeout", type=float, default=60.0, help="Maximum seconds to wait for stable reconnect (default: %(default)s).")
+    parser.add_argument("--plan", "--dry-run", dest="plan", action="store_true", help="Print selected phases and safety gates without I/O, builds or artifacts.")
+    args = parser.parse_args(argv)
+    if args.plan and not args.desktop_url and not args.esp32_url:
+        args.desktop_url = "http://desktop.invalid"
+        args.esp32_url = "http://esp32.invalid"
     if not args.desktop_url and not args.esp32_url:
         parser.error("provide at least one of --desktop-url or --esp32-url")
+    if not all(math.isfinite(value) and value > 0 for value in (args.timeout, args.reconnect_timeout)):
+        parser.error("timeouts must be positive and finite")
+    if args.device_id < 0:
+        parser.error("--device-id must be nonnegative")
+    if args.snapshot_path and args.desktop_url and args.esp32_url:
+        parser.error("--snapshot-path requires exactly one target")
+    if args.destructive_profile == "full":
+        args.allow_destructive = args.allow_audio = True
+        args.manual_audio = True
+        args.require_strict_snapshot = args.restore_on_exit = True
+    if args.manual_audio:
+        args.allow_audio = True
+    if (args.allow_destructive or args.require_strict_snapshot or args.manual_reconnect
+            or args.manual_device_console or args.snapshot_path):
+        args.restore_on_exit = True
     return args
 
 
@@ -472,6 +574,8 @@ def http_json(
 
 
 async def ws_receive_one(url: str, *, send: str | bytes | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
+    import websockets
+
     async with websockets.connect(url, open_timeout=timeout, ping_interval=None, close_timeout=timeout) as ws:
         if send is not None:
             await ws.send(send)
@@ -485,6 +589,8 @@ async def ws_receive_many(
     timeout: float = DEFAULT_TIMEOUT,
     count: int = 2,
 ) -> list[Any]:
+    import websockets
+
     async with websockets.connect(url, open_timeout=timeout, ping_interval=None, close_timeout=timeout) as ws:
         for item in sends:
             await ws.send(item)
@@ -744,19 +850,6 @@ def json_dump(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def snapshot_cli_prefix(target: Target) -> list[str]:
-    assert target.cli_bin is not None
-    if target.cli_transport:
-        return [str(target.cli_bin), *shlex.split(target.cli_transport)]
-    return [
-        str(target.cli_bin),
-        "--daemon-url",
-        target.base_url,
-        "--device-index",
-        str(target.device_id),
-    ]
-
-
 def create_snapshot_artifacts(run_dir: Path, target: Target) -> SnapshotArtifacts:
     root = run_dir / target.label
     root.mkdir(parents=True, exist_ok=True)
@@ -789,42 +882,85 @@ def compare_snapshot_documents(expected: dict[str, Any], actual: dict[str, Any])
     return mismatches
 
 
+def snapshot_identity(snapshot: dict[str, Any]) -> tuple[int, int, int]:
+    device = snapshot.get("device", {})
+    values = tuple(device.get(key) for key in ("serial", "hwId", "dspVersion"))
+    if not all(type(value) is int for value in values) or values[0] <= 0:
+        raise SafetyStop("snapshot has no usable device identity")
+    return values
+
+
+def verify_target_identity(target: Target, snapshot: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    # /devices is ordered by device index; fail closed if the requested slot is absent.
+    resp, devices = http_json("GET", target.path("/devices"), timeout=timeout)
+    assert_true(resp.status == 200 and isinstance(devices, list), "cannot read device identity")
+    assert_true(0 <= target.device_id < len(devices), "target device index is absent")
+    version = devices[target.device_id].get("version", {})
+    actual = tuple(version.get(key) for key in ("serial", "hw_id", "dsp_version"))
+    if actual != snapshot_identity(snapshot):
+        raise SafetyStop(f"{target.label}: device identity mismatch; refusing all further writes")
+
+
+def validate_strict_snapshot(snapshot: Any) -> None:
+    assert_true(isinstance(snapshot, dict) and snapshot.get("formatVersion") == 1, "unsupported snapshot format")
+    assert_true(snapshot.get("completeness", {}).get("strict") is True, "strict snapshot incomplete or unsupported")
+    snapshot_identity(snapshot)
+    presets = snapshot.get("presets", [])
+    count = snapshot["device"].get("presetCount", 0)
+    assert_true(type(count) is int and count > 0 and len(presets) == count, "snapshot missing preset payloads")
+    assert_true({p.get("slot") for p in presets} == set(range(count)), "snapshot preset slots incomplete")
+    assert_true(all(p.get("complete") is True and p.get("completeness", {}).get("strict") is True
+                    and isinstance(p.get("shadow"), dict) for p in presets), "snapshot contains unrestorable presets")
+
+
+def export_snapshot(target: Target, path: Path) -> dict[str, Any]:
+    resp, snapshot = http_json("GET", target.path(f"/devices/{target.device_id}/snapshot"), timeout=300.0)
+    json_dump(path, snapshot)
+    assert_true(resp.status == 200, f"strict snapshot export returned {resp.status}")
+    validate_strict_snapshot(snapshot)
+    return snapshot
+
+
+def assert_snapshot_equal(expected: dict[str, Any], actual: dict[str, Any]) -> None:
+    validate_strict_snapshot(actual)
+    if snapshot_identity(expected) != snapshot_identity(actual):
+        raise SafetyStop("snapshot device identity mismatch")
+    mismatches = compare_snapshot_documents(normalize_snapshot(expected), normalize_snapshot(actual))
+    assert_true(not mismatches, f"snapshot did not match baseline (top-level mismatches: {', '.join(mismatches[:8])})")
+
+
 def start_destructive_snapshot_guard(
     harness: Harness,
     target: Target,
     run_dir: Path | None,
 ) -> SnapshotArtifacts | None:
-    if not harness.args.allow_destructive or target.kind != "desktop":
+    if not harness.args.restore_on_exit:
         return None
     section = f"{target.label}-snapshot"
-    if target.cli_bin is None:
-        harness.skip(section, "snapshot guard", "CLI binary unavailable")
-        return None
     assert run_dir is not None
-    ensure_cli_available(target.cli_bin)
     artifacts = create_snapshot_artifacts(run_dir, target)
 
     def export_baseline_step() -> str:
-        run_command(
-            [
-                *snapshot_cli_prefix(target),
-                "snapshot",
-                "export",
-                str(artifacts.snapshot_before),
-            ],
-            cwd=ROOT,
-            timeout=max(120.0, harness.args.timeout),
-        )
-        return str(artifacts.snapshot_before.relative_to(ROOT))
+        resp, playback = http_json("GET", target.path(f"/devices/{target.device_id}/play"))
+        assert_true(resp.status == 200 and isinstance(playback, dict) and playback.get("playing") is False,
+                    "cannot establish idle playback state")
+        snapshot = export_snapshot(target, artifacts.snapshot_before)
+        verify_target_identity(target, snapshot)
+        if harness.args.snapshot_path:
+            assert_true(not harness.args.snapshot_path.exists(), "--snapshot-path already exists; refusing to overwrite")
+            json_dump(harness.args.snapshot_path, snapshot)
+        return str(artifacts.snapshot_before)
 
-    harness.run_step(section, "strict snapshot baseline export", export_baseline_step)
+    harness.run_step(section, "strict snapshot baseline export", export_baseline_step, hard_stop=True)
 
     def capture_baseline_http_step() -> str:
         json_dump(artifacts.device_before, read_status(target))
         json_dump(artifacts.config_before, read_config(target))
-        return str(artifacts.root.relative_to(ROOT))
+        if target.kind == "esp32":
+            json_dump(artifacts.root / "ezbeq-before.json", read_ezbeq_devices(target))
+        return str(artifacts.root)
 
-    harness.run_step(section, "capture baseline HTTP state", capture_baseline_http_step)
+    harness.run_step(section, "capture baseline HTTP state", capture_baseline_http_step, hard_stop=True)
     return artifacts
 
 
@@ -837,72 +973,56 @@ def finish_destructive_snapshot_guard(
         return
     section = f"{target.label}-snapshot"
 
-    restore_ok = harness.run_step(
+    harness.run_step(
         section,
         "snapshot restore",
         lambda: restore_snapshot(target, artifacts.snapshot_before, artifacts.restore_result),
         abort_on_fail=False,
+        hard_stop=True,
     )
 
-    if restore_ok:
-        harness.run_step(
-            section,
-            "post-restore snapshot verify",
-            lambda: verify_snapshot_restore(target, artifacts),
-            abort_on_fail=False,
-        )
-        harness.run_step(
-            section,
-            "capture post-restore HTTP state",
-            lambda: capture_post_restore_http_state(target, artifacts),
-            abort_on_fail=False,
-        )
+    harness.run_step(
+        section,
+        "post-restore snapshot verify",
+        lambda: verify_snapshot_restore(target, artifacts),
+        abort_on_fail=False,
+        hard_stop=True,
+    )
+    harness.run_step(
+        section,
+        "capture post-restore HTTP state",
+        lambda: capture_post_restore_http_state(target, artifacts),
+        abort_on_fail=False,
+        hard_stop=True,
+    )
 
 
 def restore_snapshot(target: Target, snapshot_path: Path, restore_result_path: Path) -> str:
-    proc = run_command(
-        [
-            *snapshot_cli_prefix(target),
-            "snapshot",
-            "import",
-            str(snapshot_path),
-        ],
-        cwd=ROOT,
-        timeout=300.0,
-    )
-    detail = (proc.stdout.strip() or proc.stderr.strip() or "restored snapshot").splitlines()[-1]
-    json_dump(
-        restore_result_path,
-        {
-            "restored": True,
-            "snapshot": str(snapshot_path),
-            "detail": detail,
-        },
-    )
-    return detail
+    try:
+        snapshot = json.loads(snapshot_path.read_text())
+        validate_strict_snapshot(snapshot)
+        verify_target_identity(target, snapshot)
+        resp, verified = http_json("POST", target.path(f"/devices/{target.device_id}/snapshot"), snapshot, timeout=300.0)
+        assert_true(resp.status == 200, f"snapshot restore returned {resp.status}")
+        assert_snapshot_equal(snapshot, verified)
+    except Exception as exc:
+        json_dump(restore_result_path, {"restored": False, "snapshot": str(snapshot_path), "detail": str(exc)})
+        raise
+    json_dump(restore_result_path, {"restored": True, "snapshot": str(snapshot_path), "equalWithoutMetadata": True})
+    return "restored snapshot and verified baseline equality"
 
 
 def verify_snapshot_restore(target: Target, artifacts: SnapshotArtifacts) -> str:
-    run_command(
-        [
-            *snapshot_cli_prefix(target),
-            "snapshot",
-            "export",
-            str(artifacts.snapshot_after),
-        ],
-        cwd=ROOT,
-        timeout=max(120.0, DEFAULT_TIMEOUT),
-    )
-    before = normalize_snapshot(json.loads(artifacts.snapshot_before.read_text()))
-    after = normalize_snapshot(json.loads(artifacts.snapshot_after.read_text()))
-    if before != after:
-        mismatches = compare_snapshot_documents(before, after)
-        raise StepFailed(
-            "post-restore snapshot did not match the baseline"
-            + (f" (top-level mismatches: {', '.join(mismatches[:8])})" if mismatches else "")
-        )
-
     restore_data = json.loads(artifacts.restore_result.read_text())
+    try:
+        before = json.loads(artifacts.snapshot_before.read_text())
+        verify_target_identity(target, before)
+        after = export_snapshot(target, artifacts.snapshot_after)
+        assert_snapshot_equal(before, after)
+    except Exception as exc:
+        restore_data.update({"restored": False, "equalWithoutMetadata": False, "detail": str(exc)})
+        json_dump(artifacts.restore_result, restore_data)
+        raise
     restore_data["equalWithoutMetadata"] = True
     restore_data["snapshotAfter"] = str(artifacts.snapshot_after)
     json_dump(artifacts.restore_result, restore_data)
@@ -912,7 +1032,14 @@ def verify_snapshot_restore(target: Target, artifacts: SnapshotArtifacts) -> str
 def capture_post_restore_http_state(target: Target, artifacts: SnapshotArtifacts) -> str:
     json_dump(artifacts.device_after, read_status(target))
     json_dump(artifacts.config_after, read_config(target))
-    return str(artifacts.root.relative_to(ROOT))
+    if target.kind == "esp32":
+        ezbeq = read_ezbeq_devices(target)
+        json_dump(artifacts.root / "ezbeq-after.json", ezbeq)
+        # Levels are transient; slot metadata is the state the operator sees.
+        before = json.loads((artifacts.root / "ezbeq-before.json").read_text())
+        assert_true(ezbeq_slots_from_document(before, context="baseline") == ezbeq_slots_from_document(ezbeq, context="restored"),
+                    "ezBEQ slot metadata did not return to baseline")
+    return str(artifacts.root)
 
 
 def wait_for_playback_completion(play_result: dict[str, Any], *, padding_sec: float = 0.5) -> None:
@@ -1183,25 +1310,82 @@ def run_common_http_suite(harness: Harness, target: Target) -> None:
         harness.skip(section, "negative HTTP paths", "ESP32-focused negative checks skipped for desktop target")
 
 
+def wait_for_idle_playback(target: Target, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp, state = http_json("GET", target.path(f"/devices/{target.device_id}/play"),
+                                timeout=min(5.0, max(0.01, deadline - time.monotonic())))
+        if resp.status == 200 and isinstance(state, dict) and state.get("playing") is False:
+            return
+        time.sleep(0.1)
+    raise SafetyStop("playback did not become idle; refusing to restore listening volume")
+
+
+@contextlib.contextmanager
+def safe_test_volume(harness: Harness, target: Target) -> Iterable[None]:
+    harness.confirm(target, "audible playback at -35 dB")
+    if target.label in harness.baselines:
+        verify_target_identity(target, harness.baselines[target.label])
+    devices = read_devices(target)
+    assert_true(0 <= target.device_id < len(devices), "audio target device index absent")
+    version = devices[target.device_id]["version"]
+    identity = {"device": {"serial": version["serial"], "hwId": version["hw_id"], "dspVersion": version["dsp_version"]}}
+    harness.baselines.setdefault(target.label, identity)
+    wait_for_idle_playback(target, harness.args.reconnect_timeout)
+    original = float(read_status(target)["master"]["volume"])
+    try:
+        resp, _ = http_json("POST", target.path(f"/devices/{target.device_id}"), {"volume": -35.0})
+        assert_true(resp.status == 200, f"setting -35 dB test volume returned {resp.status}")
+        approx_equal(float(read_status(target)["master"]["volume"]), -35.0, tolerance=0.01)
+        yield
+    finally:
+        wait_for_idle_playback(target, harness.args.reconnect_timeout)
+        verify_target_identity(target, identity)
+        resp, _ = http_json("POST", target.path(f"/devices/{target.device_id}"), {"volume": original})
+        if resp.status != 200:
+            raise SafetyStop(f"listening-volume restore returned {resp.status}")
+        try:
+            approx_equal(float(read_status(target)["master"]["volume"]), original, tolerance=0.01)
+        except StepFailed as exc:
+            raise SafetyStop(f"listening-volume restore failed: {exc}") from exc
+
+
+def audio_request(harness: Harness, target: Target, path: str, payload: Any) -> tuple[HttpResponse, Any]:
+    # Recheck for every pass, including after an operator checkpoint.
+    verify_target_identity(target, harness.baselines[target.label])
+    wait_for_idle_playback(target, harness.args.reconnect_timeout)
+    resp, _ = http_json("POST", target.path(f"/devices/{target.device_id}"), {"volume": -35.0})
+    if resp.status != 200:
+        raise SafetyStop(f"setting -35 dB before playback returned {resp.status}")
+    try:
+        approx_equal(float(read_status(target)["master"]["volume"]), -35.0, tolerance=0.01)
+    except StepFailed as exc:
+        raise SafetyStop(f"test volume verification failed: {exc}") from exc
+    print(f"{target.label}: test volume verified at -35 dB; audio will play now.", flush=True)
+    return http_json("POST", target.path(path), payload, timeout=max(10.0, harness.args.timeout))
+
+
 def run_playback_suite(harness: Harness, target: Target) -> None:
     if not harness.args.allow_audio:
         harness.skip(f"{target.label}-playback", "playback suite", "--allow-audio not set")
         return
+    with safe_test_volume(harness, target):
+        run_audio_steps(harness, target)
 
+
+def run_audio_steps(harness: Harness, target: Target) -> None:
     section = f"{target.label}-playback"
 
     def sweep_only_step() -> str:
         _, before = http_json("POST", target.path("/sync"), {"clientTimeUs": 1})
-        resp, data = http_json(
-            "POST",
-            target.path(f"/devices/{target.device_id}/play"),
+        resp, data = audio_request(
+            harness, target, f"/devices/{target.device_id}/play",
             {
                 "markerBefore": False,
                 "markerAfter": False,
                 "sweepDurationSec": 1.0,
                 "decaySec": 0.25,
             },
-            timeout=max(10.0, harness.args.timeout),
         )
         _, after = http_json("POST", target.path("/sync"), {"clientTimeUs": 2})
         assert_true(resp.status == 200 and isinstance(data, dict), f"{target.label}: /play sweep-only returned {resp.status}")
@@ -1211,30 +1395,35 @@ def run_playback_suite(harness: Harness, target: Target) -> None:
         wait_for_playback_completion(data)
         return f"startedAtUs={data['startedAtUs']} totalSamples={data['totalSamples']}"
 
-    harness.run_step(section, "sweep-only /play", sweep_only_step)
+    if harness.run_step(section, "sweep-only /play", sweep_only_step) and harness.args.manual_audio:
+        harness.checkpoint(target, "audio-sweep", "Sweep-only approved?")
 
     def marker_test_step() -> str:
-        resp, data = http_json(
-            "POST",
-            target.path(f"/devices/{target.device_id}/play?test=marker"),
+        resp, data = audio_request(
+            harness, target, f"/devices/{target.device_id}/play?test=marker",
             {},
-            timeout=max(10.0, harness.args.timeout),
         )
         assert_true(resp.status == 200 and isinstance(data, dict), f"{target.label}: marker test returned {resp.status}")
         assert_true(int(data.get("toneBurstOffsetSamples", -1)) == 0, f"{target.label}: marker test expected toneBurstOffsetSamples=0")
         wait_for_playback_completion(data)
         return f"sampleRate={data['sampleRate']} totalSamples={data['totalSamples']}"
 
-    harness.run_step(section, "?test=marker", marker_test_step)
+    if harness.run_step(section, "?test=marker", marker_test_step) and harness.args.manual_audio:
+        harness.checkpoint(target, "audio-marker", "Marker-only approved?")
+
+    def combined_step() -> str:
+        resp, data = audio_request(harness, target, f"/devices/{target.device_id}/play",
+                                  {"markerBefore": True, "markerAfter": True, "sweepDurationSec": 1.0, "decaySec": 0.25})
+        assert_true(resp.status == 200 and isinstance(data, dict), f"combined playback returned {resp.status}")
+        assert_true(int(data.get("sweepOffsetSamples", -1)) > 0, "combined playback missing marker offset")
+        wait_for_playback_completion(data)
+        return "combined marker + sweep completed"
+
+    if harness.run_step(section, "combined marker + sweep /play", combined_step) and harness.args.manual_audio:
+        harness.checkpoint(target, "audio-combined", "Combined marker + sweep approved?")
 
     def legacy_field_negative_step() -> str:
-        resp = http_request(
-            "POST",
-            target.path(f"/devices/{target.device_id}/play"),
-            body=json.dumps({"tailToneBurst": {}}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            timeout=max(10.0, harness.args.timeout),
-        )
+        resp, _ = audio_request(harness, target, f"/devices/{target.device_id}/play", {"tailToneBurst": {}})
         assert_true(resp.status == 400, f"{target.label}: legacy playback field expected 400, got {resp.status}")
         return "legacy fields rejected"
 
@@ -1242,17 +1431,16 @@ def run_playback_suite(harness: Harness, target: Target) -> None:
 
     if target.kind == "esp32":
         def playback_busy_step() -> str:
-            _, play_data = http_json(
-                "POST",
-                target.path(f"/devices/{target.device_id}/play"),
+            play_resp, play_data = audio_request(
+                harness, target, f"/devices/{target.device_id}/play",
                 {
                     "markerBefore": False,
                     "markerAfter": False,
                     "sweepDurationSec": 4.0,
                     "decaySec": 1.0,
                 },
-                timeout=max(10.0, harness.args.timeout),
             )
+            assert_true(play_resp.status == 200, f"busy-test playback returned {play_resp.status}")
             deadline = time.time() + 2.0
             status_code = None
             devices_code = None
@@ -1832,15 +2020,147 @@ def build_targets(args: argparse.Namespace) -> list[Target]:
     return targets
 
 
+def assert_snapshot_busy(harness: Harness, target: Target, artifacts: SnapshotArtifacts, method: str) -> str:
+    baseline = json.loads(artifacts.snapshot_before.read_text())
+    verify_target_identity(target, baseline)
+    current = read_status(target)["master"]
+    config = read_config(target)
+    result: dict[str, Any] = {}
+    mutations_observed: list[dict[str, Any]] = []
+    busy_observed = False
+    started = threading.Event()
+
+    def snapshot_worker() -> None:
+        started.set()
+        try:
+            result["response"], result["snapshot"] = http_json(
+                method, target.path(f"/devices/{target.device_id}/snapshot"),
+                baseline if method == "POST" else None, timeout=300.0)
+        except Exception as exc:
+            result["error"] = exc
+
+    worker = threading.Thread(target=snapshot_worker, daemon=True)
+    worker.start()
+    started.wait(harness.args.timeout)
+    try:
+        deadline = time.monotonic() + harness.args.timeout
+        while worker.is_alive() and time.monotonic() < deadline:
+            probe = http_request("GET", target.path(f"/devices/{target.device_id}"), timeout=harness.args.timeout)
+            if probe.status == 409:
+                busy_observed = True
+                break
+            time.sleep(0.01)
+        else:
+            raise StepFailed("snapshot busy window not observed; concurrency coverage is unproven")
+        # Same-value writes minimize damage if a broken guard admits a mutation.
+        mutations = [
+            (f"/devices/{target.device_id}", {"volume": current["volume"]}),
+            (f"/devices/{target.device_id}/config", {"outputs": [{"index": config["outputs"][0]["index"],
+                                                                      "gain": config["outputs"][0]["gain"]}]}),
+        ]
+        for path, payload in mutations:
+            resp, _ = http_json("POST", target.path(path), payload, timeout=harness.args.timeout)
+            mutations_observed.append({"path": path, "status": resp.status})
+            assert_true(resp.status == 409, f"concurrent mutation {path} expected 409, got {resp.status}")
+    finally:
+        worker.join(timeout=305.0)
+        json_dump(artifacts.root / f"snapshot-busy-{method.lower()}.json",
+                  {"status": result["response"].status if "response" in result else None,
+                   "snapshot": result.get("snapshot"), "error": str(result.get("error", "")),
+                   "busyObserved": busy_observed, "mutations": mutations_observed, "timedOut": worker.is_alive()})
+        if worker.is_alive():
+            raise SafetyStop("snapshot request exceeded its timeout; operation state is unknown")
+    if "error" in result:
+        raise StepFailed(f"snapshot request failed: {result['error']}")
+    assert_true(result["response"].status == 200, f"snapshot {method} returned {result['response'].status}")
+    assert_snapshot_equal(baseline, result["snapshot"])
+    return "master and config mutations both returned 409 inside observed snapshot busy window"
+
+
+def wait_for_reconnect(target: Target, baseline: dict[str, Any], timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    stable_reads = 0
+    last_error = "no successful status read"
+    while time.monotonic() < deadline:
+        try:
+            remaining = max(0.01, deadline - time.monotonic())
+            verify_target_identity(target, baseline, timeout=min(5.0, remaining))
+            resp, status = http_json("GET", target.path(f"/devices/{target.device_id}"),
+                                     timeout=min(5.0, max(0.01, deadline - time.monotonic())))
+            assert_true(resp.status == 200 and isinstance(status, dict) and isinstance(status.get("master"), dict),
+                        f"reconnect status returned {resp.status}")
+            stable_reads += 1
+            if stable_reads >= 2 and time.monotonic() <= deadline:
+                return "same device identity and two consecutive live status reads"
+        except SafetyStop:
+            raise
+        except (StepFailed, OSError) as exc:
+            last_error = str(exc)
+            stable_reads = 0
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    raise SafetyStop(f"{target.label}: reconnect timed out after {timeout}s ({last_error})")
+
+
+def run_recovery_suite(harness: Harness, target: Target, artifacts: SnapshotArtifacts) -> None:
+    section = f"{target.label}-recovery"
+    baseline = json.loads(artifacts.snapshot_before.read_text())
+
+    def restore_baseline() -> str:
+        restore_snapshot(target, artifacts.snapshot_before, artifacts.restore_result)
+        return verify_snapshot_restore(target, artifacts)
+
+    # Start recovery coverage from the exact saved state, not earlier mutation state.
+    harness.run_step(section, "restore baseline before recovery", restore_baseline, hard_stop=True)
+    if harness.args.destructive_profile == "full":
+        count = baseline["device"]["presetCount"]
+        slot = (baseline["master"]["activePreset"] + 1) % count
+        routes = ["preset/reset", f"preset/{slot}/reset", "preset/reset-all", "reboot"]
+        for route in routes:
+            def recovery_step(route: str = route) -> str:
+                verify_target_identity(target, baseline)
+                harness.confirm(target, f"POST /devices/{target.device_id}/{route}")
+                resp, _ = http_json("POST", target.path(f"/devices/{target.device_id}/{route}"), timeout=300.0)
+                assert_true(resp.status == 200, f"{route} returned {resp.status}")
+                wait_for_reconnect(target, baseline, harness.args.reconnect_timeout)
+                if route == "reboot":
+                    recovered = export_snapshot(target, artifacts.root / "snapshot-after-reboot.json")
+                    assert_snapshot_equal(baseline, recovered)
+                else:
+                    export_snapshot(target, artifacts.root / f"snapshot-after-{route.replace('/', '-')}.json")
+                restore_baseline()
+                return "reconnected with same identity; strict snapshot checked and baseline restored"
+            harness.run_step(section, route, recovery_step, hard_stop=True)
+    if harness.args.manual_reconnect:
+        if not harness.args.ci and (sys.stdin.isatty() and not harness.args.non_interactive or
+                                   f"{target.label}.reconnect" in harness.manual_answers):
+            harness.confirm(target, "physical unplug/replug or power cycle")
+        answer = harness.checkpoint(target, "reconnect", "Unplug/replug or power-cycle the MiniDSP, then confirm reconnect timing and sanity (include elapsed time in note).")
+        if answer == "pass":
+            def physical_recovery() -> str:
+                wait_for_reconnect(target, baseline, harness.args.reconnect_timeout)
+                snapshot = export_snapshot(target, artifacts.root / "snapshot-after-manual-reconnect.json")
+                assert_snapshot_equal(baseline, snapshot)
+                return "physical recovery identity and baseline snapshot match"
+            harness.run_step(section, "physical reconnect verification", physical_recovery, hard_stop=True)
+
+
 def run_target_suite(harness: Harness, target: Target, run_dir: Path | None) -> None:
     guard = None
     deferred_exit: SystemExit | None = None
     try:
         guard = start_destructive_snapshot_guard(harness, target, run_dir)
-        run_common_http_suite(harness, target)
-        run_transport_suite(harness, target)
-        run_cli_suite(harness, target)
-        run_playback_suite(harness, target)
+        if guard:
+            harness.baselines[target.label] = json.loads(guard.snapshot_before.read_text())
+            # Prove the baseline can be restored before enabling destructive groups.
+            finish_destructive_snapshot_guard(harness, target, guard)
+            if harness.args.destructive_profile == "full":
+                for method in ("GET", "POST"):
+                    harness.run_step(f"{target.label}-snapshot", f"{method} snapshot concurrent mutations",
+                                     lambda method=method: assert_snapshot_busy(harness, target, guard, method), hard_stop=True)
+        for suite in (run_common_http_suite, run_transport_suite, run_cli_suite, run_playback_suite):
+            if guard:
+                verify_target_identity(target, json.loads(guard.snapshot_before.read_text()))
+            suite(harness, target)
         if target.kind == "esp32":
             run_ezbeq_suite(harness, target)
             run_esp32_specific_suite(harness, target)
@@ -1848,39 +2168,93 @@ def run_target_suite(harness: Harness, target: Target, run_dir: Path | None) -> 
             harness.skip(f"{target.label}-ezbeq", "embedded ezBEQ suite", "embedded ezBEQ routes are ESP32-only")
         if harness.args.run_upstream_ezbeq:
             run_upstream_ezbeq_suite(harness, target)
+        if guard and (harness.args.destructive_profile == "full" or harness.args.manual_reconnect):
+            run_recovery_suite(harness, target, guard)
+        if harness.args.manual_device_console:
+            harness.checkpoint(target, "device-console", "Device Console discovers/connects, basic controls work, and no initialize/disconnect prompt regression? Close it before continuing.")
     except SystemExit as exc:
         deferred_exit = exc
     finally:
+        if guard:
+            harness.run_step(f"{target.label}-snapshot", "idle before final restore",
+                             lambda: wait_for_idle_playback(target, harness.args.reconnect_timeout), hard_stop=True)
         finish_destructive_snapshot_guard(harness, target, guard)
         if deferred_exit is not None:
             raise deferred_exit
 
 
+def plan_lines(args: argparse.Namespace) -> list[str]:
+    lines = ["Plan only: no target I/O, CLI, builds, prompts or artifact writes."]
+    if not args.skip_static:
+        lines.append("static: repo checks / CLI and ESP32 builds / catalogue build")
+    for target in build_targets(args):
+        lines.append(f"{target.label}: {target.base_url} device index {target.device_id}")
+        if args.restore_on_exit:
+            lines += ["  preflight: idle playback / strict complete snapshot / device identity / baseline HTTP state",
+                      "  hard stop: failed capture, unsupported strict snapshot, identity mismatch or failed restore/equality",
+                      "  preflight: import baseline, re-export and compare before mutations"]
+        if args.destructive_profile == "full":
+            lines.append("  snapshot GET and POST: concurrent master/config mutations must return 409")
+        lines += ["  HTTP control/config/measurement-mode compatibility (with local restores)",
+                  "  raw WebSocket / TCP / CLI flags, URLs and environment compatibility"]
+        if args.allow_destructive:
+            lines.append("  destructive: preset copy / ESP32 ezBEQ overwrite")
+        if args.allow_audio:
+            lines += ["  confirm audio (interactive YES or --yes-i-know)",
+                      "  audio: set and verify -35 dB / announce / sweep-only / marker-only / combined / legacy rejection / ESP32 busy",
+                      "  audio: wait until idle, restore and verify previous listening volume"]
+        if target.kind == "esp32":
+            lines.append("  embedded ezBEQ REST/WS / hosted bundle / updater compatibility")
+        if args.run_upstream_ezbeq:
+            lines.append("  optional spawned upstream ezBEQ interoperability")
+        if args.destructive_profile == "full":
+            lines += ["  restore baseline before recovery",
+                      "  confirm each reset/reboot (interactive YES or --yes-i-know)",
+                      "  reset active preset / reset alternate preset / reset-all (reboots) / reboot",
+                      "  after each: bounded stable reconnect / identity / strict snapshot / baseline restore and equality"]
+        for enabled, name in [(args.manual_audio, "audio-sweep / audio-marker / audio-combined"),
+                              (args.manual_reconnect, "reconnect (physical recovery plus identity/snapshot check)"),
+                              (args.manual_device_console, "device-console")]:
+            if enabled:
+                lines.append(f"  manual JSON checkpoints: {name} (CI skips; otherwise prompt or answer file)")
+        if args.restore_on_exit:
+            lines.append("  finally: idle / identity / snapshot import / strict snapshot equality / HTTP and ezBEQ state / durable reports")
+        if target.kind == "desktop":
+            lines.append("  separate required hardware lane: direct-USB CLI snapshot round-trip with daemon stopped")
+    return lines
+
+
 def main() -> int:
     args = parse_args()
+    if args.plan:
+        print("\n".join(plan_lines(args)))
+        return 0
     harness = Harness(args)
-    run_dir = prepare_run_artifact_dir(args.artifact_root) if args.allow_destructive else None
+    run_dir = prepare_run_artifact_dir(args.artifact_root) if (args.restore_on_exit or args.allow_audio or
+              args.manual_device_console or args.manual_reconnect) else None
+    harness.run_dir = run_dir
 
-    if not args.skip_static:
-        run_static_checks(harness, args)
-    else:
-        harness.skip("static", "static repo checks", "--skip-static set")
-
-    for target in build_targets(args):
-        run_target_suite(harness, target, run_dir)
-
-    summary = "\n".join(harness.summary_lines())
-    print(summary)
-    if args.report:
-        harness.write_report(args.report)
-        print(f"Report written to {args.report}")
-    if run_dir is not None:
-        markdown_report = run_dir / "report.md"
-        json_report = run_dir / "report.json"
-        harness.write_report(markdown_report)
-        harness.write_json_report(json_report)
-        print(f"Artifact report written to {markdown_report}")
-        print(f"Artifact JSON written to {json_report}")
+    try:
+        if not args.skip_static:
+            run_static_checks(harness, args)
+        else:
+            harness.skip("static", "static repo checks", "--skip-static set")
+        for target in build_targets(args):
+            run_target_suite(harness, target, run_dir)
+    except (Exception, SystemExit, KeyboardInterrupt) as exc:
+        if not harness.results or harness.results[-1].status != "FAIL":
+            harness.results.append(StepResult("safety", "run aborted", "FAIL", 0.0, str(exc) or type(exc).__name__))
+            harness.failures += 1
+        print(f"Run stopped: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        print("\n".join(harness.summary_lines()))
+        if args.report:
+            harness.write_report(args.report)
+        if run_dir is not None:
+            harness.write_report(run_dir / "report.md")
+            harness.write_json_report(run_dir / "report.json")
+            print(f"Artifact reports written to {run_dir}")
     return 1 if harness.failures else 0
 
 

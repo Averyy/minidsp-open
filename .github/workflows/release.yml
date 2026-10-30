@@ -13,6 +13,8 @@ env:
   # crashes LLVM on this code ("Cannot select: XtensaISD::PCREL_WRAPPER");
   # move these only after a local release build passes on the new version.
   ESPUP_VERSION: v0.16.0
+  # GitHub release asset digest: esp-rs/espup v0.16.0, Linux x86_64 (uncompressed).
+  ESPUP_SHA256: 3f7522db440c84e2ff04cfd08c1822f9186c7ee285792591017cd69cf9701766
   XTENSA_RUST_VERSION: 1.93.0.0
   CARGO_TERM_COLOR: always
 
@@ -26,7 +28,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Check release versions
@@ -57,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Install ESP-IDF build prerequisites
@@ -66,7 +68,7 @@ jobs:
           # ESP-IDF 6.0 needs Python >= 3.10 and CMake >= 3.22.1; ubuntu-latest meets both.
           sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev cmake ninja-build python3 python3-venv libclang-dev
       - name: Cache Xtensa toolchain, ESP-IDF, and Cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.espressif
@@ -83,6 +85,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           curl --fail --location --retry 3 https://github.com/esp-rs/espup/releases/download/${ESPUP_VERSION}/espup-x86_64-unknown-linux-gnu -o "$RUNNER_TEMP/espup"
+          echo "${ESPUP_SHA256}  $RUNNER_TEMP/espup" | sha256sum --check --strict
           chmod +x "$RUNNER_TEMP/espup"
           # --std leaves the matching Xtensa GCC (15.1 for IDF 6.0) to esp-idf-sys.
           "$RUNNER_TEMP/espup" install --targets esp32s3 --name esp --std --toolchain-version "$XTENSA_RUST_VERSION"
@@ -93,14 +96,14 @@ jobs:
           MINIDSP_BUILD_REV: v${{ needs.version.outputs.version }}
         run: |
           tools/esp-cargo build --release
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Package firmware and device manifest
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           uv run --python 3.12 --with esptool==5.6.0 tools/release-firmware-manifest.py \
             --version "$VERSION" --build-dir app-esp32/target/xtensa-esp32s3-espidf/release
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: firmware
           path: dist/*
@@ -127,7 +130,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Install Linux dependencies
@@ -142,7 +145,7 @@ jobs:
           rustup update stable --no-self-update
           rustup default stable
           rustup target add "$TARGET"
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -171,7 +174,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path "target/$env:TARGET/release/minidsp.exe" -DestinationPath "dist/minidsp-$env:VERSION-$env:TARGET.zip"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: desktop-${{ matrix.target }}
           path: dist/*
@@ -181,7 +184,7 @@ jobs:
     needs: [esp32, desktop]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           path: dist
           merge-multiple: true
@@ -192,7 +195,7 @@ jobs:
           mapfile -t assets < <(find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
           sha256sum "${assets[@]}" > SHA256SUMS
           sha256sum --check SHA256SUMS
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-assets
           path: dist/*
@@ -205,11 +208,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: release-assets
           path: dist
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
           fail_on_unmatched_files: true

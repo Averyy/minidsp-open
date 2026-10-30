@@ -16,7 +16,7 @@ use esp_idf_svc::sys;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -445,7 +445,7 @@ fn fetch_release_manifest() -> Result<ReleaseManifest, String> {
 }
 
 /// Ask GitHub for the latest release and record the answer for `status()`.
-pub fn check_for_update() -> ReleaseCheck {
+fn check_for_update() -> ReleaseCheck {
     let checked_at_uptime_sec = uptime_sec();
     let check = match fetch_release_manifest() {
         Ok(manifest) => {
@@ -552,19 +552,69 @@ fn install_latest_release_claimed() -> Result<String, OtaError> {
     Ok(manifest.version)
 }
 
-/// Daily release check; installs nothing on its own.
-pub fn start_background_checker() -> Result<(), std::io::Error> {
-    std::thread::Builder::new()
-        .name("fw_check".into())
-        .stack_size(12 * 1024)
-        .spawn(|| {
-            std::thread::sleep(FIRST_CHECK_DELAY);
-            loop {
-                check_for_update();
-                std::thread::sleep(CHECK_INTERVAL);
+const CHECK_COOLDOWN: Duration = Duration::from_secs(30);
+static CHECK_WORKER: crate::threads::Worker =
+    crate::threads::Worker::new(c"fw_check", "fw_check", 12 * 1024);
+static CHECK_WAKE: Condvar = Condvar::new();
+static CHECK_STATE: Mutex<CheckState> = Mutex::new(CheckState {
+    started: false,
+    pending: false,
+    last_finished: None,
+});
+
+struct CheckState {
+    started: bool,
+    pending: bool,
+    last_finished: Option<Instant>,
+}
+
+/// Queue at most one manual check on the permanent checker. The cooldown also
+/// covers failed network attempts, so bursts cannot exhaust tasks or sockets.
+pub fn request_check() -> Result<(), &'static str> {
+    start_background_checker().map_err(|_| "firmware checker unavailable")?;
+    let mut state = CHECK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.pending {
+        return Err("check in progress");
+    }
+    if state
+        .last_finished
+        .is_some_and(|t| t.elapsed() < CHECK_COOLDOWN)
+    {
+        return Err("check cooldown; retry after 30 seconds");
+    }
+    state.pending = true;
+    CHECK_WAKE.notify_one();
+    Ok(())
+}
+
+/// Daily release check and manual triggers share one persistent PSRAM worker.
+pub fn start_background_checker() -> Result<(), String> {
+    let mut state = CHECK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.started {
+        return Ok(());
+    }
+    CHECK_WORKER.run(|| {
+        let mut next_check = Instant::now() + FIRST_CHECK_DELAY;
+        loop {
+            let mut state = CHECK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            while !state.pending && Instant::now() < next_check {
+                let wait = next_check.saturating_duration_since(Instant::now());
+                state = CHECK_WAKE
+                    .wait_timeout(state, wait)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
             }
-        })
-        .map(|_| ())
+            state.pending = true;
+            drop(state);
+            check_for_update();
+            let mut state = CHECK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            state.pending = false;
+            state.last_finished = Some(Instant::now());
+            next_check = Instant::now() + CHECK_INTERVAL;
+        }
+    })?;
+    state.started = true;
+    Ok(())
 }
 
 /// Confirm a freshly updated image once it has proven it can be reached

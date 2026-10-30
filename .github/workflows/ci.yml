@@ -13,6 +13,8 @@ env:
   # crashes LLVM on this code ("Cannot select: XtensaISD::PCREL_WRAPPER");
   # move these only after a local release build passes on the new version.
   ESPUP_VERSION: v0.16.0
+  # GitHub release asset digest: esp-rs/espup v0.16.0, Linux x86_64 (uncompressed).
+  ESPUP_SHA256: 3f7522db440c84e2ff04cfd08c1822f9186c7ee285792591017cd69cf9701766
   XTENSA_RUST_VERSION: 1.93.0.0
   CARGO_TERM_COLOR: always
 
@@ -24,7 +26,7 @@ jobs:
   host:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Install system dependencies
@@ -33,7 +35,7 @@ jobs:
           sudo apt-get install -y libudev-dev libusb-1.0-0-dev libasound2-dev pkg-config
       - name: Install stable Rust
         run: rustup update stable --no-self-update && rustup default stable
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -48,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Install ESP-IDF build prerequisites
@@ -57,7 +59,7 @@ jobs:
           # ESP-IDF 6.0 needs Python >= 3.10 and CMake >= 3.22.1; ubuntu-latest meets both.
           sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev cmake ninja-build python3 python3-venv libclang-dev
       - name: Cache Xtensa toolchain, ESP-IDF, and Cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.espressif
@@ -74,6 +76,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           curl --fail --location --retry 3 https://github.com/esp-rs/espup/releases/download/${ESPUP_VERSION}/espup-x86_64-unknown-linux-gnu -o "$RUNNER_TEMP/espup"
+          echo "${ESPUP_SHA256}  $RUNNER_TEMP/espup" | sha256sum --check --strict
           chmod +x "$RUNNER_TEMP/espup"
           # --std leaves the matching Xtensa GCC (15.1 for IDF 6.0) to esp-idf-sys.
           "$RUNNER_TEMP/espup" install --targets esp32s3 --name esp --std --toolchain-version "$XTENSA_RUST_VERSION"

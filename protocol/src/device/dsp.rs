@@ -1,6 +1,6 @@
 //! DSP address tables for all device structures.
 //!
-//! All addresses from MiniDSP Device Console v2.10.6 DSP_default_parameters.xml.
+//! All addresses from the DSP_default_parameters.xml files in MiniDSP Device Console 1.2.3 (macOS bundle).
 //! Each address is a u16 index into DSP memory (4 bytes per index, float32 LE for new dialect).
 
 /// PEQ band addresses (5 contiguous addresses per band: b0, b1, b2, a1, a2).

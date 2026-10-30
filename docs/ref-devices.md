@@ -1,6 +1,6 @@
 # minidsp-open: Device Registry
 
-All data extracted from MiniDSP Device Console v2.10.6 (2026-03-29).
+All data extracted from MiniDSP Device Console's macOS bundle, version 1.2.3 per its `Info.plist` (extracted 2026-03-29).
 Sources:
 - `app/MiniDSP Device Console.app/Contents/Resources/device_support_package/` (primary — SHARC devices)
 - `app/apk-extracted/assets/www/js/controllers.js` (miniDSP Controller Android app — confirms source maps, adds legacy devices)

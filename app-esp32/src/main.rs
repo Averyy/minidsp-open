@@ -281,6 +281,7 @@ fn main() {
     }
 
     diagnostics::log_internal_heap("ready");
+    diagnostics::capture_boot_task_names();
     diagnostics::log_task_stacks();
     info!("minidsp-open ready");
 

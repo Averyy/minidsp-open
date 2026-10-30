@@ -16,6 +16,15 @@ Current planning note:
 - keep `/play` audio-quality investigation separate from routing/control verification so audible sweep bugs do not get misdiagnosed as HID/config bugs
 - when judging `/play` audio quality, use the current shared REW/MSO-style default (`5-400 Hz` hybrid sweep with `2 s` low-level dither pre-silence and `2 s` post-silence), not the retired `BRAP`-bundle default
 
+## Offline audit status
+
+The [source/host audit inventory](NOTES-compatibility-audit.md) lists all **55**
+items that were unchecked at audit start, including each item's disposition and
+upstream citations. Checks labelled offline or host do not add physical-device
+coverage. Real socket binds are unavailable in the audit sandbox; HTTP,
+WebSocket and bridge tests use in-memory duplex streams. The separate live
+Device Console, LAN, multi-device and ezBEQ process gates remain unchecked.
+
 ## Exit Criteria
 
 We are done when all of the following are true:
@@ -136,8 +145,11 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 ### 1.9 Closure for old MiniDSP todo
 
 - [ ] All former ESP32/MiniDSP investigation items are verified here.
+  Audit item 1: Open: finish the remaining physical/runtime gates before retiring this investigation.
 - [ ] Any remaining failure is narrower than “HID framing issue”.
+  Audit item 2: Open: live recovery, arbitration and audio checks remain individually scoped in PROGRESS.md.
 - [ ] No separate investigation todo is needed anymore.
+  Audit item 3: Open: keep the master checklist until the live gates close.
 
 ---
 
@@ -186,6 +198,7 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
   Verified on 2026-04-09 on the physical 2x4 HD:
   CLI `output 2 crossover set 0 ...` changed all four group-0 biquads on the live device, `GET /devices/0/config` read back the new coefficients immediately, and the original group was restored through `/config`.
 - [ ] compressor subcommand
+  Audit item 4: Open: upstream flag syntax is now parser-tested; audible retest needs loud material and a threshold that triggers compression.
   Updated 2026-04-09 official-app capture finding: Device Console uses plain `0x13` writes on the physical 2x4 HD — output-0 addresses `bypass=22`, `threshold=40`, `ratio=42`, `attack=44`, `release=45`. The interleaved `0x14 0x0046 0x01` polls are compressor-meter reads, not authoritative parameter readback.
   Updated 2026-04-10 protocol RE finding (CLOSED as test-methodology issue): multi-angle RE (Device Console JS source, APK, Wi-DG, all captures) confirmed compressor ratio/attack/release write as raw float32-LE via `0x13` ctrl=`0x80` — same encoding this repo already uses. "No change in value" session log messages = Device Console in-memory cache comparison, not hardware readback. Most likely prior test failure: default threshold `-30 dBFS` is too quiet to trigger audible compression on typical test signals. Protocol gap is closed. **Remaining item**: audible retest on loud material with threshold set to trigger; if audible compression is confirmed, check this item.
   Updated 2026-04-09 daemon finding: `POST /devices/0/config` changed output-0 compressor state on the physical 2x4 HD and a fresh daemon restart still returned the same values via token-gated scalar shadow restore.
@@ -203,9 +216,12 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
   Updated 2026-04-10 recovery-model finding: the daemon can now also recover missing preset routing/FIR/compressor shadow from the official Device Console `setting*.xml` cache when the XML timestamp matches the device token for that slot; this is stronger than stale cache but still controller-side reconstruction.
 - [x] debug subcommand
   Verified on 2026-04-09 via `debug id`, `debug send`, `debug dump-word`, and `debug dump-float` on the physical 2x4 HD.
-- [ ] `--force-kind`
-- [ ] deprecated `--force-device`
-- [ ] deprecated `--force-dsp`
+- [x] `--force-kind`
+  Audit item 5: Settled offline: all upstream DeviceKind spellings resolve; added missing m2x4 and generic; parser/resolver regression.
+- [x] deprecated `--force-device`
+  Audit item 6: Settled offline: accepted no-op retained; absent from audited dev CLI. Use --force-kind for an override.
+- [x] deprecated `--force-dsp`
+  Audit item 7: Settled offline: accepted no-op retained; absent from audited dev CLI. Use --force-kind for an override.
 
 ### 2.5 `--url` compatibility paths
 
@@ -215,7 +231,8 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
   Verified on 2026-04-09 with `status` and source switching against the local desktop daemon on the physical 2x4 HD.
 - [x] `--url usb://path`
   Verified on 2026-04-09 directly against the physical 2x4 HD with the emitted macOS HID path form `usb://DevSrvsID%3A1234567890?vid=2752&pid=0011`.
-- [ ] `--url usb:%2Fpath?...` probe-style URL
+- [x] `--url usb:%2Fpath?...` probe-style URL
+  Audit item 8: Settled offline: percent decoding/query stripping and encoded platform paths tested; transport opens the decoded HID path.
 
 ### 2.6 Auto-discovery / default behavior
 
@@ -228,8 +245,11 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 ### 2.7 `--all-local-devices`
 
 - [ ] Verified with 2+ local USB devices attached.
+  Audit item 9: Open: attach at least two physical USB processors.
 - [ ] Confirms fan-out across local HID devices.
-- [ ] Confirms current limitation to local USB only is understood and documented.
+  Audit item 10: Open: exercise reversible writes on both attached USB processors and confirm fan-out.
+- [x] Confirms current limitation to local USB only is understood and documented.
+  Audit item 11: Settled offline: CLI rejects explicit remote transports; permanent contract documents USB-only fan-out.
 
 ---
 
@@ -305,9 +325,13 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 ### 4.1 Basic bridge behavior
 
 - [ ] TCP bridge accepts one compatibility client.
-- [ ] Second TCP client is rejected as expected.
-- [ ] Frame handling works in normal length-prefixed mode.
-- [ ] WI-DG-style fixed-size packet mode works.
+  Audit item 12: Open: source accepts clients and in-memory handler works; real socket acceptance could not run in this sandbox.
+- [x] Second desktop TCP client is accepted (up to eight clients), matching upstream multi-client behavior.
+  Audit item 13: Settled offline: obsolete rejection expectation corrected. Upstream permits multiple clients; desktop admits up to eight; two stream handlers pass concurrently.
+- [x] Frame handling works in normal length-prefixed mode. (Desktop host stream verification.)
+  Audit item 14: Settled offline, desktop: in-memory bridge test covers fragmented request frames and checksum-free replies.
+- [x] WI-DG-style fixed-size packet mode works. (Desktop host stream verification.)
+  Audit item 15: Settled offline, desktop: padded replies fixed to omit checksum; 64-byte stream regression pins padding and payload.
 
 ### 4.2 Device Console compatibility
 
@@ -322,14 +346,19 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
   - **Bridge follow-up landed 2026-04-13:** shared helper `protocol/src/packet.rs::encode_device_console_tcp_response` now enforces those exact reply shapes; both the daemon TCP bridge and the ESP32 TCP bridge use it; `cargo +esp test -p minidsp-protocol --lib`, `cargo +esp test -p minidsp-daemon --lib`, and `cd app-esp32 && esp cargo build` passed after the change.
   - **Live-verified 2026-04-13:** after reflashing the attached ESP32-S3 board `firmware-board`, the stock macOS Device Console connected to the network device and completed `Initialize to Default Settings` end to end with no JS error and no error dialog. The app log showed both `GetFinishFlashBlockDspCmd` sends completing, then `Reloading Preset 1...`, `ChangePresetSlotDspCmd sent`, `reloadCurrentPreset: preset-change-completed`, `Reload Preset Completed`, and `Initialize-to-Default completed.`
 - [ ] Device Console can perform normal interactive operations through the bridge.
+  Audit item 16: Open: running stock Device Console plus MiniDSP required for status/volume/mute/source/preset/routing/PEQ/compressor operations.
   - **Required once the basic connect succeeds:** read master status, change volume, toggle mute, switch source, switch preset, view routing matrix, view/edit PEQ bands, view/edit compressor params. Record each via the HID capture log (`MINIDSP_DC_HID_LOG=/tmp/minidsp-bridge-verify.jsonl`) and confirm the app does not crash or show state corruption.
 
 ### 4.3 Coexistence / arbitration
 
 - [ ] Device Console over TCP plus HTTP status reads coexist correctly.
+  Audit item 17: Open: run Device Console TCP session concurrently with HTTP status reads on a physical processor.
 - [ ] Device Console over TCP plus HTTP writes coexist correctly.
+  Audit item 18: Open: run Device Console TCP session concurrently with reversible HTTP writes on a physical processor.
 - [ ] Device Console over TCP plus levels polling coexist correctly.
-- [ ] No response cross-wiring or obvious queue corruption occurs.
+  Audit item 19: Open: run Device Console TCP session concurrently with state/levels WebSocket polling on a physical processor.
+- [x] No response cross-wiring or obvious queue corruption occurs in the desktop fake-device stream regression.
+  Audit item 20: Settled offline for fake devices: concurrent normal/padded bridge streams and real HTTP handlers share the queue without response mixing. Physical Device Console gates remain above.
 
 ---
 
@@ -338,13 +367,18 @@ This section closes the remaining work from the former ESP32/MiniDSP investigati
 ### 5.1 Desktop daemon
 
 - [ ] Broadcast advertisement works.
+  Audit item 21: Open: packet construction/cadence is covered by host tests; receive real desktop broadcasts on the LAN.
 - [ ] Multicast advertisement works.
+  Audit item 22: Open: targets include multicast by source/host test; receive real multicast on the LAN.
 - [ ] `probe --net` discovers the daemon/device.
+  Audit item 23: Open: run probe --net while the daemon advertises on a real interface; socket bind is blocked here.
 
 ### 5.2 ESP32 without MiniDSP attached
 
 - [ ] Fallback bridge identity is advertised.
+  Audit item 24: Open: boot an ESP32 without MiniDSP, capture its appliance beacon, and decode its identity.
 - [ ] `probe --net` discovers the live board in no-device mode.
+  Audit item 25: Open: run probe --net against that live no-device ESP32.
 
 ### 5.3 ESP32 with MiniDSP attached
 
@@ -387,7 +421,8 @@ This section is mandatory before deleting the compatibility todo.
 
 ## Section 7: Negative / Error-Path Verification
 
-- [ ] No-device responses return stable JSON errors.
+- [x] No-device responses return stable JSON errors.
+  Audit item 26: Settled offline, desktop: GET/POST missing devices return JSON 404; in-memory HTTP test verifies both. ESP32 no-device operation remains section 5.2.
 - [x] Unknown source names return `400`.
   2026-04-12: ESP32 switched to wildcard `/devices/0/source/*` parsing, so unknown source names now return explicit `400` instead of falling through the router; PascalCase and device-specific valid source names are also accepted. Existing live verification on 2026-04-11 already covered the distinct `400 source not available on this device` path for `spdif` on a 2x4 HD.
 - [x] Out-of-range device index errors are correct.
@@ -408,9 +443,13 @@ This section is mandatory before deleting the compatibility todo.
 ## Section 8: Multi-Device / Matrix Verification
 
 - [ ] 2+ local USB devices tested with desktop daemon.
+  Audit item 27: Open: connect two physical USB devices to the daemon.
 - [ ] Device indexing is stable across CLI and daemon.
+  Audit item 28: Open: direct CLI/initial USB daemon sorting is corrected to serial order; confirm stable live mappings across CLI/daemon and topology changes.
 - [ ] Equivalent multi-device deployment assumptions from `ref-compatibility.md` are exercised at least once.
-- [ ] Any limitation found is recorded in `PROGRESS.md`.
+  Audit item 29: Open: config arrays and two fake device selectors are tested; exercise two actual listeners/devices on distinct addresses.
+- [x] Any limitation found is recorded in `PROGRESS.md`.
+  Audit item 30: Settled: current runtime, socket and ESP32-alias limitations are recorded in PROGRESS.md.
 
 ---
 
@@ -423,7 +462,9 @@ This section is mandatory before deleting the compatibility todo.
 - [x] `minidsp -o jsonline` over the live ESP32 TCP bridge returns parseable compatibility JSON.
   Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: `cargo +esp run -q -p minidsp-app -- --tcp 192.0.2.251:5333 -o jsonline` returned compact JSON with the expected `master`, `input_levels`, and `output_levels` fields.
 - [ ] Actual ezBEQ process reads `minidsp -o jsonline` successfully end to end.
+  Audit item 31: Open: run the actual ezBEQ process with this binary and a real device or protocol simulator; source consumers are inspected.
 - [ ] Actual ezBEQ process connects to `/devices/{id}?levels=true&poll=true` successfully end to end.
+  Audit item 32: Open: run actual ezBEQ with the state/levels WebSocket; in-memory HTTP/WS client tests cover the wire shapes.
 - [x] ezBEQ-style slot switch behavior is correct when preset changes are involved.
   Verified on 2026-04-12 on the attached ESP32 + physical 2x4 HD: the shell-out load file switched to preset `1`, wrote the first PEQ set, switched to preset `2`, wrote the second PEQ set, and subsequent preset changes/readback showed the correct filter set on each preset with no wrong-preset application.
 
@@ -474,21 +515,31 @@ This section must be completed after the technical tests.
 ### 10.1 Former ESP32/MiniDSP Investigation Todo
 
 - [ ] Every open claim is either verified or superseded.
+  Audit item 33: Open: physical runtime closure is still required.
 - [ ] Any remaining useful historical context is copied into a permanent reference doc if needed.
+  Audit item 34: Open: complete the investigation closure review after the live gates.
 - [ ] No separate temporary todo file is needed.
+  Audit item 35: Open: retain this checklist while runtime gates remain.
 
 ### 10.2 Former Compatibility Audit Todo
 
-- [ ] Every item under “Remaining Gaps” is either verified or moved to `PROGRESS.md` as an active issue.
-- [ ] Every item under “What We Can Honestly Claim Right Now” is updated to match verified reality.
+- [x] Every item under “Remaining Gaps” is either verified or moved to `PROGRESS.md` as an active issue.
+  Audit item 36: Settled: all initial unchecked items have explicit dispositions here and runtime follow-ups in PROGRESS.md.
+- [x] Every item under “What We Can Honestly Claim Right Now” is updated to match verified reality.
+  Audit item 37: Settled: reference docs distinguish the source/host baseline from live hardware and application verification.
 - [ ] No separate temporary todo file is needed once no validation gap remains.
+  Audit item 38: Open: validation gaps remain, so the checklist cannot be retired.
 
 ### 10.3 `docs/ref-compatibility.md`
 
-- [ ] Contract matches verified desktop behavior.
+- [x] Contract matches verified desktop behavior.
+  Audit item 39: Settled for audited desktop surfaces: reference contract now describes supported aliases, framing, source-backed differences, and host-test limits.
 - [ ] Contract matches verified ESP32 behavior where parity is claimed.
+  Audit item 40: Open: new desktop HTTP routing/crossover aliases are not implemented on ESP32; verify parity after matching request support.
 - [ ] No aspirational or unverified wording remains.
-- [ ] Any intentional limitation is called out explicitly.
+  Audit item 41: Open: full live-contract freeze remains gated; target requirements are distinguished from verified results.
+- [x] Any intentional limitation is called out explicitly.
+  Audit item 42: Settled: UDP fingerprints, HTTP error/metadata differences, polling cadence, deprecated no-ops and transport limits are explicit.
 
 ---
 
@@ -530,24 +581,37 @@ This section must be completed after the technical tests.
 
 ### 10.4 `docs/ref-ezbeq.md`
 
-- [ ] Desktop binary-swap compatibility claims match verified reality.
+- [x] Desktop binary-swap compatibility claims match verified reality.
+  Audit item 43: Settled docs review: binary-swap target is distinguished from the still-pending actual ezBEQ process rerun.
 - [ ] ESP32 embedded-ezBEQ claims match verified reality.
-- [ ] The doc does not imply broader real-hardware validation than was actually performed.
-- [ ] Any remaining caveat is phrased as a current fact, not hidden in TODO files.
+  Audit item 44: Open: current hosted 2.12.4 bundle needs browser Levels/upload/reconnect/offline-reload verification.
+- [x] The doc does not imply broader real-hardware validation than was actually performed.
+  Audit item 45: Settled docs review: only recorded 2x4 HD physical results are claimed; broader families are unverified.
+- [x] Any remaining caveat is phrased as a current fact, not hidden in TODO files.
+  Audit item 46: Settled docs review: current runtime/browser/alias caveats are stated in the reference docs.
 
 ### 10.5 `PROGRESS.md`
 
-- [ ] Current status distinguishes implementation from hardware verification.
-- [ ] Any failed verification is added as a concrete open item.
-- [ ] Open verification, deferred work, and next steps reflect the post-test reality.
+- [x] Current status distinguishes implementation from hardware verification.
+  Audit item 47: Settled: PROGRESS.md separates implementation/host evidence from physical verification.
+- [x] Any failed verification is added as a concrete open item.
+  Audit item 48: Settled: blocked socket validation and unported ESP32 aliases have concrete follow-ups in PROGRESS.md.
+- [x] Open verification, deferred work, and next steps reflect the post-test reality.
+  Audit item 49: Settled: remaining Device Console, ezBEQ, LAN, multi-device and compressor gates are listed explicitly.
 - [ ] User-visible changes are in [CHANGELOG.md](../CHANGELOG.md) under Unreleased; `PROGRESS.md` has no dated history.
+  Audit item 50: Open for lead: CHANGELOG.md is intentionally untouched under the delegated task instruction.
 
 ---
 
 ## Final Go / No-Go
 
 - [ ] Desktop compatibility claim is justified.
+  Audit item 51: Open: finish real socket/LAN, multi-device and actual-client reruns before broad desktop signoff.
 - [ ] ESP32 compatibility claim is justified.
+  Audit item 52: Open: finish ESP32 runtime and current UI checks, including alias parity before extending that claim.
 - [ ] Device Console coexistence claim is justified.
+  Audit item 53: Open: requires running Device Console arbitration tests on physical hardware.
 - [ ] ezBEQ compatibility claim is justified.
+  Audit item 54: Open: requires actual ezBEQ process and latest hosted bundle reruns.
 - [ ] The old TODO docs can be retired.
+  Audit item 55: Open: retain the checklist until the remaining release gates close.

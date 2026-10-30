@@ -1,125 +1,216 @@
 # Live Validation Harness
 
-This file documents the repeatable validation workflow built around
-[`tools/run-live-validation.py`](../tools/run-live-validation.py).
+[`tools/run-live-validation.py`](../tools/run-live-validation.py) is the shared
+entry point for desktop-daemon and ESP32 compatibility and destructive checks.
+Run Python through `uv`.
 
-The goal is simple: after any material change, run one command for the
-machine-checkable compatibility surface instead of trying to remember a long
-manual curl / CLI / ezBEQ sequence.
+## Offline verification and planning
 
-## What It Covers
-
-The harness exercises the automatable subset of `docs/todo-checker.md`:
-
-- static repo checks
-- desktop and ESP32 HTTP compatibility routes
-- raw WebSocket and TCP bridge round-trips
-- CLI compatibility through direct flags, `--url`, `--daemon-url`, and env vars
-- `--force-kind` plus deprecated `--force-device` / `--force-dsp` acceptance
-- source, preset, mute, gain, config, measurement-mode, `/sync`, and OpenAPI checks
-- ESP32-only negative paths
-- embedded ezBEQ REST + WebSocket routes
-- hosted ezBEQ bundle and updater smoke
-- optional spawned upstream ezBEQ process against our CLI / TCP bridge
-
-It intentionally separates the risky paths:
-
-- `--allow-audio` enables `/play` tests and playback-busy checks
-- `--allow-destructive` enables preset-copy and overwrite-style mutations
-- on desktop targets, `--allow-destructive` now captures a strict snapshot
-  baseline first, restores it at the end of the run, and writes an artifact
-  bundle under `.scratch/live-validation-runs/<timestamp>/`
-
-## What Stays Manual
-
-No script can honestly replace these checks:
-
-- audible quality approval for sweep-only, marker-only, and combined playback
-- unplug / replug and power-cycle timing behavior
-- official MiniDSP Device Console interactive verification
-- multi-device USB indexing with two or more physical units attached
-- product-family-specific features that need hardware we do not currently have on the bench
-
-Treat the harness as the default gate, then use the short manual checklist below
-for the remaining human / hardware-only cases.
-
-## Typical Commands
-
-ESP32 safe smoke, no audible or destructive mutations:
+These commands do not contact a daemon, LAN target, USB device, or audio output:
 
 ```bash
-./tools/run-live-validation.py \
-  --esp32-url http://192.0.2.251:5380 \
-  --continue-on-fail
+uv run --offline --no-project python tools/test-live-validation.py
+uv run --offline --no-project python tools/run-live-validation.py --help
+uv run --offline --no-project python tools/run-live-validation.py \
+  --desktop-url http://example.invalid --esp32-url http://esp32.invalid \
+  --destructive-profile full --manual-reconnect --manual-device-console --plan
 ```
 
-ESP32 full compatibility run, including `/play` and destructive routes:
+`--plan` (alias `--dry-run`) exits before target access, CLI execution, builds,
+manual-answer reads, prompts, or artifact writes. It prints selected phases,
+confirmations and hard stops. With no URL flags, it shows both lanes using
+reserved `.invalid` example hosts. WebSocket dependencies are loaded only by live WS
+checks; the offline commands need only Python's standard library.
+
+The unit tests use an in-memory fake HTTP/device layer and prohibit real HTTP,
+sockets and CLI execution. They cover manual answers, CI skips, confirmation,
+strict-capture and restore failures, identity mismatches, audio volume safety,
+reconnect timeouts, snapshot concurrency, failure artifacts, and the new full
+workflow. They do not establish hardware correctness.
+
+## Live lanes
+
+Only run the following commands on an intentionally prepared bench. Keep the
+unit idle, stop external control clients, and close Device Console except during
+its explicit checkpoint. Confirm there is no pending measurement-mode restore;
+the compatibility API does not expose a portable read-only check for that state.
+
+The non-audio compatibility lane covers HTTP controls/config/measurement-mode,
+WS/TCP bridges, CLI transports/flags/environment variables, embedded ezBEQ,
+hosted bundle/updater smoke, and optional upstream ezBEQ. It still performs
+control mutations and local restores; it is not a read-only smoke test.
 
 ```bash
-./tools/run-live-validation.py \
-  --esp32-url http://192.0.2.251:5380 \
-  --allow-audio \
-  --allow-destructive \
-  --continue-on-fail \
-  --report .scratch/live-validation-esp32.md
+uv run --script tools/run-live-validation.py \
+  --desktop-url http://127.0.0.1:5380 --restore-on-exit --continue-on-fail
 ```
 
-Desktop + ESP32 combined run:
+For ESP32, replace `--desktop-url` with `--esp32-url http://BOARD:5380`.
+Both flags can be supplied for two independently owned bench devices. Do not
+point both lanes at the same physical MiniDSP or let a daemon and direct-USB CLI
+own its HID interface concurrently.
+
+### Desktop daemon lane
+
+Required coverage is HTTP, raw and compatibility WebSockets, TCP 5333, CLI
+`--daemon-url`, CLI `--url http://`, `--url ws://`, `--url tcp://`, and transport
+environment variables. Snapshot guards use the shared HTTP routes and remain
+active with `--skip-cli`. `--desktop-cli-transport` changes CLI compatibility
+checks; it does not redirect the HTTP snapshot guard to a different device.
+
+### Desktop direct-USB lane (separate, required hardware gate)
+
+The daemon-backed harness does not prove direct USB. Stop the daemon and close
+Device Console, select one physical MiniDSP explicitly with `--device-index`,
+and use the same built CLI for a strict direct-USB round-trip:
 
 ```bash
-./tools/run-live-validation.py \
+# Hardware only: daemon stopped, exactly the intended MiniDSP selected.
+target/debug/minidsp --device-index 0 snapshot export /tmp/usb-before.json
+target/debug/minidsp --device-index 0 snapshot import /tmp/usb-before.json
+target/debug/minidsp --device-index 0 snapshot export /tmp/usb-after.json
+```
+
+Use fresh artifact paths. Compare device identity, master state, per-preset
+payloads/tokens and FIR blocks; exclude capture/tool/notes metadata. Save both
+snapshots with the run evidence, then restart the daemon for its lane. Never
+substitute `--daemon-url` or a network transport for this direct-USB gate.
+Multiple attached USB devices and indexing require a separate physical test.
+
+### ESP32 lane
+
+The same snapshot-backed workflow uses ESP32 HTTP snapshot export/import,
+compatibility HTTP, WS, TCP 5333, embedded ezBEQ REST/WS, hosted bundle/updater,
+playback and recovery routes. Strict export and a verified baseline replay must
+succeed before destructive mutations. Optional `--run-upstream-ezbeq` adds the
+spawned upstream process checks; the full profile does not install or spawn it
+implicitly.
+
+## Full destructive profile
+
+```bash
+uv run --script tools/run-live-validation.py \
   --desktop-url http://127.0.0.1:5380 \
-  --esp32-url http://192.0.2.251:5380 \
-  --continue-on-fail \
-  --report .scratch/live-validation-full.md
+  --destructive-profile full \
+  --manual-reconnect --manual-device-console \
+  --artifacts-dir .scratch/live-validation-runs
 ```
 
-Desktop destructive run with automatic snapshot baseline / restore artifacts:
+`--destructive-profile full` implies `--allow-destructive`, `--allow-audio`,
+`--manual-audio`, `--require-strict-snapshot` and `--restore-on-exit`.
+Physical reconnect and Device Console remain optional explicit checkpoints.
 
-```bash
-./tools/run-live-validation.py \
-  --desktop-url http://127.0.0.1:5380 \
-  --allow-destructive \
-  --continue-on-fail
+The sequence is:
+
+1. Verify idle playback, capture a strict complete snapshot and baseline HTTP
+   state, and match snapshot identity against the selected device.
+2. Import the baseline and re-export/compare it before any mutation suites.
+   A complete export alone is insufficient proof that restore works.
+3. Exercise snapshot GET/export and POST/restore concurrently with same-value
+   master and config writes. Both mutations must return `409` inside an observed
+   busy window. If the window cannot be observed, fail as unproven rather than
+   passing or skipping concurrency coverage. Boundary races can fail this check;
+   retain artifacts and investigate on hardware.
+4. Run existing HTTP, transport, CLI and destructive preset-copy checks.
+5. Confirm audio, save the previous listening volume, and set/read back **-35 dB**
+   before every `/play` request. Announce before playing sweep-only, marker-only,
+   combined marker/sweep, and ESP32 playback-busy checks. Record three separate
+   audio approvals. Wait until playback is idle before restoring and verifying
+   the previous volume, including on failure. A stuck playback run stops cleanup
+   before raising the listening volume.
+6. Run ESP32 ezBEQ/hosted-bundle checks and optional upstream ezBEQ.
+7. Restore the baseline, then confirm each active-preset reset, alternate-preset
+   reset, reset-all (which reboots), and explicit MiniDSP reboot. After each,
+   require two consecutive live status reads of the same identity within
+   `--reconnect-timeout`, capture a strict snapshot, and restore/compare baseline.
+   Explicit reboot additionally requires its recovered snapshot to match the
+   baseline before restore. The reboot route reboots the MiniDSP, not the ESP32.
+8. Record optional physical reconnect and Device Console checkpoints. A passed
+   physical reconnect answer triggers bounded identity/status and baseline
+   snapshot checks. Include observed reconnect duration in its operator note.
+9. In `finally`, verify idle playback and identity, import baseline, re-export,
+   compare snapshots and capture HTTP state. ESP32 ezBEQ slot metadata must also
+   match. Emit reports on success and failure.
+
+Hard stops override `--continue-on-fail`: failed/incomplete baseline capture,
+unsupported strict snapshot, failed restore/equality, identity mismatch, unsafe
+volume verification/restoration, failed recovery, or unproven snapshot busy
+assertions. Identity mismatch prevents snapshot import into the replacement
+device. Failed restore details are durable in `restore-result.json`. Cleanup is
+attempted after ordinary failures and interrupts; it cannot guarantee recovery
+after process termination, power loss, or unavailable hardware.
+
+Before audio, reset or reboot, the operator must type `YES`. For a deliberately
+unattended run, `--yes-i-know` explicitly authorizes those actions. Neither manual
+answer files nor `--continue-on-fail` provide this authorization. Full mode is
+not a claim that every family supports these operations: strict snapshot
+validation and baseline replay are eligibility gates, and hardware rollout is
+still pending below.
+
+## Flags and artifacts
+
+- `--allow-destructive`: preset-copy / ezBEQ overwrite, with strict snapshot
+  capture and automatic rollback on either target. Missing CLI does not bypass
+  the guard.
+- `--allow-audio`: playback with confirmation, verified -35 dB and previous-volume
+  restoration. This flag alone does not request a whole-device snapshot guard.
+- `--restore-on-exit`: strict baseline and preflight replay, plus final rollback
+  on success/failure, without enabling audio/reset/reboot.
+- `--require-strict-snapshot`: also enables `--restore-on-exit`.
+- `--snapshot-path PATH`: save an additional copy of the newly captured strict
+  baseline; requires one target, enables rollback, and refuses an existing path.
+  This is an output path, not an externally supplied restore image.
+- `--artifacts-dir DIR`: alias for existing `--artifact-root`; each run creates a
+  timestamped subdirectory with per-target artifacts and top-level reports.
+- `--reconnect-timeout SECONDS`: stable reconnect / idle wait limit (default 60).
+- `--manual-audio`: enables audio and three approval checkpoints.
+- `--manual-reconnect`, `--manual-device-console`: explicit human checks; both
+  enable snapshot rollback. Close Device Console before answering its prompt.
+- `--non-interactive`: no prompts; missing manual answers become explicit skips.
+- `--manual-answers FILE`: JSON answers instead of terminal input, also usable
+  with `--non-interactive`. Answers attest to operator observations, not to an
+  automated acoustic/physical/official-app test.
+- `--ci`: skip all human checkpoints, including supplied answers. Also enabled
+  by a truthy `CI` environment variable. It does not authorize audio or recovery;
+  a live full CI run still requires `--yes-i-know` and deliberately attached hardware.
+
+Example manual-answer file (keys use `desktop` or `esp32`):
+
+```json
+{
+  "desktop.audio-sweep": {"status": "pass", "note": "Clean sweep"},
+  "desktop.audio-marker": {"status": "fail", "note": "Audible click"},
+  "desktop.audio-combined": {"status": "skip", "note": "Speaker disconnected"},
+  "desktop.reconnect": {"status": "pass", "note": "Unplug/replug: 4 seconds; controls work"},
+  "desktop.device-console": {"status": "pass", "note": "Discovery and basic controls work; app closed"}
+}
 ```
 
-Full ESP32 run with a real upstream ezBEQ process in front of our bridge:
+Every answer requires `status` (`pass`, `fail`, `skip`) and a string `note`.
+Invalid answers fail the checkpoint; a failed human answer fails the overall run.
+Answers are written immediately to `manual-checkpoints.json` with target,
+checkpoint, prompt, source and timestamp, and included in `report.json` and the
+Markdown summary. Skips never count as human approval.
 
-```bash
-./tools/run-live-validation.py \
-  --esp32-url http://192.0.2.251:5380 \
-  --run-upstream-ezbeq \
-  --continue-on-fail
-```
+The bundle also includes per-target `snapshot-before.json`, `snapshot-after.json`,
+`device-before.json`, `device-after.json`, `config-before.json`, `config-after.json`,
+`restore-result.json`, snapshot concurrency/recovery evidence, and ESP32
+`ezbeq-before.json` / `ezbeq-after.json`. Top-level `report.md` / `report.json`
+record each phase. `--report PATH` additionally writes a Markdown report there.
 
-If you already know the repo is built and only want live checks:
+## Hardware validation still required
 
-```bash
-./tools/run-live-validation.py \
-  --esp32-url http://192.0.2.251:5380 \
-  --skip-static \
-  --continue-on-fail
-```
+The new orchestration has offline fake-device coverage only. Prior 2x4 HD
+snapshot/restore bench results remain documented in
+[device-state recovery](ref-device-state-recovery.md); they do not validate this
+new full sequence. Before promoting it as a live gate:
 
-## Operator Notes
-
-- Keep the MiniDSP attached and idle before starting.
-- Keep the official Device Console closed during routine harness runs.
-- Use low speaker volume before `--allow-audio`.
-- On desktop, `--allow-destructive` now restores the full device from a strict
-  snapshot at the end of the run, but it still performs real live mutations in
-  between, so keep the unit idle until the run finishes.
-- Use `--allow-destructive` only when overwriting inactive presets or ezBEQ slot state is acceptable.
-- Prefer `--report` so the result can be attached to a commit, PR, or progress note.
-- The desktop destructive artifact bundle currently includes
-  `snapshot-before.json`, `snapshot-after.json`, `device-before.json`,
-  `device-after.json`, `config-before.json`, `config-after.json`,
-  `restore-result.json`, plus top-level `report.md` / `report.json`.
-
-## Manual Checklist
-
-- Confirm the harness passed for the intended target set.
-- If playback changed, run the harness again with `--allow-audio`, listen to sweep-only, marker-only, and combined playback, and record explicit human approval.
-- If reconnect behavior changed, do live unplug / replug and power-cycle checks on the ESP32 path after the harness completes.
-- If TCP bridge or discovery code changed, do one focused official Device Console sanity pass.
-- If device-matrix code changed, update `docs/todo-checker.md` and `PROGRESS.md` with what hardware was actually re-verified. Record user-visible changes in [CHANGELOG.md](../CHANGELOG.md) under Unreleased; keep dated history out of `PROGRESS.md`.
+- Run no-mutation snapshot/replay, limited destructive, then full profile on the
+  2x4 HD desktop-daemon and ESP32 lanes; retain failure and busy-window evidence.
+- Perform the separate direct-USB round-trip with exclusive ownership.
+- Listen to all three passes, measure physical reconnect timing and complete the
+  Device Console checkpoint; a CI skip cannot satisfy these gates.
+- Repeat on additional device/DSP families, including FIR and Dirac completeness
+  and reset/reboot behavior. Do not mark a profile verified from fake tests.
+- Verify multiple USB-device indexing and richer product-specific mutation
+  surfaces on actual hardware. These are outside this orchestration change.

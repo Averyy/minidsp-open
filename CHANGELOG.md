@@ -20,6 +20,8 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - Device Console HID capture fixtures (54 sanitized exchanges, 13 opcodes) with parser and client/queue replay tests.
 - Research notes on Device Console device identity, the `0xFFEA` source bitmap, and Dirac preset layouts.
 - A typed parser and encoder for the HT/HTx selectable-source bitmap at `0xFFEA`, from the research above; not yet read or written by the client.
+- Destructive validation workflow: a full profile with hard stops, recorded manual checkpoints, verified -35 dB audio steps, reboot/reconnect identity checks, concurrent 409 assertions and a no-target `--plan` mode, with fake-device tests.
+- SECURITY.md describing the LAN trust model and how to report vulnerabilities.
 
 ### Changed
 
@@ -65,6 +67,8 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - ESP-IDF 6.x WebSocket handshakes register the callback required by the updated HTTP server.
 - The release and catalogue-sync workflows referenced a `setup-uv` version that doesn't exist; the catalogue sync also waits for GitHub Pages to be enabled instead of failing every four hours.
 - The ESP32 no longer replays its boot log at startup, which printed every boot line twice on serial and pushed real entries out of `/debug/log`.
+- CLI, config and HTTP compatibility with minidsp-rs from an offline audit: crossover, compressor, routing and selector forms, command files, TOML arrays and device bindings, HTTP routing/crossover shapes and padded TCP replies.
+- Firmware update checks run on one persistent worker with a cooldown instead of a new thread per request, and `/debug/info` no longer reads task names from freed task memory.
 
 ### Removed
 
@@ -72,6 +76,9 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 
 ### Security
 
+- Browser requests that change state, and WebSocket upgrades, need a local or configured Origin on both the board and the daemon; native clients without Origin are unaffected. DNS-rebound pages are refused. Unlike minidsp-rs, an unset `cors_origin` is no longer permissive.
+- WiFi credentials can only be changed in provisioning mode, firmware uploads and catalogue source overrides are off in provisioning, and source overrides need a `dev-updater-override` build.
+- Workflow actions are pinned to commit SHAs and the espup download is checksum-verified.
 - Checked-in documentation and fixtures use synthetic device identifiers; flashing tools accept an explicit port instead of a maintainer-specific device path.
 
 ## Snapshot and recovery milestone (untagged) - 2026-04-16

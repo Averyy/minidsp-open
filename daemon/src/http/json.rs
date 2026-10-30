@@ -84,6 +84,7 @@ pub struct PeqConfigJson {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BiquadCoeffJson {
     pub b0: f32,
     pub b1: f32,
@@ -92,11 +93,28 @@ pub struct BiquadCoeffJson {
     pub a2: f32,
 }
 
+impl Default for BiquadCoeffJson {
+    fn default() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RoutingConfigJson {
+    #[serde(alias = "index")]
     pub output: u8,
-    pub enabled: bool,
-    pub gain_db: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mute: Option<bool>,
+    #[serde(alias = "gain", skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f32>,
     /// Per-cell polarity inversion. Only honored on families whose
     /// `RoutingMatrix.polarity_base` is populated (Flex Eight, Flex HT/HTx,
     /// DDRC-88BM). `None` leaves the cell's polarity untouched.
@@ -125,6 +143,11 @@ pub struct IndexedBiquadJson {
 pub struct CrossoverConfigJson {
     pub index: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "coeff",
+        default,
+        deserialize_with = "deserialize_crossover_filters"
+    )]
     pub filters: Option<Vec<IndexedBiquadJson>>,
     pub bypass: Option<bool>,
 }
@@ -136,4 +159,94 @@ pub struct FirConfigJson {
     pub coefficients: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_taps: Option<u16>,
+}
+
+fn deserialize_crossover_filters<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<IndexedBiquadJson>>, D::Error> {
+    #[derive(Deserialize)]
+    struct Flat {
+        index: u8,
+        #[serde(flatten)]
+        coeff: BiquadCoeffJson,
+    }
+    let filters = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?;
+    filters
+        .map(|filters| {
+            filters
+                .into_iter()
+                .map(|value| {
+                    if value.get("coeff").is_none() {
+                        let flat: Flat =
+                            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                        Ok(IndexedBiquadJson {
+                            index: flat.index,
+                            coeff: Some(flat.coeff),
+                        })
+                    } else {
+                        serde_json::from_value(value).map_err(serde::de::Error::custom)
+                    }
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    // minidsp-rs 8e987f9, minidsp/src/model.rs:208-250, 316-350:
+    // routing uses index/mute/gain; crossover coeff entries are flat biquads.
+    #[test]
+    fn upstream_config_routing_and_crossover_shapes() {
+        let config: ConfigWriteJson = serde_json::from_str(r#"{
+            "inputs":[{"index":0,"routing":[{"index":2,"mute":true},{"index":1,"gain":-3.5}]}],
+            "outputs":[{"index":0,"crossover":[{"index":1,"coeff":[{"index":2,"b0":1,"b1":0,"b2":0,"a1":0,"a2":0}]}]}]
+        }"#).unwrap();
+        let routes = config.inputs.unwrap().remove(0).routing.unwrap();
+        assert_eq!(routes[0].output, 2);
+        assert_eq!(routes[0].mute, Some(true));
+        assert_eq!(routes[0].gain_db, None);
+        assert_eq!(routes[1].gain_db, Some(-3.5));
+        assert_eq!(routes[1].enabled, None);
+        let filter = config
+            .outputs
+            .unwrap()
+            .remove(0)
+            .crossover
+            .unwrap()
+            .remove(0)
+            .filters
+            .unwrap()
+            .remove(0);
+        assert_eq!(filter.index, 2);
+        assert_eq!(filter.coeff.unwrap().b0, 1.0);
+    }
+
+    #[test]
+    fn existing_config_extensions_and_invalid_coefficients_remain_supported() {
+        let config: ConfigWriteJson = serde_json::from_str(r#"{
+            "inputs":[{"index":0,"routing":[{"output":2,"enabled":true,"gain_db":-2}]}],
+            "outputs":[{"index":0,"crossover":[{"index":0,"filters":[{"index":1,"coeff":{"b0":1,"b1":0,"b2":0,"a1":0,"a2":0}}]}]}]
+        }"#).unwrap();
+        assert_eq!(
+            config.inputs.unwrap()[0].routing.as_ref().unwrap()[0].enabled,
+            Some(true)
+        );
+        assert!(
+            config.outputs.unwrap()[0].crossover.as_ref().unwrap()[0]
+                .filters
+                .as_ref()
+                .unwrap()[0]
+                .coeff
+                .is_some()
+        );
+        assert!(
+            serde_json::from_str::<CrossoverConfigJson>(
+                r#"{"index":0,"coeff":[{"index":0,"b0":"bad","b1":0,"b2":0,"a1":0,"a2":0}]}"#
+            )
+            .is_err()
+        );
+    }
 }

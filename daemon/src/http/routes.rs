@@ -14,6 +14,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use minidsp_protocol::http_origin::origin_allowed;
 use minidsp_protocol::playback::{
     PlayRequest, PlaybackPlan, PlaybackStatus, SyncRequest, SyncResponse, ToneBurstParams,
 };
@@ -23,7 +24,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::oneshot;
-use tower_http::cors::{Any, CorsLayer};
 
 /// JSON error response — minidsp-rs compatible format: `{"error": "message"}`.
 #[derive(Debug, Serialize)]
@@ -134,12 +134,21 @@ async fn get_ready_device_or_status(
 }
 
 pub fn router(state: Arc<DaemonState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    router_with_origins(state, None).expect("default CORS origin is valid")
+}
 
-    Router::new()
+pub fn router_with_origins(
+    state: Arc<DaemonState>,
+    allowed_origins: Option<&str>,
+) -> Result<Router, axum::http::header::InvalidHeaderValue> {
+    let configured = allowed_origins
+        .map(str::parse::<axum::http::HeaderValue>)
+        .transpose()?;
+    let origin_policy = axum::middleware::from_fn(move |request, next| {
+        browser_origin_policy(request, next, configured.clone())
+    });
+
+    Ok(Router::new()
         .route("/devices", get(list_devices))
         .route(
             "/devices/{id}",
@@ -202,8 +211,83 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/llms.txt", get(llms_txt))
         .fallback(fallback)
-        .layer(cors)
-        .with_state(state)
+        .layer(axum::middleware::map_response(json_status_errors))
+        .layer(origin_policy)
+        .with_state(state))
+}
+
+async fn json_status_errors(response: axum::response::Response) -> axum::response::Response {
+    use axum::body::HttpBody;
+    let status = response.status();
+    if (status.is_client_error() || status.is_server_error())
+        && response.body().size_hint().exact() == Some(0)
+    {
+        return ApiError::new(
+            status,
+            status.canonical_reason().unwrap_or("request failed"),
+        )
+        .into_response();
+    }
+    response
+}
+
+// Enforce before extractors or handlers: simple form/text requests can mutate
+// state without a CORS preflight, and WebSockets do not enforce CORS themselves.
+async fn browser_origin_policy(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+    configured: Option<axum::http::HeaderValue>,
+) -> axum::response::Response {
+    use axum::http::{Method, header};
+    let headers = request.headers();
+    let origin = headers.get(header::ORIGIN).cloned();
+    let allowed = headers.get_all(header::ORIGIN).iter().count() <= 1
+        && origin_allowed(
+            origin.as_ref().map(|v| v.to_str().unwrap_or("")),
+            headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+            configured.as_ref().and_then(|v| v.to_str().ok()),
+        );
+    let preflight = request.method() == Method::OPTIONS;
+    let protected = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) || headers.contains_key(header::SEC_WEBSOCKET_KEY)
+        || headers
+            .get(header::UPGRADE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    if !allowed && (protected || preflight) {
+        return ApiError::new(StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    let requested_headers = headers.get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned();
+    let mut response = if preflight {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+    response
+        .headers_mut()
+        .append(header::VARY, header::HeaderValue::from_static("Origin"));
+    if allowed && let Some(origin) = origin {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        if preflight {
+            response.headers_mut().insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                header::HeaderValue::from_static("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+            );
+            if let Some(requested_headers) = requested_headers {
+                response
+                    .headers_mut()
+                    .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, requested_headers);
+            }
+            response.headers_mut().append(
+                header::VARY,
+                header::HeaderValue::from_static("Access-Control-Request-Headers"),
+            );
+        }
+    }
+    response
 }
 
 // -- WebSocket query params --
@@ -211,9 +295,9 @@ pub fn router(state: Arc<DaemonState>) -> Router {
 #[derive(Debug, Deserialize, Default)]
 struct WsQueryParams {
     #[serde(default)]
-    poll: Option<bool>,
+    poll: Option<String>,
     #[serde(default)]
-    levels: Option<bool>,
+    levels: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -243,8 +327,8 @@ async fn device_get_or_ws(
         let ws = WebSocketUpgrade::from_request(req, &state)
             .await
             .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let poll = params.poll.unwrap_or(false);
-        let levels = params.levels.unwrap_or(false);
+        let poll = params.poll.is_some();
+        let levels = params.levels.is_some();
         return Ok(ws
             .on_upgrade(move |socket| ws_state_levels(socket, client, poll, levels))
             .into_response());
@@ -1140,10 +1224,20 @@ async fn write_config(
                 }
                 if let Some(routes) = input.routing {
                     for route in routes {
-                        client
-                            .set_routing(input.index, route.output, route.enabled, route.gain_db)
-                            .await
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        let routing = table.routing;
+                        let cell = input.index as u16 * routing.cols as u16 + route.output as u16;
+                        if let Some(gain) = route.gain_db {
+                            client
+                                .set_channel_gain(routing.gain_base + cell, gain)
+                                .await
+                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        }
+                        if let Some(enabled) = route.enabled.or(route.mute.map(|muted| !muted)) {
+                            client
+                                .set_channel_mute(routing.status_base + cell, !enabled)
+                                .await
+                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        }
                         if let Some(inverted) = route.polarity_inverted {
                             client
                                 .set_routing_polarity(input.index, route.output, inverted)
@@ -1393,8 +1487,9 @@ async fn read_config(
                     .into_iter()
                     .map(|route| RoutingConfigJson {
                         output: route.output,
-                        enabled: route.enabled,
-                        gain_db: route.gain_db,
+                        enabled: Some(route.enabled),
+                        mute: None,
+                        gain_db: Some(route.gain_db),
                         polarity_inverted: route.polarity_inverted,
                     })
                     .collect(),

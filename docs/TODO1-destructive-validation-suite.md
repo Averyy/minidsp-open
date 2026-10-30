@@ -10,15 +10,33 @@ artifacts, compatibility transports, and playback checks. Completed work is in
 
 ### Remaining scope
 
-This doc is still not fully complete as written.
-The remaining work is:
+The orchestration below is implemented and covered by offline fake-device unit
+tests. The new full sequence has **not** been run against hardware. Prior live
+snapshot results above do not constitute sign-off for the new workflow.
 
-- structured manual checkpoint recording for audio / reconnect / Device Console
-- a truly explicit "full destructive profile" with its proposed flags and hard stops
-- integrated reboot / reconnect coverage in the same destructive workflow
-- clearer direct-USB desktop lane requirements alongside the daemon-backed lane
-- stronger concurrency / busy-behavior assertions during snapshot export / restore
-- broader ESP32 and multi-profile rollout beyond the already verified paths
+- [x] Structured manual checkpoint recording for audio / reconnect / Device
+  Console, with prompt/file answers, explicit CI skips and durable JSON.
+- [x] Explicit `--destructive-profile full`, proposed snapshot/artifact/manual
+  controls, confirmation gates and unconditional safety hard stops.
+- [x] Integrated reset / reboot / bounded reconnect, identity checks and strict
+  post-recovery snapshots, with baseline replay/equality after recovery.
+- [x] Explicit separate direct-USB desktop lane requirements alongside the
+  daemon-backed lane in [ref-live-validation.md](ref-live-validation.md).
+- [x] Concurrent master/config mutations must return `409` during observed
+  snapshot export and restore busy windows; an unobserved window fails as
+  unproven rather than passing.
+- [x] Shared HTTP snapshot guard for desktop and ESP32; strict baseline replay
+  before suites and rollback/reporting on failures, even with `--skip-cli`.
+- [x] Offline unit tests, `--help` and a full-profile `--plan` / `--dry-run` that
+  performs no target access, builds, prompts or artifact writes.
+- [ ] Run staged snapshot-only, limited destructive and full-profile validation
+  on desktop-daemon and ESP32 2x4 HD hardware; investigate real busy-window
+  timing and retain artifacts.
+- [ ] Re-run the separate direct-USB round-trip with the daemon stopped.
+- [ ] Record real acoustic approvals, physical recovery timing and Device
+  Console observations using the new checkpoints.
+- [ ] Broader ESP32 and multi-profile rollout, FIR/Dirac truthfulness checks and
+  multiple-device USB indexing on actual hardware.
 
 This plan is no longer blocked on shared snapshot import/export.
 That prerequisite is already complete and documented in:
@@ -61,20 +79,19 @@ Also note the current ceiling:
 
 - the harness now proves full-device return-to-baseline for the verified
   desktop path through shared snapshot export/import
-- it still does not yet implement every later-stage idea in this document,
-  especially manual checkpoint capture and the explicit "full profile" controls
+- the new checkpoint/full-profile/recovery orchestration is implemented but has
+  only fake-device coverage; the broader hardware matrix remains open
 
 ## Why The Current Harness Is Not Enough
 
 The current harness is no longer just a conservative smoke test, but it is not
 yet the final shape described below:
 
-- it still relies on `--allow-destructive` / `--allow-audio` rather than the
-  stronger explicit profile and manual-gate flags proposed later
-- it does not yet record manual approvals inside the artifact bundle
-- reboot / reconnect and Device Console gates are still separate operator work
-- the direct-USB desktop lane is verified, but not yet called out as a first-
-  class lane in the harness plan below
+- the explicit full profile is implemented, but needs staged live sign-off
+- recorded approvals still require real human acoustic/physical/app observations
+- direct USB remains a separate required hardware gate with exclusive ownership
+- additional product-family mutation surfaces and live matrix coverage still
+  need hardware
 
 Those are the remaining gaps this plan should close.
 
@@ -286,7 +303,10 @@ Also keep scope honest:
 
 The suite should support explicit manual checkpoints with artifact logging.
 
-This is still an open item today and should remain explicit until it exists.
+Implemented through `--manual-audio`, `--manual-reconnect`,
+`--manual-device-console`, `--manual-answers` and `--non-interactive`.
+Answers are written immediately to `manual-checkpoints.json` and included in
+the reports. `--ci` / a truthy `CI` environment explicitly skips human checks.
 
 ### Audio approval
 
@@ -353,7 +373,7 @@ The final report should answer two different questions clearly:
 Keep the current entry point:
 
 ```bash
-./tools/run-live-validation.py ...
+uv run --script tools/run-live-validation.py ...
 ```
 
 Add new flags instead of a second tool:
@@ -367,15 +387,30 @@ Add new flags instead of a second tool:
 --manual-audio
 --manual-reconnect
 --manual-device-console
+--manual-answers answers.json
+--non-interactive
+--ci
+--yes-i-know
+--reconnect-timeout 60
+--plan
 ```
 
 Reasonable behavior:
 
-- `--destructive-profile full` implies `--allow-destructive`
+- `--destructive-profile full` implies `--allow-destructive`, `--allow-audio`,
+  `--manual-audio`, `--require-strict-snapshot` and `--restore-on-exit`
 - `--manual-audio` implies `--allow-audio`
 - `--restore-on-exit` should run on both success and failure
 - `--destructive-profile full` should error out immediately when strict snapshot
   support is not available for the chosen target
+
+These controls are implemented; see [ref-live-validation.md](ref-live-validation.md)
+for current semantics and artifact/answer schemas. `--snapshot-path` is an
+additional output copy of a newly captured baseline, never an arbitrary input
+restore image. Safety stops override `--continue-on-fail`. Audio/reset/reboot
+require interactive `YES` or explicit `--yes-i-know`; answer files do not grant
+that authorization. Every playback request sets and verifies -35 dB first and
+announces before playback, with previous-volume restore after idle playback.
 
 ## Test Matrix
 
@@ -493,22 +528,21 @@ The harness itself needs staged proof:
 
 ## Next Honest Steps
 
-If we keep extending this plan, the right next items are:
-
-1. add structured manual checkpoint recording to the artifact report
-2. make the direct-USB desktop lane an explicit required matrix item
-3. add snapshot concurrency / busy-behavior assertions during restore
-4. integrate reboot / reconnect into the same destructive workflow where safe
-5. only then promote the harness to the stronger "full destructive profile"
-   shape described here
+1. Run the documented offline test command:
+   `uv run --offline --no-project python tools/test-live-validation.py`.
+2. Review the full step list using `--destructive-profile full --plan` without a
+   connected target.
+3. On an intentionally prepared bench, run Stage 1, Stage 2 and Stage 3 on the
+   existing 2x4 HD desktop/ESP32 paths, including busy-window timing and failure
+   cleanup. No live target was accessed for this implementation.
+4. Complete the separate direct-USB lane and record real manual checkpoints.
+5. Roll out to additional device/DSP families only with their own strict
+   snapshot/replay and FIR/Dirac/recovery evidence.
 
 ## Remaining Implementation Order
 
-The next implementation order is:
-
-1. add manual checkpoint recording for audio / reconnect / official app
-2. make the direct-USB desktop lane an explicit required matrix item
-3. add snapshot concurrency / busy-behavior assertions during restore
-4. extend the suite to reboot / reconnect and fuller ezBEQ coverage
-5. only after that, promote the harness to the stronger "full destructive
-   profile" shape described here and retire any duplicated ad-hoc restore logic
+The remaining work is hardware validation and any failures it reveals, broader
+product-specific control mutations/ezBEQ coverage, and multi-profile rollout.
+The new full profile is available for staged validation, not yet a live-verified
+replacement for the established bench gates. Targeted per-step restores remain;
+shared snapshot import is the authoritative final rollback.

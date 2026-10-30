@@ -1,6 +1,6 @@
 # minidsp-open: Complete DSP Address Tables
 
-All addresses extracted from MiniDSP Device Console v2.10.6 `DSP_default_parameters.xml` files.
+All addresses extracted from the `DSP_default_parameters.xml` files in MiniDSP Device Console's macOS bundle (version 1.2.3 per its `Info.plist`).
 Each address is a u16 index into DSP memory (4 bytes per index).
 
 Important: do not assume every new-dialect config slot is float32.

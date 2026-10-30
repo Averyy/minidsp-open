@@ -4,6 +4,10 @@ version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+default = []
+dev-updater-override = []
+
 [dependencies]
 # Shared protocol crate (std mode — ESP-IDF is std-on-FreeRTOS)
 minidsp-protocol = { path = "../protocol" }

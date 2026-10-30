@@ -2,7 +2,7 @@
 
 Static research, 2026-10-29. No device, application session, firmware execution, or local capture was used. Only this note was added; existing documentation and code were left unchanged.
 
-The inspected bundle identifies itself as **1.2.3**, not the 2.10.6 named in `docs/ref-address-tables.md` (`Contents/Info.plist`, lines 19–22; extracted `package.json`, line 4). Conclusions below concern these local assets.
+The inspected bundle identifies itself as **1.2.3** (`Contents/Info.plist`, lines 19–22; extracted `package.json`, line 4), the same bundle the address tables came from. Conclusions below concern these local assets.
 
 ## Evidence references and method
 

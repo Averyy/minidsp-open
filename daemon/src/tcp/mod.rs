@@ -12,7 +12,7 @@
 //! and `SO_KEEPALIVE` with a 120 s idle probe (so idle Device Console tabs
 //! still register as disconnected if the client vanishes without FIN).
 //!
-//! Multi-client support: up to 4 simultaneous TCP clients are served. A
+//! Multi-client support: up to 8 simultaneous TCP clients are served. A
 //! shared async mutex (`bridge_mutex`) is acquired around every raw HID
 //! command so two clients cannot interleave USB traffic at the bridge layer.
 //! The deeper `DaemonState` also serializes per-device I/O — this outer
@@ -43,6 +43,15 @@ const KEEPALIVE_IDLE: Duration = Duration::from_secs(120);
 
 /// Run the TCP bridge server on the given address.
 pub async fn serve(addr: &str, state: Arc<DaemonState>) -> std::io::Result<()> {
+    serve_device(addr, state, None, None).await
+}
+
+pub async fn serve_device(
+    addr: &str,
+    state: Arc<DaemonState>,
+    index: Option<usize>,
+    serial: Option<u32>,
+) -> std::io::Result<()> {
     let listener = listen_reuseaddr(addr)?;
     tracing::info!("TCP bridge listening on {addr}");
 
@@ -75,16 +84,20 @@ pub async fn serve(addr: &str, state: Arc<DaemonState>) -> std::io::Result<()> {
         let bridge_mutex = bridge_mutex.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            handle_client(stream, peer, state, bridge_mutex).await;
+            serve_connection(stream, peer, state, bridge_mutex, index, serial).await;
         });
     }
 }
 
-async fn handle_client(
-    mut stream: tokio::net::TcpStream,
+/// Forward one byte stream through the same bridge used by accepted TCP sockets.
+/// Kept transport-generic so host tests can exercise framing without network access.
+pub async fn serve_connection<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: T,
     peer: std::net::SocketAddr,
     state: Arc<DaemonState>,
     bridge_mutex: Arc<Mutex<()>>,
+    index: Option<usize>,
+    serial: Option<u32>,
 ) {
     let mut read_buf = Vec::with_capacity(512);
     let mut tmp = [0u8; 512];
@@ -103,7 +116,7 @@ async fn handle_client(
                     if payload.is_empty() {
                         continue;
                     }
-                    if let Some(client) = state.get_device(0).await {
+                    if let Some(client) = state.bridge_device(index, serial).await {
                         let tcp_request = payload.clone();
                         let result = {
                             let _guard = bridge_mutex.lock().await;
@@ -113,7 +126,7 @@ async fn handle_client(
                         match result {
                             Ok(raw_resp) => {
                                 let frame = if chunked_mode {
-                                    let mut frame = packet::encode_frame(&raw_resp);
+                                    let mut frame = packet::encode_tcp_response(&raw_resp);
                                     frame.resize(64.max(frame.len()), 0);
                                     frame
                                 } else {

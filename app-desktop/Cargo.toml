@@ -23,3 +23,5 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 urlencoding = "2"
 toml = "0.8"
+shlex = "1"
+socket2 = { version = "0.5", features = ["all"] }

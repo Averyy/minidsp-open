@@ -74,6 +74,10 @@ tools/esp-cargo build --release
 
 For driver development, use `ESP_UAC2_HOST_PATH="$HOME/code/esp-uac2-host/components/usb_host_uac2" tools/esp-cargo build --release` to build against a local working copy without editing tracked files.
 
+## Security
+
+Use minidsp-open on a trusted LAN. See [SECURITY.md](SECURITY.md) for the trust model, limits, and private vulnerability reporting.
+
 ## Credits
 
 - [minidsp-rs](https://github.com/mrene/minidsp-rs) by mrene worked out most of the MiniDSP USB protocol. This project is a separate implementation, but it wouldn't exist without that work.

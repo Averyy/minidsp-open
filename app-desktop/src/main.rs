@@ -24,7 +24,7 @@ mod output;
 #[command(name = "minidsp", version, about = "MiniDSP controller")]
 struct Cli {
     /// Output format
-    #[arg(short = 'o', long, value_name = "FORMAT")]
+    #[arg(short = 'o', long, value_name = "FORMAT", value_parser = ["text", "json", "jsonline"])]
     output: Option<String>,
 
     /// Execute commands from a file
@@ -100,10 +100,11 @@ fn resolve_force_kind(kind: &str) -> Option<(u8, u8)> {
         "4x10hd" | "4x10-hd" | "m4x10hd" => Some((1, 0)),
         "10x10hd" | "10x10-hd" | "m10x10hd" => Some((1, 51)),
         "nanodigi-2x8" | "nanodigi2x8" => Some((2, 54)),
-        "2x4" => Some((2, 22)),
+        "2x4" | "m2x4" => Some((2, 22)),
         "msharc-4x8" | "minisharc" | "msharc4x8" => Some((4, 0)),
         "ddrc-88bm" | "ddrc88bm" => Some((6, 95)),
         "cdsp-8x12v2" | "cdsp8x12v2" | "c8x12v2" => Some((11, 97)),
+        "generic" => Some((0, 0)),
         _ => None,
     }
 }
@@ -308,8 +309,18 @@ enum ChannelCommand {
     },
     /// Compressor settings (output channels only)
     Compressor {
+        #[arg(short = 'b', long, value_parser = parse_on_off)]
+        bypass: Option<bool>,
+        #[arg(short = 't', long, allow_hyphen_values = true)]
+        threshold: Option<f32>,
+        #[arg(short = 'k', long)]
+        ratio: Option<f32>,
+        #[arg(short = 'a', long)]
+        attack: Option<f32>,
+        #[arg(short = 'r', long)]
+        release: Option<f32>,
         #[command(subcommand)]
-        cmd: CompressorCommand,
+        cmd: Option<CompressorCommand>,
     },
     /// FIR filter
     Fir {
@@ -322,7 +333,10 @@ enum ChannelCommand {
         output: u8,
         /// Gain in dB for this routing path
         #[arg(allow_hyphen_values = true)]
-        gain_db: f32,
+        gain_db: String,
+        /// Value for upstream routing gain/enable commands
+        #[arg(allow_negative_numbers = true)]
+        value: Option<String>,
         /// Disable this route instead of enabling it
         #[arg(long)]
         off: bool,
@@ -334,6 +348,9 @@ enum ChannelCommand {
 
 #[derive(Subcommand, Clone)]
 enum CrossoverCommand {
+    /// Upstream syntax: crossover <group> <index> <set|bypass|clear>
+    #[command(external_subcommand)]
+    Compatibility(Vec<String>),
     /// Set crossover biquad coefficients (group of 4: [b0 b1 b2 a1 a2] x4)
     Set {
         /// "0" for group 0 (e.g. low-pass), "1" for group 1 (e.g. high-pass)
@@ -409,7 +426,7 @@ enum PeqCommand {
         #[arg(action = clap::ArgAction::Set, value_parser = parse_on_off)]
         state: bool,
     },
-    /// Clear PEQ band (set to identity biquad + bypass on)
+    /// Clear PEQ band (set to identity biquad and enable it)
     Clear,
 }
 
@@ -555,7 +572,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = connect(&cli).await?;
     let result = async {
         apply_force_kind(&mut client, &cli).await?;
-        execute_command(&mut client, &cli).await
+        execute_command(&client, &cli).await
     }
     .await;
     let close_result = client.close().await;
@@ -586,7 +603,7 @@ pub(crate) async fn apply_force_kind(
 }
 
 async fn execute_command(
-    client: &mut MiniDspClient,
+    client: &MiniDspClient,
     cli: &Cli,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
@@ -786,12 +803,22 @@ pub(crate) async fn connect_all_local(
         );
     }
 
-    let devices = minidsp::transport::hid::enumerate()?;
+    discover_local_clients().await
+}
+
+pub(crate) async fn discover_local_clients()
+-> Result<Vec<MiniDspClient>, Box<dyn std::error::Error>> {
     let mut clients = Vec::new();
-    for dev in devices {
-        let transport = HidTransport::open(&dev.path)?;
-        clients.push(MiniDspClient::connect(Box::new(transport)).await?);
+    for device in minidsp::transport::hid::enumerate()? {
+        match HidTransport::open(&device.path) {
+            Ok(transport) => match MiniDspClient::connect(Box::new(transport)).await {
+                Ok(client) => clients.push(client),
+                Err(error) => tracing::warn!("Device {}: {error}", device.path),
+            },
+            Err(error) => tracing::warn!("Device {}: {error}", device.path),
+        }
     }
+    clients.sort_by_key(MiniDspClient::serial);
     Ok(clients)
 }
 
@@ -835,41 +862,14 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
 
     // 2. Explicit TCP (or MINIDSP_TCP env var)
     if let Some(addr) = cli.tcp.as_deref().or(env_tcp.as_deref()) {
-        let transport = TcpTransport::connect(addr).await?;
+        let transport = TcpTransport::connect(&tcp_address(addr)).await?;
         return Ok(MiniDspClient::connect(Box::new(transport)).await?);
     }
 
     // 3. --url flag or MINIDSP_URL env var (tcp://host:port, usb://path, usb:path)
     let url_source = cli.url.as_deref().or(env_url.as_deref());
     if let Some(url) = url_source {
-        if let Some(addr) = url.strip_prefix("tcp://") {
-            let transport = TcpTransport::connect(addr).await?;
-            return Ok(MiniDspClient::connect(Box::new(transport)).await?);
-        } else if url.starts_with("ws://") || url.starts_with("http://") {
-            if !is_direct_ws_endpoint(url) {
-                let devices = discover_daemon_tcp(url).await?;
-                if device_idx >= devices.len() {
-                    return Err(format!(
-                        "device index {device_idx} out of range (found {} device{})",
-                        devices.len(),
-                        if devices.len() == 1 { "" } else { "s" }
-                    )
-                    .into());
-                }
-            }
-            let transport = WsTransport::connect(url, device_idx).await?;
-            return Ok(MiniDspClient::connect(Box::new(transport)).await?);
-        } else if let Some(path) = url.strip_prefix("usb://") {
-            let path = parse_usb_url_path(path)?;
-            let transport = HidTransport::open(&path)?;
-            return Ok(MiniDspClient::connect(Box::new(transport)).await?);
-        } else if let Some(path) = url.strip_prefix("usb:") {
-            let path = parse_usb_url_path(path)?;
-            let transport = HidTransport::open(&path)?;
-            return Ok(MiniDspClient::connect(Box::new(transport)).await?);
-        } else {
-            return Err(format!("unsupported URL scheme in '{url}' (expected tcp://, ws://, http://, usb://, or usb:)").into());
-        }
+        return connect_transport_url(url, device_idx).await;
     }
 
     // 4. Daemon URL (or MINIDSPD_URL env var) — connects via WebSocket to /devices/{id}/ws
@@ -909,23 +909,74 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
         }
     }
 
-    // Use --device-index or MINIDSP_INDEX env var to select a specific USB device
-    if let Some(idx) = cli.device_index.or(env_index) {
-        let devices = minidsp::transport::hid::enumerate()?;
-        let dev = devices.get(idx).ok_or_else(|| {
-            format!(
-                "device index {idx} out of range (found {} device{})",
-                devices.len(),
-                if devices.len() == 1 { "" } else { "s" },
-            )
-        })?;
-        let transport = HidTransport::open(&dev.path)?;
-        Ok(MiniDspClient::connect(Box::new(transport)).await?)
-    } else {
-        match HidTransport::open_first() {
-            Ok(transport) => Ok(MiniDspClient::connect(Box::new(transport)).await?),
-            Err(e) => Err(format!("no MiniDSP device found: {e}").into()),
+    let mut clients = discover_local_clients().await?;
+    if device_idx >= clients.len() {
+        return Err(format!(
+            "device index {device_idx} out of range (found {} devices)",
+            clients.len()
+        )
+        .into());
+    }
+    Ok(clients.remove(device_idx))
+}
+
+pub(crate) async fn connect_transport_url(
+    url: &str,
+    device_idx: usize,
+) -> Result<MiniDspClient, Box<dyn std::error::Error>> {
+    use minidsp::transport::Transport;
+    let transport: Box<dyn Transport> = if let Some(addr) = url.strip_prefix("tcp://") {
+        Box::new(TcpTransport::connect(&tcp_address(addr)).await?)
+    } else if url.starts_with("ws://") || url.starts_with("http://") {
+        if !is_direct_ws_endpoint(url) {
+            let devices = discover_daemon_tcp(url).await?;
+            if device_idx >= devices.len() {
+                return Err(format!(
+                    "device index {device_idx} out of range (found {} devices)",
+                    devices.len()
+                )
+                .into());
+            }
         }
+        Box::new(WsTransport::connect(url, device_idx).await?)
+    } else if let Some(path) = url
+        .strip_prefix("usb://")
+        .or_else(|| url.strip_prefix("usb:"))
+    {
+        let decoded = parse_usb_url_path(path)?;
+        if decoded.is_empty() {
+            let query = path
+                .split_once('?')
+                .map(|(_, query)| query)
+                .unwrap_or_default();
+            let field = |key: &str| {
+                query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .find_map(|(name, value)| (name == key).then_some(value))
+            };
+            let vid = field("vid").ok_or("USB URL requires a path or vid/pid query")?;
+            let selector = field("pid")
+                .map(|pid| format!("{vid}:{pid}"))
+                .unwrap_or_else(|| vid.to_owned());
+            Box::new(open_usb_selector(&selector, device_idx)?)
+        } else {
+            Box::new(HidTransport::open(&decoded)?)
+        }
+    } else {
+        return Err(format!(
+            "unsupported URL scheme in '{url}' (expected tcp://, ws://, http://, usb://, or usb:)"
+        )
+        .into());
+    };
+    Ok(MiniDspClient::connect(transport).await?)
+}
+
+fn tcp_address(addr: &str) -> String {
+    if addr.contains(':') {
+        addr.to_owned()
+    } else {
+        format!("{addr}:5333")
     }
 }
 
@@ -967,7 +1018,9 @@ fn open_usb_selector(
         return Ok(HidTransport::open(&dev.path)?);
     }
 
-    Ok(HidTransport::open(selector)?)
+    Ok(HidTransport::open(
+        selector.strip_prefix("path=").unwrap_or(selector),
+    )?)
 }
 
 fn is_direct_ws_endpoint(url: &str) -> bool {
@@ -1193,7 +1246,12 @@ pub(crate) fn discover_network_devices(
     use std::net::{Ipv4Addr, UdpSocket};
 
     let debug = std::env::var_os("MINIDSP_DEBUG_DISCOVERY").is_some();
-    let socket = UdpSocket::bind("0.0.0.0:3999")?;
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.bind(&"0.0.0.0:3999".parse::<std::net::SocketAddr>()?.into())?;
+    let socket: UdpSocket = socket.into();
     socket.join_multicast_v4(&Ipv4Addr::new(224, 0, 0, 250), &Ipv4Addr::UNSPECIFIED)?;
     socket.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
 
@@ -1241,6 +1299,44 @@ pub(crate) fn discover_network_devices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // minidsp-rs 8e987f9, protocol/src/device/probe.rs:19-49 and
+    // minidsp/src/transport/hid/discover.rs:26-37, main.rs:127-133.
+    #[test]
+    fn upstream_force_kinds_usb_urls_and_tcp_default_port() {
+        for kind in [
+            "generic",
+            "m4x10hd",
+            "m10x10hd",
+            "msharc4x8",
+            "m2x4hd",
+            "shd",
+            "ddrc24",
+            "ddrc88bm",
+            "nanodigi2x8",
+            "c8x12v2",
+            "m2x4",
+            "flex",
+            "flexhtx",
+        ] {
+            assert!(resolve_force_kind(kind).is_some(), "{kind}");
+            assert!(Cli::try_parse_from(["minidsp", "--force-kind", kind]).is_ok());
+        }
+        for flag in ["--force-device", "--force-dsp"] {
+            assert!(Cli::try_parse_from(["minidsp", flag, "100"]).is_ok());
+        }
+        assert_eq!(
+            parse_usb_url_path("%2Fdev%2Fhidraw3?vid=2752&pid=0011").unwrap(),
+            "/dev/hidraw3"
+        );
+        assert_eq!(
+            parse_usb_url_path("DevSrvsID%3A123?vid=2752&pid=0011").unwrap(),
+            "DevSrvsID:123"
+        );
+        assert_eq!(tcp_address("192.0.2.1"), "192.0.2.1:5333");
+        assert_eq!(tcp_address("192.0.2.1:5334"), "192.0.2.1:5334");
+        assert!(Cli::try_parse_from(["minidsp", "-o", "bad"]).is_err());
+    }
 
     #[test]
     fn direct_ws_endpoint_detection() {

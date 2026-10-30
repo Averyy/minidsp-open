@@ -90,6 +90,8 @@ pub fn start(
         // (and makes a fresh OTA image roll back). Each slot is just a table
         // entry, so keep generous headroom.
         max_uri_handlers: 128,
+        // Leave room for the origin policy's response headers too.
+        max_resp_headers: 12,
         // `/devices/0/play` does request parsing, source switching, and
         // playback-thread orchestration before handing back the response.
         // The default 16 KiB httpd task stack is not enough on real hardware.
@@ -252,7 +254,7 @@ pub fn start(
     register_source_routes(&mut server, state.clone(), audio_state.clone())?;
     register_preset_routes(&mut server, state.clone(), audio_state.clone())?;
 
-    register_firmware_routes(&mut server, audio_state.clone())?;
+    register_firmware_routes(&mut server, audio_state.clone(), ap_ip.is_some())?;
     register_rattle_routes(&mut server, state.clone(), audio_state.clone())?;
 
     {
@@ -1027,7 +1029,13 @@ pub fn start(
     )?;
 
     // Debug / diagnostics endpoints
-    register_debug_routes(&mut server, state.clone(), audio_state.clone(), nvs.clone())?;
+    register_debug_routes(
+        &mut server,
+        state.clone(),
+        audio_state.clone(),
+        nvs.clone(),
+        ap_ip.is_some(),
+    )?;
 
     // WebSocket for status streaming (gated on ESP-IDF httpd WS support)
     #[cfg(esp_idf_httpd_ws_support)]
@@ -1118,40 +1126,41 @@ pub fn start(
         })?;
     }
 
-    // POST /api/wifi/connect — WiFi provisioning form handler
-    let nvs_wifi = nvs.clone();
-    server.fn_handler("/api/wifi/connect", Method::Post, move |mut req| {
-        let body_bytes = match read_request_body(&mut req, 512) {
-            Ok(b) => b,
-            Err(msg) => return send_provision_error(req, msg),
-        };
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("");
+    if ap_ip.is_some() {
+        // POST /api/wifi/connect — WiFi provisioning form handler
+        let nvs_wifi = nvs.clone();
+        server.fn_handler("/api/wifi/connect", Method::Post, move |mut req| {
+            let body_bytes = match read_request_body(&mut req, 512) {
+                Ok(b) => b,
+                Err(msg) => return send_provision_error(req, msg),
+            };
+            let body = std::str::from_utf8(&body_bytes).unwrap_or("");
 
-        // Parse form-encoded body: ssid=...&password=...
-        let mut ssid = String::new();
-        let mut password = String::new();
-        for pair in body.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                let decoded = urldecode(value);
-                match key {
-                    "ssid" => ssid = decoded,
-                    "password" => password = decoded,
-                    _ => {}
+            // Parse form-encoded body: ssid=...&password=...
+            let mut ssid = String::new();
+            let mut password = String::new();
+            for pair in body.split('&') {
+                if let Some((key, value)) = pair.split_once('=') {
+                    let decoded = urldecode(value);
+                    match key {
+                        "ssid" => ssid = decoded,
+                        "password" => password = decoded,
+                        _ => {}
+                    }
                 }
             }
-        }
 
-        if ssid.is_empty() {
-            return send_provision_error(req, "SSID is required");
-        }
+            if ssid.is_empty() {
+                return send_provision_error(req, "SSID is required");
+            }
 
-        // Save credentials to NVS (partition passed from main — not ::take())
-        if let Err(e) = crate::wifi::save_credentials(&nvs_wifi, &ssid, &password) {
-            return send_provision_error(req, &format!("Save failed: {e}"));
-        }
+            // Save credentials to NVS (partition passed from main — not ::take())
+            if let Err(e) = crate::wifi::save_credentials(&nvs_wifi, &ssid, &password) {
+                return send_provision_error(req, &format!("Save failed: {e}"));
+            }
 
-        // Return success page, then restart
-        let html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+            // Return success page, then restart
+            let html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
                     <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
                     <title>WiFi Saved</title>\
                     <style>body{font-family:system-ui;max-width:400px;margin:40px auto;\
@@ -1160,16 +1169,17 @@ pub fn start(
                     <h2 style=\"color:#53c28b\">WiFi credentials saved!</h2>\
                     <p>Device will restart and connect to your network.</p>\
                     </body></html>";
-        let headers = [("Server", "miniDSP-Open"), ("Content-Type", "text/html")];
-        let mut resp = req.into_response(200, None, &headers)?;
-        resp.write_all(html.as_bytes())?;
-        // Schedule restart after response is sent
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            unsafe { esp_idf_svc::sys::esp_restart() };
-        });
-        Ok(())
-    })?;
+            let headers = [("Server", "miniDSP-Open"), ("Content-Type", "text/html")];
+            let mut resp = req.into_response(200, None, &headers)?;
+            resp.write_all(html.as_bytes())?;
+            // Schedule restart after response is sent
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            });
+            Ok(())
+        })?;
+    }
 
     // Catch-all GET handler:
     // - SoftAP mode: redirect to captive portal
@@ -1293,6 +1303,7 @@ fn register_debug_routes(
     state: SharedDeviceState,
     audio_state: usb_audio::SharedAudioState,
     nvs: EspDefaultNvsPartition,
+    #[cfg_attr(not(feature = "dev-updater-override"), allow(unused_variables))] provisioning: bool,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     // GET /debug/info — JSON system diagnostics
     {
@@ -1490,7 +1501,8 @@ fn register_debug_routes(
     }
 
     // POST /debug/updater — set or clear updater base URL override
-    {
+    #[cfg(feature = "dev-updater-override")]
+    if !provisioning {
         let nvs = nvs.clone();
         server.fn_handler("/debug/updater", Method::Post, move |mut req| {
             let body = match read_request_body(&mut req, 512) {
@@ -1574,6 +1586,7 @@ fn register_debug_routes(
 fn register_firmware_routes(
     server: &mut EspHttpServer<'static>,
     audio_state: usb_audio::SharedAudioState,
+    provisioning: bool,
 ) -> Result<(), esp_idf_svc::sys::EspError> {
     const FIRMWARE_TASK_STACK_BYTES: usize = 12 * 1024;
 
@@ -1591,7 +1604,7 @@ fn register_firmware_routes(
     // Raw app image upload: `curl --data-binary @app.bin
     // 'http://BOARD/firmware?sha256=<hex>'`. The image streams straight into
     // the inactive slot; the board reboots into it once ESP-IDF verifies it.
-    {
+    if !provisioning {
         let audio = audio_state.clone();
         server.fn_handler("/firmware", Method::Post, move |mut req| {
             if audio.is_playing() {
@@ -1628,18 +1641,14 @@ fn register_firmware_routes(
     }
 
     // Ask GitHub for the latest release; poll GET /firmware for `latest`.
-    server.fn_handler("/firmware/check", Method::Post, |req| {
-        let spawned = std::thread::Builder::new()
-            .name("fw_check_now".into())
-            .stack_size(FIRMWARE_TASK_STACK_BYTES)
-            .spawn(|| {
-                crate::ota::check_for_update();
-            });
-        match spawned {
-            Ok(_) => send_json(req, 202, r#"{"status":"checking"}"#),
-            Err(e) => send_error(req, 500, &format!("spawn check: {e}")),
-        }
-    })?;
+    server.fn_handler(
+        "/firmware/check",
+        Method::Post,
+        |req| match crate::ota::request_check() {
+            Ok(()) => send_json(req, 202, r#"{"status":"checking"}"#),
+            Err(message) => send_error(req, 409, message),
+        },
+    )?;
 
     // Install the latest GitHub release; poll GET /firmware for `progress`.
     {
@@ -2903,7 +2912,6 @@ pub fn send_json<C: esp_idf_svc::http::server::Connection>(
     let headers = [
         ("Server", "miniDSP-Open"),
         ("Content-Type", "application/json"),
-        ("Access-Control-Allow-Origin", "*"),
     ];
     let mut resp = req.into_response(status, None, &headers)?;
     resp.write_all(body.as_bytes())?;
@@ -2956,7 +2964,6 @@ fn send_text<C: esp_idf_svc::http::server::Connection>(
     let headers = [
         ("Server", "miniDSP-Open"),
         ("Content-Type", "text/plain; charset=utf-8"),
-        ("Access-Control-Allow-Origin", "*"),
     ];
     let mut resp = req.into_response(200, None, &headers)?;
     resp.write_all(text.as_bytes())?;
@@ -3008,7 +3015,6 @@ fn send_javascript<C: esp_idf_svc::http::server::Connection>(
     let headers = [
         ("Server", "miniDSP-Open"),
         ("Content-Type", "application/javascript"),
-        ("Access-Control-Allow-Origin", "*"),
         ("Cache-Control", "no-store"),
     ];
     let mut resp = req.into_response(200, None, &headers)?;
@@ -3030,7 +3036,6 @@ fn send_gzip_file<C: esp_idf_svc::http::server::Connection>(
         ("Server", "miniDSP-Open"),
         ("Content-Type", content_type),
         ("Content-Encoding", "gzip"),
-        ("Access-Control-Allow-Origin", "*"),
         ("Cache-Control", "no-store"),
         ("Content-Length", content_length.as_str()),
     ];
@@ -3048,11 +3053,7 @@ fn send_html<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
     html: &str,
 ) -> Result<(), C::Error> {
-    let headers = [
-        ("Server", "miniDSP-Open"),
-        ("Content-Type", "text/html"),
-        ("Access-Control-Allow-Origin", "*"),
-    ];
+    let headers = [("Server", "miniDSP-Open"), ("Content-Type", "text/html")];
     let mut resp = req.into_response(200, None, &headers)?;
     resp.write_all(html.as_bytes())?;
     Ok(())
@@ -3084,12 +3085,10 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
 ) -> Result<(), C::Error> {
     let headers = [
         ("Server", "miniDSP-Open"),
-        ("Access-Control-Allow-Origin", "*"),
         (
             "Access-Control-Allow-Methods",
             "GET, POST, PUT, DELETE, PATCH, OPTIONS",
         ),
-        ("Access-Control-Allow-Headers", "Content-Type"),
         ("Access-Control-Max-Age", "86400"),
     ];
     let mut resp = req.into_response(204, None, &headers)?;
@@ -3100,10 +3099,7 @@ fn send_cors_preflight<C: esp_idf_svc::http::server::Connection>(
 fn send_empty_200<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
 ) -> Result<(), C::Error> {
-    let headers = [
-        ("Server", "miniDSP-Open"),
-        ("Access-Control-Allow-Origin", "*"),
-    ];
+    let headers = [("Server", "miniDSP-Open")];
     let mut resp = req.into_response(200, None, &headers)?;
     resp.write_all(b"")?;
     Ok(())
@@ -5062,16 +5058,130 @@ fn summarize_write_latencies(samples: &[i64]) -> (i64, i64, i64, i64, i64, i64) 
 // WebSocket support (status streaming)
 // ---------------------------------------------------------------------------
 
-/// Preserve svc 0.53's connection-time callback on IDF >=6.0.1, where the
-/// normal URI handler is only called for data frames after a WS upgrade.
-/// This is "Option 2" from Espressif's 6.0 HTTP server migration guide
-/// (`ws_post_handshake_cb = handler`), applied at link time (`--wrap`, see
-/// build.rs) because esp-idf-svc 0.53 builds the `httpd_uri_t` itself and
-/// leaves the field unset; without it the `New` connection event never fires.
-/// Remove this, the `--wrap` flag and CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
-/// once esp-idf-svc sets `ws_post_handshake_cb` for WebSocket handlers.
-/// IDF copies the registration, so the adapted value need only live for this call.
+type NativeHttpHandler =
+    unsafe extern "C" fn(*mut esp_idf_svc::sys::httpd_req_t) -> esp_idf_svc::sys::esp_err_t;
+static NATIVE_HTTP_HANDLER: std::sync::OnceLock<NativeHttpHandler> = std::sync::OnceLock::new();
+
+unsafe fn request_header(
+    req: *mut esp_idf_svc::sys::httpd_req_t,
+    name: &std::ffi::CStr,
+) -> Result<Option<std::ffi::CString>, ()> {
+    use esp_idf_svc::sys::*;
+    let len = httpd_req_get_hdr_value_len(req, name.as_ptr());
+    let mut value = vec![0u8; len + 1];
+    let result =
+        httpd_req_get_hdr_value_str(req, name.as_ptr(), value.as_mut_ptr().cast(), value.len());
+    if result == ESP_ERR_NOT_FOUND {
+        return Ok(None);
+    }
+    if result != ESP_OK {
+        return Err(());
+    }
+    std::ffi::CString::from_vec_with_nul(value)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+unsafe fn request_origin_allowed(req: *mut esp_idf_svc::sys::httpd_req_t) -> bool {
+    let Ok(origin) = request_header(req, c"Origin") else {
+        return false;
+    };
+    let Ok(host) = request_header(req, c"Host") else {
+        return false;
+    };
+    minidsp_protocol::http_origin::origin_allowed(
+        origin.as_ref().map(|v| v.to_str().unwrap_or("")),
+        host.as_ref().and_then(|v| v.to_str().ok()),
+        None,
+    )
+}
+
+unsafe fn reject_origin(req: *mut esp_idf_svc::sys::httpd_req_t) -> esp_idf_svc::sys::esp_err_t {
+    use esp_idf_svc::sys::*;
+    httpd_resp_set_status(req, c"403 Forbidden".as_ptr());
+    httpd_resp_set_type(req, c"application/json".as_ptr());
+    let body = br#"{"error":"origin not allowed"}"#;
+    httpd_resp_send(req, body.as_ptr().cast(), body.len() as isize);
+    // Close rejected requests rather than trying to drain an untrusted body.
+    ESP_FAIL
+}
+
 #[cfg(esp_idf_httpd_ws_support)]
+unsafe extern "C" fn ws_check_origin(
+    req: *mut esp_idf_svc::sys::httpd_req_t,
+) -> esp_idf_svc::sys::esp_err_t {
+    if request_origin_allowed(req) {
+        esp_idf_svc::sys::ESP_OK
+    } else {
+        reject_origin(req)
+    }
+}
+
+/// Runs before every HTTP handler, including simple text/form mutations.
+/// Header storage stays alive until the blocking handler has sent its response.
+unsafe extern "C" fn origin_checked_handler(
+    req: *mut esp_idf_svc::sys::httpd_req_t,
+) -> esp_idf_svc::sys::esp_err_t {
+    use esp_idf_svc::sys::*;
+    #[cfg(esp_idf_httpd_ws_support)]
+    if httpd_ws_get_fd_info((*req).handle, httpd_req_to_sockfd(req))
+        == httpd_ws_client_info_t_HTTPD_WS_CLIENT_WEBSOCKET
+    {
+        return NATIVE_HTTP_HANDLER
+            .get()
+            .map_or(ESP_FAIL, |handler| handler(req));
+    }
+    let allowed = request_origin_allowed(req);
+    let protected = [
+        http_method_HTTP_POST,
+        http_method_HTTP_PUT,
+        http_method_HTTP_PATCH,
+        http_method_HTTP_DELETE,
+        http_method_HTTP_OPTIONS,
+    ]
+    .contains(&((*req).method as u32));
+    if protected && !allowed {
+        return reject_origin(req);
+    }
+    let origin = if allowed {
+        request_header(req, c"Origin").ok().flatten()
+    } else {
+        None
+    };
+    let preflight_headers = if (*req).method as u32 == http_method_HTTP_OPTIONS {
+        request_header(req, c"Access-Control-Request-Headers")
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    httpd_resp_set_hdr(
+        req,
+        c"Vary".as_ptr(),
+        c"Origin, Access-Control-Request-Headers".as_ptr(),
+    );
+    if let Some(origin) = &origin {
+        httpd_resp_set_hdr(
+            req,
+            c"Access-Control-Allow-Origin".as_ptr(),
+            origin.as_ptr(),
+        );
+        if let Some(headers) = &preflight_headers {
+            httpd_resp_set_hdr(
+                req,
+                c"Access-Control-Allow-Headers".as_ptr(),
+                headers.as_ptr(),
+            );
+        }
+    }
+    NATIVE_HTTP_HANDLER
+        .get()
+        .map_or(ESP_FAIL, |handler| handler(req))
+}
+
+/// Adapt svc's single request trampoline, preserving its user context and
+/// IDF 6's post-handshake callback. The pre-handshake check rejects upgrades
+/// before IDF sends 101; checking only the New event would be too late.
 #[no_mangle]
 unsafe extern "C" fn __wrap_httpd_register_uri_handler(
     handle: esp_idf_svc::sys::httpd_handle_t,
@@ -5083,13 +5193,24 @@ unsafe extern "C" fn __wrap_httpd_register_uri_handler(
             registration: *const esp_idf_svc::sys::httpd_uri_t,
         ) -> esp_idf_svc::sys::esp_err_t;
     }
-
     if registration.is_null() {
         return __real_httpd_register_uri_handler(handle, registration);
     }
     let mut adapted = *registration;
-    if adapted.is_websocket && adapted.ws_post_handshake_cb.is_none() {
-        adapted.ws_post_handshake_cb = adapted.handler;
+    let Some(handler) = adapted.handler else {
+        return esp_idf_svc::sys::ESP_FAIL;
+    };
+    let original = NATIVE_HTTP_HANDLER.get_or_init(|| handler);
+    if *original as usize != handler as usize {
+        return esp_idf_svc::sys::ESP_FAIL;
+    }
+    adapted.handler = Some(origin_checked_handler);
+    #[cfg(esp_idf_httpd_ws_support)]
+    if adapted.is_websocket {
+        adapted.ws_pre_handshake_cb = Some(ws_check_origin);
+        if adapted.ws_post_handshake_cb.is_none() {
+            adapted.ws_post_handshake_cb = Some(handler);
+        }
     }
     __real_httpd_register_uri_handler(handle, &adapted)
 }
@@ -5380,11 +5501,6 @@ unsafe fn ws_send_http_json(raw_req: *mut esp_idf_svc::sys::httpd_req_t, status:
     use esp_idf_svc::sys::*;
 
     httpd_resp_set_type(raw_req, c"application/json".as_ptr());
-    httpd_resp_set_hdr(
-        raw_req,
-        c"Access-Control-Allow-Origin".as_ptr(),
-        c"*".as_ptr(),
-    );
 
     let status_text = match status {
         200 => b"200 OK\0".as_slice(),
@@ -5925,7 +6041,6 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
     let headers = [
         ("Server", "miniDSP-Open"),
         ("Content-Type", content_type),
-        ("Access-Control-Allow-Origin", "*"),
         ("Cache-Control", cache_control),
     ];
     let mut resp = req.into_response(200, None, &headers)?;
@@ -5993,7 +6108,6 @@ fn proxy_catalogue_file<C: esp_idf_svc::http::server::Connection>(
         let headers = [
             ("Server", "miniDSP-Open"),
             ("Content-Type", content_type),
-            ("Access-Control-Allow-Origin", "*"),
             ("Cache-Control", "no-store"),
             ("Content-Length", len.as_str()),
         ];
@@ -6002,7 +6116,6 @@ fn proxy_catalogue_file<C: esp_idf_svc::http::server::Connection>(
         let headers = [
             ("Server", "miniDSP-Open"),
             ("Content-Type", content_type),
-            ("Access-Control-Allow-Origin", "*"),
             ("Cache-Control", "no-store"),
         ];
         req.into_response(200, None, &headers)?
