@@ -258,6 +258,43 @@ pub fn dirac_bypass(bypass: bool) -> Vec<u8> {
     vec![CMD_DIRAC_BYPASS, if bypass { 0x01 } else { 0x00 }]
 }
 
+/// Commands that can reload or replace DSP state even without a preset-index
+/// change. Acknowledged-readback provenance must be invalidated on an attempt,
+/// including an ambiguous failure; a later acknowledged write can reestablish it.
+pub fn invalidates_config_readback(command: u8) -> bool {
+    matches!(
+        command,
+        CMD_SET_CONFIG | CMD_RESET | CMD_ENTER_BOOTLOADER | CMD_COPY_PRESET
+    )
+}
+
+/// Commands that can replace preset/device context. Ordinary DSP/mute writes
+/// and the official modification-token bookkeeping do not change this context.
+pub fn invalidates_snapshot_context(payload: &[u8]) -> bool {
+    match payload.first().copied() {
+        Some(command) if invalidates_config_readback(command) => true,
+        Some(CMD_WRITE_FLASH) => {
+            if payload.len() < 3 {
+                return true;
+            }
+            let addr = u16::from_be_bytes([payload[1], payload[2]]) as usize;
+            let token_start =
+                u16::from_be_bytes([crate::eeprom::TOKENS_ADDR.0, crate::eeprom::TOKENS_ADDR.1])
+                    as usize;
+            !(addr >= token_start && addr + payload.len() - 3 <= token_start + 16)
+        }
+        Some(
+            CMD_ERASE_FLASH
+            | CMD_WRITE_FLASH_BLOCK
+            | CMD_FINISH_FLASH_BLOCK
+            | CMD_WRITE_FLASH_FULL_ADDR
+            | CMD_LOAD_DSP_PROGRAM
+            | CMD_RELOAD_E2PROM_HEADER,
+        ) => true,
+        _ => false,
+    }
+}
+
 /// Build a Reset command.
 pub fn reset() -> Vec<u8> {
     vec![CMD_RESET]

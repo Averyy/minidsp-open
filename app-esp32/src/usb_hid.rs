@@ -153,6 +153,7 @@ struct CallbackState {
     /// Incremented for each NEW_DEV so reconnect logic can notice a fresh attach
     /// even if another thread already consumed or cleared the queued address.
     attach_generation: AtomicU32,
+    connection_epoch: AtomicU32,
     /// Snapshot of attach_generation at the most recent DEV_GONE. Cleanup uses
     /// this to avoid wiping a newer attach that raced with teardown.
     last_disconnect_attach_generation: AtomicU32,
@@ -178,6 +179,7 @@ fn cb_state() -> &'static CallbackState {
         device_present: AtomicBool::new(false),
         last_attach_ms: AtomicU32::new(0),
         attach_generation: AtomicU32::new(0),
+        connection_epoch: AtomicU32::new(0),
         last_disconnect_attach_generation: AtomicU32::new(0),
         session_generation: AtomicU8::new(0),
         out_submit_count: AtomicU32::new(0),
@@ -228,6 +230,7 @@ pub struct UsbHidBus {
     ep_out: AtomicU8,
     hid_intf: Mutex<Option<u8>>,
     session_ready: AtomicBool,
+    installed_epoch: AtomicU32,
     lock: Mutex<()>,
     out_sync: XferSync,
     in_sync: XferSync,
@@ -455,6 +458,11 @@ impl UsbHidBus {
     ) -> Result<(u16, u16), UsbHidError> {
         let (dev_hdl, vid, pid, hid_intf, ep_in, ep_out) = device;
         self.begin_new_session();
+        let epoch = cb_state()
+            .connection_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        self.installed_epoch.store(epoch, Ordering::SeqCst);
 
         *self.dev_hdl.lock().unwrap() = dev_hdl;
         self.ep_in.store(ep_in, Ordering::SeqCst);
@@ -606,6 +614,7 @@ impl UsbHidBus {
                         let (lock, cvar) = &cb.dev_event;
                         let mut guard = lock.lock().unwrap();
                         *cb.new_dev_addr.lock().unwrap() = Some(addr);
+                        cb.connection_epoch.fetch_add(1, Ordering::SeqCst);
                         cb.device_present.store(true, Ordering::SeqCst);
                         cb.last_attach_ms
                             .store((esp_timer_get_time() / 1000) as u32, Ordering::SeqCst);
@@ -627,6 +636,7 @@ impl UsbHidBus {
             ep_out: AtomicU8::new(0),
             hid_intf: Mutex::new(None),
             session_ready: AtomicBool::new(false),
+            installed_epoch: AtomicU32::new(0),
             lock: Mutex::new(()),
             out_sync: XferSync::new(),
             in_sync: XferSync::new(),
@@ -706,6 +716,7 @@ impl UsbHidBus {
     /// True if the USB device is currently connected.
     pub fn is_connected(&self) -> bool {
         self.session_ready.load(Ordering::SeqCst)
+            && self.installed_epoch.load(Ordering::SeqCst) == self.connection_epoch()
             && cb_state().device_present.load(Ordering::SeqCst)
             && !self.dev_hdl.lock().unwrap().is_null()
     }
@@ -761,12 +772,25 @@ impl UsbHidBus {
     ///
     /// The payload is the raw command bytes (e.g., `[0x31]` for ReadHardwareId).
     /// This method handles frame encoding, USB transfer, and frame decoding.
-    pub fn command_with_timeout(
+    pub fn connection_epoch(&self) -> u32 {
+        cb_state().connection_epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn command_at_epoch(&self, payload: &[u8], epoch: u32) -> Result<Vec<u8>, UsbHidError> {
+        self.command_with_timeout_at_epoch(payload, XFER_TIMEOUT, epoch)
+    }
+
+    pub fn command_with_timeout_at_epoch(
         &self,
         payload: &[u8],
         timeout: Duration,
+        expected_epoch: u32,
     ) -> Result<Vec<u8>, UsbHidError> {
         let _lock = self.lock.lock().unwrap();
+        if expected_epoch != self.connection_epoch() {
+            return Err(UsbHidError::Disconnected);
+        }
+        let command_epoch = self.connection_epoch();
         debug!("USB command start: {:02x?}", payload);
 
         // Check connection under lock to avoid TOCTOU race
@@ -872,6 +896,9 @@ impl UsbHidBus {
                         "USB HID: accepting AudioSrcChanged notification as set_source completion: {:02x?}",
                         decoded
                     );
+                    if command_epoch != self.connection_epoch() || !self.is_connected() {
+                        return Err(UsbHidError::Disconnected);
+                    }
                     return Ok(decoded);
                 }
 
@@ -889,6 +916,9 @@ impl UsbHidBus {
                         );
                         continue;
                     }
+                }
+                if command_epoch != self.connection_epoch() || !self.is_connected() {
+                    return Err(UsbHidError::Disconnected);
                 }
                 return Ok(decoded);
             }
@@ -919,11 +949,6 @@ impl UsbHidBus {
         } else if let Err(err) = self.cleanup_device() {
             warn!("USB cleanup after response timeout failed: {err}");
         }
-    }
-
-    /// Send a command payload and receive the response with the default timeout.
-    pub fn command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
-        self.command_with_timeout(payload, XFER_TIMEOUT)
     }
 
     /// Best-effort cleanup of the current device (release interface, close).
@@ -1375,6 +1400,7 @@ unsafe extern "C" fn client_event_callback(
             cb.attach_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
         );
+        cb.connection_epoch.fetch_add(1, Ordering::SeqCst);
         cb.device_present.store(false, Ordering::SeqCst);
         cb.last_attach_ms.store(0, Ordering::SeqCst);
         crate::led::set_device_ready(false);

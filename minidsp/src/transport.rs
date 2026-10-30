@@ -6,6 +6,8 @@ use std::pin::Pin;
 /// Error type for transport operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
+    #[error("snapshot context precondition failed")]
+    PreconditionFailed,
     #[error("I/O error: {0}")]
     Io(String),
     #[error("USB HID error: {0}")]

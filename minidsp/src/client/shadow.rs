@@ -191,6 +191,8 @@ impl MiniDspClient {
     }
 
     async fn apply_active_shadow_snapshot(&self, snapshot: Option<PresetShadowState>) {
+        // Older persisted shadows include seeded identities without provenance.
+        self.invalidate_readback_knowledge().await;
         {
             let mut peq_shadow = self.peq_shadow.lock().await;
             *peq_shadow = build_peq_shadow(&self.profile);
@@ -251,6 +253,7 @@ impl MiniDspClient {
         };
 
         if let Some(previous) = previous {
+            self.queue.invalidate_snapshot_context();
             let skip_capture = {
                 self.skip_trusted_shadow_capture_once
                     .lock()
@@ -303,12 +306,39 @@ impl MiniDspClient {
 
     pub(crate) async fn mark_snapshot_trusted(&self, preset: u8) {
         self.trusted_snapshot_presets.lock().await.insert(preset);
+        self.invalidated_snapshot_presets
+            .lock()
+            .await
+            .remove(&preset);
         if *self.active_preset.lock().await == Some(preset) {
             self.skip_trusted_shadow_capture_once
                 .lock()
                 .await
                 .insert(preset);
         }
+    }
+
+    /// Drop trust without marking the preset's contents uncertain.
+    pub(crate) async fn untrust_snapshot(&self, preset: u8) {
+        self.trusted_snapshot_presets.lock().await.remove(&preset);
+    }
+
+    /// The preset's stored contents are uncertain: drop its trust and keep the
+    /// token and default-image paths from vouching for it.
+    pub(crate) async fn revoke_snapshot_trust(&self, preset: u8) {
+        self.trusted_snapshot_presets.lock().await.remove(&preset);
+        self.invalidated_snapshot_presets
+            .lock()
+            .await
+            .insert(preset);
+    }
+
+    pub async fn revoke_all_snapshot_trust(&self) {
+        self.trusted_snapshot_presets.lock().await.clear();
+        self.invalidated_snapshot_presets
+            .lock()
+            .await
+            .extend(0..self.profile.presets);
     }
 
     pub(super) async fn note_preset_mutation(&self) {
@@ -320,9 +350,104 @@ impl MiniDspClient {
         }
     }
 
+    /// Reconnection can replace volatile state without changing the preset number.
+    pub(super) async fn synchronize_readback_epoch(&self) -> u64 {
+        let mut observed = self.readback_epoch.lock().await;
+        let current = self.queue.reconnect_epoch();
+        // Stored presets survive a reconnect, so snapshot trust stays; only
+        // this session's acknowledged-field knowledge is lost.
+        if *observed != current {
+            self.invalidate_readback_knowledge().await;
+            *observed = current;
+        }
+        current
+    }
+
+    pub(super) async fn invalidate_active_snapshot_readback(&self) {
+        let active = *self.active_preset.lock().await;
+        if let Some(preset) = active {
+            self.revoke_snapshot_trust(preset).await;
+        }
+    }
+
+    /// Invalidate acknowledged knowledge before dispatch, including lost-ACK writes.
+    pub async fn invalidate_config_readback_for_write(&self, payload: &[u8]) {
+        self.synchronize_readback_epoch().await;
+        // A same-slot reload/reset can replace state without changing the preset
+        // number. Failed responses also leave the prior state uncertain.
+        self.invalidate_readback_for_command(payload).await;
+        if let Some((addr, _)) = parse_raw_write_biquad(payload, &self.profile.dialect) {
+            self.peq_readback_known
+                .lock()
+                .await
+                .entry(addr)
+                .or_default()
+                .0 = false;
+        }
+        if let Some((addr, _)) = parse_raw_bypass_filter(payload) {
+            self.peq_readback_known
+                .lock()
+                .await
+                .entry(addr)
+                .or_default()
+                .1 = false;
+        }
+        if let Some((addr, _)) = parse_raw_selector_write(payload, &self.profile.dialect)
+            .or_else(|| parse_raw_linked_selector_write(payload, &self.profile.dialect))
+        {
+            self.scalar_readback_known.lock().await.remove(&addr);
+            self.selector_readback_known.lock().await.remove(&addr);
+        } else if payload.first().copied() == Some(commands::CMD_WRITE_DSP) && payload.len() >= 8 {
+            // Any control byte: a RAM-only write (0xA0) is not parsed as a
+            // selector write, but it still changes the selector's value.
+            let addr = u16::from_be_bytes([payload[2], payload[3]]);
+            self.scalar_readback_known.lock().await.remove(&addr);
+            self.selector_readback_known.lock().await.remove(&addr);
+        }
+        // Linked integer writes can change destinations even if their ACK is lost.
+        if payload.first().copied() == Some(commands::CMD_WRITE_BIQUAD)
+            && payload.get(1).is_some_and(|ctrl| *ctrl > 0x80)
+        {
+            let count = usize::from(payload[1] - 0x80);
+            for bytes in payload
+                .get(4..4 + count * 2)
+                .unwrap_or(&[])
+                .as_chunks::<2>()
+                .0
+            {
+                let addr = u16::from_be_bytes([bytes[0], bytes[1]]);
+                self.scalar_readback_known.lock().await.remove(&addr);
+                self.selector_readback_known.lock().await.remove(&addr);
+            }
+        }
+        if payload.first().copied() == Some(commands::CMD_WRITE_DSP) && payload.len() >= 8 {
+            let addr = u16::from_be_bytes([payload[2], payload[3]]);
+            for (&base, known) in self.peq_readback_known.lock().await.iter_mut() {
+                if minidsp_protocol::shadow::coefficient_span_contains(base, addr) {
+                    known.0 = false;
+                }
+            }
+        }
+    }
+
+    /// A field write that fails or goes unacknowledged leaves the active
+    /// preset's contents uncertain, so its snapshot trust goes with it.
+    pub async fn revoke_trust_after_failed_write(&self, payload: &[u8]) {
+        if matches!(
+            payload.first(),
+            Some(&commands::CMD_WRITE_DSP)
+                | Some(&commands::CMD_WRITE_BIQUAD)
+                | Some(&commands::CMD_BYPASS_FILTER)
+                | Some(&commands::CMD_FIR_LOAD_DATA)
+        ) {
+            self.invalidate_active_snapshot_readback().await;
+        }
+    }
+
     /// Mirror the side effects of a successful raw-bridge write into the
     /// client's shadow state so `/config` can reflect raw WS/TCP activity.
     pub async fn mirror_raw_command_if_success(&self, payload: &[u8], raw_response: &[u8]) {
+        self.invalidate_config_readback_for_write(payload).await;
         let parsed =
             commands::parse_response_for_request(payload, raw_response, &self.profile.dialect);
         if matches!(
@@ -337,6 +462,39 @@ impl MiniDspClient {
             ) {
                 self.note_preset_mutation().await;
             }
+            if let Some((addr, _)) = parse_raw_write_biquad(payload, &self.profile.dialect) {
+                self.peq_readback_known
+                    .lock()
+                    .await
+                    .entry(addr)
+                    .or_default()
+                    .0 = true;
+            }
+            if let Some((addr, _)) = parse_raw_bypass_filter(payload) {
+                self.peq_readback_known
+                    .lock()
+                    .await
+                    .entry(addr)
+                    .or_default()
+                    .1 = true;
+            }
+            if let Some((addr, _)) = parse_raw_selector_write(payload, &self.profile.dialect)
+                .or_else(|| parse_raw_linked_selector_write(payload, &self.profile.dialect))
+            {
+                if self.prefers_scalar_shadow_for_addr(addr) {
+                    self.scalar_readback_known.lock().await.insert(addr);
+                } else {
+                    self.selector_readback_known.lock().await.insert(addr);
+                }
+            } else if self.profile.dialect.value_format == ValueFormat::Float32
+                && payload.first().copied() == Some(commands::CMD_WRITE_DSP)
+                && payload.len() >= 8
+            {
+                self.scalar_readback_known
+                    .lock()
+                    .await
+                    .insert(u16::from_be_bytes([payload[2], payload[3]]));
+            }
             mirror_raw_command_to_shadow(
                 payload,
                 &self.profile.dialect,
@@ -346,10 +504,13 @@ impl MiniDspClient {
                 |addr| self.prefers_scalar_shadow_for_addr(addr),
             )
             .await;
+        } else {
+            self.revoke_trust_after_failed_write(payload).await;
         }
     }
 
     pub async fn export_shadow_state(&self) -> DeviceShadowState {
+        self.synchronize_readback_epoch().await;
         let active_shadow = self.capture_active_shadow().await;
         let active_preset = *self.active_preset.lock().await;
         let mut presets = self.preset_shadows.lock().await.clone();

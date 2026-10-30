@@ -36,6 +36,7 @@ struct QueuedCommand {
     response_tx: oneshot::Sender<Result<QueueResponse, TransportError>>,
     allow_unknown_response: bool,
     replay_safe: bool,
+    snapshot_token: Option<String>,
     #[allow(dead_code)]
     batch_id: Option<u64>,
     timeout: Duration,
@@ -78,6 +79,8 @@ struct QueueInner {
     transport: Mutex<Box<dyn Transport>>,
     transport_url: String,
     reconnect_config: ReconnectConfig,
+    snapshot_session: Option<String>,
+    snapshot_generation: std::sync::atomic::AtomicU64,
     queues: Mutex<[VecDeque<QueuedCommand>; 4]>,
     #[allow(dead_code)]
     state: Mutex<QueueState>,
@@ -124,6 +127,13 @@ impl CommandQueue {
                 transport: Mutex::new(transport),
                 transport_url,
                 reconnect_config,
+                snapshot_session: {
+                    let mut bytes = [0u8; 16];
+                    getrandom::getrandom(&mut bytes)
+                        .ok()
+                        .map(|()| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+                },
+                snapshot_generation: std::sync::atomic::AtomicU64::new(0),
                 queues: Mutex::new([
                     VecDeque::new(),
                     VecDeque::new(),
@@ -252,6 +262,7 @@ impl CommandQueue {
             }
             queues[priority as usize].push_back(QueuedCommand {
                 replay_safe: allow_replay && is_replay_safe(&payload),
+                snapshot_token: None,
                 payload,
                 priority,
                 response_tx: tx,
@@ -271,6 +282,18 @@ impl CommandQueue {
         commands: Vec<Vec<u8>>,
         priority: Priority,
     ) -> Result<Vec<Response>, TransportError> {
+        self.execute_batch_with_snapshot(commands, priority, None)
+            .await
+    }
+
+    /// The executor checks this precondition immediately before every send.
+    /// Conditional writes are never replayed after an ambiguous exchange.
+    pub async fn execute_batch_with_snapshot(
+        &self,
+        commands: Vec<Vec<u8>>,
+        priority: Priority,
+        snapshot_token: Option<String>,
+    ) -> Result<Vec<Response>, TransportError> {
         let batch_id = self
             .inner
             .next_batch_id
@@ -285,7 +308,8 @@ impl CommandQueue {
             for payload in commands {
                 let (tx, rx) = oneshot::channel();
                 queues[priority as usize].push_back(QueuedCommand {
-                    replay_safe: is_replay_safe(&payload),
+                    replay_safe: snapshot_token.is_none() && is_replay_safe(&payload),
+                    snapshot_token: snapshot_token.clone(),
                     payload,
                     priority,
                     response_tx: tx,
@@ -307,6 +331,16 @@ impl CommandQueue {
             responses.push(qr.parsed);
         }
         Ok(responses)
+    }
+
+    pub fn snapshot_token(&self) -> Option<String> {
+        self.inner.snapshot_token()
+    }
+
+    pub fn invalidate_snapshot_context(&self) {
+        self.inner
+            .snapshot_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Check if level polling is paused.
@@ -356,6 +390,20 @@ impl QueueInner {
     }
 
     /// Drain independently of callers so cancellation cannot abandon an exchange.
+    fn snapshot_token(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.is_shutdown() || self.needs_reconnect.load(SeqCst) {
+            return None;
+        }
+        Some(format!(
+            "{}-{:x}-{:x}-{:x}",
+            self.snapshot_session.as_ref()?,
+            self.reconnect_epoch.load(SeqCst),
+            self.disconnect_epoch.load(SeqCst),
+            self.snapshot_generation.load(SeqCst)
+        ))
+    }
+
     async fn process_next(&self) {
         let _processing = self.processing.lock().await;
         let mut shutdown = self.shutdown_rx.clone();
@@ -403,6 +451,11 @@ impl QueueInner {
             self.batch_active
                 .store(active_batch.is_some(), std::sync::atomic::Ordering::Relaxed);
             let result = loop {
+                if let Some(expected) = &cmd.snapshot_token
+                    && self.snapshot_token().as_ref() != Some(expected)
+                {
+                    break Err(TransportError::PreconditionFailed);
+                }
                 if self
                     .needs_reconnect
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -411,7 +464,7 @@ impl QueueInner {
                     break Err(err);
                 }
                 let result = self.execute_queued_command(&cmd).await;
-                if result.is_err() {
+                if result.is_err() && !matches!(result, Err(TransportError::PreconditionFailed)) {
                     // An ambiguous exchange must be resynchronized before any send.
                     self.needs_reconnect
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -444,6 +497,15 @@ impl QueueInner {
             .copied()
             .ok_or_else(|| TransportError::Io("empty command payload".into()))?;
 
+        if let Some(expected) = &cmd.snapshot_token
+            && (self.snapshot_token().as_ref() != Some(expected) || !transport.is_connected())
+        {
+            return Err(TransportError::PreconditionFailed);
+        }
+        if commands::invalidates_snapshot_context(&cmd.payload) {
+            self.snapshot_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         transport.send_frame(&cmd.payload).await?;
 
         loop {
@@ -517,6 +579,11 @@ impl QueueInner {
                 continue;
             }
 
+            if cmd.snapshot_token.is_some() && !matches!(response, Response::Ack) {
+                return Err(TransportError::Io(
+                    "conditional mute write was not acknowledged".into(),
+                ));
+            }
             return Ok(QueueResponse {
                 parsed: response,
                 raw,
@@ -1526,6 +1593,7 @@ mod tests {
                 response_tx: tx1,
                 allow_unknown_response: false,
                 replay_safe: true,
+                snapshot_token: None,
                 batch_id: None,
                 timeout: Duration::from_millis(5),
             });
@@ -1535,6 +1603,7 @@ mod tests {
                 response_tx: tx2,
                 allow_unknown_response: false,
                 replay_safe: true,
+                snapshot_token: None,
                 batch_id: None,
                 timeout: Duration::from_millis(5),
             });
@@ -1812,5 +1881,73 @@ mod tests {
             "read floats response must not be trimmed: got {} bytes",
             resp.len()
         );
+    }
+    #[tokio::test]
+    async fn conditional_mutes_preserve_context_and_reject_stale_token_without_send() {
+        let transport =
+            FakeTransport::new([Ok(vec![commands::RESP_OK]), Ok(vec![commands::RESP_OK])]);
+        let sent = transport.sent.clone();
+        let queue = CommandQueue::new(Box::new(transport));
+        let token = queue.snapshot_token().unwrap();
+        queue
+            .execute(commands::write_flash(0xff, 0xc8, &[1; 4]), Priority::High)
+            .await
+            .unwrap();
+        assert_eq!(queue.snapshot_token().as_deref(), Some(token.as_str()));
+        let mute = commands::write_dsp_u32_le_with_ctrl(100, 1, 0x80);
+        queue
+            .execute_batch_with_snapshot(
+                vec![mute.clone()],
+                Priority::Critical,
+                Some(token.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.snapshot_token().as_deref(), Some(token.as_str()));
+        queue.invalidate_snapshot_context();
+        let err = queue
+            .execute_batch_with_snapshot(vec![mute], Priority::Critical, Some(token))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransportError::PreconditionFailed));
+        assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_does_not_send_remainder_after_ambiguous_first_ack() {
+        let transport = FakeTransport::new([Err(TransportError::Disconnected)]);
+        let sent = transport.sent.clone();
+        let queue = CommandQueue::new(Box::new(transport));
+        let token = queue.snapshot_token().unwrap();
+        let mutes = vec![
+            commands::write_dsp_u32_le_with_ctrl(100, 1, 0x80),
+            commands::write_dsp_u32_le_with_ctrl(101, 1, 0x80),
+        ];
+        assert!(
+            queue
+                .execute_batch_with_snapshot(mutes, Priority::Critical, Some(token))
+                .await
+                .is_err()
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(queue.snapshot_token().is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_same_slot_reload_changes_context_before_ack() {
+        let transport = FakeTransport::new([Ok(vec![commands::RESP_PRESET_COMPLETE])]);
+        let queue = CommandQueue::new(Box::new(transport));
+        let token = queue.snapshot_token().unwrap();
+        queue
+            .execute_raw(
+                commands::set_config(0, commands::PRESET_CHANGE_RELOAD_SAME_SLOT),
+                Priority::Critical,
+            )
+            .await
+            .unwrap();
+        assert_ne!(queue.snapshot_token().as_deref(), Some(token.as_str()));
+        let other = CommandQueue::new(Box::new(FakeTransport::new([])));
+        assert_ne!(queue.snapshot_token(), other.snapshot_token());
     }
 }

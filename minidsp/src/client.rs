@@ -13,9 +13,9 @@ use minidsp_protocol::eeprom;
 use minidsp_protocol::shadow::{PeqShadow, build_peq_shadow, sanitize_shadow_preferred_scalar};
 use minidsp_protocol::status::{
     BiquadCoeffs, BmChannelConfig, BmChannelPatch, BmMixerCellConfig, BmMixerCellPatch,
-    BmStateConfig, CompressorConfig, CrossoverGroupConfig, DeviceConfig, DeviceInfo, FirConfig,
-    IndexedBiquadConfig, InputChannelConfig, MasterStatusView, OutputChannelConfig, PeqBandConfig,
-    RoutingConfig, StatusSummary,
+    BmStateConfig, CompressorConfig, ConfigReadback, ConfigReadbackSource, CrossoverGroupConfig,
+    DeviceConfig, DeviceInfo, FirConfig, IndexedBiquadConfig, InputChannelConfig, MasterStatusView,
+    OutputChannelConfig, PeqBandConfig, RoutingConfig, StatusSummary,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -350,6 +350,11 @@ pub struct MiniDspClient {
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
     /// Shadow state for PEQ bands when the device does not expose live coeff readback.
     peq_shadow: Arc<Mutex<HashMap<u16, PeqShadow>>>,
+    peq_readback_known: Mutex<HashMap<u16, (bool, bool)>>,
+    scalar_readback_known: Mutex<HashSet<u16>>,
+    selector_readback_known: Mutex<HashSet<u16>>,
+    pub(crate) invalidated_snapshot_presets: Mutex<HashSet<u8>>,
+    readback_epoch: Mutex<u64>,
     /// Shadow state for selector-style integer slots and other SHARC integer
     /// controls whose live DSP100 readback can collapse or stay at `0`.
     selector_shadow: Arc<Mutex<HashMap<u16, u16>>>,
@@ -401,8 +406,15 @@ impl MiniDspClient {
                 | Some(&commands::CMD_BYPASS_FILTER)
                 | Some(&commands::CMD_FIR_LOAD_DATA)
         );
-        let resp = self.queue.execute(payload, priority).await?;
-        Self::ensure_write_response(resp, context)?;
+        self.invalidate_config_readback_for_write(&payload).await;
+        let result = match self.queue.execute(payload.clone(), priority).await {
+            Ok(resp) => Self::ensure_write_response(resp, context),
+            Err(err) => Err(err.into()),
+        };
+        if result.is_err() {
+            self.revoke_trust_after_failed_write(&payload).await;
+        }
+        result?;
         if mutates_preset {
             self.note_preset_mutation().await;
         }
@@ -416,11 +428,19 @@ impl MiniDspClient {
         timeout: Duration,
         context: &str,
     ) -> Result<(), ClientError> {
-        let resp = self
+        self.invalidate_config_readback_for_write(&payload).await;
+        let result = match self
             .queue
-            .execute_with_timeout(payload, priority, timeout)
-            .await?;
-        Self::ensure_write_response(resp, context)
+            .execute_with_timeout(payload.clone(), priority, timeout)
+            .await
+        {
+            Ok(resp) => Self::ensure_write_response(resp, context),
+            Err(err) => Err(err.into()),
+        };
+        if result.is_err() {
+            self.revoke_trust_after_failed_write(&payload).await;
+        }
+        result
     }
 
     pub async fn close(&self) -> Result<(), ClientError> {
@@ -497,6 +517,11 @@ impl MiniDspClient {
             volume_settings: Default::default(),
             pending_write,
             peq_shadow,
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow,
             scalar_shadow,
             fir_shadow,
@@ -907,6 +932,8 @@ impl MiniDspClient {
         if before.preset == preset && reset_mode != commands::PRESET_CHANGE_RELOAD_SAME_SLOT {
             return Ok(before);
         }
+        self.invalidate_readback_for_command(&commands::set_config(preset, reset_mode))
+            .await;
         let _levels = self.queue.pause_levels();
 
         async {
@@ -961,6 +988,8 @@ impl MiniDspClient {
     /// Reset the device and verify that it becomes temporarily unavailable and
     /// then responsive again when the hardware does not return `ResetComplete`.
     async fn reset_with_verification_locked(&self) -> Result<(), ClientError> {
+        self.invalidate_readback_for_command(&commands::reset())
+            .await;
         let _levels = self.queue.pause_levels();
         let disconnect_epoch = self.queue.disconnect_epoch();
 
@@ -1000,6 +1029,8 @@ impl MiniDspClient {
     /// `EnterBootloader (0x3E)` followed by an expected temporary outage and
     /// master-status recovery.
     async fn reboot_with_verification_locked(&self) -> Result<(), ClientError> {
+        self.invalidate_readback_for_command(&commands::enter_bootloader())
+            .await;
         let _levels = self.queue.pause_levels();
         let disconnect_epoch = self.queue.disconnect_epoch();
 
@@ -1093,6 +1124,92 @@ impl MiniDspClient {
             "set dirac bypass",
         )
         .await
+    }
+
+    /// Restore output mute values only if device/preset continuity still matches.
+    /// Queue serialization covers raw bridge commands too; no replay after lost ACK.
+    pub async fn restore_output_mutes_if_snapshot(
+        &self,
+        values: &[(u8, bool)],
+        expected: &str,
+    ) -> Result<(), ClientError> {
+        if values.is_empty()
+            || expected.is_empty()
+            || expected.len() > 256
+            || !expected.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        {
+            return Err(ClientError::Protocol(
+                "invalid conditional mute restoration".into(),
+            ));
+        }
+        let table = self.profile.dsp_table.ok_or(ClientError::Unsupported)?;
+        let mut seen = HashSet::new();
+        let mut payloads = Vec::with_capacity(values.len());
+        for &(index, muted) in values {
+            if !seen.insert(index) {
+                return Err(ClientError::Protocol("duplicate output index".into()));
+            }
+            let output = table
+                .outputs
+                .get(index as usize)
+                .ok_or_else(|| ClientError::Protocol("invalid output index".into()))?;
+            let payload = match self.profile.dialect.value_format {
+                ValueFormat::Float32 => commands::write_dsp_u32_le_with_ctrl(
+                    output.mute,
+                    if muted { 1 } else { 2 },
+                    0x80,
+                ),
+                ValueFormat::FixedPoint => {
+                    let bytes =
+                        minidsp_protocol::dialect::encode_mute(muted, &self.profile.dialect);
+                    let raw = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    commands::write_dsp(
+                        output.mute,
+                        minidsp_protocol::dialect::fixed_point_to_float(raw),
+                        true,
+                        &self.profile.dialect,
+                    )
+                }
+            };
+            payloads.push(payload);
+        }
+        // Observe a changed device-selected preset before queueing any restoration.
+        let started_in = self.get_master_status().await?.preset;
+        for payload in &payloads {
+            self.invalidate_config_readback_for_write(payload).await;
+        }
+        let responses = match self
+            .queue
+            .execute_batch_with_snapshot(
+                payloads.clone(),
+                Priority::Critical,
+                Some(expected.to_owned()),
+            )
+            .await
+        {
+            Ok(responses) => responses,
+            Err(err) => {
+                // Earlier mutes in the batch may have been written, into the
+                // preset that was active when the restore began.
+                self.revoke_snapshot_trust(started_in).await;
+                self.invalidate_active_snapshot_readback().await;
+                return Err(err.into());
+            }
+        };
+        if self.queue.snapshot_token().as_deref() != Some(expected) {
+            self.invalidate_readback_knowledge().await;
+            return Err(TransportError::PreconditionFailed.into());
+        }
+        for (payload, response) in payloads.iter().zip(responses) {
+            Self::ensure_write_response(response, "conditional output mute restoration")?;
+            self.mirror_raw_command_if_success(payload, &[commands::RESP_OK])
+                .await;
+        }
+        if self.queue.snapshot_token().as_deref() != Some(expected) {
+            self.invalidate_readback_knowledge().await;
+            return Err(TransportError::PreconditionFailed.into());
+        }
+        Ok(())
     }
 
     /// Set channel mute using dialect-aware encoding.
@@ -1494,6 +1611,12 @@ impl MiniDspClient {
     /// Write biquad coefficients to a PEQ band.
     /// Warns (but does not reject) unstable filters for minidsp-rs compatibility.
     pub async fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), ClientError> {
+        self.peq_readback_known
+            .lock()
+            .await
+            .entry(addr)
+            .or_default()
+            .0 = false;
         if !minidsp_protocol::biquad::is_stable_any_convention(coeffs) {
             tracing::warn!(
                 "writing potentially unstable biquad at addr {addr}: a1={}, a2={}",
@@ -1513,11 +1636,23 @@ impl MiniDspClient {
             bypass: false,
         });
         entry.coeffs = *coeffs;
+        self.peq_readback_known
+            .lock()
+            .await
+            .entry(addr)
+            .or_default()
+            .0 = true;
         Ok(())
     }
 
     /// Set PEQ bypass state.
     pub async fn bypass_filter(&self, addr: u16, bypass: bool) -> Result<(), ClientError> {
+        self.peq_readback_known
+            .lock()
+            .await
+            .entry(addr)
+            .or_default()
+            .1 = false;
         self.execute_write(
             commands::bypass_filter(addr, bypass, &self.profile.dialect),
             Priority::High,
@@ -1530,6 +1665,12 @@ impl MiniDspClient {
             bypass: false,
         });
         entry.bypass = bypass;
+        self.peq_readback_known
+            .lock()
+            .await
+            .entry(addr)
+            .or_default()
+            .1 = true;
         Ok(())
     }
 
@@ -1566,6 +1707,7 @@ impl MiniDspClient {
 
     /// Write DSP parameter.
     pub async fn write_dsp(&self, addr: u16, value: f32, save: bool) -> Result<(), ClientError> {
+        self.scalar_readback_known.lock().await.remove(&addr);
         self.execute_write(
             commands::write_dsp(addr, value, save, &self.profile.dialect),
             Priority::High,
@@ -1577,6 +1719,7 @@ impl MiniDspClient {
                 .lock()
                 .await
                 .insert(addr, value.to_bits());
+            self.scalar_readback_known.lock().await.insert(addr);
         }
         Ok(())
     }
@@ -1599,7 +1742,13 @@ impl MiniDspClient {
 
         self.write_dsp(addr, value, save).await?;
 
-        let after = self.read_param_word(addr).await?;
+        let after = match self.read_param_word(addr).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.scalar_readback_known.lock().await.remove(&addr);
+                return Err(error);
+            }
+        };
         if after != expected {
             if self.prefers_scalar_shadow_for_addr(addr) {
                 tracing::info!(
@@ -1607,6 +1756,7 @@ impl MiniDspClient {
                 );
                 return Ok(());
             }
+            self.scalar_readback_known.lock().await.remove(&addr);
             return Err(ClientError::Protocol(format!(
                 "{context} at addr {addr} did not persist (before=0x{before:08X}, expected=0x{expected:08X}, after=0x{after:08X})"
             )));
@@ -1679,6 +1829,7 @@ impl MiniDspClient {
         value: u16,
         context: &str,
     ) -> Result<(), ClientError> {
+        self.selector_readback_known.lock().await.remove(&addr);
         self.execute_write(
             commands::write_dsp_u32_le_with_ctrl(addr, value as u32, 0x80),
             Priority::High,
@@ -1686,10 +1837,12 @@ impl MiniDspClient {
         )
         .await?;
         self.selector_shadow.lock().await.insert(addr, value);
+        self.selector_readback_known.lock().await.insert(addr);
         Ok(())
     }
 
     async fn restore_selector_shadow(&self, addr: u16, previous: Option<u16>) {
+        self.selector_readback_known.lock().await.remove(&addr);
         let mut shadow = self.selector_shadow.lock().await;
         if let Some(value) = previous {
             shadow.insert(addr, value);
@@ -1710,7 +1863,13 @@ impl MiniDspClient {
     where
         F: Fn(u16) -> bool,
     {
-        let after = self.read_param_word(addr).await? as u16;
+        let after = match self.read_param_word(addr).await {
+            Ok(value) => value as u16,
+            Err(error) => {
+                self.restore_selector_shadow(addr, previous_shadow).await;
+                return Err(error);
+            }
+        };
         if matches_expected(after) {
             return Ok(());
         }
@@ -1869,6 +2028,8 @@ impl MiniDspClient {
     /// reports a status byte above [`eeprom::VERIFY_PROGRAM_OK_MAX`], which
     /// Device Console treats as a failed flash persist.
     pub async fn copy_preset_verified(&self) -> Result<(), ClientError> {
+        self.invalidate_readback_for_command(&commands::copy_preset(true))
+            .await;
         self.queue
             .execute(commands::copy_preset(true), Priority::Critical)
             .await?;
@@ -1910,6 +2071,11 @@ impl MiniDspClient {
     }
 
     async fn write_preset_defaults_locked(&self) -> Result<(), ClientError> {
+        self.invalidate_readback_knowledge().await;
+        if let Some(slot) = *self.active_preset.lock().await {
+            self.trusted_snapshot_presets.lock().await.remove(&slot);
+            self.invalidated_snapshot_presets.lock().await.insert(slot);
+        }
         let image = self.default_preset_image()?;
         self.write_flash_image_block(
             FLASH_BLOCK_PRESET_VALUES,
@@ -2066,6 +2232,7 @@ impl MiniDspClient {
             ValueFormat::Float32 => samples.min(u16::MAX as u32),
             ValueFormat::FixedPoint => samples,
         };
+        self.scalar_readback_known.lock().await.remove(&addr);
         self.execute_write(
             commands::write_dsp_delay(
                 addr,
@@ -2079,8 +2246,15 @@ impl MiniDspClient {
         .await?;
         if self.profile.dialect.value_format == ValueFormat::Float32 {
             self.scalar_shadow.lock().await.insert(addr, expected);
+            self.scalar_readback_known.lock().await.insert(addr);
         }
-        let after = self.read_param_scalar_u32(addr).await?;
+        let after = match self.read_param_scalar_u32(addr).await {
+            Ok(after) => after,
+            Err(err) => {
+                self.scalar_readback_known.lock().await.remove(&addr);
+                return Err(err);
+            }
+        };
         if after != expected {
             if self.prefers_scalar_shadow_for_addr(addr) {
                 tracing::info!(
@@ -2088,6 +2262,7 @@ impl MiniDspClient {
                 );
                 return Ok(());
             }
+            self.scalar_readback_known.lock().await.remove(&addr);
             return Err(ClientError::Protocol(format!(
                 "set channel delay at addr {addr} did not persist (before={before}, expected={expected}, after={after})"
             )));
@@ -2107,6 +2282,7 @@ impl MiniDspClient {
             ValueFormat::Float32 => samples.min(u16::MAX as u32),
             ValueFormat::FixedPoint => samples,
         };
+        self.scalar_readback_known.lock().await.remove(&addr);
         self.execute_write(
             commands::write_dsp_delay(addr, samples, true, &self.profile.dialect),
             Priority::High,
@@ -2115,8 +2291,15 @@ impl MiniDspClient {
         .await?;
         if self.profile.dialect.value_format == ValueFormat::Float32 {
             self.scalar_shadow.lock().await.insert(addr, expected);
+            self.scalar_readback_known.lock().await.insert(addr);
         }
-        let after = self.read_param_scalar_u32(addr).await?;
+        let after = match self.read_param_scalar_u32(addr).await {
+            Ok(after) => after,
+            Err(err) => {
+                self.scalar_readback_known.lock().await.remove(&addr);
+                return Err(err);
+            }
+        };
         if after != expected {
             if self.prefers_scalar_shadow_for_addr(addr) {
                 tracing::info!(
@@ -2124,6 +2307,7 @@ impl MiniDspClient {
                 );
                 return Ok(());
             }
+            self.scalar_readback_known.lock().await.remove(&addr);
             return Err(ClientError::Protocol(format!(
                 "set channel delay at addr {addr} did not persist (before={before}, expected={expected}, after={after})"
             )));
@@ -2194,13 +2378,6 @@ impl MiniDspClient {
         }
     }
 
-    async fn read_config_bypass(&self, addr: u16) -> Result<bool, ClientError> {
-        match self.profile.dialect.value_format {
-            ValueFormat::Float32 => Ok(matches!(self.read_selector_word(addr).await?, 1 | 3)),
-            ValueFormat::FixedPoint => self.read_config_mute(addr).await,
-        }
-    }
-
     async fn read_selector_word(&self, addr: u16) -> Result<u16, ClientError> {
         let raw = self.read_param_word(addr).await? as u16;
         if raw == 1
@@ -2214,13 +2391,6 @@ impl MiniDspClient {
 
     async fn selector_shadow_value(&self, addr: u16) -> Option<u16> {
         self.selector_shadow.lock().await.get(&addr).copied()
-    }
-
-    async fn read_routing_enabled(&self, addr: u16) -> Result<bool, ClientError> {
-        if let Some(shadow) = self.selector_shadow_value(addr).await {
-            return Ok(shadow == 2);
-        }
-        Ok(self.read_param_word(addr).await? != 0)
     }
 
     async fn read_config_delay_ms(&self, addr: u16) -> Result<f32, ClientError> {
@@ -2488,6 +2658,7 @@ impl MiniDspClient {
     /// Reads current coefficients and bypass state for every PEQ band on every
     /// input and output channel, stores them internally, then sets all bands to bypass.
     pub async fn enter_measurement_mode(&self) -> Result<(), ClientError> {
+        self.synchronize_readback_epoch().await;
         let table = self.profile.dsp_table.ok_or(ClientError::Unsupported)?;
         let mut bands: Vec<(u16, [f32; 5], bool)> = Vec::new();
 
@@ -2519,6 +2690,9 @@ impl MiniDspClient {
         for &(addr, _, _) in &bands {
             bypass_cmds.push(commands::bypass_filter(addr, true, &self.profile.dialect));
         }
+        for payload in &bypass_cmds {
+            self.invalidate_config_readback_for_write(payload).await;
+        }
         ensure_write_batch(
             self.queue
                 .execute_batch(bypass_cmds, Priority::Critical)
@@ -2526,6 +2700,12 @@ impl MiniDspClient {
             "enter measurement mode bypass",
         )?;
         apply_peq_shadow_bypass(&self.peq_shadow, &bands, true).await;
+        {
+            let mut known = self.peq_readback_known.lock().await;
+            for &(addr, _, _) in &bands {
+                known.entry(addr).or_default().1 = true;
+            }
+        }
 
         tracing::info!(
             "measurement mode: saved and bypassed {} PEQ bands",
@@ -2555,6 +2735,21 @@ impl MiniDspClient {
         &self,
         saved: &SavedPeqState,
     ) -> Result<(), ClientError> {
+        {
+            let mut known = self.peq_readback_known.lock().await;
+            for &(addr, _, _) in &saved.bands {
+                known.remove(&addr);
+            }
+        }
+        self.synchronize_readback_epoch().await;
+        let result = self.restore_measurement_batches(saved).await;
+        if result.is_err() {
+            self.invalidate_active_snapshot_readback().await;
+        }
+        result
+    }
+
+    async fn restore_measurement_batches(&self, saved: &SavedPeqState) -> Result<(), ClientError> {
         let current_shadow = self.peq_shadow.lock().await.clone();
         let (phase1_cmds, phase2_cmds, phase3_cmds) =
             build_measurement_restore_batches(&current_shadow, &saved.bands, &self.profile.dialect);
@@ -2589,6 +2784,10 @@ impl MiniDspClient {
         let mut shadow = self.peq_shadow.lock().await;
         for &(addr, coeffs, bypass) in &saved.bands {
             shadow.insert(addr, PeqShadow { coeffs, bypass });
+            self.peq_readback_known
+                .lock()
+                .await
+                .insert(addr, (true, true));
         }
         Ok(())
     }
@@ -2613,6 +2812,12 @@ impl MiniDspClient {
         if bands.is_empty() {
             return Ok(());
         }
+        {
+            let mut known = self.peq_readback_known.lock().await;
+            for &(addr, _, _) in bands {
+                known.remove(&addr);
+            }
+        }
 
         {
             let mut pending = self.pending_write.lock().await;
@@ -2621,6 +2826,7 @@ impl MiniDspClient {
             });
         }
 
+        self.synchronize_readback_epoch().await;
         let mut reconnect_epoch = self.queue.reconnect_epoch();
         loop {
             let replay = {
@@ -2630,13 +2836,17 @@ impl MiniDspClient {
             let replay =
                 replay.ok_or_else(|| ClientError::Protocol("missing pending PEQ write".into()))?;
 
-            execute_peq_batch(
+            if let Err(err) = execute_peq_batch(
                 &self.queue,
                 &self.profile.dialect,
                 &self.peq_shadow,
                 &replay,
             )
-            .await?;
+            .await
+            {
+                self.invalidate_active_snapshot_readback().await;
+                return Err(err);
+            }
 
             let current_epoch = self.queue.reconnect_epoch();
             if current_epoch == reconnect_epoch {
@@ -2651,6 +2861,12 @@ impl MiniDspClient {
             reconnect_epoch = current_epoch;
         }
 
+        {
+            let mut known = self.peq_readback_known.lock().await;
+            for &(addr, _, _) in bands {
+                known.insert(addr, (true, true));
+            }
+        }
         *self.pending_write.lock().await = None;
         self.note_preset_mutation().await;
         Ok(())
@@ -2684,35 +2900,340 @@ impl MiniDspClient {
             .unwrap_or(minidsp_protocol::biquad::BYPASS))
     }
 
-    /// Read PEQ bypass state. Bypass is stored at addr+5 on SHARC devices.
-    /// Returns None if the read fails or the device doesn't support bypass readback.
+    /// Return cached PEQ bypass state, or None when this address is absent.
+    /// This helper performs no device read and does not establish provenance.
     async fn read_peq_bypass(&self, addr: u16) -> Option<bool> {
         self.peq_shadow.lock().await.get(&addr).map(|s| s.bypass)
     }
 
+    pub(super) async fn invalidate_readback_for_command(&self, payload: &[u8]) {
+        if !payload
+            .first()
+            .copied()
+            .is_some_and(commands::invalidates_config_readback)
+        {
+            return;
+        }
+        self.invalidate_readback_knowledge().await;
+        // Switching, reloading, resetting or rebooting leaves the stored presets
+        // as they were, so their trust stays. A copy replaces a stored preset.
+        if payload.first() == Some(&commands::CMD_COPY_PRESET) {
+            self.revoke_all_snapshot_trust().await;
+        }
+    }
+
+    pub(super) async fn invalidate_readback_knowledge(&self) {
+        self.peq_readback_known.lock().await.clear();
+        self.scalar_readback_known.lock().await.clear();
+        self.selector_readback_known.lock().await.clear();
+    }
+
+    async fn config_gain_readback(
+        &self,
+        addr: u16,
+        report: &mut ConfigReadback,
+        path: String,
+    ) -> f32 {
+        let result: Result<(f32, ConfigReadbackSource), ClientError> = async {
+            if matches!(self.profile.dialect.value_format, ValueFormat::Float32) {
+                let preferred = self.prefers_scalar_shadow_for_addr(addr);
+                if preferred && let Some(raw) = self.scalar_shadow.lock().await.get(&addr).copied()
+                {
+                    return Ok((
+                        f32::from_bits(raw),
+                        if self.scalar_readback_known.lock().await.contains(&addr) {
+                            ConfigReadbackSource::Shadow
+                        } else {
+                            ConfigReadbackSource::Default
+                        },
+                    ));
+                }
+                let raw = self.read_param_word(addr).await?;
+                let value = if preferred {
+                    sanitize_shadow_preferred_scalar(raw).unwrap_or(f32::from_bits(raw))
+                } else {
+                    f32::from_bits(raw)
+                };
+                Ok((
+                    value,
+                    if preferred {
+                        ConfigReadbackSource::Default
+                    } else {
+                        ConfigReadbackSource::Device
+                    },
+                ))
+            } else {
+                self.read_config_gain_db(addr)
+                    .await
+                    .map(|v| (v, ConfigReadbackSource::Device))
+            }
+        }
+        .await;
+        match result {
+            Ok((value, source)) => {
+                report.record(
+                    path,
+                    source,
+                    (!value.is_finite()).then(|| "non-finite gain readback".into()),
+                );
+                value
+            }
+            Err(error) => {
+                report.record(path, ConfigReadbackSource::Default, Some(error.to_string()));
+                0.0
+            }
+        }
+    }
+
+    async fn config_selector_readback(
+        &self,
+        addr: u16,
+        bypass: bool,
+        report: &mut ConfigReadback,
+        path: String,
+    ) -> bool {
+        let result = if matches!(self.profile.dialect.value_format, ValueFormat::Float32) {
+            match self.read_param_word(addr).await {
+                Ok(raw) => {
+                    let raw = raw as u16;
+                    let shadow = self.selector_shadow_value(addr).await;
+                    let replacement = if raw == 1 {
+                        shadow.filter(|&v| v != 1)
+                    } else {
+                        None
+                    };
+                    let value = replacement.unwrap_or(raw);
+                    let source = if replacement.is_some()
+                        || (self.profile.has_unreliable_selector_readback && shadow == Some(raw))
+                    {
+                        if self.selector_readback_known.lock().await.contains(&addr) {
+                            ConfigReadbackSource::Shadow
+                        } else {
+                            ConfigReadbackSource::Default
+                        }
+                    } else if self.profile.has_unreliable_selector_readback {
+                        ConfigReadbackSource::Default
+                    } else {
+                        ConfigReadbackSource::Device
+                    };
+                    Ok((
+                        if bypass {
+                            matches!(value, 1 | 3)
+                        } else {
+                            value == 1
+                        },
+                        source,
+                    ))
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.read_config_mute(addr)
+                .await
+                .map(|value| (value, ConfigReadbackSource::Device))
+        };
+        match result {
+            Ok((value, source)) => {
+                report.record(path, source, None);
+                value
+            }
+            Err(error) => {
+                report.record(path, ConfigReadbackSource::Default, Some(error.to_string()));
+                false
+            }
+        }
+    }
+
+    async fn config_routing_readback(
+        &self,
+        addr: u16,
+        report: &mut ConfigReadback,
+        path: String,
+    ) -> bool {
+        if matches!(self.profile.dialect.value_format, ValueFormat::Float32)
+            && let Some(shadow) = self.selector_shadow_value(addr).await
+        {
+            report.record(
+                path,
+                if self.selector_readback_known.lock().await.contains(&addr) {
+                    ConfigReadbackSource::Shadow
+                } else {
+                    ConfigReadbackSource::Default
+                },
+                None,
+            );
+            return shadow == 2;
+        }
+        match self.read_param_word(addr).await {
+            Ok(raw) => {
+                let ambiguous = matches!(self.profile.dialect.value_format, ValueFormat::Float32)
+                    && (self.profile.has_unreliable_selector_readback || raw == 1);
+                report.record(
+                    path,
+                    if ambiguous {
+                        ConfigReadbackSource::Default
+                    } else {
+                        ConfigReadbackSource::Device
+                    },
+                    None,
+                );
+                raw != 0
+            }
+            Err(error) => {
+                report.record(path, ConfigReadbackSource::Default, Some(error.to_string()));
+                false
+            }
+        }
+    }
+
+    async fn config_delay_readback(
+        &self,
+        addr: u16,
+        report: &mut ConfigReadback,
+        path: String,
+    ) -> f32 {
+        let source = if self.prefers_scalar_shadow_for_addr(addr) {
+            if self.scalar_shadow.lock().await.contains_key(&addr)
+                && self.scalar_readback_known.lock().await.contains(&addr)
+            {
+                ConfigReadbackSource::Shadow
+            } else {
+                ConfigReadbackSource::Default
+            }
+        } else {
+            ConfigReadbackSource::Device
+        };
+        match self.read_config_delay_ms(addr).await {
+            Ok(value) => {
+                report.record(
+                    path,
+                    source,
+                    (!value.is_finite()).then(|| "non-finite delay readback".into()),
+                );
+                value
+            }
+            Err(error) => {
+                report.record(path, ConfigReadbackSource::Default, Some(error.to_string()));
+                0.0
+            }
+        }
+    }
+
+    async fn config_peq_readback(
+        &self,
+        addr: u16,
+        report: &mut ConfigReadback,
+        path: String,
+    ) -> [f32; 5] {
+        let mut error = None;
+        if !self.profile.has_unreliable_selector_readback {
+            match self.read_floats(addr, 5).await {
+                Ok(values) if values.len() >= 5 && values[..5] != [0.0; 5] => {
+                    let coeffs = [values[0], values[1], values[2], values[3], values[4]];
+                    report.record(
+                        path,
+                        ConfigReadbackSource::Device,
+                        (!coeffs.iter().all(|v| v.is_finite()))
+                            .then(|| "non-finite biquad readback".into()),
+                    );
+                    return coeffs;
+                }
+                Ok(_) => error = Some("missing or all-zero biquad readback".into()),
+                Err(err) => error = Some(err.to_string()),
+            }
+        }
+        let known = self
+            .peq_readback_known
+            .lock()
+            .await
+            .get(&addr)
+            .is_some_and(|v| v.0);
+        let shadow = self.peq_shadow.lock().await;
+        let coeffs = shadow
+            .get(&addr)
+            .map(|s| s.coeffs)
+            .unwrap_or(minidsp_protocol::biquad::BYPASS);
+        if !coeffs.iter().all(|v| v.is_finite()) && error.is_none() {
+            error = Some("non-finite biquad shadow".into());
+        }
+        report.record(
+            path,
+            if known && shadow.contains_key(&addr) {
+                ConfigReadbackSource::Shadow
+            } else {
+                ConfigReadbackSource::Default
+            },
+            error,
+        );
+        coeffs
+    }
+
+    async fn config_peq_bypass_readback(
+        &self,
+        addr: u16,
+        report: &mut ConfigReadback,
+        path: String,
+    ) -> bool {
+        let known = self
+            .peq_readback_known
+            .lock()
+            .await
+            .get(&addr)
+            .is_some_and(|v| v.1);
+        let value = self.read_peq_bypass(addr).await;
+        report.record(
+            path,
+            if known && value.is_some() {
+                ConfigReadbackSource::Shadow
+            } else {
+                ConfigReadbackSource::Default
+            },
+            None,
+        );
+        value.unwrap_or(false)
+    }
+
     /// Read the full device config including all PEQ coefficients.
     pub async fn read_device_config(&self) -> Result<DeviceConfig, ClientError> {
+        let read_epoch = self.synchronize_readback_epoch().await;
+        let snapshot_token = self.queue.snapshot_token();
         let master_raw = self.get_master_status().await?;
+        let mut readback = ConfigReadback::default();
+        for field in ["preset", "source", "volume", "mute"] {
+            readback.record(
+                format!("master_status.{field}"),
+                ConfigReadbackSource::Device,
+                None,
+            );
+        }
         let source_name = self
             .profile
             .sources
             .source_for_index(master_raw.source)
             .map(|s| s.pascal_case().to_string())
             .unwrap_or_else(|| format!("Unknown({})", master_raw.source));
-
         let dirac = if self.profile.has_dirac {
-            let resp = self
+            let response = self
                 .queue
                 .execute(commands::read_flash(0xFF, 0xE0, 1), Priority::Normal)
                 .await;
-            match resp {
-                Ok(Response::FlashData(data)) if !data.is_empty() => Some(data[0] == 0),
-                _ => Some(false),
+            match response {
+                Ok(Response::FlashData(data)) if !data.is_empty() => {
+                    readback.record("master_status.dirac", ConfigReadbackSource::Device, None);
+                    Some(data[0] == 0)
+                }
+                other => {
+                    readback.record(
+                        "master_status.dirac",
+                        ConfigReadbackSource::Default,
+                        Some(format!("Dirac read failed: {other:?}")),
+                    );
+                    Some(false)
+                }
             }
         } else {
             None
         };
-
         let master_status = MasterStatusView {
             preset: master_raw.preset,
             source: source_name,
@@ -2720,63 +3241,107 @@ impl MiniDspClient {
             mute: master_raw.is_muted(),
             dirac,
         };
-
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
-
         if let Some(table) = self.profile.dsp_table {
-            // Read input channels
             for (ch_idx, input) in table.inputs.iter().enumerate() {
+                let prefix = format!("inputs.{ch_idx}");
                 let gain = if let Some(addr) = input.gain {
-                    self.read_config_gain_db(addr).await.ok()
+                    let value = self
+                        .config_gain_readback(addr, &mut readback, format!("{prefix}.gain"))
+                        .await;
+                    if readback.fields.last().is_some_and(|f| f.error.is_some()) {
+                        readback.fields.last_mut().unwrap().source =
+                            ConfigReadbackSource::Unavailable;
+                        None
+                    } else {
+                        Some(value)
+                    }
                 } else {
                     None
                 };
                 let mute = if let Some(addr) = input.mute {
-                    self.read_config_mute(addr).await.ok()
+                    let value = self
+                        .config_selector_readback(
+                            addr,
+                            false,
+                            &mut readback,
+                            format!("{prefix}.mute"),
+                        )
+                        .await;
+                    if readback.fields.last().is_some_and(|f| f.error.is_some()) {
+                        readback.fields.last_mut().unwrap().source =
+                            ConfigReadbackSource::Unavailable;
+                        None
+                    } else {
+                        Some(value)
+                    }
                 } else {
                     None
                 };
                 let mut peq = Vec::new();
                 for (band_idx, band) in input.peq.iter().enumerate() {
-                    if let Ok(coeffs) = self.read_peq_coeffs(band.addr).await {
-                        peq.push(PeqBandConfig {
-                            index: band_idx as u8,
-                            coeff: BiquadCoeffs::from_array(&coeffs),
-                            bypass: self.read_peq_bypass(band.addr).await.unwrap_or(false),
-                        });
-                    }
+                    let coeffs = self
+                        .config_peq_readback(
+                            band.addr,
+                            &mut readback,
+                            format!("{prefix}.peq.{band_idx}.coeff"),
+                        )
+                        .await;
+                    let bypass = self
+                        .config_peq_bypass_readback(
+                            band.addr,
+                            &mut readback,
+                            format!("{prefix}.peq.{band_idx}.bypass"),
+                        )
+                        .await;
+                    peq.push(PeqBandConfig {
+                        index: band_idx as u8,
+                        coeff: BiquadCoeffs::from_array(&coeffs),
+                        bypass,
+                    });
                 }
                 let mut routing_entries = Vec::new();
                 let routing = table.routing;
                 if ch_idx < routing.rows as usize {
                     for output in 0..routing.cols {
                         let flat_idx = ch_idx as u16 * routing.cols as u16 + output as u16;
-                        let status_addr = routing.status_base + flat_idx;
-                        let gain_addr = routing.gain_base + flat_idx;
-                        let enabled = match self.profile.dialect.value_format {
-                            // DSP100 mixer status readback via 0x14 is boolean-
-                            // collapsed, so prefer the selector shadow after any
-                            // successful write on this client. Fall back to the
-                            // raw non-zero check only when no shadow exists yet.
-                            ValueFormat::Float32 => self
-                                .read_routing_enabled(status_addr)
-                                .await
-                                .unwrap_or(false),
-                            ValueFormat::FixedPoint => {
-                                self.read_param_word(status_addr).await.unwrap_or(0) != 0
+                        let route = format!("{prefix}.routing.{output}");
+                        let enabled = self
+                            .config_routing_readback(
+                                routing.status_base + flat_idx,
+                                &mut readback,
+                                format!("{route}.enabled"),
+                            )
+                            .await;
+                        let gain_db = self
+                            .config_gain_readback(
+                                routing.gain_base + flat_idx,
+                                &mut readback,
+                                format!("{route}.gain_db"),
+                            )
+                            .await;
+                        let polarity_inverted = if let Some(base) = routing.polarity_base {
+                            match self.read_param_scalar_u32(base + flat_idx).await {
+                                Ok(raw) => {
+                                    readback.record(
+                                        format!("{route}.polarity_inverted"),
+                                        ConfigReadbackSource::Device,
+                                        None,
+                                    );
+                                    Some(raw != 0)
+                                }
+                                Err(error) => {
+                                    readback.record(
+                                        format!("{route}.polarity_inverted"),
+                                        ConfigReadbackSource::Unavailable,
+                                        Some(error.to_string()),
+                                    );
+                                    None
+                                }
                             }
-                        };
-                        let gain_db = self.read_config_gain_db(gain_addr).await.unwrap_or(0.0);
-                        let polarity_inverted = match routing.polarity_base {
-                            Some(base) => {
-                                let polarity_addr = base + flat_idx;
-                                self.read_param_scalar_u32(polarity_addr)
-                                    .await
-                                    .ok()
-                                    .map(|raw| raw != 0)
-                            }
-                            None => None,
+                        } else {
+                            None
                         };
                         routing_entries.push(RoutingConfig {
                             output,
@@ -2794,95 +3359,191 @@ impl MiniDspClient {
                     routing: routing_entries,
                 });
             }
-
-            // Read output channels
             for (ch_idx, output) in table.outputs.iter().enumerate() {
-                let gain_val = self.read_config_gain_db(output.gain).await.unwrap_or(0.0);
-                let mute_val = self.read_config_mute(output.mute).await.unwrap_or(false);
-                let delay_val = if let Some(delay_addr) = output.delay {
-                    self.read_config_delay_ms(delay_addr).await.unwrap_or(0.0)
+                let prefix = format!("outputs.{ch_idx}");
+                let gain_val = self
+                    .config_gain_readback(output.gain, &mut readback, format!("{prefix}.gain"))
+                    .await;
+                let mute_val = self
+                    .config_selector_readback(
+                        output.mute,
+                        false,
+                        &mut readback,
+                        format!("{prefix}.mute"),
+                    )
+                    .await;
+                let delay_val = if let Some(addr) = output.delay {
+                    self.config_delay_readback(addr, &mut readback, format!("{prefix}.delay"))
+                        .await
                 } else {
+                    readback.record(
+                        format!("{prefix}.delay"),
+                        ConfigReadbackSource::Default,
+                        None,
+                    );
                     0.0
                 };
-
                 let mut peq = Vec::new();
                 for (band_idx, band) in output.peq.iter().enumerate() {
-                    if let Ok(coeffs) = self.read_peq_coeffs(band.addr).await {
-                        peq.push(PeqBandConfig {
-                            index: band_idx as u8,
-                            coeff: BiquadCoeffs::from_array(&coeffs),
-                            bypass: self.read_peq_bypass(band.addr).await.unwrap_or(false),
-                        });
-                    }
+                    let coeffs = self
+                        .config_peq_readback(
+                            band.addr,
+                            &mut readback,
+                            format!("{prefix}.peq.{band_idx}.coeff"),
+                        )
+                        .await;
+                    let bypass = self
+                        .config_peq_bypass_readback(
+                            band.addr,
+                            &mut readback,
+                            format!("{prefix}.peq.{band_idx}.bypass"),
+                        )
+                        .await;
+                    peq.push(PeqBandConfig {
+                        index: band_idx as u8,
+                        coeff: BiquadCoeffs::from_array(&coeffs),
+                        bypass,
+                    });
                 }
-
                 let mut crossover = Vec::new();
                 if let Some(xover) = output.crossover {
                     for (group_idx, base_addr) in [(0u8, xover.lpf_addr), (1u8, xover.hpf_addr)] {
+                        let group = format!("{prefix}.crossover.{group_idx}");
                         let mut filters = Vec::new();
                         for band_idx in 0..4u8 {
-                            let addr = base_addr + band_idx as u16 * 5;
-                            if let Ok(coeffs) = self.read_peq_coeffs(addr).await {
-                                filters.push(IndexedBiquadConfig {
-                                    index: band_idx,
-                                    coeff: BiquadCoeffs::from_array(&coeffs),
-                                });
-                            }
+                            let coeffs = self
+                                .config_peq_readback(
+                                    base_addr + band_idx as u16 * 5,
+                                    &mut readback,
+                                    format!("{group}.filters.{band_idx}.coeff"),
+                                )
+                                .await;
+                            filters.push(IndexedBiquadConfig {
+                                index: band_idx,
+                                coeff: BiquadCoeffs::from_array(&coeffs),
+                            });
                         }
+                        let bypass = self
+                            .config_peq_bypass_readback(
+                                base_addr,
+                                &mut readback,
+                                format!("{group}.bypass"),
+                            )
+                            .await;
                         crossover.push(CrossoverGroupConfig {
                             index: group_idx,
                             filters,
-                            bypass: self.read_peq_bypass(base_addr).await.unwrap_or(false),
+                            bypass,
                         });
                     }
                 }
-
                 let fir = if let Some(fir) = output.fir {
-                    let shadow_taps = self.selector_shadow_value(fir.taps_count).await;
-                    let active_taps = match self.read_param_scalar_u32(fir.taps_count).await {
-                        Ok(value) if self.profile.has_unreliable_selector_readback => shadow_taps
-                            .or_else(|| {
-                                (1..=fir.max_taps as u32)
-                                    .contains(&value)
-                                    .then_some(value as u16)
-                            }),
-                        Ok(value) if (1..=fir.max_taps as u32).contains(&value) => {
-                            Some(value as u16)
+                    let shadow = self.selector_shadow_value(fir.taps_count).await;
+                    let read = self.read_param_scalar_u32(fir.taps_count).await;
+                    let (active_taps, source, error) = match read {
+                        Ok(_value)
+                            if self.profile.has_unreliable_selector_readback
+                                && shadow.is_some() =>
+                        {
+                            (
+                                shadow.unwrap(),
+                                if self
+                                    .selector_readback_known
+                                    .lock()
+                                    .await
+                                    .contains(&fir.taps_count)
+                                {
+                                    ConfigReadbackSource::Shadow
+                                } else {
+                                    ConfigReadbackSource::Default
+                                },
+                                None,
+                            )
                         }
-                        _ => shadow_taps,
+                        Ok(value) if (1..=fir.max_taps as u32).contains(&value) => {
+                            (value as u16, ConfigReadbackSource::Device, None)
+                        }
+                        other => (
+                            shadow.unwrap_or(0),
+                            if shadow.is_some()
+                                && self
+                                    .selector_readback_known
+                                    .lock()
+                                    .await
+                                    .contains(&fir.taps_count)
+                            {
+                                ConfigReadbackSource::Shadow
+                            } else {
+                                ConfigReadbackSource::Default
+                            },
+                            Some(format!("FIR tap count unavailable: {other:?}")),
+                        ),
                     };
+                    readback.record(format!("{prefix}.fir.active_taps"), source, error);
+                    let bypass = self
+                        .config_selector_readback(
+                            fir.bypass,
+                            true,
+                            &mut readback,
+                            format!("{prefix}.fir.bypass"),
+                        )
+                        .await;
                     Some(FirConfig {
-                        bypass: self.read_config_bypass(fir.bypass).await.unwrap_or(false),
-                        active_taps: active_taps.unwrap_or(0),
-                    })
-                } else {
-                    None
-                };
-
-                let compressor = if let Some(comp) = &output.compressor {
-                    let bypass = self.read_config_bypass(comp.bypass).await.unwrap_or(false);
-                    let threshold = self
-                        .read_config_gain_db(comp.threshold)
-                        .await
-                        .unwrap_or(0.0);
-                    let comp_gain = self.read_config_gain_db(comp.gain).await.unwrap_or(0.0);
-                    let ratio = self.read_config_gain_db(comp.ratio).await.unwrap_or(0.0);
-                    let knee = self.read_config_gain_db(comp.knee).await.unwrap_or(0.0);
-                    let attack = self.read_config_gain_db(comp.attack).await.unwrap_or(0.0);
-                    let release = self.read_config_gain_db(comp.release).await.unwrap_or(0.0);
-                    Some(CompressorConfig {
                         bypass,
-                        threshold,
-                        gain: comp_gain,
-                        ratio,
-                        knee,
-                        attack,
-                        release,
+                        active_taps,
                     })
                 } else {
                     None
                 };
-
+                let compressor = if let Some(comp) = &output.compressor {
+                    let base = format!("{prefix}.compressor");
+                    Some(CompressorConfig {
+                        bypass: self
+                            .config_selector_readback(
+                                comp.bypass,
+                                true,
+                                &mut readback,
+                                format!("{base}.bypass"),
+                            )
+                            .await,
+                        threshold: self
+                            .config_gain_readback(
+                                comp.threshold,
+                                &mut readback,
+                                format!("{base}.threshold"),
+                            )
+                            .await,
+                        gain: self
+                            .config_gain_readback(comp.gain, &mut readback, format!("{base}.gain"))
+                            .await,
+                        ratio: self
+                            .config_gain_readback(
+                                comp.ratio,
+                                &mut readback,
+                                format!("{base}.ratio"),
+                            )
+                            .await,
+                        knee: self
+                            .config_gain_readback(comp.knee, &mut readback, format!("{base}.knee"))
+                            .await,
+                        attack: self
+                            .config_gain_readback(
+                                comp.attack,
+                                &mut readback,
+                                format!("{base}.attack"),
+                            )
+                            .await,
+                        release: self
+                            .config_gain_readback(
+                                comp.release,
+                                &mut readback,
+                                format!("{base}.release"),
+                            )
+                            .await,
+                    })
+                } else {
+                    None
+                };
                 outputs.push(OutputChannelConfig {
                     index: ch_idx as u8,
                     gain: gain_val,
@@ -2895,8 +3556,15 @@ impl MiniDspClient {
                 });
             }
         }
-
+        if self.queue.reconnect_epoch() != read_epoch {
+            self.synchronize_readback_epoch().await;
+            readback.invalidate("device reconnected during config readback");
+        }
+        if snapshot_token.is_some() && self.queue.snapshot_token() == snapshot_token {
+            readback.snapshot_token = snapshot_token;
+        }
         Ok(DeviceConfig {
+            readback: Some(readback),
             master_status,
             inputs,
             outputs,
@@ -3483,6 +4151,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -3665,6 +4338,7 @@ mod tests {
 
     struct BlockingRestoreTransport {
         opcode: AtomicU8,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
         writing: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
@@ -3675,7 +4349,11 @@ mod tests {
             payload: &[u8],
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
             self.opcode.store(payload[0], Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            let payload = payload.to_vec();
+            Box::pin(async move {
+                self.sent.lock().await.push(payload);
+                Ok(())
+            })
         }
         fn recv_frame(
             &self,
@@ -3703,14 +4381,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_restore_holds_transition_lock_during_payload_replay() {
+    async fn same_slot_snapshot_restore_revokes_mute_token_even_when_payload_replay_fails() {
         let writing = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let sent = Arc::new(Mutex::new(Vec::new()));
         let client = Arc::new(scripted_client(Box::new(BlockingRestoreTransport {
             opcode: AtomicU8::new(0),
+            sent: sent.clone(),
             writing: writing.clone(),
             release: release.clone(),
         })));
+        *client.active_preset.lock().await = Some(0);
+        let old_token = client.queue.snapshot_token().unwrap();
         let addr = client.profile.dsp_table.unwrap().inputs[0].peq[0].addr;
         let preset = crate::snapshot::PresetSnapshot {
             slot: 0,
@@ -3737,9 +4419,34 @@ mod tests {
             .await
             .unwrap();
         assert!(client.state_transition_lock.try_lock().is_err());
+        assert_ne!(
+            client.queue.snapshot_token().as_deref(),
+            Some(old_token.as_str())
+        );
+        assert!(
+            !sent
+                .lock()
+                .await
+                .iter()
+                .any(|payload| payload[0] == commands::CMD_SET_CONFIG)
+        );
         release.notify_one();
         assert!(restore.await.unwrap().is_err());
         assert!(client.state_transition_lock.try_lock().is_ok());
+        let before = sent.lock().await.len();
+        let error = client
+            .restore_output_mutes_if_snapshot(&[(0, false)], &old_token)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Transport(TransportError::PreconditionFailed)
+        ));
+        assert!(
+            sent.lock().await[before..]
+                .iter()
+                .all(|payload| !commands::is_write_command(payload[0]))
+        );
     }
 
     #[tokio::test]
@@ -3834,7 +4541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_fir_transfer_updates_trusted_shadow_when_mute_restore_fails() {
+    async fn successful_fir_transfer_keeps_snapshot_trust_when_only_the_master_unmute_fails() {
         let client = scripted_client(Box::new(ScriptTransport {
             responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
                 vec![commands::CMD_READ_FLASH, 0, 0, 0, 0],
@@ -3856,6 +4563,7 @@ mod tests {
             .iter()
             .find_map(|output| output.fir)
             .unwrap();
+        *client.active_preset.lock().await = Some(0);
         client
             .store_preset_shadow_snapshot(
                 0,
@@ -3880,7 +4588,15 @@ mod tests {
         client.update_active_preset(1).await;
         client.update_active_preset(0).await;
         let state = client.export_shadow_state().await;
+        // Every FIR write was acknowledged; master mute is not preset content.
         assert!(state.trusted_snapshot_presets.contains(&0));
+        assert!(
+            !client
+                .invalidated_snapshot_presets
+                .lock()
+                .await
+                .contains(&0)
+        );
         assert_eq!(state.selector[&fir.taps_count], 2);
         assert_eq!(
             state.presets[&0].fir_blocks[&fir.data_start],
@@ -4302,6 +5018,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4383,6 +5104,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4462,6 +5188,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4533,6 +5264,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4582,6 +5318,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4624,6 +5365,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4717,6 +5463,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4753,6 +5504,11 @@ mod tests {
             volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
+            peq_readback_known: Mutex::new(HashMap::new()),
+            scalar_readback_known: Mutex::new(HashSet::new()),
+            selector_readback_known: Mutex::new(HashSet::new()),
+            invalidated_snapshot_presets: Mutex::new(HashSet::new()),
+            readback_epoch: Mutex::new(0),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
             scalar_shadow: Arc::new(Mutex::new(HashMap::new())),
             fir_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4791,5 +5547,304 @@ mod tests {
         assert_eq!(sanitize_shadow_preferred_scalar(2), Some(0.0));
         assert_eq!(sanitize_shadow_preferred_scalar(0x4A03_9901), Some(0.0));
         assert_eq!(sanitize_shadow_preferred_scalar(9.5f32.to_bits()), None);
+    }
+    #[tokio::test]
+    async fn config_readback_distinguishes_seeded_peq_defaults_from_acknowledged_writes() {
+        let client = scripted_client(Box::new(ScriptTransport {
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                vec![commands::RESP_OK],
+                vec![commands::RESP_OK],
+            ]))),
+            disconnect_data_once: None,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        }));
+        *client.peq_shadow.lock().await = build_peq_shadow(client.profile());
+        let mut before = ConfigReadback::default();
+        assert_eq!(
+            client
+                .config_peq_readback(8480, &mut before, "inputs.0.peq.0.coeff".into())
+                .await,
+            minidsp_protocol::biquad::BYPASS
+        );
+        assert!(
+            !client
+                .config_peq_bypass_readback(8480, &mut before, "inputs.0.peq.0.bypass".into())
+                .await
+        );
+        assert!(
+            before
+                .fields
+                .iter()
+                .all(|field| field.source == ConfigReadbackSource::Default)
+        );
+        let coeffs = [1.0, 0.1, 0.0, 0.2, 0.0];
+        client.write_biquad(8480, &coeffs).await.unwrap();
+        client.bypass_filter(8480, true).await.unwrap();
+        let mut after = ConfigReadback::default();
+        assert_eq!(
+            client
+                .config_peq_readback(8480, &mut after, "inputs.0.peq.0.coeff".into())
+                .await,
+            coeffs
+        );
+        assert!(
+            client
+                .config_peq_bypass_readback(8480, &mut after, "inputs.0.peq.0.bypass".into())
+                .await
+        );
+        assert!(after.complete);
+        assert!(
+            after
+                .fields
+                .iter()
+                .all(|field| field.source == ConfigReadbackSource::Shadow)
+        );
+        // Old persisted data has no provenance, even when its values match.
+        let saved = client.export_shadow_state().await;
+        client.apply_shadow_state(&saved).await;
+        let mut restored = ConfigReadback::default();
+        assert_eq!(
+            client
+                .config_peq_readback(8480, &mut restored, "inputs.0.peq.0.coeff".into())
+                .await,
+            coeffs
+        );
+        assert!(!restored.complete);
+    }
+
+    #[tokio::test]
+    async fn config_readback_retains_legacy_mute_and_route_fallbacks_but_exposes_failure() {
+        let client = scripted_client(Box::new(ScriptTransport {
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                vec![commands::RESP_ERROR, 1],
+                vec![commands::RESP_ERROR, 1],
+            ]))),
+            disconnect_data_once: None,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut report = ConfigReadback::default();
+        assert!(
+            !client
+                .config_selector_readback(2, false, &mut report, "outputs.0.mute".into())
+                .await
+        );
+        assert!(
+            !client
+                .config_routing_readback(2, &mut report, "inputs.0.routing.0.enabled".into())
+                .await
+        );
+        assert!(!report.complete);
+        assert_eq!(report.fields.len(), 2);
+        assert!(report.fields.iter().all(|field| field.source == ConfigReadbackSource::Default && field.error.is_some()));
+    }
+
+    #[tokio::test]
+    async fn config_readback_does_not_call_collapsed_selectors_device_proof() {
+        let client = scripted_client(Box::new(ScriptTransport {
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                vec![0x14, 0, 2, 1, 0, 0, 0],
+                vec![0x14, 0, 2, 1, 0, 0, 0],
+            ]))),
+            disconnect_data_once: None,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut report = ConfigReadback::default();
+        assert!(
+            client
+                .config_selector_readback(2, false, &mut report, "outputs.0.mute".into())
+                .await
+        );
+        assert!(
+            client
+                .config_routing_readback(2, &mut report, "inputs.0.routing.0.enabled".into())
+                .await
+        );
+        assert!(
+            report
+                .fields
+                .iter()
+                .all(|field| field.source == ConfigReadbackSource::Default)
+        );
+        // Presence in a cached map alone is not proof of an acknowledged write.
+        client.selector_shadow.lock().await.insert(2, 2);
+        let mut cached = ConfigReadback::default();
+        assert!(
+            client
+                .config_routing_readback(2, &mut cached, "inputs.0.routing.0.enabled".into())
+                .await
+        );
+        assert!(!cached.complete);
+        client.selector_readback_known.lock().await.insert(2);
+        let mut known = ConfigReadback::default();
+        assert!(
+            client
+                .config_routing_readback(2, &mut known, "inputs.0.routing.0.enabled".into())
+                .await
+        );
+        assert!(known.complete);
+        assert_eq!(known.fields[0].source, ConfigReadbackSource::Shadow);
+    }
+
+    #[tokio::test]
+    async fn config_readback_marks_nonfinite_gain_as_failed_even_when_transport_succeeds() {
+        let mut response = vec![0x14, 0, 2];
+        response.extend(f32::NAN.to_bits().to_le_bytes());
+        let client = scripted_client(Box::new(ScriptTransport {
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([response]))),
+            disconnect_data_once: None,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut report = ConfigReadback::default();
+        assert!(
+            client
+                .config_gain_readback(2, &mut report, "outputs.0.gain".into())
+                .await
+                .is_nan()
+        );
+        assert!(!report.complete);
+        assert!(
+            report.fields[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("non-finite")
+        );
+    }
+    #[tokio::test]
+    async fn readback_knowledge_is_invalidated_by_raw_same_slot_reload_and_failed_reset() {
+        let client = scripted_client(Box::new(DummyTransport));
+        for (request, response) in [
+            (
+                commands::set_config(0, commands::PRESET_CHANGE_RELOAD_SAME_SLOT),
+                vec![commands::RESP_OK],
+            ),
+            (commands::reset(), vec![commands::RESP_ERROR, 1]),
+            (commands::enter_bootloader(), vec![commands::RESP_OK]),
+        ] {
+            client.trusted_snapshot_presets.lock().await.insert(0);
+            client
+                .peq_readback_known
+                .lock()
+                .await
+                .insert(8480, (true, true));
+            client.scalar_readback_known.lock().await.insert(40);
+            client.selector_readback_known.lock().await.insert(2);
+            client
+                .mirror_raw_command_if_success(&request, &response)
+                .await;
+            // None of these change a stored preset, so its snapshot trust stays.
+            assert!(client.trusted_snapshot_presets.lock().await.contains(&0));
+            assert!(client.invalidated_snapshot_presets.lock().await.is_empty());
+            assert!(client.peq_readback_known.lock().await.is_empty());
+            assert!(client.scalar_readback_known.lock().await.is_empty());
+            assert!(client.selector_readback_known.lock().await.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn attempted_word_write_invalidates_only_affected_coefficient_knowledge() {
+        let client = scripted_client(Box::new(DummyTransport));
+        client
+            .peq_readback_known
+            .lock()
+            .await
+            .insert(100, (true, true));
+        client
+            .peq_readback_known
+            .lock()
+            .await
+            .insert(200, (true, true));
+        client.scalar_readback_known.lock().await.extend([101, 500]);
+        *client.active_preset.lock().await = Some(0);
+        client.trusted_snapshot_presets.lock().await.insert(0);
+        // No ACK is needed to revoke knowledge: the device may apply a timed-out write.
+        let write = commands::write_dsp_u32(101, 123, true);
+        client.invalidate_config_readback_for_write(&write).await;
+        {
+            let known = client.peq_readback_known.lock().await;
+            assert_eq!(known.get(&100), Some(&(false, true)));
+            assert_eq!(known.get(&200), Some(&(true, true)));
+        }
+        assert!(!client.scalar_readback_known.lock().await.contains(&101));
+        assert!(client.scalar_readback_known.lock().await.contains(&500));
+        // Preset trust survives the attempt and is lost only if the write fails.
+        assert!(client.trusted_snapshot_presets.lock().await.contains(&0));
+        client.revoke_trust_after_failed_write(&write).await;
+        assert!(!client.trusted_snapshot_presets.lock().await.contains(&0));
+        assert!(
+            client
+                .invalidated_snapshot_presets
+                .lock()
+                .await
+                .contains(&0)
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_preset_revokes_trust_in_every_stored_preset() {
+        let client = scripted_client(Box::new(DummyTransport));
+        client.trusted_snapshot_presets.lock().await.extend([0, 1]);
+        client
+            .invalidate_config_readback_for_write(&commands::copy_preset(true))
+            .await;
+        assert!(client.trusted_snapshot_presets.lock().await.is_empty());
+        assert!(
+            client
+                .invalidated_snapshot_presets
+                .lock()
+                .await
+                .contains(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn ram_only_raw_write_revokes_selector_knowledge() {
+        let client = scripted_client(Box::new(DummyTransport));
+        client.selector_readback_known.lock().await.insert(300);
+        // Control 0xA0 is not parsed as a selector write; it still changes the value.
+        let request = commands::write_dsp_u32_le_with_ctrl(300, 1, 0xA0);
+        client
+            .mirror_raw_command_if_success(&request, &[commands::RESP_OK])
+            .await;
+        assert!(!client.selector_readback_known.lock().await.contains(&300));
+    }
+
+    #[tokio::test]
+    async fn attempted_linked_write_invalidates_every_destination_before_ack() {
+        let client = scripted_client(Box::new(DummyTransport));
+        client
+            .selector_readback_known
+            .lock()
+            .await
+            .extend([100, 200, 300]);
+        let request = [commands::CMD_WRITE_BIQUAD, 0x81, 0, 100, 0, 200, 2, 0, 0, 0];
+        client.invalidate_config_readback_for_write(&request).await;
+        let known = client.selector_readback_known.lock().await;
+        assert!(!known.contains(&100));
+        assert!(!known.contains(&200));
+        assert!(known.contains(&300));
+    }
+    #[tokio::test]
+    async fn changed_reconnect_epoch_revokes_acknowledged_fields_but_keeps_snapshot_trust() {
+        let client = scripted_client(Box::new(DummyTransport));
+        client
+            .peq_readback_known
+            .lock()
+            .await
+            .insert(100, (true, true));
+        client.scalar_readback_known.lock().await.insert(200);
+        client.selector_readback_known.lock().await.insert(300);
+        client.trusted_snapshot_presets.lock().await.insert(0);
+        // A differing remembered epoch exercises the same transition as queue reconnect.
+        *client.readback_epoch.lock().await = u64::MAX;
+        assert_eq!(
+            client.synchronize_readback_epoch().await,
+            client.queue.reconnect_epoch()
+        );
+        assert!(client.peq_readback_known.lock().await.is_empty());
+        assert!(client.scalar_readback_known.lock().await.is_empty());
+        assert!(client.selector_readback_known.lock().await.is_empty());
+        // Stored presets survive a reconnect.
+        assert!(client.trusted_snapshot_presets.lock().await.contains(&0));
+        assert!(client.invalidated_snapshot_presets.lock().await.is_empty());
     }
 }

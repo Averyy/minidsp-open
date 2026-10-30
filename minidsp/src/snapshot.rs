@@ -291,6 +291,7 @@ impl MiniDspClient {
         let token_map = shadow_state.preset_tokens;
         let preset_shadows = shadow_state.presets;
         let trusted = shadow_state.trusted_snapshot_presets;
+        let invalidated = self.invalidated_snapshot_presets.lock().await.clone();
         let official_files = load_official_preset_files(
             self.profile(),
             &info.product_name,
@@ -303,13 +304,30 @@ impl MiniDspClient {
         populate_live_fir_blocks(self, &mut active_preset_shadow).await?;
 
         let mut presets = Vec::with_capacity(self.profile().presets as usize);
-        let mut issues = Vec::new();
+        let mut issues: Vec<String> = active_config
+            .readback
+            .as_ref()
+            .map(|report| {
+                report
+                    .fields
+                    .iter()
+                    .filter_map(|field| {
+                        field
+                            .error
+                            .as_ref()
+                            .map(|error| format!("active config {}: {error}", field.path))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["active config readback provenance missing".into()]);
         let mut notes = Vec::new();
         let default_image = default_preset_image_for_dsp(self.dsp_version());
 
         for slot in 0..self.profile().presets {
             let token = token_map.get(&slot).copied();
-            let source = if trusted.contains(&slot) {
+            let source = if invalidated.contains(&slot) {
+                PresetSource { issues: vec!["preset contents changed or reload outcome is uncertain; cached/token-derived source is not trusted".into()], ..PresetSource::default() }
+            } else if trusted.contains(&slot) {
                 match preset_shadows.get(&slot) {
                     Some(shadow) => build_shadow_preset_source(self.profile(), shadow),
                     None => PresetSource {
@@ -324,7 +342,11 @@ impl MiniDspClient {
             } else if let Some(file) = official_files.get(&slot) {
                 build_official_xml_preset_source(self.profile(), file)
             } else if slot == active_preset {
-                build_live_preset_source(self.profile(), &active_preset_shadow)
+                build_live_preset_source(
+                    self.profile(),
+                    &active_preset_shadow,
+                    active_config.readback.as_ref(),
+                )
             } else {
                 PresetSource {
                     issues: vec![
@@ -421,12 +443,17 @@ impl MiniDspClient {
         let learn_result = async {
             for slot in 0..self.profile().presets {
                 self.set_config(slot).await?;
-                let (shadow, _source) = capture_live_preset_source(self).await?;
+                let (shadow, source) = capture_live_preset_source(self).await?;
                 let trust_live = token_map.contains_key(&slot)
-                    && !self.profile().has_unreliable_selector_readback;
+                    && !self.profile().has_unreliable_selector_readback
+                    && source.issues.is_empty();
+                // An incomplete capture is kept as an untrusted copy: it must not
+                // replace a trusted one, but the default-image path still applies.
                 self.store_preset_shadow_snapshot(slot, shadow).await;
                 if trust_live {
                     self.mark_snapshot_trusted(slot).await;
+                } else {
+                    self.untrust_snapshot(slot).await;
                 }
             }
             Ok::<(), ClientError>(())
@@ -493,9 +520,17 @@ impl MiniDspClient {
                 preset.slot
             );
         } else {
+            // A bulk payload replacement changes continuity even when selecting
+            // the already-active slot is a no-op. Revoke before any attempted
+            // mutation, and retain revocation if the restore fails partway.
+            self.queue().invalidate_snapshot_context();
             self.set_config_with_mode_locked(preset.slot, commands::PRESET_CHANGE_WITHOUT_RESET)
                 .await?;
-            apply_shadow_to_active_preset(self, shadow, &preset.fir_blocks).await?;
+            if let Err(err) = apply_shadow_to_active_preset(self, shadow, &preset.fir_blocks).await
+            {
+                self.revoke_snapshot_trust(preset.slot).await;
+                return Err(err);
+            }
         }
 
         let token_matches = current.is_some_and(|current| current.token == preset.token);
@@ -881,8 +916,14 @@ fn build_official_xml_preset_source(
     }
 }
 
-fn build_live_preset_source(profile: &DeviceProfile, shadow: &PresetShadowState) -> PresetSource {
-    let mut issues = Vec::new();
+fn build_live_preset_source(
+    profile: &DeviceProfile,
+    shadow: &PresetShadowState,
+    readback: Option<&minidsp_protocol::status::ConfigReadback>,
+) -> PresetSource {
+    let mut issues = readback
+        .map(|report| report.issues())
+        .unwrap_or_else(|| vec!["config readback provenance missing".into()]);
     if profile.has_unreliable_selector_readback {
         issues.push(
             "active preset fell back to live readback on a profile with non-authoritative runtime selector/scalar fields"
@@ -1615,7 +1656,7 @@ async fn capture_live_preset_source(
     let config = client.read_device_config().await?;
     let mut shadow = shadow_from_device_config(client.profile(), &config);
     populate_live_fir_blocks(client, &mut shadow).await?;
-    let source = build_live_preset_source(client.profile(), &shadow);
+    let source = build_live_preset_source(client.profile(), &shadow, config.readback.as_ref());
     Ok((shadow, source))
 }
 

@@ -40,8 +40,25 @@ pub struct MasterStatusResponseJson {
 }
 
 /// Config write request body for POST /devices/{id}/config.
+/// Dedicated fail-closed endpoint: legacy /config must never be a fallback.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MuteRestoreJson {
+    pub if_snapshot_token: String,
+    pub outputs: Vec<MuteRestoreOutputJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MuteRestoreOutputJson {
+    pub index: u8,
+    pub mute: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConfigWriteJson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_snapshot_token: Option<String>,
     pub master_status: Option<MasterStatusPostJson>,
     pub inputs: Option<Vec<InputConfigJson>>,
     pub outputs: Option<Vec<OutputConfigJson>>,
@@ -248,5 +265,28 @@ mod compatibility_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod mute_restore_contract_tests {
+    use super::MuteRestoreJson;
+
+    #[test]
+    fn conditional_restore_requires_token_and_rejects_other_writes() {
+        assert!(
+            serde_json::from_str::<MuteRestoreJson>(
+                r#"{"if_snapshot_token":"opaque","outputs":[{"index":0,"mute":true}]}"#
+            )
+            .is_ok()
+        );
+        for body in [
+            r#"{"outputs":[{"index":0,"mute":true}]}"#,
+            r#"{"if_snapshot_token":"opaque","outputs":[{"index":0,"mute":true,"gain":0}]}"#,
+            r#"{"if_snapshot_token":"opaque","outputs":[{"index":0,"mute":true}],"master_status":{"preset":1}}"#,
+            r#"{"if_snapshot_token":"opaque","outputs":[{"index":0}]}"#,
+        ] {
+            assert!(serde_json::from_str::<MuteRestoreJson>(body).is_err());
+        }
     }
 }

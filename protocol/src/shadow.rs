@@ -143,3 +143,10 @@ pub fn parse_raw_linked_selector_write(payload: &[u8], dialect: &Dialect) -> Opt
     let addr = u16::from_be_bytes([payload[2], payload[3]]);
     Some((addr, u32::from_le_bytes(value_bytes) as u16))
 }
+
+/// Whether a DSP word belongs to the five-word coefficient block (without wrapping).
+pub fn coefficient_span_contains(base: u16, word_addr: u16) -> bool {
+    let base = u32::from(base);
+    let word = u32::from(word_addr);
+    word >= base && word < base + 5
+}

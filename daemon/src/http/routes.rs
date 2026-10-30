@@ -158,6 +158,10 @@ pub fn router_with_origins(
         )
         .route("/devices/{id}/config", post(write_config).get(read_config))
         .route(
+            "/devices/{id}/config/restore-mutes",
+            post(restore_config_mutes),
+        )
+        .route(
             "/devices/{id}/snapshot",
             get(export_snapshot).post(import_snapshot),
         )
@@ -1163,12 +1167,62 @@ fn validate_config_indices(
     Ok(())
 }
 
+async fn restore_config_mutes(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<usize>,
+    Json(body): Json<MuteRestoreJson>,
+) -> Result<StatusCode, StatusCode> {
+    if body.outputs.is_empty()
+        || body.if_snapshot_token.is_empty()
+        || body.if_snapshot_token.len() > 256
+        || !body
+            .if_snapshot_token
+            .bytes()
+            .all(|b| (0x21..=0x7e).contains(&b))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let client = get_ready_device_or_status(&state, id).await?;
+    let table = client
+        .profile()
+        .dsp_table
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+    let mut seen = std::collections::HashSet::new();
+    if body
+        .outputs
+        .iter()
+        .any(|output| output.index as usize >= table.outputs.len() || !seen.insert(output.index))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let values = body
+        .outputs
+        .iter()
+        .map(|output| (output.index, output.mute))
+        .collect::<Vec<_>>();
+    client
+        .restore_output_mutes_if_snapshot(&values, &body.if_snapshot_token)
+        .await
+        .map_err(client_error_to_status)?;
+    state
+        .persist_device_shadow_after_preset_mutation(&client)
+        .await;
+    if client.queue().snapshot_token().as_deref() != Some(body.if_snapshot_token.as_str()) {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(StatusCode::OK)
+}
+
 async fn write_config(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<usize>,
     Json(body): Json<ConfigWriteJson>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let client = get_ready_device_or_status(&state, id).await?;
+    if body.if_snapshot_token.is_some() {
+        // Dedicated route is required: old daemons silently ignore unknown JSON keys.
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if body.inputs.is_some() || body.outputs.is_some() {
         let table = client
             .profile()
@@ -1493,11 +1547,14 @@ async fn read_config(
         .profile()
         .dsp_table
         .ok_or(StatusCode::NOT_IMPLEMENTED)?;
-    let config = client
+    let snapshot_token = client.queue().snapshot_token();
+    let read_epoch = client.reconnect_epoch();
+    let mut config = client
         .read_device_config()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let mut readback = config.readback.take().unwrap_or_default();
     let inputs = config
         .inputs
         .into_iter()
@@ -1542,7 +1599,24 @@ async fn read_config(
     for (idx, output) in config.outputs.into_iter().enumerate() {
         let invert = if let Some(ch) = table.outputs.get(idx) {
             match ch.polarity {
-                Some(addr) => client.read_channel_invert(addr).await.ok(),
+                Some(addr) => match client.read_channel_invert(addr).await {
+                    Ok(value) => {
+                        readback.record(
+                            format!("outputs.{}.invert", output.index),
+                            minidsp_protocol::status::ConfigReadbackSource::Device,
+                            None,
+                        );
+                        Some(value)
+                    }
+                    Err(error) => {
+                        readback.record(
+                            format!("outputs.{}.invert", output.index),
+                            minidsp_protocol::status::ConfigReadbackSource::Unavailable,
+                            Some(error.to_string()),
+                        );
+                        None
+                    }
+                },
                 None => None,
             }
         } else {
@@ -1618,6 +1692,15 @@ async fn read_config(
         });
     }
 
+    if client.reconnect_epoch() != read_epoch {
+        readback.invalidate("device reconnected during config readback");
+    }
+    readback.snapshot_token =
+        if snapshot_token.is_some() && client.queue().snapshot_token() == snapshot_token {
+            snapshot_token
+        } else {
+            None
+        };
     Ok(Json(serde_json::json!({
         "master_status": {
             "preset": config.master_status.preset,
@@ -1626,6 +1709,7 @@ async fn read_config(
             "mute": config.master_status.mute,
             "dirac": config.master_status.dirac,
         },
+        "readback": readback,
         "inputs": inputs,
         "outputs": outputs,
     }))
@@ -2036,6 +2120,9 @@ async fn restore_measurement_mode(
 /// Map ClientError to HTTP status code, including 503 for busy.
 fn client_error_to_status(e: minidsp::client::ClientError) -> StatusCode {
     match e {
+        minidsp::client::ClientError::Transport(
+            minidsp::transport::TransportError::PreconditionFailed,
+        ) => StatusCode::CONFLICT,
         minidsp::client::ClientError::Busy => StatusCode::SERVICE_UNAVAILABLE,
         minidsp::client::ClientError::Transport(minidsp::transport::TransportError::Busy) => {
             StatusCode::SERVICE_UNAVAILABLE

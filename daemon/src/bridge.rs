@@ -25,6 +25,22 @@ pub async fn execute_raw_bridge_command(
     let settings = state.settings.read().await;
     settings.clamp_payload(&mut payload);
     let request = payload.clone();
+    client.invalidate_config_readback_for_write(&payload).await;
+    // Raw flash writes other than modification-token bookkeeping can replace
+    // stored presets that this controller never sees again.
+    if matches!(
+        payload.first().copied(),
+        Some(
+            commands::CMD_WRITE_FLASH
+                | commands::CMD_WRITE_FLASH_FULL_ADDR
+                | commands::CMD_WRITE_FLASH_BLOCK
+                | commands::CMD_FINISH_FLASH_BLOCK
+                | commands::CMD_ERASE_FLASH
+        )
+    ) && commands::invalidates_snapshot_context(&payload)
+    {
+        client.revoke_all_snapshot_trust().await;
+    }
 
     if payload.first().copied() == Some(commands::CMD_SET_CONFIG) && payload.len() >= 2 {
         let preset = payload[1];
@@ -74,11 +90,13 @@ pub async fn execute_raw_bridge_command(
         return Ok(raw_resp);
     }
 
-    let raw_resp = client
-        .queue()
-        .execute_raw(payload, Priority::Normal)
-        .await
-        .map_err(|e| e.to_string())?;
+    let raw_resp = match client.queue().execute_raw(payload, Priority::Normal).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            client.revoke_trust_after_failed_write(&request).await;
+            return Err(err.to_string());
+        }
+    };
     client
         .mirror_raw_command_if_success(&request, &raw_resp)
         .await;

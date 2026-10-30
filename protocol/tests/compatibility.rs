@@ -798,3 +798,135 @@ fn tcp_response_encoding() {
     assert_eq!(resp[0], 5); // self-inclusive length: 4 + 1
     assert_eq!(&resp[1..], &[0x31, 0x01, 0x55, 0x0A]);
 }
+
+#[test]
+fn config_readback_metadata_is_additive_and_distinguishes_known_from_fallback() {
+    use minidsp_protocol::status::{ConfigReadback, ConfigReadbackSource, DeviceConfig};
+    let legacy = serde_json::json!({"master_status":{"preset":0,"source":"Usb","volume":-20.0,"mute":false},"inputs":[],"outputs":[]});
+    let mut config: DeviceConfig = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(config.readback.is_none());
+    assert_eq!(serde_json::to_value(&config).unwrap(), legacy);
+    let mut report = ConfigReadback::default();
+    report.record("outputs.0.mute", ConfigReadbackSource::Device, None);
+    report.record("inputs.0.peq.0.coeff", ConfigReadbackSource::Shadow, None);
+    assert!(report.complete);
+    report.record(
+        "inputs.0.routing.0.enabled",
+        ConfigReadbackSource::Default,
+        Some("read failed".into()),
+    );
+    assert!(!report.complete);
+    config.readback = Some(report);
+    let json = serde_json::to_value(config).unwrap();
+    assert_eq!(json["readback"]["version"], 1);
+    assert_eq!(json["readback"]["fields"][0]["source"], "device");
+    assert!(json["readback"]["fields"][0].get("error").is_none());
+    assert_eq!(json["readback"]["fields"][2]["error"], "read failed");
+    assert_eq!(json["inputs"], legacy["inputs"]);
+    assert_eq!(json["outputs"], legacy["outputs"]);
+}
+
+#[test]
+fn connection_change_invalidates_every_field_and_preserves_prior_errors() {
+    use minidsp_protocol::status::{ConfigReadback, ConfigReadbackSource};
+    let mut report = ConfigReadback::default();
+    report.record("outputs.0.mute", ConfigReadbackSource::Device, None);
+    report.record(
+        "inputs.0.routing.1.enabled",
+        ConfigReadbackSource::Shadow,
+        None,
+    );
+    report.record(
+        "outputs.1.gain",
+        ConfigReadbackSource::Default,
+        Some("read failed".into()),
+    );
+    report.invalidate("connection changed");
+    assert!(!report.complete);
+    assert!(
+        report
+            .fields
+            .iter()
+            .all(|field| field.source == ConfigReadbackSource::Unavailable
+                && field.error.as_ref().unwrap().contains("connection changed"))
+    );
+    assert_eq!(
+        report.fields[2].error.as_deref(),
+        Some("read failed; connection changed")
+    );
+    let mut empty = ConfigReadback::default();
+    empty.invalidate("connection changed");
+    assert!(!empty.complete);
+    assert_eq!(empty.fields.len(), 1);
+    assert_eq!(empty.fields[0].path, "config");
+}
+
+#[test]
+fn content_replacing_commands_invalidate_config_readback_even_for_same_slot_reload() {
+    for request in [
+        set_config(0, PRESET_CHANGE_RELOAD_SAME_SLOT),
+        reset(),
+        enter_bootloader(),
+        copy_preset(true),
+    ] {
+        assert!(invalidates_config_readback(request[0]));
+    }
+    for request in [read_flash(0xff, 0, 4), set_source(0), set_mute(false)] {
+        assert!(!invalidates_config_readback(request[0]));
+    }
+}
+
+#[test]
+fn coefficient_span_invalidation_is_bounded_and_does_not_wrap() {
+    use minidsp_protocol::shadow::coefficient_span_contains;
+    for offset in 0..5 {
+        assert!(coefficient_span_contains(100, 100 + offset));
+    }
+    assert!(!coefficient_span_contains(100, 99));
+    assert!(!coefficient_span_contains(100, 105));
+    assert!(coefficient_span_contains(u16::MAX - 1, u16::MAX));
+    assert!(!coefficient_span_contains(u16::MAX - 1, 0));
+}
+
+#[test]
+fn snapshot_context_tracks_disruptive_writes_but_not_mute_bookkeeping() {
+    assert!(invalidates_snapshot_context(&set_config(
+        0,
+        PRESET_CHANGE_RELOAD_SAME_SLOT
+    )));
+    assert!(invalidates_snapshot_context(&reset()));
+    assert!(invalidates_snapshot_context(&[CMD_COPY_PRESET]));
+    assert!(invalidates_snapshot_context(&[CMD_ENTER_BOOTLOADER]));
+    for opcode in [
+        CMD_ERASE_FLASH,
+        CMD_WRITE_FLASH_BLOCK,
+        CMD_FINISH_FLASH_BLOCK,
+        CMD_WRITE_FLASH_FULL_ADDR,
+        CMD_LOAD_DSP_PROGRAM,
+        CMD_RELOAD_E2PROM_HEADER,
+    ] {
+        assert!(invalidates_snapshot_context(&[opcode]));
+    }
+    assert!(invalidates_snapshot_context(&write_flash(
+        0xff,
+        0xd7,
+        &[1, 2]
+    )));
+
+    assert!(invalidates_snapshot_context(&write_flash(0, 0, &[1])));
+    assert!(!invalidates_snapshot_context(&write_flash(
+        0xff, 0xc8, &[1; 16]
+    )));
+    assert!(invalidates_snapshot_context(&write_flash(
+        0xff, 0xc7, &[1; 16]
+    )));
+    assert!(!invalidates_snapshot_context(&write_dsp_u32_le_with_ctrl(
+        100, 1, 0x80
+    )));
+    let mut report = minidsp_protocol::status::ConfigReadback {
+        snapshot_token: Some("opaque-context".into()),
+        ..Default::default()
+    };
+    report.invalidate("connection changed");
+    assert!(report.snapshot_token.is_none());
+}

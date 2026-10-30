@@ -202,6 +202,123 @@ pub struct BmMixerCellPatch {
     pub polarity_inverted: Option<bool>,
 }
 
+/// Provenance of one semantic config field. Shadow is controller knowledge,
+/// never an independent physical readback guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "std", serde(rename_all = "lowercase"))]
+pub enum ConfigReadbackSource {
+    Device,
+    Shadow,
+    Default,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct ConfigReadbackField {
+    /// Dotted semantic path; numeric components identify physical channels/slots.
+    pub path: String,
+    pub source: ConfigReadbackSource,
+    #[cfg_attr(
+        feature = "std",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub struct ConfigReadback {
+    pub version: u8,
+    /// Opaque device/preset continuity token for conditional mute restoration.
+    #[cfg_attr(
+        feature = "std",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub snapshot_token: Option<String>,
+    /// Every reported supported field is known (device/shadow) without errors.
+    /// Does not mean atomic, independently read, or acoustically verified.
+    pub complete: bool,
+    pub fields: Vec<ConfigReadbackField>,
+}
+
+impl Default for ConfigReadback {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            snapshot_token: None,
+            complete: true,
+            fields: Vec::new(),
+        }
+    }
+}
+
+impl ConfigReadback {
+    /// A connection change invalidates each positive field assertion, not just
+    /// the aggregate flag: consumers intentionally assess only fields they use.
+    pub fn invalidate(&mut self, reason: &str) {
+        self.snapshot_token = None;
+        self.complete = false;
+        for field in &mut self.fields {
+            field.source = ConfigReadbackSource::Unavailable;
+            field.error = Some(match field.error.take() {
+                Some(previous) => format!("{previous}; {reason}"),
+                None => reason.to_string(),
+            });
+        }
+        if self.fields.is_empty() {
+            self.record(
+                "config",
+                ConfigReadbackSource::Unavailable,
+                Some(reason.to_string()),
+            );
+        }
+    }
+
+    pub fn record(
+        &mut self,
+        path: impl Into<String>,
+        source: ConfigReadbackSource,
+        error: Option<String>,
+    ) {
+        if error.is_some()
+            || matches!(
+                source,
+                ConfigReadbackSource::Default | ConfigReadbackSource::Unavailable
+            )
+        {
+            self.complete = false;
+        }
+        self.fields.push(ConfigReadbackField {
+            path: path.into(),
+            source,
+            error,
+        });
+    }
+
+    /// Issues that prevent promoting fallback-filled data to a complete snapshot.
+    pub fn issues(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter(|field| {
+                field.error.is_some()
+                    || matches!(
+                        field.source,
+                        ConfigReadbackSource::Default | ConfigReadbackSource::Unavailable
+                    )
+            })
+            .map(|field| {
+                format!(
+                    "config {}: {}",
+                    field.path,
+                    field.error.as_deref().unwrap_or("value is not known")
+                )
+            })
+            .collect()
+    }
+}
+
 /// Full device config — JSON-serializable representation of all device state.
 ///
 /// Used for config readback (GET /devices/{id}/config), measurement mode
@@ -209,6 +326,11 @@ pub struct BmMixerCellPatch {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
 pub struct DeviceConfig {
+    #[cfg_attr(
+        feature = "std",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub readback: Option<ConfigReadback>,
     pub master_status: MasterStatusView,
     pub inputs: Vec<InputChannelConfig>,
     pub outputs: Vec<OutputChannelConfig>,

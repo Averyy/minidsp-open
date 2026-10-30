@@ -30,7 +30,10 @@ use minidsp_protocol::playback::{
 use minidsp_protocol::rattle::{RattlePlan, RattleRequest, RattleResponse};
 use minidsp_protocol::settings::Settings;
 use minidsp_protocol::source::Source;
-use minidsp_protocol::status::{BmChannelPatch, BmMixerCellPatch, DeviceConfig, StatusSummary};
+use minidsp_protocol::status::{
+    BmChannelPatch, BmMixerCellPatch, ConfigReadback, ConfigReadbackSource, DeviceConfig,
+    StatusSummary,
+};
 use serde_json::json;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -526,6 +529,72 @@ pub fn start(
         })?;
     }
 
+    // Dedicated conditional endpoint: legacy firmware must fail the URI,
+    // never ignore a new precondition field on the old unconditional endpoint.
+    {
+        let st = state.clone();
+        let audio = audio_state.clone();
+        server.fn_handler(
+            "/devices/0/config/restore-mutes",
+            Method::Post,
+            move |mut req| {
+                req = match reject_hid_during_playback(req, &audio)? {
+                    Some(req) => req,
+                    None => return Ok(()),
+                };
+                let dev = match get_device(&st) {
+                    Some(d) => d,
+                    None => return send_json(req, 503, r#"{"error":"no device"}"#),
+                };
+                let body = match read_request_body(&mut req, 128 * 1024) {
+                    Ok(body) => body,
+                    Err("request body too large") => {
+                        return send_error(req, 413, "request body too large");
+                    }
+                    Err(_) => return send_error(req, 400, "failed to read request body"),
+                };
+
+                let json: serde_json::Value = match serde_json::from_slice(&body) {
+                    Ok(v) => v,
+                    Err(_) => return send_error(req, 400, "invalid JSON"),
+                };
+
+                // Validate the entire conditional shape before acquiring the
+                // mutation lock or issuing any device write.
+                let (token, outputs) = match conditional_mute_patch(
+                    &json,
+                    dev.profile()
+                        .dsp_table
+                        .map(|t| t.outputs.len())
+                        .unwrap_or(0),
+                ) {
+                    Ok(patch) => patch,
+                    Err(error) => return send_error(req, 400, error),
+                };
+                let _op = try_device_operation_or_409!(req, dev);
+                if let Err(error) = dev.assert_snapshot_token(token) {
+                    return send_error(req, 409, &error.to_string());
+                }
+                let table = dev
+                    .profile()
+                    .dsp_table
+                    .expect("conditional output validation requires table");
+                for (index, mute) in outputs {
+                    if let Err(error) = dev.assert_snapshot_token(token) {
+                        return send_error(req, 409, &error.to_string());
+                    }
+                    if let Err(error) = dev.set_channel_mute(table.outputs[index].mute, mute) {
+                        return send_error(req, 500, &error.to_string());
+                    }
+                }
+                if let Err(error) = dev.assert_snapshot_token(token) {
+                    return send_error(req, 409, &error.to_string());
+                }
+                send_json(req, 200, r#"{"status":"ok"}"#)
+            },
+        )?;
+    }
+
     // POST /devices/0/config — full config write (PEQ, gain, mute, delay, polarity, master)
     {
         let st = state.clone();
@@ -553,6 +622,14 @@ pub fn start(
                 Ok(v) => v,
                 Err(_) => return send_error(req, 400, "invalid JSON"),
             };
+
+            if json.get("if_snapshot_token").is_some() {
+                return send_error(
+                    req,
+                    400,
+                    "conditional restoration requires /devices/0/config/restore-mutes",
+                );
+            }
 
             let requested_source = if let Some(source) = json
                 .get("master_status")
@@ -637,7 +714,7 @@ pub fn start(
                             let band = match input_ch.peq.get(band_idx) {
                                 Some(band) => band,
                                 None => {
-                                    return send_error(req, 400, "input peq index out of range")
+                                    return send_error(req, 400, "input peq index out of range");
                                 }
                             };
                             if let Some(coeff) = peq.get("coeff") {
@@ -744,7 +821,7 @@ pub fn start(
                             let band = match output_ch.peq.get(band_idx) {
                                 Some(band) => band,
                                 None => {
-                                    return send_error(req, 400, "output peq index out of range")
+                                    return send_error(req, 400, "output peq index out of range");
                                 }
                             };
                             info!(
@@ -2599,11 +2676,82 @@ fn parse_query_param(uri: &str, key: &str) -> Option<String> {
     })
 }
 
+/// The token and the (output index, mute) pairs of a conditional mute restore.
+type ConditionalMutePatch<'a> = (&'a str, Vec<(usize, bool)>);
+
+fn conditional_mute_patch(
+    json: &serde_json::Value,
+    output_count: usize,
+) -> Result<ConditionalMutePatch<'_>, &'static str> {
+    let object = json
+        .as_object()
+        .ok_or("conditional config must be an object")?;
+    if object.len() != 2
+        || object
+            .keys()
+            .any(|key| key != "if_snapshot_token" && key != "outputs")
+    {
+        return Err("conditional config accepts only if_snapshot_token and output mute fields");
+    }
+    let token = object
+        .get("if_snapshot_token")
+        .and_then(|v| v.as_str())
+        .ok_or("if_snapshot_token must be a string")?;
+    if token.is_empty() || token.len() > 256 || !token.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err("invalid snapshot token");
+    }
+    let outputs = object
+        .get("outputs")
+        .and_then(|v| v.as_array())
+        .ok_or("conditional outputs must be an array")?;
+    if outputs.is_empty() {
+        return Err("conditional outputs must not be empty");
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut patch = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let fields = output
+            .as_object()
+            .ok_or("conditional output must be an object")?;
+        if fields.len() != 2 || fields.keys().any(|key| key != "index" && key != "mute") {
+            return Err("conditional output accepts only index and mute");
+        }
+        let index = fields
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or("invalid output index")?;
+        if index >= output_count || !seen.insert(index) {
+            return Err("duplicate or out-of-range conditional output index");
+        }
+        let mute = fields
+            .get("mute")
+            .and_then(|v| v.as_bool())
+            .ok_or("conditional mute must be boolean")?;
+        patch.push((index, mute));
+    }
+    Ok((token, patch))
+}
+
 fn config_json(dev: &DeviceState, config: DeviceConfig) -> String {
     let Some(table) = dev.profile().dsp_table else {
         return "{}".into();
     };
 
+    let mut readback = config.readback.clone().unwrap_or_else(|| {
+        let mut report = ConfigReadback::default();
+        report.record(
+            "config",
+            ConfigReadbackSource::Unavailable,
+            Some("config readback metadata missing".into()),
+        );
+        report
+    });
+    if let Err(error) = dev.assert_connection_current() {
+        readback.invalidate(&format!(
+            "connection changed before config serialization: {error}"
+        ));
+    }
     let inputs = config
         .inputs
         .into_iter()
@@ -2660,13 +2808,28 @@ fn config_json(dev: &DeviceState, config: DeviceConfig) -> String {
     let outputs = config
         .outputs
         .into_iter()
-        .enumerate()
-        .map(|(idx, output)| {
+        .map(|output| {
             let invert = table
                 .outputs
-                .get(idx)
+                .get(output.index as usize)
                 .and_then(|ch| ch.polarity)
-                .and_then(|addr| dev.read_channel_invert(addr).ok());
+                .and_then(|addr| {
+                    let path = format!("outputs.{}.invert", output.index);
+                    match dev.read_channel_invert(addr) {
+                        Ok(value) => {
+                            readback.record(path, ConfigReadbackSource::Device, None);
+                            Some(value)
+                        }
+                        Err(error) => {
+                            readback.record(
+                                path,
+                                ConfigReadbackSource::Unavailable,
+                                Some(error.to_string()),
+                            );
+                            None
+                        }
+                    }
+                });
 
             let mut output_obj = serde_json::Map::new();
             output_obj.insert("index".into(), json!(output.index));
@@ -2790,7 +2953,17 @@ fn config_json(dev: &DeviceState, config: DeviceConfig) -> String {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-    body.push_str("]}");
+    match dev.snapshot_token() {
+        Ok(token) if readback.snapshot_token.as_deref() == Some(token.as_str()) => {}
+        Ok(_) => readback.invalidate("snapshot context changed during config serialization"),
+        Err(error) => readback.invalidate(&format!(
+            "connection changed during config serialization: {error}"
+        )),
+    }
+
+    body.push_str("],\"readback\":");
+    body.push_str(&serde_json::to_string(&readback).expect("readback metadata serializes"));
+    body.push('}');
     body
 }
 
@@ -4051,9 +4224,17 @@ fn run_rattle_thread(
         frame_bytes: plan.layout().frame_bytes(),
     };
     let schedule = plan.schedule();
-    info!("rattle session: tones={}, tone_samples={}, gap_samples={}, cycles={}, volumes={:?}, master={} dB, rate={} Hz, depth={}",
-        schedule.frequencies_hz.len(), schedule.tone_samples, schedule.gap_samples,
-        schedule.cycles, schedule.volumes_db, plan.master_volume_db(), format.sample_rate, format.bit_depth.bits());
+    info!(
+        "rattle session: tones={}, tone_samples={}, gap_samples={}, cycles={}, volumes={:?}, master={} dB, rate={} Hz, depth={}",
+        schedule.frequencies_hz.len(),
+        schedule.tone_samples,
+        schedule.gap_samples,
+        schedule.cycles,
+        schedule.volumes_db,
+        plan.master_volume_db(),
+        format.sample_rate,
+        format.bit_depth.bits()
+    );
     let panic_token = cleanup.token();
     let mut panic_cleanup = None;
     let result: Result<(), String> = (|| {
@@ -4557,26 +4738,26 @@ fn stream_playback(
     let (write_min_us, write_max_us, write_avg_us, write_p50_us, write_p95_us, write_p99_us) =
         write_latencies_us.summary();
     info!(
-                "playback completed in {} ms (gen={} ms, write={} ms, expected_bytes={}, actual_bytes={}, writes={}, last_write_bytes={}, tx_need_data={}, transfer_errors={}, stream_errors={}, last_write_after_start={} ms, stop_time={} ms, write_min={} us, write_max={} us, write_avg={} us, write_p50={} us, write_p95={} us, write_p99={} us)",
-                (usb_audio::server_time_us() - playback_started_us) / 1000,
-                gen_time_us / 1000,
-                write_time_us / 1000,
-                total_bytes,
-                total_bytes_written,
-                write_latencies_us.len(),
-                last_write_bytes,
-                usb_audio::tx_need_data_count(),
-                transfer_errors,
-                stream_errors,
-                (last_write_return_us - playback_started_us) / 1000,
-                (stop_finished_us - stop_started_us) / 1000,
-                write_min_us,
-                write_max_us,
-                write_avg_us,
-                write_p50_us,
-                write_p95_us,
-                write_p99_us,
-            );
+        "playback completed in {} ms (gen={} ms, write={} ms, expected_bytes={}, actual_bytes={}, writes={}, last_write_bytes={}, tx_need_data={}, transfer_errors={}, stream_errors={}, last_write_after_start={} ms, stop_time={} ms, write_min={} us, write_max={} us, write_avg={} us, write_p50={} us, write_p95={} us, write_p99={} us)",
+        (usb_audio::server_time_us() - playback_started_us) / 1000,
+        gen_time_us / 1000,
+        write_time_us / 1000,
+        total_bytes,
+        total_bytes_written,
+        write_latencies_us.len(),
+        last_write_bytes,
+        usb_audio::tx_need_data_count(),
+        transfer_errors,
+        stream_errors,
+        (last_write_return_us - playback_started_us) / 1000,
+        (stop_finished_us - stop_started_us) / 1000,
+        write_min_us,
+        write_max_us,
+        write_avg_us,
+        write_p50_us,
+        write_p95_us,
+        write_p99_us,
+    );
     if !rattle {
         audio_state.finish_last_run(run_error.clone());
     }

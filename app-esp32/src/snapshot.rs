@@ -274,10 +274,22 @@ impl DeviceState {
         let token_map = self.read_modification_tokens()?;
         let shadows = self.export_shadow_snapshots();
         let trusted = self.trusted_snapshot_slots();
+        let invalidated = self.invalidated_snapshot_slots();
         let default_image = default_preset_image_for_dsp(self.dsp_version());
 
         let mut presets = Vec::with_capacity(profile.presets as usize);
         let mut issues = Vec::new();
+        // Presets below use their own trusted sources; master state is taken
+        // from this live config and must not silently inherit Dirac defaults.
+        match &active_config.readback {
+            Some(readback) => issues.extend(
+                readback
+                    .issues()
+                    .into_iter()
+                    .filter(|issue| issue.starts_with("config master_status.")),
+            ),
+            None => issues.push("live master config readback provenance is unavailable".into()),
+        }
         let mut notes = vec![
             "ESP32 snapshot export is controller-shadow-backed and will refuse strict export for presets the board has not learned truthfully.".to_string(),
         ];
@@ -301,7 +313,7 @@ impl DeviceState {
                         ..PresetSource::default()
                     },
                 }
-            } else if token == Some(RECOVERY_MODIFICATION_TOKEN) {
+            } else if token == Some(RECOVERY_MODIFICATION_TOKEN) && !invalidated.contains(&slot) {
                 build_default_preset_source(profile, default_image)
             } else {
                 PresetSource {
@@ -337,6 +349,7 @@ impl DeviceState {
             });
         }
 
+        self.assert_connection_current()?;
         Ok(DeviceSnapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
             captured_at: snapshot_timestamp(),
@@ -383,15 +396,20 @@ impl DeviceState {
             for slot in 0..profile.presets {
                 self.set_config_with_verify(slot, commands::PRESET_CHANGE_WITHOUT_RESET)?;
                 let (shadow, source) = capture_live_preset_source(self)?;
-                let trust_live =
-                    token_map.contains_key(&slot) && !profile.has_unreliable_selector_readback;
+                let trust_live = token_map.contains_key(&slot)
+                    && !profile.has_unreliable_selector_readback
+                    && source.issues.is_empty();
                 info!(
                     "snapshot learn slot {} trust_live={} issues={:?}",
                     slot, trust_live, source.issues
                 );
+                // An incomplete capture is kept as an untrusted copy: it must not
+                // replace a trusted one, but the default-image path still applies.
                 self.store_preset_shadow_snapshot(slot, shadow);
                 if trust_live {
                     self.mark_snapshot_trusted(slot);
+                } else {
+                    self.untrust_snapshot(slot);
                 }
             }
             Ok(())
@@ -448,7 +466,13 @@ impl DeviceState {
             .map(|block| (block.data_start, block.coefficients.clone()))
             .collect();
 
+        // The enclosing restore holds the operation guard. Replacing the active
+        // slot can make set_config_with_verify a no-op, while the following DSP
+        // writes still replace its contents. Invalidate before either mutation
+        // so a failed/partial restore cannot retain an earlier mute snapshot.
+        self.invalidate_snapshot_context();
         self.set_config_with_verify(preset.slot, commands::PRESET_CHANGE_WITHOUT_RESET)?;
+        self.invalidate_snapshot_trust(Some(preset.slot));
         apply_shadow_to_active_preset(self, &shadow)?;
 
         if let Some(token) = preset.token.as_deref() {
@@ -575,7 +599,41 @@ fn capture_live_preset_source(
     let config = device.read_device_config()?;
     let mut shadow = shadow_from_device_config(device.profile(), &config);
     populate_live_fir_blocks(device, &mut shadow)?;
-    let source = build_live_preset_source(device.profile(), &shadow);
+    let mut source = build_live_preset_source(device.profile(), &shadow);
+    match &config.readback {
+        Some(readback) => source.issues.extend(readback.issues()),
+        None => source
+            .issues
+            .push("live config readback provenance is unavailable".into()),
+    }
+    // Channel polarity is absent from DeviceConfig; replace placeholders only
+    // with successful independent reads, and retain failures as snapshot issues.
+    if let Some(table) = device.profile().dsp_table {
+        for (kind, index, addr) in table
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ch)| ch.polarity.map(|a| ("inputs", i, a)))
+            .chain(
+                table
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, ch)| ch.polarity.map(|a| ("outputs", i, a))),
+            )
+        {
+            shadow.selector.remove(&addr);
+            match device.read_channel_invert(addr) {
+                Ok(value) => {
+                    shadow.selector.insert(addr, u16::from(value));
+                }
+                Err(error) => source
+                    .issues
+                    .push(format!("{kind}.{index}.invert: {error}")),
+            }
+        }
+    }
+    source.shadow = Some(snapshot_shadow_payload(shadow.clone()));
     Ok((shadow, source))
 }
 

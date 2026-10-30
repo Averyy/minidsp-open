@@ -320,6 +320,41 @@ Additional `/config` request compatibility:
 
 Error responses retain minidsp-open's existing `{"error":"message"}` envelope and HTTP status distinctions (`400`, `404`, `409`, `503` as applicable). Empty error responses from desktop status-only handlers now also have this JSON envelope. This deliberately differs from upstream `dev`'s HTTP `500` and `{"message":...,"error":{"type":...}}` errors. Upstream `/api` Redoc and `*.schema` metadata routes are not provided; minidsp-open exposes `/openapi.json` instead.
 
+### Config readback provenance
+
+`GET /devices/{id}/config` adds a `readback` object on desktop and ESP32. The existing value fields don't change, including the fallback values older versions returned when a read failed. A `false` mute, a disabled route, an identity filter or a zero gain is not by itself proof that the device reported it.
+
+```json
+{"readback":{"version":1,"complete":false,"snapshot_token":"…","fields":[
+  {"path":"outputs.0.mute","source":"device"},
+  {"path":"inputs.0.peq.0.coeff","source":"shadow"},
+  {"path":"inputs.0.routing.3.enabled","source":"default","error":"read failed"}
+]}}
+```
+
+Each path names one field by its physical channel, output, filter or group index, not by its position in the JSON arrays. One record covers each of: `master_status.*`; `inputs.I.gain`, `.mute`, `.peq.B.coeff`, `.peq.B.bypass`, `.routing.O.enabled`, `.gain_db`, `.polarity_inverted`; `outputs.O.gain`, `.mute`, `.delay`, `.invert`, `.peq.B.*`, `.crossover.G.filters.B.coeff`, `.crossover.G.bypass`, `.fir.bypass`, `.fir.active_taps`, and the compressor fields. A `.coeff` record covers all five coefficients. Features a device doesn't have are left out, except the always-present zero `delay`, which is marked `default`.
+
+| `source` | Meaning |
+|---|---|
+| `device` | Read from the device in this connection. |
+| `shadow` | Written by this controller and acknowledged in this connection. It isn't a fresh read, and it can't see a change made elsewhere (front panel, Device Console on another computer). |
+| `default` | A fallback: a compatibility default, a value stored before provenance existed, or a read the device is known to report unreliably (mutes and routing on the 2x4 HD and Flex). |
+| `unavailable` | The value couldn't be established, for example after a read error or a reconnect during the request. A legacy value may still be present. |
+
+`error` appears only when there is one, and a read error stays an error even when a fallback filled in the value. `complete` is true when every listed field is `device` or `shadow` with no error; it doesn't mean the read was atomic or acoustically checked. A client that depends on particular fields should check those paths and treat a missing path, an unknown `version`, a duplicate path, an error, `default` or `unavailable` as unknown.
+
+Field knowledge (`shadow`) is dropped before each write is sent and comes back only when that write is acknowledged. A raw write to one word of a biquad drops knowledge of that whole biquad. A preset switch or reload, reset, reboot, copy or reconnect drops all of it. Stored-preset snapshot trust is separate: switching, reloading, resetting, rebooting and reconnecting leave the stored presets alone and keep it. A write that fails or isn't acknowledged, a copy, a raw flash write outside the modification tokens, or a snapshot restore that fails partway revokes it for the presets affected. Snapshot learning keeps a capture it can't trust as an untrusted copy instead of refusing.
+
+#### Conditional output-mute restore
+
+`readback.snapshot_token` is an opaque string (printable ASCII, no spaces) that identifies the controller session, the device connection and the preset context. **POST `/devices/{id}/config/restore-mutes`** takes `{"if_snapshot_token":"…","outputs":[{"index":0,"mute":true},…]}` and nothing else: other fields, duplicate or out-of-range indices, or a malformed token get 400 before anything is written. Plain `POST /config` rejects `if_snapshot_token` with 400, so a client can't fall back to it by mistake: an older server would ignore the field there and write unconditionally. On an older server the dedicated route doesn't exist and fails without writing.
+
+The token changes on a preset switch or reload (including the same slot), reset, reboot, copy, flash writes that replace preset contents, a snapshot restore (including into the active slot, and even if it fails), a reconnect, and a preset change observed on the device. Ordinary DSP and mute writes and modification-token bookkeeping don't change it. `GET /config` leaves `snapshot_token` out if the context changed while the config was being read.
+
+The server checks the token immediately before sending each mute, and sends the mutes as one batch that is never replayed after an uncertain exchange. A token that no longer matches gets 409. That includes a change detected after the last mute was sent, because the caller can't then know which context its mutes went into. A transport error or an unacknowledged write is an error with no rollback, and some mutes may already be written. Don't retry old mute values in a new context.
+
+The token doesn't give exclusive control. It can't catch a change that is made and undone between two observations, so a measurement tool still needs its own physical checks.
+
 ## WebSocket Contract
 
 ### Canonical compatibility endpoint
