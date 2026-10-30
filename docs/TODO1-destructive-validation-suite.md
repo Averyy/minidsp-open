@@ -22,9 +22,9 @@ snapshot results above do not constitute sign-off for the new workflow.
   post-recovery snapshots, with baseline replay/equality after recovery.
 - [x] Explicit separate direct-USB desktop lane requirements alongside the
   daemon-backed lane in [ref-live-validation.md](ref-live-validation.md).
-- [x] Concurrent master/config mutations must return `409` during observed
-  snapshot export and restore busy windows; an unobserved window fails as
-  unproven rather than passing.
+- [x] Desktop concurrent master/config mutations must return `409` during
+  observed snapshot export and restore busy windows. ESP32 queued requests must
+  complete after the snapshot response. Unobserved overlap fails as unproven.
 - [x] Shared HTTP snapshot guard for desktop and ESP32; strict baseline replay
   before suites and rollback/reporting on failures, even with `--skip-cli`.
 - [x] Offline unit tests, `--help` and a full-profile `--plan` / `--dry-run` that

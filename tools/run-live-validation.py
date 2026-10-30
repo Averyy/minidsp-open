@@ -116,6 +116,7 @@ class Target:
     tcp_port: int
     cli_bin: Path | None
     cli_transport: str | None = None
+    settings: dict[str, Any] | None = None
 
     @property
     def parsed(self) -> urllib.parse.ParseResult:
@@ -542,6 +543,11 @@ def http_request(
                 body=decode_body(raw, resp_headers),
             )
     except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise SafetyStop(
+                f"{url}: target is password-protected; the suite doesn't send credentials, "
+                "and the TCP bridge is off while protected, so clear the password for validation"
+            ) from exc
         raw = exc.read()
         resp_headers = {k: v for k, v in exc.headers.items()}
         return HttpResponse(
@@ -629,6 +635,19 @@ def read_config(target: Target) -> dict[str, Any]:
     return data
 
 
+def read_settings(target: Target, *, refresh: bool = False) -> dict[str, Any]:
+    if target.settings is not None and not refresh:
+        return target.settings
+    resp, data = http_json("GET", target.path("/settings"))
+    assert_true(resp.status == 200 and isinstance(data, dict) and "maxVolumeDb" in data,
+                f"{target.label}: GET /settings missing maxVolumeDb")
+    ceiling = data["maxVolumeDb"]
+    assert_true(ceiling is None or (type(ceiling) in {int, float} and math.isfinite(ceiling)),
+                f"{target.label}: maxVolumeDb must be a number or null")
+    target.settings = data
+    return data
+
+
 def read_ezbeq_devices(target: Target) -> dict[str, Any]:
     resp, data = http_json("GET", target.path("/api/2/devices"))
     assert_true(resp.status == 200 and isinstance(data, dict), f"{target.label}: GET /api/2/devices failed")
@@ -670,6 +689,11 @@ def choose_gain_delta(value: float) -> float:
     if abs(candidate - value) < 0.01:
         candidate = value + 1.0
     return round(candidate, 2)
+
+
+def choose_volume_delta(value: float, ceiling: float | None) -> float:
+    limit = 0.0 if ceiling is None else ceiling
+    return round(value - 0.5 if value + 0.5 >= limit else value + 0.5, 2)
 
 
 def extract_input_peq_fingerprint(config: dict[str, Any]) -> list[Any]:
@@ -738,6 +762,8 @@ def wait_for_http(url: str, timeout: float) -> None:
             if resp.status == 200:
                 return
             last_status = resp.status
+        except SafetyStop:
+            raise
         except StepFailed:
             pass
         time.sleep(0.5)
@@ -759,6 +785,8 @@ def wait_for_upstream_ezbeq_catalogue(base_url: str, timeout: float) -> None:
                 last_detail = "authors list empty"
             else:
                 last_detail = f"authors returned HTTP {resp.status}"
+        except SafetyStop:
+            raise
         except (StepFailed, json.JSONDecodeError) as exc:
             last_detail = str(exc)
         time.sleep(0.5)
@@ -1042,12 +1070,68 @@ def capture_post_restore_http_state(target: Target, artifacts: SnapshotArtifacts
     return str(artifacts.root)
 
 
-def wait_for_playback_completion(play_result: dict[str, Any], *, padding_sec: float = 0.5) -> None:
-    total_samples = play_result.get("totalSamples")
-    sample_rate = play_result.get("sampleRate")
-    if not isinstance(total_samples, int) or not isinstance(sample_rate, int) or sample_rate <= 0:
-        return
-    time.sleep(total_samples / sample_rate + padding_sec)
+def wait_for_playback_completion(target: Target, play_result: dict[str, Any], *, timeout: float) -> None:
+    state = wait_for_idle_playback(target, timeout)
+    last = state.get("last")
+    assert_true(isinstance(last, dict), "idle playback status missing last run")
+    assert_true(last.get("startedAtUs") == play_result.get("startedAtUs"), "playback status does not match started run")
+    assert_true(last.get("state") == "completed", f"playback did not complete successfully: {last}")
+    for field in ("error", "sourceRestoreError", "volumeRestoreError"):
+        assert_true(last.get(field) is None, f"playback reported {field}: {last.get(field)}")
+
+
+def run_settings_suite(harness: Harness, target: Target) -> None:
+    section = f"{target.label}-http"
+    harness.run_step(section, "GET /settings", lambda: f"maxVolumeDb={read_settings(target)['maxVolumeDb']}")
+    original = dict(read_settings(target))
+
+    def settings_round_trip_step() -> str:
+        try:
+            resp, data = http_json("POST", target.path("/settings"), original)
+            assert_true(resp.status == 200 and data == original, f"{target.label}: same-value settings POST failed")
+            assert_true(read_settings(target, refresh=True) == original, "settings did not round trip")
+        finally:
+            try:
+                resp, _ = http_json("POST", target.path("/settings"), original)
+                assert_true(resp.status == 200 and read_settings(target, refresh=True) == original,
+                            "settings restore POST/GET failed")
+            except Exception as exc:
+                raise SafetyStop(f"original settings could not be restored: {exc}") from exc
+        return "same-value POST verified; original settings restored"
+
+    if harness.args.allow_destructive:
+        harness.run_step(section, "POST /settings same-value round trip + restore", settings_round_trip_step)
+    else:
+        harness.skip(section, "POST /settings same-value round trip + restore", "--allow-destructive not set")
+
+    def rattle_ceiling_step() -> str:
+        # A broken rejection would play this request, so it only runs where
+        # that tone stays at or below the approved -35 dB test level.
+        harness.confirm(target, "a possible 0.5 s tone at or below -35 dB if the ceiling rejection fails")
+        path = target.path(f"/devices/{target.device_id}/rattle")
+        resp, before = http_json("GET", path)
+        assert_true(resp.status == 200 and isinstance(before, dict) and before.get("playing") is False,
+                    "cannot establish idle rattle state before ceiling rejection")
+        ceiling = original["maxVolumeDb"]
+        resp, _ = http_json("POST", path, {"frequenciesHz": [40.0], "volumesDb": [ceiling + 0.5],
+                                          "toneSec": 0.5, "gapSec": 0.0, "cycles": 1})
+        after_resp, after = http_json("GET", path)
+        if (after_resp.status != 200 or not isinstance(after, dict) or after.get("playing") is not False
+                or after.get("last") != before.get("last")):
+            with contextlib.suppress(Exception):
+                http_json("POST", target.path(f"/devices/{target.device_id}/rattle/stop"), {})
+            raise SafetyStop("rattle ceiling rejection changed playback state; sent rattle stop")
+        assert_true(resp.status == 400, f"above-ceiling rattle expected 400, got {resp.status}")
+        return f"rattle above {ceiling} dB rejected without starting playback"
+
+    ceiling = original["maxVolumeDb"]
+    if ceiling is None:
+        harness.skip(section, "rattle maximum-volume ceiling rejection", "no maximum-volume ceiling configured")
+    elif not harness.args.allow_audio or ceiling + 0.5 > -35.0:
+        harness.skip(section, "rattle maximum-volume ceiling rejection",
+                     "needs --allow-audio and a ceiling at or below -35.5 dB, so a failed rejection can't play louder than -35 dB")
+    else:
+        harness.run_step(section, "rattle maximum-volume ceiling rejection", rattle_ceiling_step)
 
 
 def run_common_http_suite(harness: Harness, target: Target) -> None:
@@ -1061,6 +1145,7 @@ def run_common_http_suite(harness: Harness, target: Target) -> None:
         return f"{len(devices)} device(s), first url={first['url']}"
 
     harness.run_step(section, "GET /devices", devices_step)
+    run_settings_suite(harness, target)
 
     def status_step() -> str:
         status = read_status(target)
@@ -1091,7 +1176,7 @@ def run_common_http_suite(harness: Harness, target: Target) -> None:
 
     def volume_step() -> str:
         original = float(baseline_master["volume"])
-        desired = choose_gain_delta(original)
+        desired = choose_volume_delta(original, read_settings(target)["maxVolumeDb"])
         resp, data = http_json("POST", target.path(f"/devices/{target.device_id}"), {"volume": desired})
         assert_true(resp.status == 200, f"{target.label}: volume POST returned {resp.status}")
         current = read_status(target)["master"]["volume"]
@@ -1134,8 +1219,12 @@ def run_common_http_suite(harness: Harness, target: Target) -> None:
     def preset_step() -> str:
         original = int(read_status(target)["master"]["preset"])
         slot_count = 4
-        with contextlib.suppress(Exception):
+        try:
             slot_count = len(read_ezbeq_devices(target)["master"]["slots"]) or slot_count
+        except SafetyStop:
+            raise
+        except Exception:
+            pass
         if slot_count <= 1:
             raise StepFailed(f"{target.label}: only {slot_count} preset available")
         desired = (original + 1) % slot_count
@@ -1310,13 +1399,13 @@ def run_common_http_suite(harness: Harness, target: Target) -> None:
         harness.skip(section, "negative HTTP paths", "ESP32-focused negative checks skipped for desktop target")
 
 
-def wait_for_idle_playback(target: Target, timeout: float) -> None:
+def wait_for_idle_playback(target: Target, timeout: float) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         resp, state = http_json("GET", target.path(f"/devices/{target.device_id}/play"),
                                 timeout=min(5.0, max(0.01, deadline - time.monotonic())))
         if resp.status == 200 and isinstance(state, dict) and state.get("playing") is False:
-            return
+            return state
         time.sleep(0.1)
     raise SafetyStop("playback did not become idle; refusing to restore listening volume")
 
@@ -1324,6 +1413,10 @@ def wait_for_idle_playback(target: Target, timeout: float) -> None:
 @contextlib.contextmanager
 def safe_test_volume(harness: Harness, target: Target) -> Iterable[None]:
     harness.confirm(target, "audible playback at -35 dB")
+    ceiling = read_settings(target)["maxVolumeDb"]
+    if ceiling is not None and ceiling < -35.0:
+        raise SafetyStop(f"maximum-volume ceiling is {ceiling} dB, below the required -35 dB test level; "
+                         "raise or clear the ceiling before audio validation")
     if target.label in harness.baselines:
         verify_target_identity(target, harness.baselines[target.label])
     devices = read_devices(target)
@@ -1392,7 +1485,7 @@ def run_audio_steps(harness: Harness, target: Target) -> None:
         for key in ["startedAtUs", "sweepOffsetSamples", "totalSamples", "sampleRate"]:
             assert_true(key in data, f"{target.label}: /play response missing {key}")
         assert_true(before["serverTimeUs"] <= data["startedAtUs"] <= after["serverTimeUs"], f"{target.label}: /play startedAtUs not bracketed by /sync")
-        wait_for_playback_completion(data)
+        wait_for_playback_completion(target, data, timeout=harness.args.reconnect_timeout)
         return f"startedAtUs={data['startedAtUs']} totalSamples={data['totalSamples']}"
 
     if harness.run_step(section, "sweep-only /play", sweep_only_step) and harness.args.manual_audio:
@@ -1405,7 +1498,7 @@ def run_audio_steps(harness: Harness, target: Target) -> None:
         )
         assert_true(resp.status == 200 and isinstance(data, dict), f"{target.label}: marker test returned {resp.status}")
         assert_true(int(data.get("toneBurstOffsetSamples", -1)) == 0, f"{target.label}: marker test expected toneBurstOffsetSamples=0")
-        wait_for_playback_completion(data)
+        wait_for_playback_completion(target, data, timeout=harness.args.reconnect_timeout)
         return f"sampleRate={data['sampleRate']} totalSamples={data['totalSamples']}"
 
     if harness.run_step(section, "?test=marker", marker_test_step) and harness.args.manual_audio:
@@ -1416,7 +1509,7 @@ def run_audio_steps(harness: Harness, target: Target) -> None:
                                   {"markerBefore": True, "markerAfter": True, "sweepDurationSec": 1.0, "decaySec": 0.25})
         assert_true(resp.status == 200 and isinstance(data, dict), f"combined playback returned {resp.status}")
         assert_true(int(data.get("sweepOffsetSamples", -1)) > 0, "combined playback missing marker offset")
-        wait_for_playback_completion(data)
+        wait_for_playback_completion(target, data, timeout=harness.args.reconnect_timeout)
         return "combined marker + sweep completed"
 
     if harness.run_step(section, "combined marker + sweep /play", combined_step) and harness.args.manual_audio:
@@ -1459,7 +1552,7 @@ def run_audio_steps(harness: Harness, target: Target) -> None:
                 f"{target.label}: playback busy guard expected 409/409, got {status_code}/{devices_code}",
             )
             if isinstance(play_data, dict):
-                wait_for_playback_completion(play_data)
+                wait_for_playback_completion(target, play_data, timeout=harness.args.reconnect_timeout)
             return "busy guard returned 409 during active playback"
 
         harness.run_step(section, "playback busy guard", playback_busy_step)
@@ -1775,7 +1868,7 @@ def run_ezbeq_suite(harness: Harness, target: Target) -> None:
 
     def patch_volume_step() -> str:
         original = float(read_status(target)["master"]["volume"])
-        desired = choose_gain_delta(original)
+        desired = choose_volume_delta(original, read_settings(target)["maxVolumeDb"])
         resp, data = http_json("PATCH", target.path("/api/3/devices/master"), {"masterVolume": desired})
         assert_true(resp.status == 200 and isinstance(data, dict), f"{target.label}: PATCH /api/3/devices/master returned {resp.status}")
         approx_equal(float(read_status(target)["master"]["volume"]), desired, tolerance=0.1)
@@ -1886,12 +1979,14 @@ def spawn_upstream_ezbeq(cli_bin: Path, target: Target, port: int) -> SpawnedEzb
     try:
         wait_for_http(base_url + "/api/1/version", timeout=60.0)
         wait_for_upstream_ezbeq_catalogue(base_url, timeout=60.0)
-    except Exception:
+    except Exception as exc:
         with contextlib.suppress(Exception):
             proc.terminate()
         output = ""
         with contextlib.suppress(Exception):
             output = proc.stdout.read() if proc.stdout else ""
+        if isinstance(exc, SafetyStop):
+            raise
         raise StepFailed(f"failed to start upstream ezBEQ at {base_url}\n{output}")
     return SpawnedEzbeq(process=proc, base_url=base_url, temp_dir=temp_dir)
 
@@ -2027,10 +2122,20 @@ def assert_snapshot_busy(harness: Harness, target: Target, artifacts: SnapshotAr
     config = read_config(target)
     result: dict[str, Any] = {}
     mutations_observed: list[dict[str, Any]] = []
+    probe_observed: dict[str, Any] = {}
+    request_workers: list[threading.Thread] = []
     busy_observed = False
     started = threading.Event()
+    serialized = target.kind == "esp32"
+    # Same-value writes minimize damage if a broken guard admits a mutation.
+    mutations = [
+        (f"/devices/{target.device_id}", {"volume": current["volume"]}),
+        (f"/devices/{target.device_id}/config", {"outputs": [{"index": config["outputs"][0]["index"],
+                                                                  "gain": config["outputs"][0]["gain"]}]}),
+    ]
 
     def snapshot_worker() -> None:
+        result["startedAt"] = time.monotonic()
         started.set()
         try:
             result["response"], result["snapshot"] = http_json(
@@ -2038,42 +2143,83 @@ def assert_snapshot_busy(harness: Harness, target: Target, artifacts: SnapshotAr
                 baseline if method == "POST" else None, timeout=300.0)
         except Exception as exc:
             result["error"] = exc
+        finally:
+            result["completedAt"] = time.monotonic()
+
+    def request_worker(method: str, path: str, payload: Any, evidence: dict[str, Any]) -> None:
+        evidence.update({"method": method, "path": path, "startedAt": time.monotonic()})
+        try:
+            # ESP32 requests wait behind the synchronous snapshot handler.
+            resp, _ = http_json(method, target.path(path), payload, timeout=300.0 + harness.args.timeout)
+            evidence["status"] = resp.status
+        except Exception as exc:
+            evidence["error"] = str(exc)
+            if isinstance(exc, SafetyStop):
+                result["error"] = exc
+        finally:
+            evidence["completedAt"] = time.monotonic()
 
     worker = threading.Thread(target=snapshot_worker, daemon=True)
     worker.start()
     started.wait(harness.args.timeout)
     try:
-        deadline = time.monotonic() + harness.args.timeout
-        while worker.is_alive() and time.monotonic() < deadline:
-            probe = http_request("GET", target.path(f"/devices/{target.device_id}"), timeout=harness.args.timeout)
-            if probe.status == 409:
-                busy_observed = True
-                break
-            time.sleep(0.01)
+        if serialized:
+            # Let the snapshot request reach the board's single httpd task
+            # first; its capture takes seconds, so later requests queue behind it.
+            time.sleep(0.5)
+            for method_, path, payload, evidence in [
+                ("GET", f"/devices/{target.device_id}", None, probe_observed),
+                *[("POST", path, payload, {}) for path, payload in mutations],
+            ]:
+                if method_ == "POST":
+                    mutations_observed.append(evidence)
+                request_thread = threading.Thread(target=request_worker, args=(method_, path, payload, evidence), daemon=True)
+                request_workers.append(request_thread)
+                request_thread.start()
         else:
-            raise StepFailed("snapshot busy window not observed; concurrency coverage is unproven")
-        # Same-value writes minimize damage if a broken guard admits a mutation.
-        mutations = [
-            (f"/devices/{target.device_id}", {"volume": current["volume"]}),
-            (f"/devices/{target.device_id}/config", {"outputs": [{"index": config["outputs"][0]["index"],
-                                                                      "gain": config["outputs"][0]["gain"]}]}),
-        ]
-        for path, payload in mutations:
-            resp, _ = http_json("POST", target.path(path), payload, timeout=harness.args.timeout)
-            mutations_observed.append({"path": path, "status": resp.status})
-            assert_true(resp.status == 409, f"concurrent mutation {path} expected 409, got {resp.status}")
+            deadline = time.monotonic() + harness.args.timeout
+            while worker.is_alive() and time.monotonic() < deadline:
+                probe = http_request("GET", target.path(f"/devices/{target.device_id}"), timeout=harness.args.timeout)
+                probe_observed["status"] = probe.status
+                if probe.status == 409:
+                    busy_observed = True
+                    break
+                time.sleep(0.01)
+            else:
+                raise StepFailed("snapshot busy window not observed; concurrency coverage is unproven")
+            for path, payload in mutations:
+                resp, _ = http_json("POST", target.path(path), payload, timeout=harness.args.timeout)
+                mutations_observed.append({"path": path, "status": resp.status})
+                assert_true(resp.status == 409, f"concurrent mutation {path} expected 409, got {resp.status}")
     finally:
         worker.join(timeout=305.0)
+        for request_thread in request_workers:
+            request_thread.join(timeout=305.0 + harness.args.timeout)
+        timed_out = worker.is_alive() or any(thread.is_alive() for thread in request_workers)
         json_dump(artifacts.root / f"snapshot-busy-{method.lower()}.json",
                   {"status": result["response"].status if "response" in result else None,
                    "snapshot": result.get("snapshot"), "error": str(result.get("error", "")),
-                   "busyObserved": busy_observed, "mutations": mutations_observed, "timedOut": worker.is_alive()})
-        if worker.is_alive():
-            raise SafetyStop("snapshot request exceeded its timeout; operation state is unknown")
+                   "concurrencyModel": "serialized" if serialized else "busy-409",
+                   "snapshotStartedAt": result.get("startedAt"), "snapshotCompletedAt": result.get("completedAt"),
+                   "busyObserved": busy_observed, "probe": probe_observed,
+                   "mutations": mutations_observed, "timedOut": timed_out})
+        if timed_out:
+            raise SafetyStop("snapshot concurrency request exceeded its timeout; operation state is unknown")
     if "error" in result:
+        if isinstance(result["error"], SafetyStop):
+            raise result["error"]
         raise StepFailed(f"snapshot request failed: {result['error']}")
     assert_true(result["response"].status == 200, f"snapshot {method} returned {result['response'].status}")
     assert_snapshot_equal(baseline, result["snapshot"])
+    if serialized:
+        for evidence in [probe_observed, *mutations_observed]:
+            assert_true("error" not in evidence and 200 <= evidence.get("status", 0) < 300,
+                        f"serialized request failed: {evidence}")
+            assert_true(evidence["startedAt"] < result["completedAt"],
+                        "snapshot completed before concurrent request started; serialization coverage is unproven")
+            assert_true(evidence["completedAt"] > result["completedAt"],
+                        f"concurrent request {evidence['path']} completed before snapshot response")
+        return "probe, master and config requests completed successfully after snapshot response; strict baseline matched"
     return "master and config mutations both returned 409 inside observed snapshot busy window"
 
 
@@ -2194,17 +2340,21 @@ def plan_lines(args: argparse.Namespace) -> list[str]:
                       "  hard stop: failed capture, unsupported strict snapshot, identity mismatch or failed restore/equality",
                       "  preflight: import baseline, re-export and compare before mutations"]
         if args.destructive_profile == "full":
-            lines.append("  snapshot GET and POST: concurrent master/config mutations must return 409")
+            if target.kind == "esp32":
+                lines.append("  snapshot GET and POST: concurrent probe/master/config requests must complete after snapshot response")
+            else:
+                lines.append("  snapshot GET and POST: concurrent master/config mutations must return 409")
         lines += ["  HTTP control/config/measurement-mode compatibility (with local restores)",
+                  "  settings: GET shape / ceiling-aware volume steps / above-ceiling rattle rejection (audio, ceiling <= -35.5 dB)",
                   "  raw WebSocket / TCP / CLI flags, URLs and environment compatibility"]
         if args.allow_destructive:
-            lines.append("  destructive: preset copy / ESP32 ezBEQ overwrite")
+            lines.append("  destructive: same-value settings POST and restore / preset copy / ESP32 ezBEQ overwrite")
         if args.allow_audio:
             lines += ["  confirm audio (interactive YES or --yes-i-know)",
                       "  audio: set and verify -35 dB / announce / sweep-only / marker-only / combined / legacy rejection / ESP32 busy",
-                      "  audio: wait until idle, restore and verify previous listening volume"]
+                      "  audio: require successful terminal status without stream/restore errors, then restore previous volume"]
         if target.kind == "esp32":
-            lines.append("  embedded ezBEQ REST/WS / hosted bundle / updater compatibility")
+            lines.append("  embedded ezBEQ REST/WS / firmware status shape / hosted bundle / updater compatibility")
         if args.run_upstream_ezbeq:
             lines.append("  optional spawned upstream ezBEQ interoperability")
         if args.destructive_profile == "full":
@@ -2260,6 +2410,16 @@ def main() -> int:
 
 def run_esp32_specific_suite(harness: Harness, target: Target) -> None:
     section = f"{target.label}-board"
+
+    def firmware_step() -> str:
+        resp, data = http_json("GET", target.path("/firmware"))
+        assert_true(resp.status == 200 and isinstance(data, dict), f"{target.label}: GET /firmware failed")
+        for field in ("version", "build", "runningSlot", "slotState"):
+            assert_true(isinstance(data.get(field), str) and bool(data[field]), f"/firmware missing string {field}")
+        assert_true(data["slotState"] in {"valid", "pendingVerify", "unknown"}, f"unexpected firmware slotState: {data['slotState']}")
+        return f"version={data['version']} build={data['build']} slot={data['runningSlot']} state={data['slotState']}"
+
+    harness.run_step(section, "GET /firmware", firmware_step)
 
     def debug_info_step() -> str:
         resp, data = http_json("GET", target.path("/debug/info"))

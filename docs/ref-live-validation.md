@@ -25,8 +25,10 @@ checks; the offline commands need only Python's standard library.
 The unit tests use an in-memory fake HTTP/device layer and prohibit real HTTP,
 sockets and CLI execution. They cover manual answers, CI skips, confirmation,
 strict-capture and restore failures, identity mismatches, audio volume safety,
-reconnect timeouts, snapshot concurrency, failure artifacts, and the new full
-workflow. They do not establish hardware correctness.
+maximum-volume ceilings, playback terminal failures, settings rollback, password
+protection, firmware status, reconnect timeouts, both snapshot concurrency models,
+failure artifacts, and the new full workflow. They do not establish hardware
+correctness.
 
 ## Live lanes
 
@@ -40,6 +42,18 @@ WS/TCP bridges, CLI transports/flags/environment variables, embedded ezBEQ,
 hosted bundle/updater smoke, and optional upstream ezBEQ. It still performs
 control mutations and local restores; it is not a read-only smoke test.
 
+Both lanes validate `GET /settings` and cache `maxVolumeDb` for volume and audio
+checks. Master-volume and ezBEQ volume steps go down by 0.5 dB when the current
+volume is at or within 0.5 dB of the ceiling. With `--allow-destructive`, a
+same-value settings POST is verified by GET and the original setting is restored
+in `finally`, including on failure. Settings are re-read for that round trip.
+With a ceiling at or below -35.5 dB and `--allow-audio`, an above-ceiling
+rattle request must return `400` and leave playback idle with the previous
+rattle run unchanged. A broken rejection would play that request, so the check
+needs the audio confirmation and a ceiling that keeps any tone at or below the
+-35 dB test level. If playback starts anyway, the suite sends rattle stop and
+hard-stops. It skips otherwise, and never changes the ceiling to create coverage.
+
 ```bash
 uv run --script tools/run-live-validation.py \
   --desktop-url http://127.0.0.1:5380 --restore-on-exit --continue-on-fail
@@ -49,6 +63,10 @@ For ESP32, replace `--desktop-url` with `--esp32-url http://BOARD:5380`.
 Both flags can be supplied for two independently owned bench devices. Do not
 point both lanes at the same physical MiniDSP or let a daemon and direct-USB CLI
 own its HID interface concurrently.
+
+The suite sends no credentials. Any HTTP `401` is a hard stop explaining that the
+target is password-protected and the TCP bridge is off while protected. Clear
+the ESP32 password before validation; open LAN control is the default.
 
 ### Desktop daemon lane
 
@@ -81,10 +99,12 @@ Multiple attached USB devices and indexing require a separate physical test.
 
 The same snapshot-backed workflow uses ESP32 HTTP snapshot export/import,
 compatibility HTTP, WS, TCP 5333, embedded ezBEQ REST/WS, hosted bundle/updater,
-playback and recovery routes. Strict export and a verified baseline replay must
-succeed before destructive mutations. Optional `--run-upstream-ezbeq` adds the
-spawned upstream process checks; the full profile does not install or spawn it
-implicitly.
+playback and recovery routes. Read-only `GET /firmware` must include string
+`version`, `build`, `runningSlot` and `slotState` fields, with a recognized slot
+state. Firmware checks run only for ESP32 targets. Strict export and a verified
+baseline replay must succeed before destructive mutations. Optional
+`--run-upstream-ezbeq` adds the spawned upstream process checks; the full profile
+does not install or spawn it implicitly.
 
 ## Full destructive profile
 
@@ -107,16 +127,25 @@ The sequence is:
 2. Import the baseline and re-export/compare it before any mutation suites.
    A complete export alone is insufficient proof that restore works.
 3. Exercise snapshot GET/export and POST/restore concurrently with same-value
-   master and config writes. Both mutations must return `409` inside an observed
-   busy window. If the window cannot be observed, fail as unproven rather than
-   passing or skipping concurrency coverage. Boundary races can fail this check;
-   retain artifacts and investigate on hardware.
+   master and config writes. On desktop, both mutations must return `409` inside
+   an observed busy window. ESP32's single HTTP task queues requests behind the
+   synchronous snapshot handler: launch the status probe and both mutations
+   concurrently, require successful responses, and compare completion timestamps
+   to prove they finish after the snapshot response. Each request must start
+   before that response to establish overlap. Both lanes require a strictly
+   complete snapshot equal to baseline. Unobserved overlap or boundary races fail
+   as unproven; retain artifacts and investigate on hardware.
 4. Run existing HTTP, transport, CLI and destructive preset-copy checks.
 5. Confirm audio, save the previous listening volume, and set/read back **-35 dB**
    before every `/play` request. Announce before playing sweep-only, marker-only,
    combined marker/sweep, and ESP32 playback-busy checks. Record three separate
-   audio approvals. Wait until playback is idle before restoring and verifying
-   the previous volume, including on failure. A stuck playback run stops cleanup
+   audio approvals. A ceiling below -35 dB stops audio preflight with instructions
+   to raise or clear it; the suite never raises the ceiling or changes the test
+   level. After every started run, poll `GET /devices/{id}/play` until idle and
+   require matching `last.startedAtUs`, `last.state == "completed"` and no `error`,
+   `sourceRestoreError` or `volumeRestoreError`. Elapsed time alone does not prove
+   completion. Wait until playback is idle before restoring and verifying the
+   previous volume, including on failure. A stuck playback run stops cleanup
    before raising the listening volume.
 6. Run ESP32 ezBEQ/hosted-bundle checks and optional upstream ezBEQ.
 7. Restore the baseline, then confirm each active-preset reset, alternate-preset
@@ -134,10 +163,11 @@ The sequence is:
 
 Hard stops override `--continue-on-fail`: failed/incomplete baseline capture,
 unsupported strict snapshot, failed restore/equality, identity mismatch, unsafe
-volume verification/restoration, failed recovery, or unproven snapshot busy
-assertions. Identity mismatch prevents snapshot import into the replacement
-device. Failed restore details are durable in `restore-result.json`. Cleanup is
-attempted after ordinary failures and interrupts; it cannot guarantee recovery
+volume verification/restoration, failed settings restoration, HTTP `401`, failed
+recovery, or unproven snapshot concurrency assertions. Identity mismatch prevents
+snapshot import into the replacement device. Failed restore details are durable
+in `restore-result.json`. Cleanup is attempted after ordinary failures and
+interrupts; it cannot guarantee recovery
 after process termination, power loss, or unavailable hardware.
 
 Before audio, reset or reboot, the operator must type `YES`. For a deliberately
@@ -149,9 +179,9 @@ still pending below.
 
 ## Flags and artifacts
 
-- `--allow-destructive`: preset-copy / ezBEQ overwrite, with strict snapshot
-  capture and automatic rollback on either target. Missing CLI does not bypass
-  the guard.
+- `--allow-destructive`: same-value settings round trip / preset-copy / ezBEQ
+  overwrite, with strict snapshot capture and automatic rollback on either
+  target. Missing CLI does not bypass the guard.
 - `--allow-audio`: playback with confirmation, verified -35 dB and previous-volume
   restoration. This flag alone does not request a whole-device snapshot guard.
 - `--restore-on-exit`: strict baseline and preflight replay, plus final rollback
@@ -197,6 +227,10 @@ The bundle also includes per-target `snapshot-before.json`, `snapshot-after.json
 `restore-result.json`, snapshot concurrency/recovery evidence, and ESP32
 `ezbeq-before.json` / `ezbeq-after.json`. Top-level `report.md` / `report.json`
 record each phase. `--report PATH` additionally writes a Markdown report there.
+`snapshot-busy-get.json` / `snapshot-busy-post.json` retain the concurrency model,
+snapshot status/body, probe and mutation statuses, and timeout evidence. For
+ESP32, they include monotonic request start/completion timestamps and snapshot
+completion time for the serialization assertion.
 
 ## Hardware validation still required
 

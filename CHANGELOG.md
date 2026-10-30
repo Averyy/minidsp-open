@@ -20,9 +20,9 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - Device Console HID capture fixtures (54 sanitized exchanges, 13 opcodes) with parser and client/queue replay tests.
 - Research notes on Device Console device identity, the `0xFFEA` source bitmap, and Dirac preset layouts.
 - A typed parser and encoder for the HT/HTx selectable-source bitmap at `0xFFEA`, from the research above; not yet read or written by the client.
-- Destructive validation workflow: a full profile with hard stops, recorded manual checkpoints, verified -35 dB audio steps, reboot/reconnect identity checks, concurrent 409 assertions and a no-target `--plan` mode, with fake-device tests.
+- Destructive validation workflow: a full profile with hard stops, recorded manual checkpoints, verified -35 dB audio steps, reboot/reconnect identity checks, concurrent 409 assertions (serialization checks on the single-task ESP32), ceiling-aware volume steps, terminal playback-status checks, `/settings` and `/firmware` coverage, a clear stop on password-protected boards, and a no-target `--plan` mode, with fake-device tests.
 - SECURITY.md describing the LAN trust model and how to report vulnerabilities.
-- Optional maximum master volume (off by default) on the ESP32 and the desktop daemon: `GET/POST /settings`, the `/status` page, or the `max_volume_db` config key. It clamps every volume write minidsp-open makes, including the TCP bridge and ezBEQ, and rejects rattle passes above it. The miniDSP's own knob and IR remote bypass it.
+- Optional maximum master volume (off by default) on the ESP32 and the desktop daemon: `GET/POST /settings`, the `/status` page, or the `max_volume_db` config key. It clamps every volume write minidsp-open makes, including the TCP bridge and ezBEQ, and rejects rattle passes above it. The daemon also lowers a louder device when it registers or reconnects, and the CLI accepts a bridge's clamped read-back. The miniDSP's own knob and IR remote bypass it.
 - Optional ESP32 password (off by default), set on `/status` or during first WiFi setup. With it on, the board UI, API, OTA uploads and WebSockets need a login page session, Basic `admin` credentials or a Bearer token; the TCP bridge and UDP discovery stop until it's cleared. The CLI and `tools/ota-push.sh` read it from `--password-file` or `MINIDSP_PASSWORD`. Holding BOOT for ten seconds clears the password and WiFi.
 
 ### Changed
@@ -32,7 +32,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - ESP32 builds use ESP-IDF 6.0.3 and esp-uac2-host v0.1.3; the first move from IDF 5.4 requires a USB bootloader flash.
 - Repository build and flashing wrappers select the pinned ESP-IDF and esptool versions and track external UAC2 component changes.
 - The UAC2 host driver comes from the ESP Component Registry (`averyy/usb_host_uac2` 0.1.3) instead of a sibling checkout; `ESP_UAC2_HOST_PATH` builds against a local driver working copy.
-- CI and release builds pin espup v0.16.0 and Xtensa Rust 1.93.0.0 (1.97.0.0 crashes LLVM on this firmware), use current Node 24 actions, and host tests no longer read local-only device captures.
+- CI and release builds pin espup v0.16.0 and Xtensa Rust 1.93.0.0 (1.97.0.0 crashes LLVM on this firmware), use current Node 24 actions, and host tests no longer read local-only device captures. CI also checks formatting and runs clippy with warnings denied.
 - ESP32 partitions now provide two 3 MB firmware slots and about 9.9 MB of bundle storage; existing boards need a USB flash to change layouts.
 - Hosted ezBEQ is pinned to 2.12.4 with checksum verification, slot title/author metadata, custom biquad uploads, filter-author and new-title queries, and active-slot/output controls.
 - Catalogue bundles include device-ready 96 kHz float32 coefficients with an authored-filter fallback and a sample-rate guard.

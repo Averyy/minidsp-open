@@ -72,11 +72,19 @@ impl DaemonState {
 
     pub async fn add_device(&self, id: usize, client: Arc<MiniDspClient>) {
         client.bind_volume_settings(self.settings.clone());
-        let settings = self.settings.read().await;
-        if let Err(err) = client.enforce_volume_settings(*settings).await {
-            tracing::error!("cannot enforce maximum volume on device {id}: {err}");
-            return;
-        }
+        let epoch = client.reconnect_epoch();
+        let enforced = match client
+            .enforce_volume_settings(*self.settings.read().await)
+            .await
+        {
+            Ok(()) => Some(epoch),
+            Err(err) => {
+                // Writes are still clamped; only lowering the current volume is pending.
+                tracing::warn!("cannot apply maximum volume to device {id} yet: {err}; retrying");
+                None
+            }
+        };
+        watch_volume_ceiling(id, Arc::downgrade(&client), self.settings.clone(), enforced);
 
         if let Some(saved) = self.saved_peq.read().await.get(&id).cloned() {
             client.set_saved_measurement_state(Some(saved)).await;
@@ -401,6 +409,40 @@ impl DaemonState {
 
         has_shadow_data(&shadow).then_some(shadow)
     }
+}
+
+const VOLUME_CEILING_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reapplies the maximum volume after the device's transport reconnects (a
+/// restarted device reports its stored volume), and retries a first attempt
+/// that failed. Ends when the client is dropped.
+fn watch_volume_ceiling(
+    id: usize,
+    client: std::sync::Weak<MiniDspClient>,
+    settings: Arc<RwLock<minidsp_protocol::settings::Settings>>,
+    mut enforced: Option<u64>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(VOLUME_CEILING_CHECK).await;
+            let Some(client) = client.upgrade() else {
+                return;
+            };
+            let epoch = client.reconnect_epoch();
+            if enforced == Some(epoch) {
+                continue;
+            }
+            match client.enforce_volume_settings(*settings.read().await).await {
+                Ok(()) => {
+                    if enforced.is_none() {
+                        tracing::info!("maximum volume applied to device {id}");
+                    }
+                    enforced = Some(epoch);
+                }
+                Err(err) => tracing::debug!("device {id}: maximum volume not applied yet: {err}"),
+            }
+        }
+    });
 }
 
 impl Default for DaemonState {

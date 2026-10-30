@@ -5429,7 +5429,7 @@ fn register_ws_routes(
                             // One poller at a time: the previous one was told to
                             // stop above and ends within one poll interval.
                             if let Err(e) = WS_COMPAT_WORKER.run(move || {
-                                ws_poll_loop(sender, dev_state, audio_state, stop, interval_ms);
+                                ws_poll_loop(sender, fd, dev_state, audio_state, stop, interval_ms);
                             }) {
                                 log::warn!("WebSocket compat: failed to spawn poll thread: {e}");
                             }
@@ -5696,6 +5696,7 @@ fn ws_send_logged(
 #[cfg(esp_idf_httpd_ws_support)]
 fn ws_poll_loop(
     mut sender: esp_idf_svc::http::server::ws::EspHttpWsDetachedSender,
+    fd: i32,
     state: SharedDeviceState,
     audio_state: usb_audio::SharedAudioState,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -5746,6 +5747,11 @@ fn ws_poll_loop(
         }
 
         if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // A password set, or this session revoked, since the upgrade stops
+        // pushes here; auth::tick closes the socket.
+        if !crate::auth::push_allowed(fd) {
             break;
         }
 
@@ -6035,8 +6041,11 @@ fn push_levels(
                 running.store(false, Ordering::Relaxed);
                 return;
             }
+            // Sessions revoked since their upgrade get no pushes; auth::tick
+            // closes their sockets.
             let recipients: Vec<_> = clients
                 .iter()
+                .filter(|c| crate::auth::push_allowed(c.fd))
                 .map(|c| (c.token, c.sender.clone(), c.levels))
                 .collect();
             let mut beq = beq_state.lock().unwrap_or_else(|e| e.into_inner());

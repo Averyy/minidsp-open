@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 const MAX_SOCKETS: usize = 13;
 const MAX_BODY_BYTES: usize = 768;
 const RECOVERY_HOLD: Duration = Duration::from_secs(10);
+/// IDF marks a socket as a WebSocket only after sending 101, which follows
+/// the pre-handshake grant; `tick` keeps grants this long meanwhile.
+const UPGRADE_GRACE_SECONDS: u64 = 10;
 
 static PROTECTED: AtomicBool = AtomicBool::new(false);
 static PROVISIONING: AtomicBool = AtomicBool::new(false);
@@ -36,6 +39,8 @@ enum Grant {
 struct Socket {
     fd: i32,
     grant: Grant,
+    /// When the upgrade was authorized, for the handshake grace period.
+    since: u64,
 }
 
 #[derive(Default)]
@@ -161,21 +166,31 @@ fn server() -> httpd_handle_t {
     SERVER.load(Ordering::Acquire) as httpd_handle_t
 }
 
+/// Lists httpd's open client sockets.
+fn clients(handle: httpd_handle_t) -> ([i32; MAX_SOCKETS], usize) {
+    let mut fds = [0; MAX_SOCKETS];
+    let mut len = fds.len();
+    if unsafe { httpd_get_client_list(handle, &mut len, fds.as_mut_ptr()) } != ESP_OK {
+        len = 0;
+    }
+    (fds, len)
+}
+
+fn is_websocket(handle: httpd_handle_t, fd: i32) -> bool {
+    unsafe { httpd_ws_get_fd_info(handle, fd) == httpd_ws_client_info_t_HTTPD_WS_CLIENT_WEBSOCKET }
+}
+
+/// Immediate best effort after a password change; `tick` retries refusals.
 fn close_websockets() {
     let handle = server();
     if handle.is_null() {
         return;
     }
-    unsafe {
-        let mut fds = [0; MAX_SOCKETS];
-        let mut len = fds.len();
-        if httpd_get_client_list(handle, &mut len, fds.as_mut_ptr()) == ESP_OK {
-            for fd in &fds[..len] {
-                if httpd_ws_get_fd_info(handle, *fd)
-                    == httpd_ws_client_info_t_HTTPD_WS_CLIENT_WEBSOCKET
-                {
-                    httpd_sess_trigger_close(handle, *fd);
-                }
+    let (fds, len) = clients(handle);
+    for &fd in &fds[..len] {
+        if is_websocket(handle, fd) {
+            unsafe {
+                httpd_sess_trigger_close(handle, fd);
             }
         }
     }
@@ -188,8 +203,10 @@ fn valid_grant(s: &mut State, grant: Grant, touch: bool) -> bool {
     }
 }
 
-/// Closes upgraded sockets whose session expired or was revoked, including
-/// ones that never send another frame.
+/// Closes every WebSocket without a live grant: expired or revoked sessions,
+/// sockets upgraded before protection was on, and earlier closes that httpd's
+/// full control queue refused. A grant stays until its socket is gone, so a
+/// refused close is retried on the next tick.
 pub fn tick() {
     if !protected() {
         return;
@@ -198,36 +215,46 @@ pub fn tick() {
     if handle.is_null() {
         return;
     }
+    let (fds, len) = clients(handle);
+    let open = &fds[..len];
+    let now = now();
     let mut s = state().lock().unwrap();
-    for i in 0..s.sockets.len() {
-        if let Some(socket) = s.sockets[i] {
+    for slot in s.sockets.iter_mut() {
+        if let Some(socket) = *slot {
+            let upgrading = now.saturating_sub(socket.since) < UPGRADE_GRACE_SECONDS;
+            if !open.contains(&socket.fd) || !(upgrading || is_websocket(handle, socket.fd)) {
+                *slot = None;
+            }
+        }
+    }
+    for &fd in open {
+        if is_websocket(handle, fd) && !granted(&mut s, fd, false) {
             unsafe {
-                if httpd_ws_get_fd_info(handle, socket.fd)
-                    != httpd_ws_client_info_t_HTTPD_WS_CLIENT_WEBSOCKET
-                {
-                    s.sockets[i] = None;
-                } else if !valid_grant(&mut s, socket.grant, false) {
-                    httpd_sess_trigger_close(handle, socket.fd);
-                    s.sockets[i] = None;
-                }
+                httpd_sess_trigger_close(handle, fd);
             }
         }
     }
 }
 
-/// Per-frame check for upgraded sockets; frames keep a session alive.
-pub fn websocket_allowed(fd: i32) -> bool {
-    if !protected() {
-        return true;
-    }
-    let mut s = state().lock().unwrap();
+fn granted(s: &mut State, fd: i32, touch: bool) -> bool {
     let grant = s
         .sockets
         .iter()
         .flatten()
         .find(|socket| socket.fd == fd)
         .map(|socket| socket.grant);
-    grant.is_some_and(|grant| valid_grant(&mut s, grant, true))
+    grant.is_some_and(|grant| valid_grant(s, grant, touch))
+}
+
+/// Per-frame check for upgraded sockets; frames keep a session alive.
+pub fn websocket_allowed(fd: i32) -> bool {
+    !protected() || granted(&mut state().lock().unwrap(), fd, true)
+}
+
+/// For detached senders, before each push. Doesn't extend a session; `tick`
+/// closes the sockets this refuses.
+pub fn push_allowed(fd: i32) -> bool {
+    !protected() || granted(&mut state().lock().unwrap(), fd, false)
 }
 
 unsafe fn header(req: *mut httpd_req_t, name: &CStr) -> Option<String> {
@@ -456,7 +483,14 @@ pub unsafe fn gate(req: *mut httpd_req_t, websocket: bool) -> Result<(), esp_err
     let grant = authorize(req)?;
     if websocket {
         let fd = httpd_req_to_sockfd(req);
+        let (fds, len) = clients(server());
         let mut s = state().lock().unwrap();
+        // Grants outlive refused closes, so drop those of closed sockets first.
+        for slot in s.sockets.iter_mut() {
+            if slot.is_some_and(|socket| !fds[..len].contains(&socket.fd)) {
+                *slot = None;
+            }
+        }
         let index = s
             .sockets
             .iter()
@@ -472,7 +506,11 @@ pub unsafe fn gate(req: *mut httpd_req_t, websocket: bool) -> Result<(), esp_err
                 false,
             ));
         };
-        s.sockets[index] = Some(Socket { fd, grant });
+        s.sockets[index] = Some(Socket {
+            fd,
+            grant,
+            since: now(),
+        });
     }
     Ok(())
 }

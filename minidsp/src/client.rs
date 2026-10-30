@@ -85,6 +85,9 @@ pub struct DeviceShadowState {
 }
 
 const MASTER_STATUS_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+// A louder write through a bridge that is already at its volume ceiling leaves
+// the volume unchanged; accept that after this long instead of the full timeout.
+const BRIDGED_CEILING_SETTLE: Duration = Duration::from_secs(2);
 const MASTER_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // On the live 2x4 HD, master-status can report the new preset slightly before
 // follow-on PEQ writes reliably land on that preset. A short settle window keeps
@@ -542,6 +545,11 @@ impl MiniDspClient {
         &self.transport_url
     }
 
+    /// Increments each time the queue reconnects its transport.
+    pub fn reconnect_epoch(&self) -> u64 {
+        self.queue.reconnect_epoch()
+    }
+
     async fn get_master_status_with_priority(
         &self,
         priority: Priority,
@@ -811,13 +819,30 @@ impl MiniDspClient {
 
         self.execute_write(commands::set_volume(value), Priority::High, "set volume")
             .await?;
+        // A minidsp-open daemon or board between this client and the device
+        // may clamp the write to its maximum volume, which this client can't
+        // see. Larger raw values are quieter. Direct USB stays strict.
+        let bridged = !self.transport_url.starts_with("usb:");
+        let louder = value < before.volume;
+        let timeout = if bridged && louder {
+            BRIDGED_CEILING_SETTLE
+        } else {
+            MASTER_STATUS_VERIFY_TIMEOUT
+        };
         let after = self
-            .wait_for_master_status_until(MASTER_STATUS_VERIFY_TIMEOUT, |master| {
-                master.volume == value
+            .wait_for_master_status_until(timeout, |master| {
+                master.volume == value || (bridged && master.volume != before.volume)
             })
             .await?;
 
         if after.volume == value {
+            Ok(())
+        } else if bridged && after.volume > value {
+            tracing::warn!(
+                "volume is {:.1} dB, quieter than the requested {:.1} dB; the controller's maximum volume may have limited it",
+                -0.5 * f64::from(after.volume),
+                -0.5 * f64::from(value)
+            );
             Ok(())
         } else {
             Err(ClientError::Protocol(format!(
@@ -3468,6 +3493,107 @@ mod tests {
             active_preset: Mutex::new(Some(0)),
             state_transition_lock: Mutex::new(()),
         }
+    }
+
+    /// A device behind a bridge that clamps volume writes to `ceiling` (raw).
+    #[derive(Clone)]
+    struct CeilingTransport {
+        volume: Arc<AtomicU8>,
+        ceiling: u8,
+        url: &'static str,
+        last_payload: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl crate::transport::Transport for CeilingTransport {
+        fn send_frame(
+            &self,
+            payload: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            let payload = payload.to_vec();
+            Box::pin(async move {
+                if payload.first() == Some(&commands::CMD_SET_VOLUME) {
+                    self.volume
+                        .store(payload[1].max(self.ceiling), Ordering::SeqCst);
+                }
+                *self.last_payload.lock().await = payload;
+                Ok(())
+            })
+        }
+
+        fn recv_frame(
+            &self,
+            _timeout_ms: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            Box::pin(async move {
+                let payload = self.last_payload.lock().await.clone();
+                match payload.first().copied() {
+                    Some(commands::CMD_SET_VOLUME) => Ok(payload),
+                    Some(commands::CMD_READ_FLASH) => Ok(vec![
+                        commands::CMD_READ_FLASH,
+                        0,
+                        0,
+                        self.volume.load(Ordering::SeqCst),
+                        0,
+                    ]),
+                    other => Err(TransportError::Io(format!(
+                        "unexpected transport payload {other:02x?}"
+                    ))),
+                }
+            })
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn url(&self) -> String {
+            self.url.into()
+        }
+    }
+
+    fn ceiling_client(
+        url: &'static str,
+        volume: u8,
+        ceiling: u8,
+    ) -> (MiniDspClient, Arc<AtomicU8>) {
+        let volume = Arc::new(AtomicU8::new(volume));
+        let transport = CeilingTransport {
+            volume: volume.clone(),
+            ceiling,
+            url,
+            last_payload: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut client = scripted_client(Box::new(transport));
+        client.transport_url = url.into();
+        (client, volume)
+    }
+
+    #[tokio::test]
+    async fn bridged_volume_clamp_is_accepted_without_the_full_timeout() {
+        // -30 dB, asking for 0 dB through a bridge capped at -20 dB.
+        let (client, volume) = ceiling_client("tcp://bridge:5333", 60, 40);
+        let started = Instant::now();
+        client.set_volume(0).await.unwrap();
+        assert_eq!(volume.load(Ordering::SeqCst), 40);
+        assert!(started.elapsed() < BRIDGED_CEILING_SETTLE);
+
+        // Already at the ceiling: the write changes nothing, so it settles.
+        let (client, volume) = ceiling_client("ws://bridge:5380/devices/0/ws", 40, 40);
+        let started = Instant::now();
+        client.set_volume(0).await.unwrap();
+        assert_eq!(volume.load(Ordering::SeqCst), 40);
+        assert!(started.elapsed() < MASTER_STATUS_VERIFY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn direct_usb_volume_writes_still_verify_exactly() {
+        let (client, volume) = ceiling_client("usb:test", 60, 0);
+        client.set_volume(20).await.unwrap();
+        assert_eq!(volume.load(Ordering::SeqCst), 20);
     }
 
     #[derive(Clone)]

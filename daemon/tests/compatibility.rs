@@ -52,6 +52,8 @@ struct FakeTransport {
     pending: Mutex<VecDeque<Vec<u8>>>,
     serial: u16,
     volume: Mutex<u8>,
+    /// Shared with the test so the next master-status read can be failed.
+    fail_status: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Transport for FakeTransport {
     fn send_frame(
@@ -65,6 +67,12 @@ impl Transport for FakeTransport {
                 0xfe => {
                     let [a, b] = self.serial.to_be_bytes();
                     vec![CMD_READ_FLASH, a, b]
+                }
+                0xd8 if self
+                    .fail_status
+                    .swap(false, std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    vec![RESP_ERROR]
                 }
                 0xd8 => vec![CMD_READ_FLASH, 0, 0, *self.volume.lock().unwrap(), 0],
                 _ => {
@@ -123,6 +131,7 @@ async fn state_with(state: Arc<DaemonState>) -> Arc<DaemonState> {
             pending: Mutex::new(VecDeque::new()),
             serial,
             volume: Mutex::new(40),
+            fail_status: Default::default(),
         }))
         .await
         .unwrap();
@@ -406,6 +415,37 @@ async fn volume_ceiling_settings_absolute_relative_config_and_persistence() {
     );
     server.abort();
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn failed_ceiling_enforcement_registers_the_device_and_retries() {
+    let dir = std::env::temp_dir().join(format!("minidsp-ceiling-retry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let state = Arc::new(DaemonState::with_cache_path(dir.join("shadow-cache.json")));
+    *state.settings.write().await = minidsp_protocol::settings::Settings::new(Some(-20.0)).unwrap();
+    let fail_status = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client = MiniDspClient::connect(Box::new(FakeTransport {
+        pending: Mutex::new(VecDeque::new()),
+        serial: 34567,
+        // 0 dB, louder than the -20 dB ceiling.
+        volume: Mutex::new(0),
+        fail_status: fail_status.clone(),
+    }))
+    .await
+    .unwrap();
+    fail_status.store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = Arc::new(client);
+    state.add_device(0, client.clone()).await;
+    assert!(state.devices.read().await.contains_key(&0));
+    assert_eq!(client.get_master_status().await.unwrap().volume, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while client.get_master_status().await.map(|m| m.volume).ok() != Some(40) {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the ceiling guard lowers the volume after the failed first attempt");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

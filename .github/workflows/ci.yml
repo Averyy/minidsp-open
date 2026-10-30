@@ -43,6 +43,11 @@ jobs:
             target
           key: host-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: host-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - run: cargo fmt --all -- --check
+      # From the repository root, so the firmware crate formats with stable
+      # rustfmt rather than its Xtensa toolchain.
+      - run: cargo fmt --manifest-path app-esp32/Cargo.toml -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace
 

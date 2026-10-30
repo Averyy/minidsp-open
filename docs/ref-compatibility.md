@@ -598,7 +598,9 @@ ESP32 settings persist in the NVS `settings` namespace across reboot/reconnect.
 returns the saved settings. Invalid values return `400`; browser mutations use
 the existing Origin policy. Lowering the ceiling immediately lowers any louder
 connected device. If persistence or hardware lowering fails, POST returns `500`
-and retains the new runtime policy; GET reports that active policy.
+and retains the new runtime policy; GET reports that active policy. The daemon
+also lowers a louder device when it registers and after its transport
+reconnects; a failed attempt retries every 2 s without dropping the device.
 
 Absolute writes above the ceiling clamp; relative writes clamp their result.
 Status responses report the volume actually set. This covers master status,
@@ -607,7 +609,9 @@ ezBEQ master volume. Rattle requests with any `volumesDb` above it return `400`
 before audio/HID actions. `/play` uses the current volume and never raises it.
 
 CLI requests through `--daemon-url`, the daemon socket (including automatic
-socket discovery), or a minidsp-open TCP bridge are bounded. Direct USB CLI use
+socket discovery), or a minidsp-open TCP bridge are bounded. The CLI can't see
+a bridge's ceiling, so over a bridge a volume read-back quieter than requested
+counts as applied (with a warning); direct USB still requires the exact value. Direct USB CLI use
 is local terminal control and does not read/apply daemon settings. The MiniDSP's
 own front-panel knob and IR remote also bypass minidsp-open and cannot be stopped
 by this ceiling. LAN clients can raise/clear the setting; it is not authentication.
