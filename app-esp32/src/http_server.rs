@@ -4280,6 +4280,9 @@ fn run_playback_thread(params: PlaybackThreadParams) {
         restore_source,
         started_tx,
     } = params;
+    // Its exact write-latency record passed 8 KB to 16 KB in internal RAM,
+    // briefly holding 24 KB there; the job's other buffers are PSRAM already.
+    crate::psram::prefer_for_task(c"playback");
     let _busy = PlaybackBusyGuard(audio_state.clone(), true);
     let mut audio_device = Some(audio_device);
 

@@ -5,7 +5,8 @@
 //! also need. HTTP handlers build large structures out of small allocations:
 //! a snapshot restore (about a thousand, held twice) left 16 bytes and hung
 //! USB, and measurement mode starved the WiFi PHY into an abort. The HTTP
-//! server task is registered at startup, so every handler allocates in PSRAM.
+//! server task is registered at startup, so every handler allocates in PSRAM,
+//! and the playback worker registers itself for its per-write statistics.
 //! Buffers handed to the flash driver use [`internal`]: it writes a PSRAM
 //! source 32 bytes at a time.
 
