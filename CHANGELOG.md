@@ -48,6 +48,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 ### Fixed
 
 - If the ESP32 reset during USB playback (crash, watchdog, restart, reset button or flashing), the 2x4 HD could keep accepting audio but stay silent until it was power-cycled. It's intermittent: 2 of 8 controlled mid-stream resets did it. The firmware now records active streams, in RTC memory and NVS, and reboots the MiniDSP on the next boot before opening audio. A cable unplug never caused this.
+- A USB host call that never returned (a channel halt after a HID write stalled) hung the ESP32 until it was reset. A supervisor now restarts the board when device-loss cleanup runs past 30 s or the main loop stops for five minutes.
 - ESP32 HTTP handlers could exhaust internal RAM. A snapshot restore left 16 bytes, which stalled USB and hung the board until it was reset, and measurement mode starved the WiFi PHY into an abort. The HTTP server task now allocates in PSRAM, and the live validation suite (61 checks) leaves internal RAM where it started.
 - While audio played, the ESP32 `/status` page kept requesting device state that the board refuses with 409, logging a failed request every four seconds. It now shows the last known values without asking.
 - The ESP32 OpenAPI document described the rattle `bitDepth` as a number; requests take the string `"16"` or `"24"`, as `/play` and the desktop daemon document.

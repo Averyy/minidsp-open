@@ -15,11 +15,52 @@
 
 use esp_idf_svc::sys;
 use log::{error, info, warn};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[global_allocator]
 static ALLOCATOR: psram::Allocator = psram::Allocator;
+
+/// Main-loop heartbeat for the stall supervisor, in seconds since boot.
+static MAIN_LOOP_ALIVE: AtomicU32 = AtomicU32::new(0);
+/// When the main loop entered device-loss cleanup; 0 when it isn't in it.
+static USB_CLEANUP_SINCE: AtomicU32 = AtomicU32::new(0);
+/// Discovery plus interrupted-stream recovery can hold one pass about three minutes.
+const MAIN_LOOP_STALL_SECS: u32 = 300;
+/// Cleanup normally finishes in under ten seconds.
+const USB_CLEANUP_STALL_SECS: u32 = 30;
+
+fn uptime_secs() -> u32 {
+    (unsafe { sys::esp_timer_get_time() } / 1_000_000) as u32
+}
+
+/// A USB host call that never returns (a channel halt whose interrupt never
+/// comes) leaves its task holding the HID bus lock, and the main loop then
+/// waits on that lock forever. Restart instead of hanging; the boot flags
+/// cover a stream it interrupts.
+fn start_stall_supervisor() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("stall_sup".into())
+        .stack_size(3 * 1024)
+        .spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let now = uptime_secs();
+            let cleanup_since = USB_CLEANUP_SINCE.load(Ordering::Relaxed);
+            let stall = if cleanup_since != 0 && now - cleanup_since > USB_CLEANUP_STALL_SECS {
+                Some(("USB cleanup", now - cleanup_since))
+            } else {
+                let alive = MAIN_LOOP_ALIVE.load(Ordering::Relaxed);
+                (now - alive > MAIN_LOOP_STALL_SECS).then_some(("the main loop", now - alive))
+            };
+            if let Some((what, secs)) = stall {
+                error!("{what} stalled for {secs} s, likely on a USB host call that never returned; restarting");
+                std::thread::sleep(Duration::from_millis(200));
+                unsafe { sys::esp_restart() };
+            }
+        })?;
+    Ok(())
+}
 
 mod auth;
 mod device;
@@ -306,7 +347,12 @@ fn main() {
     let mut usb_backoff = Duration::from_secs(5);
     let mut next_diagnostics = Instant::now();
     let mut next_usb_scan = Instant::now();
+    MAIN_LOOP_ALIVE.store(uptime_secs(), Ordering::Relaxed);
+    if let Err(e) = start_stall_supervisor() {
+        error!("failed to spawn the stall supervisor: {e}");
+    }
     loop {
+        MAIN_LOOP_ALIVE.store(uptime_secs(), Ordering::Relaxed);
         auth::maintenance();
         usb_audio::persist_stream_flag(&nvs);
         if Instant::now() >= next_diagnostics {
@@ -321,7 +367,9 @@ fn main() {
             if has_device && !bus.is_connected() {
                 // Device was connected but is now gone
                 warn!("USB device lost — clearing device state");
+                USB_CLEANUP_SINCE.store(uptime_secs().max(1), Ordering::Relaxed);
                 bus.cleanup_after_expected_disconnect("main loop device loss");
+                USB_CLEANUP_SINCE.store(0, Ordering::Relaxed);
                 *device_state.lock().unwrap() = None;
                 usb_state = UsbState::Absent;
                 audio_state.pause_opening("HID session lost");
