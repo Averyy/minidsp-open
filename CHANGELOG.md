@@ -19,6 +19,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - Public README, contributor setup, third-party notices, and bundled license texts.
 - Device Console HID capture fixtures (54 sanitized exchanges, 13 opcodes) with parser and client/queue replay tests.
 - Research notes on Device Console device identity, the `0xFFEA` source bitmap, and Dirac preset layouts.
+- A typed parser and encoder for the HT/HTx selectable-source bitmap at `0xFFEA`, from the research above; not yet read or written by the client.
 
 ### Changed
 

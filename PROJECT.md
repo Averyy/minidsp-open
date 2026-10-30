@@ -297,7 +297,7 @@ Cross-verified against: Device Console JS, minidsp-rs source, and miniDSP Contro
 | 0xFF:0xDB | 1 | Master mute (1=muted, 0=unmuted) |
 | 0xFF:0xE0 | 1 | Dirac bypass / Master FIR bypass |
 | 0xFF:0xE8 | 2 | Display settings (byte 0: idle_secs, byte 1: brightness) — APK reads only 0xE8. Device Console may read more via SetDisplayBrightness (0x1A) which uses contrast_level and current_level as separate command params, not flash reads. |
-| 0xFF:0xEA | varies | Selectable audio sources (1 byte per source, device-dependent count) |
+| 0xFF:0xEA | 1–4 | Selectable audio sources (little-endian bitmap indexed by source ID; HT/HTx use 1 byte) |
 | 0xFF:0xED | 1 | DRE on/off state |
 | 0xFF:0xFE | 2 | Serial number (u16 BE, actual = 900000 + value) |
 | 0xFE:0x00 | N | Per-source volume offsets (1 byte per source, signed, half-dB steps) |

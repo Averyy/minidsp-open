@@ -16,10 +16,12 @@
 //! | 0xFFDA  | 2    | Master volume + mute (also via 0xFFD8[+2])  |
 //! | 0xFFE0  | 1    | Master FIR bypass                           |
 //! | 0xFFE8  | 5    | Display idle / brightness settings          |
-//! | 0xFFEA  | ≤32  | Selectable audio source descriptor (1 B/src)|
+//! | 0xFFEA  | 1–4  | Selectable audio source bitmap (LE, 1 bit/ID)|
 //! | 0xFFED  | 1    | DRE (Dynamic Range Enhancement) status      |
 //! | 0xFFFE  | 2    | Serial number (big-endian u16, + 900000)    |
 //! | 0xFE00  | var  | Per-source volume offset values (legacy)    |
+
+use crate::source::{Source, SourceMap};
 
 /// Flash page for device settings.
 pub const FLASH_PAGE: u8 = 0xFF;
@@ -48,19 +50,116 @@ pub const VERIFY_PROGRAM_ADDR: (u8, u8) = (0xFF, 0xA3);
 /// [`AUDIO_SRC_SELECT_ADDR`] (0xFFEA).
 pub const AUDIO_SRC_CHANGED_NOTIFICATION_ADDR: (u8, u8) = (0xFF, 0xA9);
 
-/// Selectable audio source descriptor base (0xFFEA, up to 32 bytes).
+/// Selectable audio source bitmap base (0xFFEA, up to four bytes).
 ///
-/// Variable-length list of source IDs (1 byte each) that the device exposes
-/// as user-selectable. Sourced from `dspMessage.js` `AudioSrcSelectMsg`
-/// (`flashAddrLB=0xea`, `maxNumSrcs=0x20`). On devices with a fixed source
-/// set (2x4 HD: Analog/Toslink/USB) this region is uninitialized; it is
-/// populated on HT/HTx-class devices where the physical input set varies.
-/// No client API is exposed yet — pending live verification on an HT device.
+/// Unsigned little-endian bits indexed by hardware source ID, not a list of
+/// source IDs. Device Console's `AudioSrcSelectMsg` allows 32 source slots;
+/// current HT/HTx maps need one byte (all enabled: 0x1E/0x1F).
+/// See `docs/NOTES-device-identity-and-dirac.md`, section 2, for the traced
+/// reader/writer and HW source maps. A source map alone does not establish
+/// that a device supports this descriptor. No client reads are enabled;
+/// live HT/HTx confirmation remains open.
 pub const AUDIO_SRC_SELECT_ADDR: (u8, u8) = (0xFF, 0xEA);
 
-/// Maximum number of source IDs returned by a read at
+/// Maximum number of source-ID bits in the bitmap at
 /// [`AUDIO_SRC_SELECT_ADDR`]. Matches Device Console's `maxNumSrcs = 0x20`.
 pub const AUDIO_SRC_SELECT_MAX_SOURCES: u8 = 32;
+
+/// Selectable sources decoded using a device profile's `sources` map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectableSources {
+    /// Enabled sources. Parsing returns these in source-map order;
+    /// encoding treats duplicate entries as a single enabled bit.
+    pub sources: Vec<Source>,
+}
+
+/// Invalid selectable-source payload or source selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectableSourcesError {
+    InvalidLength { expected: usize, actual: usize },
+    UnknownBits(u32),
+    UnknownSource(Source),
+    SourceIndexOutOfRange(u8),
+}
+
+impl core::fmt::Display for SelectableSourcesError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidLength { expected, actual } => {
+                write!(f, "expected {expected} source bitmap bytes, got {actual}")
+            }
+            Self::UnknownBits(bits) => write!(f, "undeclared source bitmap bits: {bits:#010x}"),
+            Self::UnknownSource(source) => {
+                write!(f, "source {source} is absent from the source map")
+            }
+            Self::SourceIndexOutOfRange(index) => write!(f, "source index {index} exceeds 31"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SelectableSourcesError {}
+
+fn selectable_source_layout(
+    source_map: &SourceMap,
+) -> Result<(u32, usize), SelectableSourcesError> {
+    let mut mask = 0u32;
+    for &(index, _) in source_map.sources() {
+        mask |= 1u32
+            .checked_shl(u32::from(index))
+            .ok_or(SelectableSourcesError::SourceIndexOutOfRange(index))?;
+    }
+    let byte_len = (u32::BITS - mask.leading_zeros()).div_ceil(8).max(1) as usize;
+    Ok((mask, byte_len))
+}
+
+impl SelectableSources {
+    /// Decode only the bytes read at [`AUDIO_SRC_SELECT_ADDR`], without a
+    /// command/address header. Pass the device profile's `sources` map.
+    ///
+    /// Requires exactly enough bytes to cover the highest declared source ID
+    /// (at least one byte); rejects every set bit absent from the map. A zero
+    /// bitmap decodes to no sources, but firmware acceptance is unverified.
+    pub fn from_bytes(data: &[u8], source_map: &SourceMap) -> Result<Self, SelectableSourcesError> {
+        let (valid_mask, byte_len) = selectable_source_layout(source_map)?;
+        if data.len() != byte_len {
+            return Err(SelectableSourcesError::InvalidLength {
+                expected: byte_len,
+                actual: data.len(),
+            });
+        }
+        let mut bytes = [0u8; 4];
+        bytes[..byte_len].copy_from_slice(data);
+        let bitmap = u32::from_le_bytes(bytes);
+        let unknown_bits = bitmap & !valid_mask;
+        if unknown_bits != 0 {
+            return Err(SelectableSourcesError::UnknownBits(unknown_bits));
+        }
+        Ok(Self {
+            sources: source_map
+                .sources()
+                .iter()
+                .filter_map(|&(index, source)| (bitmap & (1 << index) != 0).then_some(source))
+                .collect(),
+        })
+    }
+
+    /// Encode a complete bitmap for the profile's source map, starting at
+    /// [`AUDIO_SRC_SELECT_ADDR`]. Undeclared bits are zero; this does not merge
+    /// with flash or perform a partial update. No write or EEPROM-header reload
+    /// is sent (Device Console explicitly reloads with opcode 0x24 after writing).
+    pub fn to_bytes(&self, source_map: &SourceMap) -> Result<Vec<u8>, SelectableSourcesError> {
+        let (_, byte_len) = selectable_source_layout(source_map)?;
+        let mut bitmap = 0u32;
+        for &source in &self.sources {
+            let index = source_map
+                .index_for_source(source)
+                .ok_or(SelectableSourcesError::UnknownSource(source))?;
+            bitmap |= 1 << index;
+        }
+        Ok(bitmap.to_le_bytes()[..byte_len].to_vec())
+    }
+}
 
 /// Modification tokens EEPROM address (0xFFC8).
 ///
@@ -186,6 +285,174 @@ pub fn parse_serial(data: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::probe::identify;
+
+    #[test]
+    fn selectable_sources_ht_examples_match_hardware_profiles() {
+        // Derived Device Console examples, not observed firmware defaults.
+        for dsp_id in [113, 115] {
+            for (hw_id, bitmap, expected) in [
+                (
+                    31,
+                    0x1E,
+                    vec![Source::Toslink, Source::Spdif, Source::Usb, Source::Hdmi],
+                ),
+                (
+                    32,
+                    0x1F,
+                    vec![
+                        Source::Analog,
+                        Source::Toslink,
+                        Source::Spdif,
+                        Source::Usb,
+                        Source::Hdmi,
+                    ],
+                ),
+                (31, 0x12, vec![Source::Toslink, Source::Hdmi]),
+            ] {
+                let profile = identify(hw_id, dsp_id);
+                let selected = SelectableSources::from_bytes(&[bitmap], profile.sources).unwrap();
+                assert_eq!(selected.sources, expected);
+                assert_eq!(selected.to_bytes(profile.sources).unwrap(), [bitmap]);
+            }
+        }
+    }
+
+    #[test]
+    fn selectable_sources_ht_individual_bits_use_source_ids() {
+        for hw_id in [31, 32] {
+            let profile = identify(hw_id, 113);
+            for (bitmap, source) in [
+                (0x01, Source::Analog),
+                (0x02, Source::Toslink),
+                (0x04, Source::Spdif),
+                (0x08, Source::Usb),
+                (0x10, Source::Hdmi),
+            ] {
+                if hw_id == 31 && source == Source::Analog {
+                    continue;
+                }
+                let selected = SelectableSources::from_bytes(&[bitmap], profile.sources).unwrap();
+                assert_eq!(selected.sources, [source]);
+                assert_eq!(selected.to_bytes(profile.sources).unwrap(), [bitmap]);
+            }
+        }
+    }
+
+    #[test]
+    fn selectable_sources_empty_bitmap() {
+        for hw_id in [31, 32] {
+            let profile = identify(hw_id, 113);
+            let selected = SelectableSources::from_bytes(&[0], profile.sources).unwrap();
+            assert!(selected.sources.is_empty());
+            assert_eq!(selected.to_bytes(profile.sources).unwrap(), [0]);
+        }
+    }
+
+    #[test]
+    fn selectable_sources_reject_undeclared_bits_and_wrong_lengths() {
+        for (hw_id, valid_mask) in [(31, 0x1Eu8), (32, 0x1F)] {
+            let profile = identify(hw_id, 113);
+            // Check every possible one-byte bitmap against the declared mask.
+            for bitmap in 0..=u8::MAX {
+                let unknown = bitmap & !valid_mask;
+                let result = SelectableSources::from_bytes(&[bitmap], profile.sources);
+                if unknown == 0 {
+                    assert_eq!(result.unwrap().to_bytes(profile.sources).unwrap(), [bitmap]);
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(SelectableSourcesError::UnknownBits(u32::from(unknown)))
+                    );
+                }
+            }
+            for data in [&[][..], &[0, 0][..], &[0; 5][..]] {
+                assert_eq!(
+                    SelectableSources::from_bytes(data, profile.sources),
+                    Err(SelectableSourcesError::InvalidLength {
+                        expected: 1,
+                        actual: data.len(),
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selectable_sources_multibyte_layout_is_unsigned_little_endian() {
+        // Synthetic maps exercise the advertised 32-slot layout; packaged
+        // hardware source maps currently need only one byte.
+        let map = SourceMap::new(&[
+            (0, Source::Analog),
+            (7, Source::Toslink),
+            (8, Source::Spdif),
+            (16, Source::Usb),
+            (31, Source::Hdmi),
+        ]);
+        let selected = SelectableSources::from_bytes(&[0x81, 0x01, 0x01, 0x80], &map).unwrap();
+        assert_eq!(
+            selected.sources,
+            [
+                Source::Analog,
+                Source::Toslink,
+                Source::Spdif,
+                Source::Usb,
+                Source::Hdmi,
+            ]
+        );
+        assert_eq!(selected.to_bytes(&map).unwrap(), [0x81, 0x01, 0x01, 0x80]);
+        assert_eq!(
+            SelectableSources::from_bytes(&[0x80, 0x01, 0x01, 0x81], &map),
+            Err(SelectableSourcesError::UnknownBits(0x0100_0000))
+        );
+        let three_byte_map = SourceMap::new(&[(16, Source::Usb)]);
+        let selected = SelectableSources::from_bytes(&[0, 0, 1], &three_byte_map).unwrap();
+        assert_eq!(selected.sources, [Source::Usb]);
+        assert_eq!(selected.to_bytes(&three_byte_map).unwrap(), [0, 0, 1]);
+        assert_eq!(
+            SelectableSources::from_bytes(&[1, 0, 0], &three_byte_map),
+            Err(SelectableSourcesError::UnknownBits(1))
+        );
+        assert_eq!(
+            SelectableSources::from_bytes(&[0, 0], &three_byte_map),
+            Err(SelectableSourcesError::InvalidLength {
+                expected: 3,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn selectable_sources_encoding_validates_sources_and_uses_set_semantics() {
+        let profile = identify(31, 113);
+        let selected = SelectableSources {
+            sources: vec![Source::Analog],
+        };
+        assert_eq!(
+            selected.to_bytes(profile.sources),
+            Err(SelectableSourcesError::UnknownSource(Source::Analog))
+        );
+        let selected = SelectableSources {
+            sources: vec![Source::Toslink, Source::Toslink, Source::Hdmi],
+        };
+        assert_eq!(selected.to_bytes(profile.sources).unwrap(), [0x12]);
+    }
+
+    #[test]
+    fn selectable_sources_reject_source_ids_outside_bitmap() {
+        let map = SourceMap::new(&[(32, Source::Usb)]);
+        assert_eq!(
+            SelectableSources::from_bytes(&[0], &map),
+            Err(SelectableSourcesError::SourceIndexOutOfRange(32))
+        );
+        let selected = SelectableSources {
+            sources: vec![Source::Usb],
+        };
+        assert_eq!(
+            selected.to_bytes(&map),
+            Err(SelectableSourcesError::SourceIndexOutOfRange(32))
+        );
+    }
 
     #[test]
     fn master_status_parse() {
