@@ -12,18 +12,16 @@ use minidsp_protocol::device::probe;
 use minidsp_protocol::device::DeviceProfile;
 use minidsp_protocol::dialect::{Dialect, ValueFormat};
 use minidsp_protocol::eeprom;
+use minidsp_protocol::shadow::{
+    build_peq_shadow, parse_raw_bypass_filter, parse_raw_linked_selector_write,
+    parse_raw_selector_write, parse_raw_write_biquad, sanitize_shadow_preferred_scalar, PeqShadow,
+};
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Copy)]
-struct PeqShadow {
-    coeffs: [f32; 5],
-    bypass: bool,
-}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CachedPeqShadow {
@@ -70,48 +68,6 @@ pub struct DeviceState {
     /// Measurement-mode snapshot — `Some` while PEQ bypass is in effect,
     /// `None` once the client has explicitly restored state.
     saved_peq: Mutex<Option<SavedPeqState>>,
-}
-
-fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
-    let mut shadow = HashMap::new();
-    if let Some(table) = profile.dsp_table {
-        for input in table.inputs {
-            for band in input.peq {
-                shadow.insert(
-                    band.addr,
-                    PeqShadow {
-                        coeffs: minidsp_protocol::biquad::BYPASS,
-                        bypass: false,
-                    },
-                );
-            }
-        }
-        for output in table.outputs {
-            for band in output.peq {
-                shadow.insert(
-                    band.addr,
-                    PeqShadow {
-                        coeffs: minidsp_protocol::biquad::BYPASS,
-                        bypass: false,
-                    },
-                );
-            }
-            if let Some(crossover) = output.crossover {
-                for base in [crossover.lpf_addr, crossover.hpf_addr] {
-                    for i in 0..4u16 {
-                        shadow.insert(
-                            base + i * 5,
-                            PeqShadow {
-                                coeffs: minidsp_protocol::biquad::BYPASS,
-                                bypass: false,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
-    shadow
 }
 
 /// Timeout for slow commands that write to flash (preset copy, set_config).
@@ -2353,7 +2309,7 @@ impl DeviceState {
     }
 
     pub fn default_peq_frequencies(&self) -> &'static [u32; 10] {
-        &minidsp_protocol::device::dsp::DEFAULT_PEQ_FREQS_HZ
+        minidsp_protocol::device::dsp::default_peq_frequencies()
     }
 
     // -- Flash reads --
@@ -2527,17 +2483,12 @@ impl DeviceState {
     // -- Device info --
 
     pub fn device_info(&self) -> DeviceInfo {
-        DeviceInfo {
-            url: format!("usb://0x{:04x}:0x{:04x}", self.bus.vid(), self.bus.pid()),
-            version: DeviceVersion {
-                hw_id: self.hw_id.hw_id,
-                fw_major: self.hw_id.fw_major,
-                fw_minor: self.hw_id.fw_minor,
-                dsp_version: self.dsp_version,
-                serial: self.serial,
-            },
-            product_name: self.product_name().to_string(),
-        }
+        minidsp_protocol::status::device_info(
+            format!("usb://0x{:04x}:0x{:04x}", self.bus.vid(), self.bus.pid()),
+            &self.hw_id,
+            self.dsp_version,
+            self.serial,
+        )
     }
 }
 
@@ -2689,86 +2640,6 @@ const PEQ_SHADOW_FORMAT_V1: u8 = 0x01;
 
 fn peq_nvs_key(serial: u32) -> String {
     format!("s{serial:08x}")
-}
-
-fn sanitize_shadow_preferred_scalar(raw: u32) -> Option<f32> {
-    if raw <= 2 {
-        return Some(0.0);
-    }
-
-    let value = f32::from_bits(raw);
-    if !value.is_finite() || value.abs() > 10_000.0 {
-        return Some(0.0);
-    }
-
-    None
-}
-
-fn parse_raw_write_biquad(payload: &[u8], dialect: &Dialect) -> Option<(u16, [f32; 5])> {
-    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 26 {
-        return None;
-    }
-    if payload[1] != 0x80 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    let mut coeffs = [0.0f32; 5];
-    let mut offset = 6;
-    for coeff in &mut coeffs {
-        let bytes: [u8; 4] = payload.get(offset..offset + 4)?.try_into().ok()?;
-        *coeff = minidsp_protocol::dialect::decode_value(&bytes, dialect);
-        offset += 4;
-    }
-    Some((addr, coeffs))
-}
-
-fn parse_raw_bypass_filter(payload: &[u8]) -> Option<(u16, bool)> {
-    if payload.first().copied()? != commands::CMD_BYPASS_FILTER || payload.len() < 6 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    Some((addr, payload[1] & 0x80 != 0))
-}
-
-fn parse_raw_selector_write(payload: &[u8], dialect: &Dialect) -> Option<(u16, u16)> {
-    if dialect.value_format != ValueFormat::Float32 {
-        return None;
-    }
-    if payload.first().copied()? != commands::CMD_WRITE_DSP || payload.len() < 8 {
-        return None;
-    }
-    if payload[1] != 0x80 || payload[6] != 0 || payload[7] != 0 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    let value = u16::from_le_bytes([payload[4], payload[5]]);
-    Some((addr, value))
-}
-
-fn parse_raw_linked_selector_write(payload: &[u8], dialect: &Dialect) -> Option<(u16, u16)> {
-    if dialect.value_format != ValueFormat::Float32 {
-        return None;
-    }
-    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 10 {
-        return None;
-    }
-    let ctrl = payload[1];
-    if ctrl < 0x80 {
-        return None;
-    }
-    let linked_count = (ctrl - 0x80) as usize;
-    let linked_bytes = if linked_count == 0 {
-        2
-    } else {
-        linked_count * 2
-    };
-    let value_offset = 4 + linked_bytes;
-    let value_bytes: [u8; 4] = payload
-        .get(value_offset..value_offset + 4)?
-        .try_into()
-        .ok()?;
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    Some((addr, u32::from_le_bytes(value_bytes) as u16))
 }
 
 /// Binary-encode the PEQ shadow for NVS persistence. Layout:

@@ -79,7 +79,7 @@ and default bridge/discovery services. The remaining gates are:
 2. Extend the [destructive validation suite](docs/TODO1-destructive-validation-suite.md): recorded manual gates, explicit full profile/hard stops, direct-USB lane, snapshot concurrency assertions, reboot/reconnect integration, and wider ESP32/profile coverage.
 3. Finish [ESP32 token sync](docs/TODO2-token-sync.md): token-gated per-preset persistence, mutation/token commit handling, and the optional atomic Device Console XML helper.
 4. Lock in [ATV backend/session rules](docs/TODO2-ATV-Companion.md), then prove ESP32 reconnect/watch feasibility before custom UI and auto-reset work. Keep manual BEQ apply and the planned `/classic` fallback.
-5. Follow the [shared architecture plan](docs/TODO3-shared-arch-codebase.md) for pure helpers and workflow planners; keep platform runtimes separate.
+5. Continue Phases 2–5 of the [shared architecture plan](docs/TODO3-shared-arch-codebase.md); Phase 1 pure helpers are shared in `protocol/`. Workflow planners and later phases remain open; keep platform runtimes separate.
 6. Keep [Plex/Trakt enrichment](docs/TODO3-Plex-Trakt-Int.md), [12 V trigger control](docs/TODO4-12v-trigger.md), and [PWR-ICE support](docs/TODO4-pwr-ice-compatibility.md) scoped to their remaining research, implementation, and hardware gates.
 
 ## Validation

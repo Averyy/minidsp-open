@@ -2264,6 +2264,11 @@ const fn peq_bands_5(base: u16) -> [PeqBand; 5] {
 /// encodes in every `<filter name="PEQ_*_*">` default block.
 pub const DEFAULT_PEQ_FREQS_HZ: [u32; 10] = [20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
 
+/// Official ten-band frequency labels used after a PEQ reset.
+pub fn default_peq_frequencies() -> &'static [u32; 10] {
+    &DEFAULT_PEQ_FREQS_HZ
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -285,3 +285,23 @@ pub struct DeviceVersion {
     pub dsp_version: u8,
     pub serial: u32,
 }
+
+/// Assemble device identity while leaving transport URL selection to the caller.
+pub fn device_info(
+    url: String,
+    hw_id: &crate::commands::HardwareId,
+    dsp_version: u8,
+    serial: u32,
+) -> DeviceInfo {
+    DeviceInfo {
+        url,
+        version: DeviceVersion {
+            hw_id: hw_id.hw_id,
+            fw_major: hw_id.fw_major,
+            fw_minor: hw_id.fw_minor,
+            dsp_version,
+            serial,
+        },
+        product_name: crate::device::probe::product_name(hw_id.hw_id, dsp_version).to_string(),
+    }
+}

@@ -23,6 +23,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 
 ### Changed
 
+- Desktop and ESP32 share one copy of the PEQ shadow builder, raw-write shadow parsers, scalar sanitation, default PEQ frequencies and device-info assembly in the protocol crate; equivalence tests showed the two copies already behaved identically.
 - The workspace builds clippy-clean.
 - ESP32 builds use ESP-IDF 6.0.3 and esp-uac2-host v0.1.3; the first move from IDF 5.4 requires a USB bootloader flash.
 - Repository build and flashing wrappers select the pinned ESP-IDF and esptool versions and track external UAC2 component changes.

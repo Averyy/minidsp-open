@@ -18,5 +18,6 @@ pub mod eeprom;
 pub mod packet;
 pub mod playback;
 pub mod rattle;
+pub mod shadow;
 pub mod source;
 pub mod status;

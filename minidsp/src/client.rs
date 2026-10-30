@@ -10,11 +10,12 @@ use minidsp_protocol::device::dsp::{BassManagement, FirFilter};
 use minidsp_protocol::device::probe;
 use minidsp_protocol::dialect::ValueFormat;
 use minidsp_protocol::eeprom;
+use minidsp_protocol::shadow::{PeqShadow, build_peq_shadow, sanitize_shadow_preferred_scalar};
 use minidsp_protocol::status::{
     BiquadCoeffs, BmChannelConfig, BmChannelPatch, BmMixerCellConfig, BmMixerCellPatch,
-    BmStateConfig, CompressorConfig, CrossoverGroupConfig, DeviceConfig, DeviceInfo, DeviceVersion,
-    FirConfig, IndexedBiquadConfig, InputChannelConfig, MasterStatusView, OutputChannelConfig,
-    PeqBandConfig, RoutingConfig, StatusSummary,
+    BmStateConfig, CompressorConfig, CrossoverGroupConfig, DeviceConfig, DeviceInfo, FirConfig,
+    IndexedBiquadConfig, InputChannelConfig, MasterStatusView, OutputChannelConfig, PeqBandConfig,
+    RoutingConfig, StatusSummary,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,12 +51,6 @@ pub struct SavedPeqState {
 #[derive(Debug, Clone)]
 struct PendingWrite {
     bands: Vec<(u16, [f32; 5], bool)>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PeqShadow {
-    coeffs: [f32; 5],
-    bypass: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -375,48 +370,6 @@ pub struct MiniDspClient {
     pub(crate) state_transition_lock: Mutex<()>,
 }
 
-fn build_peq_shadow(profile: &DeviceProfile) -> HashMap<u16, PeqShadow> {
-    let mut shadow = HashMap::new();
-    if let Some(table) = profile.dsp_table {
-        for input in table.inputs {
-            for band in input.peq {
-                shadow.insert(
-                    band.addr,
-                    PeqShadow {
-                        coeffs: minidsp_protocol::biquad::BYPASS,
-                        bypass: false,
-                    },
-                );
-            }
-        }
-        for output in table.outputs {
-            for band in output.peq {
-                shadow.insert(
-                    band.addr,
-                    PeqShadow {
-                        coeffs: minidsp_protocol::biquad::BYPASS,
-                        bypass: false,
-                    },
-                );
-            }
-            if let Some(crossover) = output.crossover {
-                for base in [crossover.lpf_addr, crossover.hpf_addr] {
-                    for i in 0..4u16 {
-                        shadow.insert(
-                            base + i * 5,
-                            PeqShadow {
-                                coeffs: minidsp_protocol::biquad::BYPASS,
-                                bypass: false,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
-    shadow
-}
-
 impl MiniDspClient {
     fn ensure_write_response(resp: Response, context: &str) -> Result<(), ClientError> {
         match resp {
@@ -574,17 +527,12 @@ impl MiniDspClient {
 
     /// Get device info for the /devices list endpoint.
     pub fn device_info(&self) -> DeviceInfo {
-        DeviceInfo {
-            url: self.transport_url.clone(),
-            version: DeviceVersion {
-                hw_id: self.hw_id.hw_id,
-                fw_major: self.hw_id.fw_major,
-                fw_minor: self.hw_id.fw_minor,
-                dsp_version: self.dsp_version,
-                serial: self.serial,
-            },
-            product_name: probe::product_name(self.hw_id.hw_id, self.dsp_version).to_string(),
-        }
+        minidsp_protocol::status::device_info(
+            self.transport_url.clone(),
+            &self.hw_id,
+            self.dsp_version,
+            self.serial,
+        )
     }
 
     pub fn transport_url(&self) -> &str {
@@ -2411,7 +2359,7 @@ impl MiniDspClient {
     /// not store frequency — see [`Self::reset_all_peq_to_defaults`] for the
     /// hardware-side reset.
     pub fn default_peq_frequencies(&self) -> &'static [u32; 10] {
-        &minidsp_protocol::device::dsp::DEFAULT_PEQ_FREQS_HZ
+        minidsp_protocol::device::dsp::default_peq_frequencies()
     }
 
     /// Live readback of the active FIR tap count for a given FIR index using
@@ -3022,19 +2970,6 @@ fn sanitize_meter_values(values: &[f32]) -> Vec<f32> {
             }
         })
         .collect()
-}
-
-fn sanitize_shadow_preferred_scalar(raw: u32) -> Option<f32> {
-    if raw <= 2 {
-        return Some(0.0);
-    }
-
-    let value = f32::from_bits(raw);
-    if !value.is_finite() || value.abs() > 10_000.0 {
-        return Some(0.0);
-    }
-
-    None
 }
 
 #[cfg(test)]

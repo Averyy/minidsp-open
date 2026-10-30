@@ -2,13 +2,26 @@
 
 ## Current status
 
-This plan still has open work. `build_peq_shadow`, scalar sanitation, and raw
-write parsers remain separate in [the desktop client](../minidsp/src/client.rs),
-[desktop shadow module](../minidsp/src/client/shadow.rs), and
-[ESP32 device layer](../app-esp32/src/device.rs). Shared protocol/playback and
-bridge response encoding already exist; the helper/planner extraction,
-persistence policy, and API metadata questions below aren't complete.
-Completed shared features are recorded in [CHANGELOG.md](../CHANGELOG.md).
+Phase 1 is complete. The desktop client and ESP32 device layer now share:
+
+- `build_peq_shadow`, `PeqShadow`, the four raw-write shadow parsers, and
+  `sanitize_shadow_preferred_scalar` in [protocol/src/shadow.rs](../protocol/src/shadow.rs).
+- `default_peq_frequencies` in [protocol/src/device/dsp.rs](../protocol/src/device/dsp.rs).
+- Pure `device_info` assembly in [protocol/src/status.rs](../protocol/src/status.rs),
+  with transport URL selection kept in each caller.
+
+Before deleting either copy, host equivalence tests compared the actual desktop
+helpers, verbatim ESP32 reference bodies (the ESP32 crate is not host-testable),
+and the shared versions over table cases and deterministic sweeps, including all
+65,536 hardware/DSP ID pairs. No behavior divergences were found. The temporary
+reference copies were then reduced to shared-helper tests in
+[protocol/tests/shadow_helpers.rs](../protocol/tests/shadow_helpers.rs).
+
+Phases 2–5 remain open: workflow planners, bridge/discovery policy, API metadata,
+and reassessing a shared service crate. Runtime control flow and persistence
+remain platform-local. Shared protocol/playback and bridge response encoding
+already exist. Completed shared features are recorded in
+[CHANGELOG.md](../CHANGELOG.md).
 
 ## Goal
 

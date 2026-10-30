@@ -1,4 +1,8 @@
 use super::*;
+use minidsp_protocol::shadow::{
+    parse_raw_bypass_filter, parse_raw_linked_selector_write, parse_raw_selector_write,
+    parse_raw_write_biquad,
+};
 
 type CommandBatch = Vec<Vec<u8>>;
 type MeasurementRestoreBatches = (CommandBatch, CommandBatch, CommandBatch);
@@ -109,86 +113,6 @@ fn merge_trusted_snapshot(
     existing.scalar.extend(captured.scalar);
     existing.fir_blocks.extend(captured.fir_blocks);
     existing
-}
-
-fn parse_raw_write_biquad(
-    payload: &[u8],
-    dialect: &minidsp_protocol::dialect::Dialect,
-) -> Option<(u16, [f32; 5])> {
-    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 26 {
-        return None;
-    }
-    if payload[1] != 0x80 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    let mut coeffs = [0.0; 5];
-    let mut offset = 6;
-    for coeff in &mut coeffs {
-        let bytes: [u8; 4] = payload.get(offset..offset + 4)?.try_into().ok()?;
-        *coeff = minidsp_protocol::dialect::decode_value(&bytes, dialect);
-        offset += 4;
-    }
-    Some((addr, coeffs))
-}
-
-fn parse_raw_bypass_filter(payload: &[u8]) -> Option<(u16, bool)> {
-    if payload.first().copied()? != commands::CMD_BYPASS_FILTER || payload.len() < 6 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    let bypass = payload[1] & 0x80 != 0;
-    Some((addr, bypass))
-}
-
-fn parse_raw_selector_write(
-    payload: &[u8],
-    dialect: &minidsp_protocol::dialect::Dialect,
-) -> Option<(u16, u16)> {
-    if dialect.value_format != ValueFormat::Float32 {
-        return None;
-    }
-    if payload.first().copied()? != commands::CMD_WRITE_DSP || payload.len() < 8 {
-        return None;
-    }
-    if payload[1] != 0x80 {
-        return None;
-    }
-    if payload[6] != 0 || payload[7] != 0 {
-        return None;
-    }
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    let value = u16::from_le_bytes([payload[4], payload[5]]);
-    Some((addr, value))
-}
-
-fn parse_raw_linked_selector_write(
-    payload: &[u8],
-    dialect: &minidsp_protocol::dialect::Dialect,
-) -> Option<(u16, u16)> {
-    if dialect.value_format != ValueFormat::Float32 {
-        return None;
-    }
-    if payload.first().copied()? != commands::CMD_WRITE_BIQUAD || payload.len() < 10 {
-        return None;
-    }
-    let ctrl = payload[1];
-    if ctrl < 0x80 {
-        return None;
-    }
-    let linked_count = (ctrl - 0x80) as usize;
-    let linked_bytes = if linked_count == 0 {
-        2
-    } else {
-        linked_count * 2
-    };
-    let value_offset = 4 + linked_bytes;
-    let value_bytes: [u8; 4] = payload
-        .get(value_offset..value_offset + 4)?
-        .try_into()
-        .ok()?;
-    let addr = u16::from_be_bytes([payload[2], payload[3]]);
-    Some((addr, u32::from_le_bytes(value_bytes) as u16))
 }
 
 pub(super) async fn mirror_raw_command_to_shadow<F>(
