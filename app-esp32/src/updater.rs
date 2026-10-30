@@ -283,6 +283,8 @@ pub fn check_and_update(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Updat
     if let Err(e) = write_nvs_version(nvs, &new_version) {
         warn!("failed to save version to NVS: {e}");
     }
+    // Open ezBEQ pages learn of the new catalogue from the levels worker.
+    crate::http_server::refresh_catalogue_meta();
 
     UpdateResult::Updated {
         version: new_version,

@@ -17,8 +17,8 @@ fn copy_thread_spawn_configuration(conf: &ThreadSpawnConfiguration) -> ThreadSpa
 }
 
 /// Spawn a std thread whose stack lives in PSRAM. Only for threads that never
-/// write flash (NVS, LittleFS, OTA): flash writes disable the cache, and a
-/// task can't run on a PSRAM stack while it's off.
+/// touch flash (NVS, LittleFS, OTA): reads disable the cache as well as
+/// writes, and a task can't run on a PSRAM stack while it's off.
 pub fn spawn_psram_thread<F>(
     conf_name: &'static std::ffi::CStr,
     builder_name: &str,

@@ -5834,7 +5834,7 @@ fn register_ezbeq_ws(
             // critical section as the worker's recipient/pending-state snapshot.
             let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
             diagnostics::trace_internal_heap("ezBEQ WS new");
-            let meta = build_catalogue_meta();
+            let meta = refresh_catalogue_meta();
             ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), meta.as_bytes())?;
             diagnostics::trace_internal_heap("ezBEQ WS catalogue sent");
             if !audio_state.is_playing() {
@@ -5927,7 +5927,7 @@ fn register_ezbeq_ws(
                         )?;
                     } else if msg == "load catalogue" {
                         // The shim supplies the listing; metadata remains a server broadcast.
-                        let meta = build_catalogue_meta();
+                        let meta = refresh_catalogue_meta();
                         ws_send_logged(ws, "ezBEQ WS", FrameType::Text(false), meta.as_bytes())?;
                     } else if msg == "subscribe levels master" {
                         let mut clients = active_ws.lock().unwrap_or_else(|e| e.into_inner());
@@ -5949,8 +5949,29 @@ fn register_ezbeq_ws(
     Ok(())
 }
 
-/// Build the Catalogue meta message sent on WebSocket connect.
+/// The last Catalogue meta message read from storage. The levels worker runs
+/// on a PSRAM stack, where a LittleFS read trips the flash driver's
+/// internal-stack assert, so it only compares this copy; WebSocket handlers
+/// and the bundle updater (internal stacks) refresh it.
+static CATALOGUE_META: Mutex<String> = Mutex::new(String::new());
+
+/// Re-read the Catalogue meta message from storage and cache it. Call only
+/// from internal-stack tasks.
+pub fn refresh_catalogue_meta() -> String {
+    let meta = build_catalogue_meta();
+    *CATALOGUE_META.lock().unwrap_or_else(|e| e.into_inner()) = meta.clone();
+    meta
+}
+
 #[cfg(esp_idf_httpd_ws_support)]
+fn cached_catalogue_meta() -> String {
+    CATALOGUE_META
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Build the Catalogue meta message sent on WebSocket connect.
 fn build_catalogue_meta() -> String {
     // Read installed version from data partition
     let version = crate::storage::read_file("version.txt")
@@ -6046,7 +6067,7 @@ fn push_levels(
         };
         ticks = (ticks + 1) % 20;
         let meta = if ticks == 0 {
-            let meta = build_catalogue_meta();
+            let meta = cached_catalogue_meta();
             if meta != previous_meta {
                 previous_meta = meta.clone();
                 Some(meta)

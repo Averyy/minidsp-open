@@ -48,6 +48,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 ### Fixed
 
 - If the ESP32 reset during USB playback (crash, watchdog, restart, reset button or flashing), the 2x4 HD kept accepting audio but stayed silent until it was power-cycled. The firmware now records active streams, in RTC memory and NVS, and reboots the MiniDSP on the next boot before opening audio. A cable unplug never caused this.
+- An open hosted ezBEQ page crash-looped the ESP32 every few seconds. Its Levels worker re-read the catalogue version from flash on a PSRAM stack, which the flash driver forbids. The worker now compares a cached copy that WebSocket connects and bundle updates refresh.
 - USB audio cleanup retains failed-close handles and retries until the driver releases them.
 - ESP32 playback drains queued audio before stopping, preserving short-decay sweep endings and tail markers; desktop playback also drains device latency.
 - Missing USB start timestamps fail playback instead of returning a fabricated `startedAtUs`.
