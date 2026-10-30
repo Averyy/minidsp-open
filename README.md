@@ -66,7 +66,7 @@ cargo build --release
 cargo test
 ```
 
-The ESP32 firmware needs the Xtensa Rust toolchain ([espup](https://github.com/esp-rs/espup)), ESP-IDF v6.0.3 (esp-idf-sys downloads it), and `ldproxy`. The USB audio driver comes from the ESP Component Registry as `averyy/usb_host_uac2`, pinned to `0.1.3`; no sibling checkout is needed. [CONTRIBUTING.md](CONTRIBUTING.md#esp32-setup) has the full setup and local driver override details.
+The ESP32 firmware needs the Xtensa Rust toolchain ([espup](https://github.com/esp-rs/espup)), ESP-IDF v6.0.3 (esp-idf-sys downloads it), and `ldproxy`. The USB audio driver comes from the ESP Component Registry as `averyy/usb_host_uac2`, pinned to `0.2.0`; no sibling checkout is needed. [CONTRIBUTING.md](CONTRIBUTING.md#esp32-setup) has the full setup and local driver override details.
 
 ```bash
 tools/esp-cargo build --release

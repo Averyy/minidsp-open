@@ -96,6 +96,6 @@ See [SECURITY.md](../SECURITY.md) for the LAN trust model and unsigned-OTA limit
 ## Cutting a release
 
 1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`) and `app-esp32/Cargo.toml`. Keep it above `0.1.12`: ezBEQ reads `minidsp -V` (see `docs/ref-compatibility.md`).
-2. Pin `averyy/usb_host_uac2` in `app-esp32/Cargo.toml` to the exact ESP Component Registry version the firmware was tested against (currently `0.1.3`). Build in registry mode with `tools/esp-cargo build --release` and include the updated `app-esp32/components_esp32s3.lock`; both workflows cache against that lockfile.
+2. Pin `averyy/usb_host_uac2` in `app-esp32/Cargo.toml` to the exact ESP Component Registry version the firmware was tested against (currently `0.2.0`). Build in registry mode with `tools/esp-cargo build --release` and include the updated `app-esp32/components_esp32s3.lock`; both workflows cache against that lockfile.
 3. Optionally run the Release workflow by hand (workflow_dispatch) for a dry run that uploads artifacts without publishing.
 4. Tag `vX.Y.Z` and push the tag. The workflow checks the tag against both Cargo versions, builds the firmware and desktop binaries, and publishes the release with `firmware.json` and `SHA256SUMS`.
