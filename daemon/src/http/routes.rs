@@ -19,6 +19,7 @@ use minidsp_protocol::playback::{
     PlayRequest, PlaybackPlan, PlaybackStatus, SyncRequest, SyncResponse, ToneBurstParams,
 };
 use minidsp_protocol::rattle::{RattlePlan, RattleRequest, RattleResponse, RattleStatus};
+use minidsp_protocol::settings::Settings;
 use minidsp_protocol::source::Source;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -149,6 +150,7 @@ pub fn router_with_origins(
     });
 
     Ok(Router::new()
+        .route("/settings", get(get_settings).post(set_settings))
         .route("/devices", get(list_devices))
         .route(
             "/devices/{id}",
@@ -465,6 +467,38 @@ async fn read_dirac_state(client: &minidsp::client::MiniDspClient) -> Option<boo
 
 // -- Standard REST handlers --
 
+async fn get_settings(State(state): State<Arc<DaemonState>>) -> Json<Settings> {
+    Json(*state.settings.read().await)
+}
+
+async fn set_settings(
+    State(state): State<Arc<DaemonState>>,
+    body: Bytes,
+) -> ApiResult<Json<Settings>> {
+    let settings: Settings = serde_json::from_slice(&body)
+        .map_err(|err| ApiError::bad_request(format!("invalid settings: {err}")))?;
+    let mut current = state.settings.write().await;
+    *current = settings;
+    // Keep the new runtime policy even if persistence or hardware fails.
+    let persistence = state.persist_settings(settings);
+    let devices: Vec<_> = state.devices.read().await.values().cloned().collect();
+    let mut failure = None;
+    for client in devices {
+        if let Err(err) = client.enforce_volume_settings(settings).await {
+            failure = Some(err.to_string());
+        }
+    }
+    persistence.map_err(|err| {
+        ApiError::internal(format!("settings active but persistence failed: {err}"))
+    })?;
+    if let Some(err) = failure {
+        return Err(ApiError::internal(format!(
+            "settings saved but lowering master volume failed: {err}"
+        )));
+    }
+    Ok(Json(settings))
+}
+
 async fn list_devices(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let devices = state.devices.read().await;
     let mut list = Vec::new();
@@ -736,6 +770,12 @@ async fn start_rattle(
         serde_json::from_slice(&body)
             .map_err(|e| ApiError::bad_request(format!("invalid rattle request: {e}")))?
     };
+    state
+        .settings
+        .read()
+        .await
+        .validate_rattle_volumes(&request.volumes_db)
+        .map_err(ApiError::bad_request)?;
     let plan = RattlePlan::build(request).map_err(|e| ApiError::bad_request(e.to_string()))?;
     if !state.try_begin_playback() {
         return Err(ApiError::conflict("playback already in progress"));
@@ -818,7 +858,7 @@ async fn start_rattle(
             }
         };
         state.finish_rattle_audio(result.err());
-        // Restore the raw volume byte so the original hardware setting is exact.
+        // Restore exactly unless a newer ceiling requires a quieter volume.
         let volume_error = client
             .set_volume(previous_volume)
             .await
@@ -926,8 +966,9 @@ async fn import_snapshot(
 ) -> ApiResult<impl IntoResponse> {
     let client = get_ready_device_or_404(&state, id).await?;
     let _operation = DeviceOperationGuard::begin(state.clone(), id)?;
-    let snapshot: minidsp::snapshot::DeviceSnapshot = serde_json::from_slice(&body)
+    let mut snapshot: minidsp::snapshot::DeviceSnapshot = serde_json::from_slice(&body)
         .map_err(|_| ApiError::bad_request("invalid snapshot JSON"))?;
+    snapshot.master.volume = state.settings.read().await.clamp_db(snapshot.master.volume);
     client
         .restore_device_snapshot(&snapshot)
         .await
@@ -971,14 +1012,14 @@ async fn volume_direction(
 
     match direction.as_str() {
         "up" => {
-            let new_vol = master.volume.saturating_sub(1);
+            let new_vol = Settings::OFF.relative_steps(master.volume, 1);
             client
                 .set_volume(new_vol)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
         "down" => {
-            let new_vol = master.volume.saturating_add(1);
+            let new_vol = Settings::OFF.relative_steps(master.volume, -1);
             client
                 .set_volume(new_vol)
                 .await
@@ -2023,6 +2064,10 @@ async fn openapi() -> impl IntoResponse {
             { "url": "http://localhost:5380", "description": "Default daemon" }
         ],
         "paths": {
+            "/settings": {
+                "get": {"summary": "Get controller settings", "responses": {"200": {"description": "Settings: maxVolumeDb is null or a number"}}},
+                "post": {"summary": "Set or clear the maximum master volume; immediately lower louder devices", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["maxVolumeDb"], "properties": {"maxVolumeDb": {"type": "number", "nullable": true, "minimum": -127, "maximum": 0, "multipleOf": 0.5}}}}}}, "responses": {"200": {"description": "Saved settings"}, "400": {"description": "Invalid settings"}, "403": {"description": "Origin not allowed"}, "500": {"description": "Persistence or volume lowering failed"}}}
+            },
             "/devices": {
                 "get": {
                     "summary": "List connected devices",
@@ -2379,6 +2424,21 @@ mod tests {
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
             assert!(!state.playback_status().playing);
         }
+    }
+
+    #[tokio::test]
+    async fn rattle_ceiling_rejects_before_any_hardware_access() {
+        let state = rattle_test_state().await;
+        *state.settings.write().await = Settings::new(Some(-40.0)).unwrap();
+        let err = start_rattle(
+            State(state),
+            Path(0),
+            Bytes::from_static(br#"{"volumesDb":[-45,-35]}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.error.contains("-40"));
     }
 
     #[tokio::test]

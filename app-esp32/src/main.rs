@@ -24,6 +24,7 @@ mod ezbeq;
 mod http_server;
 mod led;
 mod ota;
+mod settings;
 mod snapshot;
 mod storage;
 mod threads;
@@ -85,6 +86,7 @@ fn main() {
 
     // Initialize NVS (required for WiFi credentials)
     let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take().expect("failed to initialize NVS");
+    settings::load(&nvs).expect("failed to load controller settings");
 
     // Mount LittleFS data partition (ezBEQ catalogue, UI, config)
     match storage::mount() {
@@ -491,6 +493,13 @@ fn on_device_activated(
     // measurement-mode commit boundaries).
     state.load_peq_shadow_from_nvs(nvs);
 
+    let settings = settings::SETTINGS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Err(err) = state.enforce_volume_settings(*settings) {
+        error!("cannot enforce maximum volume on connected device: {err}");
+        return;
+    }
     *device_state.lock().unwrap() = Some(Arc::new(state));
 }
 

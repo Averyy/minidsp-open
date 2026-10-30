@@ -1277,7 +1277,28 @@ impl DeviceState {
     // -- Control commands --
 
     pub fn set_volume(&self, value: u8) -> Result<(), UsbHidError> {
-        self.expect_write_ok(&commands::set_volume(value), "set volume")
+        let settings = crate::settings::SETTINGS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        self.expect_write_ok(
+            &commands::set_volume(settings.clamp_raw(value)),
+            "set volume",
+        )
+    }
+
+    /// Caller holds the settings lock, preventing an older volume write after lowering.
+    pub fn enforce_volume_settings(
+        &self,
+        settings: minidsp_protocol::settings::Settings,
+    ) -> Result<(), UsbHidError> {
+        if settings.max_volume_db().is_some() {
+            let current = self.get_master_status()?.volume;
+            let bounded = settings.clamp_raw(current);
+            if bounded != current {
+                self.expect_write_ok(&commands::set_volume(bounded), "lower master volume")?;
+            }
+        }
+        Ok(())
     }
 
     pub fn set_volume_db(&self, db: f32) -> Result<(), UsbHidError> {
@@ -2389,6 +2410,22 @@ impl DeviceState {
     /// the in-memory shadow state so `/config` reflects TCP bridge /
     /// WebSocket activity.
     pub fn raw_command(&self, payload: &[u8]) -> Result<Vec<u8>, UsbHidError> {
+        // Only volume commands need a policy lock or a modified payload. The
+        // bus rebuilds the HID frame length/checksum from the bounded payload.
+        let settings = (payload.first() == Some(&commands::CMD_SET_VOLUME)).then(|| {
+            crate::settings::SETTINGS
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+        });
+        let mut bounded;
+        let payload = if let Some(settings) = &settings {
+            bounded = payload.to_vec();
+            settings.clamp_payload(&mut bounded);
+            bounded.as_slice()
+        } else {
+            payload
+        };
+
         if payload.first().copied() == Some(commands::CMD_SET_CONFIG) && payload.len() >= 2 {
             let preset = payload[1];
             let reset_mode = payload

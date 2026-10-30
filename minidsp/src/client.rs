@@ -333,6 +333,8 @@ fn default_fir_block(
 
 /// Connected MiniDSP device client.
 pub struct MiniDspClient {
+    volume_settings:
+        std::sync::RwLock<Arc<tokio::sync::RwLock<minidsp_protocol::settings::Settings>>>,
     queue: Arc<CommandQueue>,
     transport_url: String,
     profile: DeviceProfile,
@@ -489,6 +491,7 @@ impl MiniDspClient {
             dsp_version,
             serial,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write,
             peq_shadow,
             selector_shadow,
@@ -760,8 +763,47 @@ impl MiniDspClient {
         self.get_status_summary_with_priority(Priority::Low).await
     }
 
+    /// Bind a daemon's live policy; direct clients default to no ceiling.
+    pub fn bind_volume_settings(
+        &self,
+        settings: Arc<tokio::sync::RwLock<minidsp_protocol::settings::Settings>>,
+    ) {
+        *self
+            .volume_settings
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = settings;
+    }
+
+    fn volume_settings(&self) -> Arc<tokio::sync::RwLock<minidsp_protocol::settings::Settings>> {
+        self.volume_settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Called while the owner holds the settings write lock. Only lowers volume.
+    pub async fn enforce_volume_settings(
+        &self,
+        settings: minidsp_protocol::settings::Settings,
+    ) -> Result<(), ClientError> {
+        if settings.max_volume_db().is_some() {
+            let current = self.get_master_status().await?.volume;
+            let bounded = settings.clamp_raw(current);
+            if bounded != current {
+                self.set_volume_unchecked(bounded).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Set volume (raw byte value, gain = -0.5 * value).
     pub async fn set_volume(&self, value: u8) -> Result<(), ClientError> {
+        let settings = self.volume_settings();
+        let settings = settings.read().await;
+        self.set_volume_unchecked(settings.clamp_raw(value)).await
+    }
+
+    async fn set_volume_unchecked(&self, value: u8) -> Result<(), ClientError> {
         let before = self.get_master_status().await?;
         if before.volume == value {
             return Ok(());
@@ -3413,6 +3455,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4130,6 +4173,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4210,6 +4254,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4288,6 +4333,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4358,6 +4404,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(HashMap::new())),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4406,6 +4453,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4447,6 +4495,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4539,6 +4588,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -4574,6 +4624,7 @@ mod tests {
             dsp_version: 100,
             serial: 912345,
             saved_peq: Mutex::new(None),
+            volume_settings: Default::default(),
             pending_write: Arc::new(Mutex::new(None)),
             peq_shadow: Arc::new(Mutex::new(build_peq_shadow(&probe::identify(10, 100)))),
             selector_shadow: Arc::new(Mutex::new(HashMap::new())),

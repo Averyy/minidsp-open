@@ -22,6 +22,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - A typed parser and encoder for the HT/HTx selectable-source bitmap at `0xFFEA`, from the research above; not yet read or written by the client.
 - Destructive validation workflow: a full profile with hard stops, recorded manual checkpoints, verified -35 dB audio steps, reboot/reconnect identity checks, concurrent 409 assertions and a no-target `--plan` mode, with fake-device tests.
 - SECURITY.md describing the LAN trust model and how to report vulnerabilities.
+- Optional maximum master volume (off by default) on the ESP32 and the desktop daemon: `GET/POST /settings`, the `/status` page, or the `max_volume_db` config key. It clamps every volume write minidsp-open makes, including the TCP bridge and ezBEQ, and rejects rattle passes above it. The miniDSP's own knob and IR remote bypass it.
 
 ### Changed
 

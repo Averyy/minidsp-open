@@ -347,6 +347,7 @@ fn parse_rattle_http_response(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(default)]
 struct DaemonConfig {
+    max_volume_db: Option<f64>,
     http_server: Option<HttpServerConfig>,
     #[serde(default, deserialize_with = "one_or_many")]
     tcp_server: Vec<TcpServerConfig>,
@@ -649,6 +650,7 @@ pub async fn server(
     }
 
     let state = Arc::new(DaemonState::new());
+    state.load_settings(config.max_volume_db).await?;
 
     // Upstream indexes successfully probed devices by serial, not HID enumeration order.
     for (i, client) in crate::discover_local_clients()

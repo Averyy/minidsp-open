@@ -18,8 +18,12 @@ use std::sync::Arc;
 pub async fn execute_raw_bridge_command(
     state: &DaemonState,
     client: &Arc<MiniDspClient>,
-    payload: Vec<u8>,
+    mut payload: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
+    // Hold the policy read lock through HID completion so lowering a ceiling
+    // cannot be followed by an older, louder in-flight volume write.
+    let settings = state.settings.read().await;
+    settings.clamp_payload(&mut payload);
     let request = payload.clone();
 
     if payload.first().copied() == Some(commands::CMD_SET_CONFIG) && payload.len() >= 2 {

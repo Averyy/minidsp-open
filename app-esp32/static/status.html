@@ -8,21 +8,23 @@
 <header><h1>miniDSP-Open</h1><a href="/update">Firmware updates</a></header>
 <p id="connection" role="status" class="error"></p>
 <section><h2>Device</h2><dl><dt>Firmware</dt><dd id="firmware">…</dd><dt>Uptime</dt><dd id="uptime">…</dd><dt>WiFi</dt><dd id="wifi">…</dd><dt>IP</dt><dd id="ip">…</dd><dt>miniDSP</dt><dd id="device">…</dd><dt>Serial</dt><dd id="serial">…</dd></dl></section>
-<section><h2>miniDSP</h2><dl><dt>Master volume</dt><dd id="volume">Unknown</dd><dt>Mute</dt><dd id="mute">Unknown</dd><dt>Source</dt><dd id="source">Unknown</dd><dt>Preset</dt><dd id="preset">Unknown</dd></dl><p id="hid" class="muted"></p></section>
+<section><h2>miniDSP</h2><dl><dt>Master volume</dt><dd id="volume">Unknown</dd><dt>Mute</dt><dd id="mute">Unknown</dd><dt>Source</dt><dd id="source">Unknown</dd><dt>Preset</dt><dd id="preset">Unknown</dd></dl><p id="hid" class="muted"></p>
+<form id="settings-form"><label>Maximum volume (dB; blank disables the ceiling)<input id="max-volume" type="number" min="-127" max="0" step="0.5" placeholder="No ceiling" disabled></label><p id="max-volume-current" class="muted">Checking maximum volume…</p><button id="save-settings" type="submit" disabled>Save maximum volume</button><p id="settings-message" role="status"></p></form>
+<p class="muted">The miniDSP front-panel knob and IR remote bypass this ceiling.</p></section>
 <section><h2>Playback state</h2><p id="playback" role="status">Checking…</p></section>
 <section><h2>Rattle finder</h2><form id="form"><div class="fields">
 <label class="wide">Tones (Hz, comma separated)<input id="tones" value="20,25,31.5,40,50,63,80,100,125,160,200" required></label>
 <label>Tone seconds<input id="hold" type="number" min="0.5" max="600" step="any" value="4" required></label>
 <label>Gap seconds<input id="gap" type="number" min="0" max="600" step="any" value="1" required></label>
 <label>Cycles<input id="cycles" type="number" min="1" step="1" value="1" required></label>
-<label class="wide">Volumes (dB, comma separated, 0.5 dB steps)<input id="volumes" value="-35" required></label>
+<label class="wide">Volumes (dB, comma separated, 0.5 dB steps)<span id="volume-hint" class="muted"></span><input id="volumes" value="-35" required></label>
 </div><p class="muted">Plays through your speakers. Start quietly. The previous master volume and source are restored afterwards; volume restoration is skipped if audio cannot be confirmed stopped.</p>
 <div class="buttons"><button id="start" type="submit" disabled>Start</button><button id="stop" type="button" disabled>Stop with fade</button></div></form>
 <p id="message" role="alert"></p><div id="tone" aria-live="polite">Ready</div><p id="position" class="muted"></p><p id="result" role="status"></p><p id="schedule-position" class="muted"></p><ol id="schedule" aria-label="Tone schedule"></ol>
 </section></main><script>
 'use strict';
 const $ = id => document.getElementById(id);
-let rattle = {playing:false}, playBusy = false, pending = false, scheduleKey = '', activeStep = -1, connected = false;
+let rattle = {playing:false}, playBusy = false, pending = false, scheduleKey = '', activeStep = -1, connected = false, maxVolumeDb = null, settingsLoaded = false, settingsDirty = false;
 async function request(path, options) {
   const response = await fetch(path, {cache:'no-store', ...options});
   const data = await response.json();
@@ -86,8 +88,30 @@ async function pollRattle() {
   catch (e) { $('connection').textContent = 'Status unavailable: ' + e.message; }
   setTimeout(pollRattle, rattle.playing ? 300 : 1800);
 }
+function renderSettings(settings) {
+  maxVolumeDb = settings.maxVolumeDb; settingsLoaded = true;
+  $('max-volume-current').textContent = maxVolumeDb === null ? 'Current maximum: no ceiling (off).' : `Current maximum: ${maxVolumeDb} dB.`;
+  $('volume-hint').textContent = maxVolumeDb === null ? ' · No ceiling' : ` · Maximum ${maxVolumeDb} dB`;
+  if (!settingsDirty) $('max-volume').value = maxVolumeDb ?? '';
+  $('max-volume').disabled = false; $('save-settings').disabled = false;
+}
+$('max-volume').oninput = () => { settingsDirty = true; };
+$('settings-form').onsubmit = async event => {
+  event.preventDefault();
+  const text = $('max-volume').value.trim(), next = text === '' ? null : Number(text);
+  if (next !== null && (!Number.isFinite(next) || next < -127 || next > 0 || !Number.isInteger(next * 2))) return;
+  $('save-settings').disabled = true;
+  try {
+    const current = await request('/settings');
+    if ((next === null || (current.maxVolumeDb !== null && next > current.maxVolumeDb)) && !confirm('Raise or disable the maximum volume? LAN clients will be able to play louder.')) return;
+    const saved = await request('/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({maxVolumeDb:next})});
+    settingsDirty = false; renderSettings(saved); $('settings-message').textContent = 'Maximum volume saved.';
+  } catch (e) { $('settings-message').textContent = e.message; }
+  finally { $('save-settings').disabled = false; }
+};
 async function pollDevice() {
   try {
+    renderSettings(await request('/settings'));
     const info = await request('/debug/info'); connected = info.usb.connected;
     $('firmware').textContent = info.firmware;
     $('uptime').textContent = `${Math.floor(info.uptime_secs / 3600)}h ${Math.floor(info.uptime_secs / 60) % 60}m ${info.uptime_secs % 60}s`;
@@ -110,9 +134,12 @@ function numbers(id) {
 $('form').onsubmit = async event => {
   event.preventDefault(); if (pending || rattle.playing || playBusy) return;
   try {
+    renderSettings(await request('/settings'));
+    if (!settingsLoaded) throw new Error('Maximum volume is unavailable.');
     const volumes = numbers('volumes'), frequencies = numbers('tones');
     if (volumes.some(v => v < -127 || v > 0)) throw new Error('Volumes must be between -127 and 0 dB.');
     if (volumes.some(v => !Number.isInteger(v * 2))) throw new Error('Volumes must use multiples of 0.5 dB.');
+    if (maxVolumeDb !== null && volumes.some(v => v > maxVolumeDb)) throw new Error(`Volumes must not exceed the maximum of ${maxVolumeDb} dB.`);
     if (volumes.some(v => v > -20) && !confirm('A volume above -20 dB can be very loud. Start this speaker test?')) return;
     pending = true; buttons(); message('Starting…');
     const response = await request('/devices/0/rattle', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({frequenciesHz:frequencies, toneSec:Number($('hold').value), gapSec:Number($('gap').value), cycles:Number($('cycles').value), volumesDb:volumes})});

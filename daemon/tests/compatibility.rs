@@ -1,5 +1,5 @@
 //! Host-only interoperability regressions. Original fake transport; no upstream code.
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use minidsp::{
     client::MiniDspClient,
     transport::{Transport, TransportError},
@@ -115,7 +115,9 @@ impl Transport for FakeTransport {
     }
 }
 async fn state() -> Arc<DaemonState> {
-    let state = Arc::new(DaemonState::new());
+    state_with(Arc::new(DaemonState::new())).await
+}
+async fn state_with(state: Arc<DaemonState>) -> Arc<DaemonState> {
     for (index, serial) in [12345, 23456].into_iter().enumerate() {
         let client = MiniDspClient::connect(Box::new(FakeTransport {
             pending: Mutex::new(VecDeque::new()),
@@ -125,6 +127,7 @@ async fn state() -> Arc<DaemonState> {
         .await
         .unwrap();
         // No persistence or Device Console cache reads in these tests.
+        client.bind_volume_settings(state.settings.clone());
         state.devices.write().await.insert(index, Arc::new(client));
     }
     state
@@ -304,4 +307,151 @@ async fn tcp_clients_and_http_share_queue_without_cross_wiring() {
     server.abort();
     first_server.abort();
     second_server.abort();
+}
+
+#[tokio::test]
+async fn volume_ceiling_settings_absolute_relative_config_and_persistence() {
+    let dir = std::env::temp_dir().join(format!("minidsp-volume-settings-{}", std::process::id()));
+    let cache = dir.join("shadow-cache.json");
+    let _ = std::fs::remove_dir_all(&dir);
+    let state = state_with(Arc::new(DaemonState::with_cache_path(cache.clone()))).await;
+    let (sender, server) = api(state.clone(), None);
+    let (status, _, body) = http(&sender, "GET", "/settings", "").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"maxVolumeDb":null})
+    );
+    for invalid in [
+        r#"{}"#,
+        r#"{"maxVolumeDb":-20.25}"#,
+        r#"{"maxVolumeDb":-127.5}"#,
+        r#"{"maxVolumeDb":1}"#,
+    ] {
+        assert_eq!(http(&sender, "POST", "/settings", invalid).await.0, 400);
+    }
+    assert_eq!(
+        http(&sender, "POST", "/settings", r#"{"maxVolumeDb":-30.5}"#)
+            .await
+            .0,
+        200
+    );
+    // Every connected device is lowered immediately, before any subsequent write.
+    for id in [0, 1] {
+        let (_, _, body) = http(&sender, "GET", &format!("/devices/{id}"), "").await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["master"]["volume"],
+            -30.5
+        );
+    }
+    for (path, body, expected) in [
+        ("/devices/0", r#"{"volume":0}"#, -30.5),
+        ("/devices/0/volume/up", "", -30.5),
+        ("/devices/0/volume/down", "", -31.0),
+        ("/devices/0/volume/up", "", -30.5),
+        ("/devices/0", r#"{"volume":-40}"#, -40.0),
+    ] {
+        let (status, _, body) = http(&sender, "POST", path, body).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["volume"],
+            expected
+        );
+    }
+    assert_eq!(
+        http(
+            &sender,
+            "POST",
+            "/devices/0/config",
+            r#"{"master_status":{"volume":0}}"#
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, _, body) = http(&sender, "GET", "/devices/0", "").await;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["master"]["volume"],
+        -30.5
+    );
+    let (status, _, body) = http(
+        &sender,
+        "POST",
+        "/devices/0/rattle",
+        r#"{"volumesDb":[-40,-30]}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(String::from_utf8(body).unwrap().contains("-30.5"));
+    let restarted = DaemonState::with_cache_path(cache.clone());
+    restarted.load_settings(None).await.unwrap();
+    assert_eq!(restarted.settings.read().await.max_volume_db(), Some(-30.5));
+    restarted.load_settings(Some(-25.0)).await.unwrap();
+    assert_eq!(restarted.settings.read().await.max_volume_db(), Some(-25.0));
+    assert!(restarted.load_settings(Some(-25.1)).await.is_err());
+    assert_eq!(
+        http(&sender, "POST", "/settings", r#"{"maxVolumeDb":null}"#)
+            .await
+            .0,
+        200
+    );
+    let restarted = DaemonState::with_cache_path(cache);
+    restarted.load_settings(None).await.unwrap();
+    assert_eq!(restarted.settings.read().await.max_volume_db(), None);
+    let (status, _, body) = http(&sender, "POST", "/devices/0", r#"{"volume":0}"#).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["volume"],
+        0.0
+    );
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn tcp_and_raw_websocket_volume_writes_obey_live_ceiling() {
+    let state = state().await;
+    *state.settings.write().await = minidsp_protocol::settings::Settings::new(Some(-35.5)).unwrap();
+    let client = state.get_device(0).await.unwrap();
+    let (mut tcp, stream) = tokio::io::duplex(4096);
+    let task = tokio::spawn(minidsp_daemon::tcp::serve_connection(
+        stream,
+        "127.0.0.1:1234".parse().unwrap(),
+        state.clone(),
+        Arc::new(tokio::sync::Mutex::new(())),
+        Some(0),
+        None,
+    ));
+    tcp.write_all(&packet::encode_frame(&set_volume(0)))
+        .await
+        .unwrap();
+    let mut reply = [0; 1];
+    tcp.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [RESP_OK]);
+    assert_eq!(client.get_master_status().await.unwrap().volume, 71);
+    // Quieter writes pass through unchanged.
+    tcp.write_all(&packet::encode_frame(&set_volume(100)))
+        .await
+        .unwrap();
+    tcp.read_exact(&mut reply).await.unwrap();
+    assert_eq!(client.get_master_status().await.unwrap().volume, 100);
+    let (sender, server) = api(state.clone(), None);
+    let (mut ws, _) =
+        tokio_tungstenite::client_async("ws://localhost/devices/0/ws", connection(&sender))
+            .await
+            .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        packet::encode_frame(&set_volume(0)),
+    ))
+    .await
+    .unwrap();
+    let response = ws.next().await.unwrap().unwrap();
+    assert_eq!(
+        packet::decode_frame(&response.into_data()).unwrap(),
+        [RESP_OK]
+    );
+    assert_eq!(client.get_master_status().await.unwrap().volume, 71);
+    ws.close(None).await.unwrap();
+    server.abort();
+    task.abort();
 }

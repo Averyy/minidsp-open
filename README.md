@@ -76,6 +76,8 @@ For driver development, use `ESP_UAC2_HOST_PATH="$HOME/code/esp-uac2-host/compon
 
 ## Security
 
+An optional maximum master volume limits HTTP, WebSocket, TCP bridge, and rattle playback levels; configure it through `/settings` (or the ESP32 `/status` page). It is off by default.
+
 Use minidsp-open on a trusted LAN. See [SECURITY.md](SECURITY.md) for the trust model, limits, and private vulnerability reporting.
 
 ## Credits

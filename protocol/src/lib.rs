@@ -20,6 +20,7 @@ pub mod http_origin;
 pub mod packet;
 pub mod playback;
 pub mod rattle;
+pub mod settings;
 pub mod shadow;
 pub mod source;
 pub mod status;

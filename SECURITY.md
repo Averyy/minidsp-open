@@ -10,6 +10,7 @@ Origin checks do not authenticate LAN clients. These limits are deliberate or re
 - The provisioning AP is open and sends credentials over HTTP; protection is tracked as P3 in [PROGRESS.md](PROGRESS.md).
 - The raw TCP bridge is unauthenticated by design for minidsp-rs compatibility.
 - The desktop daemon deliberately binds HTTP to `0.0.0.0` and uses a `0766` Unix socket.
-- Trusted LAN clients can request full-volume playback. Choose safe playback levels.
+- Set the optional maximum master volume through `/settings` (or ESP32 `/status`) to bound master-volume writes from HTTP, WebSocket, TCP bridge, and rattle playback. It is off by default. LAN clients can also raise or clear this setting; it is a safety control, not authentication.
+- The MiniDSP front-panel knob and IR remote bypass minidsp-open, so the ceiling cannot stop them. Direct USB CLI use also bypasses the daemon ceiling; CLI requests through the daemon URL/socket or a minidsp-open TCP bridge are bounded.
 
 Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/Averyy/minidsp-open/security/advisories/new). Include the affected version, reproduction steps, and impact. Please avoid public issues for undisclosed vulnerabilities.

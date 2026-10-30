@@ -565,6 +565,8 @@ TOML. The daemon must accept the same config format as minidsp-rs `minidspd`.
 
 ```toml
 ignore_advertisements = false
+# minidsp-open extension; omit for no ceiling on a fresh installation:
+# max_volume_db = -20.5
 
 [http_server]
 bind_address = "0.0.0.0:5380"
@@ -579,6 +581,36 @@ advertise = { ip = "192.168.1.100", name = "Example TV" }
 url = "tcp://192.168.1.2:5333"
 
 ```
+
+### Maximum master volume (minidsp-open extension)
+
+The top-level optional `max_volume_db` key accepts -127.0 through 0.0 in exact
+0.5 dB steps. Unset on a fresh installation means no ceiling. An explicit config
+value takes precedence at startup over runtime settings saved by `POST /settings`.
+The daemon persists runtime settings beside its shadow cache, at
+`~/.config/minidsp-open/settings.json` (temporary directory fallback when HOME is
+unavailable). Remove the config key to use the persisted value, including a
+persisted disabled ceiling. Invalid config or persisted settings fail startup.
+ESP32 settings persist in the NVS `settings` namespace across reboot/reconnect.
+
+`GET /settings` returns `{"maxVolumeDb":null}` when disabled, or a numeric ceiling.
+`POST /settings` accepts the same required field, sets or clears the ceiling, and
+returns the saved settings. Invalid values return `400`; browser mutations use
+the existing Origin policy. Lowering the ceiling immediately lowers any louder
+connected device. If persistence or hardware lowering fails, POST returns `500`
+and retains the new runtime policy; GET reports that active policy.
+
+Absolute writes above the ceiling clamp; relative writes clamp their result.
+Status responses report the volume actually set. This covers master status,
+config/snapshot writes, raw WebSocket and TCP bridge volume commands, and ESP32
+ezBEQ master volume. Rattle requests with any `volumesDb` above it return `400`
+before audio/HID actions. `/play` uses the current volume and never raises it.
+
+CLI requests through `--daemon-url`, the daemon socket (including automatic
+socket discovery), or a minidsp-open TCP bridge are bounded. Direct USB CLI use
+is local terminal control and does not read/apply daemon settings. The MiniDSP's
+own front-panel knob and IR remote also bypass minidsp-open and cannot be stopped
+by this ceiling. LAN clients can raise/clear the setting; it is not authentication.
 
 ### Browser origins (intentional security difference)
 
@@ -607,6 +639,7 @@ A page served from a public DNS name is refused even when its Host matches, beca
 
 These are allowed, but they are not part of the compatibility contract unless later promoted here:
 
+- `GET /settings` and `POST /settings` — optional maximum master volume, disabled by default; see the config extension above.
 - minidsp-open rattle-finder extensions (desktop daemon and ESP32 HTTP API):
   `minidsp --daemon-url http://host:5380 rattle` accepts optional `--tones`,
   `--start-hz`/`--end-hz`/`--count`, `--hold`, `--gap`, `--cycles`, and

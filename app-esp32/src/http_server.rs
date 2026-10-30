@@ -28,6 +28,7 @@ use minidsp_protocol::playback::{
     BitDepth, PlayRequest, PlayResponse, PlaybackPlan, SyncRequest, SyncResponse, ToneBurstParams,
 };
 use minidsp_protocol::rattle::{RattlePlan, RattleRequest, RattleResponse};
+use minidsp_protocol::settings::Settings;
 use minidsp_protocol::source::Source;
 use minidsp_protocol::status::{BmChannelPatch, BmMixerCellPatch, DeviceConfig, StatusSummary};
 use serde_json::json;
@@ -101,6 +102,53 @@ pub fn start(
         ..Default::default()
     };
     let mut server = EspHttpServer::new(&config)?;
+
+    // Registered normally so the global Origin guard covers POST /settings.
+    server.fn_handler("/settings", Method::Get, |req| {
+        let settings = *crate::settings::SETTINGS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        send_json(req, 200, &serde_json::to_string(&settings).unwrap())
+    })?;
+    {
+        let st = state.clone();
+        let partition = nvs.clone();
+        server.fn_handler("/settings", Method::Post, move |mut req| {
+            let body = match read_request_body(&mut req, 512) {
+                Ok(body) => body,
+                Err(message) => return send_error(req, 413, message),
+            };
+            let settings: Settings = match serde_json::from_slice(&body) {
+                Ok(settings) => settings,
+                Err(err) => return send_error(req, 400, &format!("invalid settings: {err}")),
+            };
+            // Match activation's lock order, including devices published during POST.
+            let mut current = crate::settings::SETTINGS
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            *current = settings;
+            let dev = get_device(&st);
+            let persistence = crate::settings::save(&partition, settings);
+            let lowering = dev
+                .map(|dev| dev.enforce_volume_settings(settings))
+                .transpose();
+            if let Err(err) = persistence {
+                return send_error(
+                    req,
+                    500,
+                    &format!("settings active but persistence failed: {err}"),
+                );
+            }
+            if let Err(err) = lowering {
+                return send_error(
+                    req,
+                    500,
+                    &format!("settings saved but lowering master volume failed: {err}"),
+                );
+            }
+            send_json(req, 200, &serde_json::to_string(&settings).unwrap())
+        })?;
+    }
 
     // GET /devices — list connected devices
     {
@@ -963,10 +1011,14 @@ pub fn start(
                 }
                 Err(_) => return send_error(req, 400, "failed to read request body"),
             };
-            let snapshot: DeviceSnapshot = match serde_json::from_slice(&body) {
+            let mut snapshot: DeviceSnapshot = match serde_json::from_slice(&body) {
                 Ok(snapshot) => snapshot,
                 Err(_) => return send_error(req, 400, "invalid snapshot JSON"),
             };
+            snapshot.master.volume = crate::settings::SETTINGS
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clamp_db(snapshot.master.volume);
             if let Err(err) = dev.restore_device_snapshot(&snapshot) {
                 if is_device_busy_error(&err) {
                     return send_error(req, 409, DEVICE_BUSY);
@@ -1694,8 +1746,8 @@ fn register_volume_routes(
             Err(e) => return send_error(req, 500, &e.to_string()),
         };
         let result = match direction.as_str() {
-            "up" => dev.set_volume(ms.volume.saturating_sub(1)),
-            "down" => dev.set_volume(ms.volume.saturating_add(1)),
+            "up" => dev.set_volume(Settings::OFF.relative_steps(ms.volume, 1)),
+            "down" => dev.set_volume(Settings::OFF.relative_steps(ms.volume, -1)),
             "toggle_mute" => dev.set_mute(!ms.is_muted()),
             _ => return send_error(req, 400, "unknown volume direction"),
         };
@@ -2711,6 +2763,10 @@ fn openapi_json() -> String {
             "license": { "name": "MIT" }
         },
         "paths": {
+            "/settings": {
+                "get": {"summary": "Get persisted controller settings", "responses": {"200": {"description": "Settings: maxVolumeDb is null or a number"}}},
+                "post": {"summary": "Set or clear the maximum master volume; immediately lower louder devices", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["maxVolumeDb"], "properties": {"maxVolumeDb": {"type": "number", "nullable": true, "minimum": -127, "maximum": 0, "multipleOf": 0.5}}}}}}, "responses": {"200": {"description": "Saved settings"}, "400": {"description": "Invalid settings"}, "403": {"description": "Origin not allowed"}, "500": {"description": "Persistence or volume lowering failed"}}}
+            },
             "/devices": { "get": { "summary": "List connected devices" } },
             "/devices/0": {
                 "get": { "summary": "Get device status" },
@@ -3771,6 +3827,13 @@ fn register_rattle_routes(
                 Err(err) => return send_error(req, 400, &format!("invalid rattle request: {err}")),
             }
         };
+        if let Err(err) = crate::settings::SETTINGS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .validate_rattle_volumes(&request.volumes_db)
+        {
+            return send_error(req, 400, &err);
+        }
         let plan = match RattlePlan::build(request) {
             Ok(plan) => plan,
             Err(err) => return send_error(req, 400, &err.to_string()),

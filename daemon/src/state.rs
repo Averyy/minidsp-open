@@ -24,6 +24,7 @@ struct PersistedShadowCache {
 
 /// Shared daemon state accessible by all HTTP/WS/TCP handlers.
 pub struct DaemonState {
+    pub settings: Arc<RwLock<minidsp_protocol::settings::Settings>>,
     pub devices: RwLock<HashMap<usize, Arc<MiniDspClient>>>,
     saved_peq: RwLock<HashMap<usize, SavedPeqState>>,
     shadow_cache: RwLock<HashMap<u32, DeviceShadowState>>,
@@ -50,9 +51,14 @@ struct ActiveRattle {
 
 impl DaemonState {
     pub fn new() -> Self {
-        let shadow_cache_path = shadow_cache_path();
+        Self::with_cache_path(shadow_cache_path())
+    }
+
+    /// Use an explicit shadow-cache location; settings are stored beside it.
+    pub fn with_cache_path(shadow_cache_path: PathBuf) -> Self {
         let shadow_cache = load_shadow_cache(&shadow_cache_path).devices;
         Self {
+            settings: Default::default(),
             devices: RwLock::new(HashMap::new()),
             saved_peq: RwLock::new(HashMap::new()),
             shadow_cache: RwLock::new(shadow_cache),
@@ -65,6 +71,13 @@ impl DaemonState {
     }
 
     pub async fn add_device(&self, id: usize, client: Arc<MiniDspClient>) {
+        client.bind_volume_settings(self.settings.clone());
+        let settings = self.settings.read().await;
+        if let Err(err) = client.enforce_volume_settings(*settings).await {
+            tracing::error!("cannot enforce maximum volume on device {id}: {err}");
+            return;
+        }
+
         if let Some(saved) = self.saved_peq.read().await.get(&id).cloned() {
             client.set_saved_measurement_state(Some(saved)).await;
         }
@@ -83,6 +96,41 @@ impl DaemonState {
             }
         }
         self.devices.write().await.insert(id, client);
+    }
+
+    /// Config overrides persisted runtime settings when explicitly supplied.
+    pub async fn load_settings(
+        &self,
+        configured: Option<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let settings = if configured.is_some() {
+            minidsp_protocol::settings::Settings::new(configured)?
+        } else {
+            match fs::read(self.settings_path()) {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Default::default(),
+                Err(err) => return Err(err.into()),
+            }
+        };
+        *self.settings.write().await = settings;
+        Ok(())
+    }
+
+    pub fn persist_settings(
+        &self,
+        settings: minidsp_protocol::settings::Settings,
+    ) -> std::io::Result<()> {
+        let path = self.settings_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(&settings)?)?;
+        fs::rename(temporary, path)
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        self.shadow_cache_path.with_file_name("settings.json")
     }
 
     pub async fn remove_device(&self, id: usize) {

@@ -134,3 +134,18 @@ async fn both_websocket_routes_check_origin_before_upgrading() {
         }
     }
 }
+
+#[tokio::test]
+async fn settings_mutations_use_the_existing_origin_guard() {
+    let response = request(
+        None,
+        "POST",
+        "/settings",
+        "Origin: https://evil.example\r\nContent-Type: application/json\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let response = request(None, "GET", "/settings", "").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains(r#"{"maxVolumeDb":null}"#));
+}
