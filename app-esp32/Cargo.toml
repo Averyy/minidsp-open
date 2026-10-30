@@ -50,6 +50,18 @@ remote_component = { name = "joltwallet/littlefs", version = "1.20" }
 remote_component = { name = "averyy/usb_host_uac2", version = "0.1.3" }
 
 # Unoptimised builds (~4.7 MB) overflow the 3 MB OTA app slots; size-optimise
-# dev builds while keeping debug info. Release keeps the default opt-level.
+# dev builds while keeping debug info.
 [profile.dev]
 opt-level = "s"
+
+# Release optimises for size too (-294 KB). The protocol crate's per-sample
+# sweep and rattle generators stay at opt-level 3, and so does esp-idf-sys,
+# which maps its opt-level onto ESP-IDF's C optimisation (3 keeps -O2).
+[profile.release]
+opt-level = "s"
+
+[profile.release.package.minidsp-protocol]
+opt-level = 3
+
+[profile.release.package.esp-idf-sys]
+opt-level = 3

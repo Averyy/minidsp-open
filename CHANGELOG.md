@@ -39,6 +39,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - ezBEQ state serialization and reusable service workers reduce ESP32 internal-RAM pressure during HTTP, WebSocket, and playback use.
 - Rattle plans and generators use memory proportional to tones plus volume passes, and ESP32 streams tones through the shared playback worker.
 - The default sweep fades in over at least one start-frequency cycle; timing markers remain enabled by default.
+- The ESP32 firmware image is about 550 KB smaller (2.46 MB in its 3 MB slot). Release Rust is size-optimised, apart from the playback generators; ESP-IDF's C code keeps full optimisation. The standard library drops backtrace support, which the board can't use, and picks its smaller algorithms. The TLS bundle keeps the common root CAs, which cover GitHub Pages and release downloads.
 - The ESP32 accepts request header blocks up to 1024 bytes (was 512), leaving room for a session cookie or Basic header on browser requests.
 - The advertised CLI version is 0.2.0 so ezBEQ enables Flex HTx input PEQs.
 - Protocol crate documentation states that supported builds require `std`.

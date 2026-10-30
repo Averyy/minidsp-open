@@ -83,4 +83,8 @@ CONFIG_MDNS_MAX_SERVICES=4
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# Common roots only (-50 KB). The firmware contacts averyy.github.io and
+# github.com release downloads (release-assets.githubusercontent.com), signed
+# by ISRG Root X1 and USERTrust ECC; both are in this set (checked 2026-10-30).
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=n
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y

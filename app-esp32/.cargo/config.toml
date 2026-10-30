@@ -7,6 +7,11 @@ runner = "espflash flash --monitor"
 
 [unstable]
 build-std = ["std", "panic_abort"]
+# Without the default "backtrace" feature (-153 KB): the board has no debug
+# info to resolve Rust backtraces, and panic messages and ESP-IDF's own crash
+# backtrace still print. optimize_for_size picks core's smaller sort and
+# formatting code (-49 KB).
+build-std-features = ["optimize_for_size"]
 
 [env]
 MCU = "esp32s3"
