@@ -54,7 +54,7 @@ Details: [ESP32 audio](docs/TODO1-esp32-usb-audio.md),
 - [ ] Resolve exact runtime identity, or document the intentional alias boundary, for HA-DSP, DDRC-22, DDRC-88, CDSP-8x12/DL, and Harmony DSP. Product/software families are known; exact runtime identities aren't.
 - [ ] Keep importer/codegen changes source-backed and regenerate coverage artifacts when device evidence changes.
 - [ ] Confirm the HT selectable-source descriptor layout at `0xFFEA` before adding a typed parser, and reverse-engineer the address table for advanced Dirac controls (`mux_bypass`, `dirac_delay`, `mixer_fir`, `fir-ctrl`, `iir-ctrl`).
-- [ ] Verify the new desktop and ESP32 CI workflows in hosted CI. Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
+- [ ] Run the release workflow on a first `vX.Y.Z` tag; CI (host tests and the ESP32 release build) already passes on GitHub. Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
 - [ ] Keep PWR-ICE compatibility, later ezBEQ expansion, and custom-PCB VBUS GPIO control deferred. DevKitC boards don't need GPIO-driven VBUS.
 
 ### Wi-DG parity
