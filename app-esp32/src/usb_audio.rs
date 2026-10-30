@@ -3,6 +3,7 @@
 //! This wraps the external `esp-uac2-host` component and maintains shared
 //! playback state independently from the HID device state.
 
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_sys::{
     esp_err_t, esp_timer_get_time, BaseType_t, EspError, ESP_ERR_INVALID_ARG, ESP_OK,
 };
@@ -21,6 +22,73 @@ use std::time::{Duration, Instant};
 
 pub type SharedAudioState = Arc<AudioState>;
 static TX_NEED_DATA_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Set while a TX stream runs, in RTC memory that panics, watchdogs and
+/// software resets don't clear. If the board resets mid-stream with VBUS
+/// still up, the 2x4 HD keeps accepting USB audio but stays silent until it
+/// reboots; a cable unplug doesn't do this. The next boot reboots the MiniDSP
+/// first when it finds the flag set (reproduced 2026-10-30).
+#[link_section = ".rtc_noinit"]
+static mut STREAM_ACTIVE: u32 = 0;
+const STREAM_ACTIVE_MAGIC: u32 = 0x5354_524D;
+
+/// An EN-pin reset (RST button, esptool) clears RTC memory too, so the main
+/// task also persists the flag to NVS. Streams start on PSRAM-stack workers,
+/// which can't write flash, so they only flip this atomic.
+static STREAM_RUNNING: AtomicBool = AtomicBool::new(false);
+static STREAM_PERSISTED: AtomicBool = AtomicBool::new(false);
+static INTERRUPTED_AT_BOOT: AtomicBool = AtomicBool::new(false);
+const STREAM_LIVE_KEY: &str = "stream_live";
+
+fn set_stream_active(active: bool) {
+    let value = if active { STREAM_ACTIVE_MAGIC } else { 0 };
+    unsafe { ptr::write_volatile(&raw mut STREAM_ACTIVE, value) };
+    STREAM_RUNNING.store(active, Ordering::SeqCst);
+}
+
+fn settings_nvs(
+    partition: &EspDefaultNvsPartition,
+) -> Result<EspNvs<NvsDefault>, esp_idf_sys::EspError> {
+    EspNvs::new(partition.clone(), "settings", true)
+}
+
+/// Reads both copies once at boot, before the first device activation.
+pub fn load_stream_flag(partition: &EspDefaultNvsPartition) {
+    let stored = settings_nvs(partition)
+        .ok()
+        .and_then(|nvs| nvs.get_u8(STREAM_LIVE_KEY).ok().flatten())
+        .is_some_and(|v| v != 0);
+    let rtc = unsafe { ptr::read_volatile(&raw const STREAM_ACTIVE) == STREAM_ACTIVE_MAGIC };
+    STREAM_PERSISTED.store(stored, Ordering::SeqCst);
+    INTERRUPTED_AT_BOOT.store(stored || rtc, Ordering::SeqCst);
+}
+
+/// Whether the previous run reset while a stream was active.
+pub fn stream_was_interrupted() -> bool {
+    INTERRUPTED_AT_BOOT.load(Ordering::SeqCst)
+}
+
+/// Called on the main task once the MiniDSP has been rebooted.
+pub fn clear_interrupted_stream(partition: &EspDefaultNvsPartition) {
+    INTERRUPTED_AT_BOOT.store(false, Ordering::SeqCst);
+    if !STREAM_RUNNING.load(Ordering::SeqCst) {
+        unsafe { ptr::write_volatile(&raw mut STREAM_ACTIVE, 0) };
+    }
+    persist_stream_flag(partition);
+}
+
+/// Main task only: NVS writes need its internal-RAM stack. A pending
+/// recovery stays persisted until it has run.
+pub fn persist_stream_flag(partition: &EspDefaultNvsPartition) {
+    let want = STREAM_RUNNING.load(Ordering::SeqCst) || INTERRUPTED_AT_BOOT.load(Ordering::SeqCst);
+    if want == STREAM_PERSISTED.load(Ordering::SeqCst) {
+        return;
+    }
+    match settings_nvs(partition).and_then(|nvs| nvs.set_u8(STREAM_LIVE_KEY, u8::from(want))) {
+        Ok(()) => STREAM_PERSISTED.store(want, Ordering::SeqCst),
+        Err(e) => warn!("USB audio: could not persist the stream flag: {e}"),
+    }
+}
 
 pub struct AudioState {
     device: Mutex<Option<Arc<Uac2Device>>>,
@@ -91,6 +159,14 @@ impl AudioState {
                                 break;
                             };
                             state.begin_open_when_allowed();
+                            // The device may have re-enumerated while this
+                            // waited at the gate (a MiniDSP reboot), so open
+                            // the newest reported interface.
+                            let (addr, iface_num) = state
+                                .last_tx_interface
+                                .lock()
+                                .unwrap()
+                                .unwrap_or((addr, iface_num));
                             open_tx_device(&state, addr, iface_num);
                             state.finish_open();
                         }
@@ -628,9 +704,15 @@ impl Uac2Device {
         };
         self.stream_errors.store(0, Ordering::SeqCst);
         self.transfer_errors.store(0, Ordering::SeqCst);
-        driver_call("uac2_host_device_start", unsafe {
+        // Set before starting, so a reset during startup counts as well.
+        set_stream_active(true);
+        let result = driver_call("uac2_host_device_start", unsafe {
             uac2_host_device_start(self.handle_ptr(), &config)
-        })
+        });
+        if result.is_err() {
+            set_stream_active(false);
+        }
+        result
     }
 
     fn validate_stream(&self, sample_rate: u32, bit_depth: BitDepth) -> Result<(), UsbAudioError> {
@@ -742,9 +824,11 @@ impl Uac2Device {
     }
 
     pub fn stop_stream(&self) -> Result<(), UsbAudioError> {
-        driver_call("uac2_host_device_stop", unsafe {
+        let result = driver_call("uac2_host_device_stop", unsafe {
             uac2_host_device_stop(self.handle_ptr())
-        })
+        });
+        set_stream_active(false);
+        result
     }
 
     /// One close attempt. `uac2_host_device_close()` stops any active
@@ -754,6 +838,8 @@ impl Uac2Device {
     fn close(&self) -> Result<(), UsbAudioError> {
         let _close = self.close_lock.lock().unwrap_or_else(|e| e.into_inner());
         let handle = self.handle_ptr();
+        // Closing stops any stream; a disconnect also lands here.
+        set_stream_active(false);
         if handle.is_null() {
             return Ok(());
         }

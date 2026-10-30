@@ -88,6 +88,7 @@ fn main() {
     // Initialize NVS (required for WiFi credentials)
     let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take().expect("failed to initialize NVS");
     settings::load(&nvs);
+    usb_audio::load_stream_flag(&nvs);
 
     // Mount LittleFS data partition (ezBEQ catalogue, UI, config)
     match storage::mount() {
@@ -185,7 +186,9 @@ fn main() {
     }
     if let Some(ref bus) = bus {
         usb_hid::register_global_bus(bus.clone());
-        match discover_and_activate_device(bus, Duration::from_secs(30)) {
+        match discover_and_activate_device(bus, Duration::from_secs(30))
+            .and_then(|state| recover_interrupted_stream(bus, state, &nvs))
+        {
             Ok(state) => {
                 usb_state = UsbState::ProtocolReady;
                 on_device_activated(state, &device_state, &beq_state, &nvs);
@@ -297,6 +300,7 @@ fn main() {
     let mut next_usb_scan = Instant::now();
     loop {
         auth::maintenance();
+        usb_audio::persist_stream_flag(&nvs);
         if Instant::now() >= next_diagnostics {
             diagnostics::tick();
             next_diagnostics = Instant::now() + Duration::from_secs(5);
@@ -323,7 +327,9 @@ fn main() {
                 log_usb_state_transition(&mut usb_state, UsbState::Absent, "device missing");
                 info!("USB: scanning for device (timeout: {usb_backoff:?})");
                 let scan_started = Instant::now();
-                match discover_and_activate_device(bus, usb_backoff) {
+                match discover_and_activate_device(bus, usb_backoff)
+                    .and_then(|state| recover_interrupted_stream(bus, state, &nvs))
+                {
                     Ok(state) => {
                         usb_backoff = Duration::from_secs(5);
                         next_usb_scan = Instant::now();
@@ -368,6 +374,32 @@ fn probe_error_is_root_port_recoverable(err: &usb_hid::UsbHidError) -> bool {
         }
         _ => false,
     }
+}
+
+/// If the previous run reset mid-stream, the MiniDSP may be accepting USB
+/// audio but silent (see `usb_audio::stream_was_interrupted`). Its own reboot
+/// clears that, so reboot it before publishing it or opening audio.
+fn recover_interrupted_stream(
+    bus: &Arc<usb_hid::UsbHidBus>,
+    state: device::DeviceState,
+    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
+) -> Result<device::DeviceState, usb_hid::UsbHidError> {
+    if !usb_audio::stream_was_interrupted() {
+        return Ok(state);
+    }
+    warn!("USB audio: the previous run reset mid-stream; rebooting the MiniDSP to clear a silent output");
+    if let Err(e) = state.reboot_device() {
+        warn!("USB audio: MiniDSP reboot after an interrupted stream failed: {e}");
+        return Ok(state);
+    }
+    usb_audio::clear_interrupted_stream(nvs);
+    drop(state);
+    // Let the reboot's disconnect land before looking for the device again.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while bus.is_connected() && Instant::now() < deadline {
+        auth::responsive_sleep(Duration::from_millis(100));
+    }
+    discover_and_activate_device(bus, Duration::from_secs(60))
 }
 
 fn discover_and_activate_device(
