@@ -56,10 +56,23 @@ pub fn protected() -> bool {
     PROTECTED.load(Ordering::Acquire)
 }
 
-pub fn load(partition: &EspDefaultNvsPartition, record: Option<PasswordRecord>) {
+/// The password as read from NVS at boot.
+pub enum StoredPassword {
+    None,
+    Valid(PasswordRecord),
+    /// Protected, but no password verifies until BOOT recovery clears it.
+    Unreadable,
+}
+
+pub fn load(partition: &EspDefaultNvsPartition, stored: StoredPassword) {
     PARTITION.set(partition.clone()).ok();
+    let (record, protected) = match stored {
+        StoredPassword::None => (None, false),
+        StoredPassword::Valid(record) => (Some(record), true),
+        StoredPassword::Unreadable => (None, true),
+    };
     state().lock().unwrap().record = record;
-    PROTECTED.store(record.is_some(), Ordering::Release);
+    PROTECTED.store(protected, Ordering::Release);
 }
 
 /// `esp_fill_random` is only a true RNG once the radio runs, so the per-boot
@@ -418,8 +431,11 @@ pub unsafe fn gate(req: *mut httpd_req_t, websocket: bool) -> Result<(), esp_err
     let path = path(req);
     let method = (*req).method as u32;
     let get = method == http_method_HTTP_GET;
+    // CORS preflights never carry credentials, and the OPTIONS handler only
+    // answers CORS headers.
     let public = !websocket
-        && ((path == "/login" && (get || method == http_method_HTTP_POST))
+        && (method == http_method_HTTP_OPTIONS
+            || (path == "/login" && (get || method == http_method_HTTP_POST))
             || (get
                 && PROVISIONING.load(Ordering::Acquire)
                 && matches!(
@@ -510,9 +526,12 @@ unsafe fn bad_request(req: *mut httpd_req_t, body: &str) -> esp_err_t {
 }
 
 /// Rate-limits and verifies a submitted password after its body was read.
+/// `authenticated` requests already passed the gate, so only their own
+/// peer budget applies.
 unsafe fn check_password(
     req: *mut httpd_req_t,
     password: &str,
+    authenticated: bool,
     status: &CStr,
     error: &str,
 ) -> Result<(), esp_err_t> {
@@ -520,7 +539,12 @@ unsafe fn check_password(
     let now = now();
     let (delay, record) = {
         let s = state().lock().unwrap();
-        (s.rate.retry_after(ip, now), s.record)
+        let delay = if authenticated {
+            s.rate.peer_retry_after(ip, now)
+        } else {
+            s.rate.retry_after(ip, now)
+        };
+        (delay, s.record)
     };
     if delay > 0 {
         return Err(throttled(req, delay, true));
@@ -545,6 +569,7 @@ unsafe fn login(req: *mut httpd_req_t) -> esp_err_t {
     if let Err(result) = check_password(
         req,
         &login.password,
+        false,
         c"401 Unauthorized",
         r#"{"error":"incorrect password"}"#,
     ) {
@@ -611,6 +636,7 @@ unsafe fn change_password(req: *mut httpd_req_t) -> esp_err_t {
         if let Err(result) = check_password(
             req,
             change.current.as_deref().unwrap_or(""),
+            true,
             c"403 Forbidden",
             r#"{"error":"current password is incorrect"}"#,
         ) {

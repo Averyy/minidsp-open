@@ -5251,12 +5251,6 @@ unsafe extern "C" fn origin_checked_handler(
     if protected && !allowed {
         return reject_origin(req);
     }
-    if let Err(result) = crate::auth::gate(req, false) {
-        return result;
-    }
-    if let Some(result) = crate::auth::route(req) {
-        return result;
-    }
     let origin = if allowed {
         request_header(req, c"Origin").ok().flatten()
     } else {
@@ -5287,6 +5281,14 @@ unsafe extern "C" fn origin_checked_handler(
                 headers.as_ptr(),
             );
         }
+    }
+    // After the CORS headers, so allowed cross-origin pages can read 401, 429
+    // and login replies.
+    if let Err(result) = crate::auth::gate(req, false) {
+        return result;
+    }
+    if let Some(result) = crate::auth::route(req) {
+        return result;
     }
     NATIVE_HTTP_HANDLER
         .get()

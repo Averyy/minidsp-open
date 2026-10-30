@@ -221,6 +221,12 @@ impl Budget {
     }
 }
 
+const PEER_ALLOWANCE: u8 = 3;
+const GLOBAL_ALLOWANCE: u8 = 10;
+
+/// Failure budgets per peer, plus a global one against several peers guessing
+/// in parallel. A peer's failures count globally only up to its own
+/// allowance, so a single peer renewing its backoff can't lock out the owner.
 #[derive(Default)]
 pub struct RateLimiter {
     global: Budget,
@@ -229,17 +235,26 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn retry_after(&self, ip: u32, now: u64) -> u64 {
-        let local = self
-            .ips
+        self.global
+            .until
+            .max(self.peer_until(ip))
+            .saturating_sub(now)
+    }
+
+    /// Ignores the global budget, for requests that already authenticated.
+    pub fn peer_retry_after(&self, ip: u32, now: u64) -> u64 {
+        self.peer_until(ip).saturating_sub(now)
+    }
+
+    fn peer_until(&self, ip: u32) -> u64 {
+        self.ips
             .iter()
             .flatten()
             .find(|(key, _)| *key == ip)
-            .map_or(0, |(_, b)| b.until);
-        self.global.until.max(local).saturating_sub(now)
+            .map_or(0, |(_, b)| b.until)
     }
 
     pub fn failure(&mut self, ip: u32, now: u64) {
-        self.global.fail(now, 10);
         let index = self
             .ips
             .iter()
@@ -257,7 +272,10 @@ impl RateLimiter {
         if entry.0 != ip {
             *entry = (ip, Budget::default());
         }
-        entry.1.fail(now, 3);
+        entry.1.fail(now, PEER_ALLOWANCE);
+        if entry.1.failures <= PEER_ALLOWANCE {
+            self.global.fail(now, GLOBAL_ALLOWANCE);
+        }
     }
 }
 
@@ -358,14 +376,28 @@ mod tests {
         for _ in 0..30 {
             rate.failure(1, 0);
         }
-        assert_eq!(rate.retry_after(2, 0), 64);
+        assert_eq!(rate.retry_after(1, 0), 64);
         assert_eq!(rate.retry_after(1, 64), 0);
-        for ip in 2..20 {
-            rate.failure(ip, 300);
+        // One peer renewing its own backoff never locks out anyone else.
+        for t in (64..1000).step_by(64) {
+            rate.failure(1, t);
+            assert_eq!(rate.retry_after(2, t), 0);
         }
-        assert!(rate.retry_after(19, 300) <= 64);
-        rate.failure(1, 1000);
-        assert_eq!(rate.retry_after(1, 1000), 0);
+        // Four peers guessing in parallel exhaust the global budget.
+        for ip in 2..6 {
+            for _ in 0..3 {
+                rate.failure(ip, 1000);
+            }
+        }
+        assert!(rate.retry_after(99, 1000) > 0);
+        assert_eq!(rate.peer_retry_after(99, 1000), 0);
+        // The peer table stays bounded and the backoff stays capped.
+        for ip in 6..40 {
+            rate.failure(ip, 2000);
+        }
+        assert!(rate.retry_after(39, 2000) <= 64);
+        rate.failure(1, 5000);
+        assert_eq!(rate.retry_after(1, 5000), 0);
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn main() {
 
     // Initialize NVS (required for WiFi credentials)
     let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take().expect("failed to initialize NVS");
-    settings::load(&nvs).expect("failed to load controller settings");
+    settings::load(&nvs);
 
     // Mount LittleFS data partition (ezBEQ catalogue, UI, config)
     match storage::mount() {

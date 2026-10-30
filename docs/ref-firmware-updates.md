@@ -81,7 +81,7 @@ So a build that breaks WiFi, the HTTP server, or boot rolls itself back, and you
 
 `version` is the Cargo package version. `build` is `MINIDSP_BUILD_REV` (`vX.Y.Z` in release builds) or `git describe --always --dirty` for local builds. `slotState` is `valid` or `pendingVerify`. Uploads and installs answer `409` during `/play` playback or while another update runs, and `400` for an unacceptable image.
 
-These endpoints are unauthenticated, like the rest of the board's API: anything on the LAN that can reach port 5380 can install firmware. Treat the board as a trusted-LAN device.
+Without the optional password these endpoints are unauthenticated, like the rest of the board's API: anything on the LAN that can reach port 5380 can install firmware. With a password set they need a login session, Basic `admin` credentials or a Bearer token, and `tools/ota-push.sh --password-file PATH` (or `MINIDSP_PASSWORD`) sends Basic on every call. Firmware is unsigned and HTTP is unencrypted either way, so treat the board as a trusted-LAN device.
 
 ## Catalogue source overrides for development
 
