@@ -38,7 +38,11 @@ use std::time::{Duration, Instant};
 
 const REBOOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(50);
 const SOURCE_SWITCH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(35);
-const RAW_BRIDGE_OPERATION_WAIT: Duration = Duration::from_millis(500);
+// A preset change holds the device for about 4 s, during which the MiniDSP
+// answers nothing anyway; a Wi-DG would just deliver the reply late. This
+// stays under the CLI's 10 s status timeout, and a client that gives up
+// sooner reopens the connection before its next command.
+const RAW_BRIDGE_OPERATION_WAIT: Duration = Duration::from_secs(8);
 const AUDIO_REOPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const AUDIO_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const AUDIO_RECOVERY_SETTLE: Duration = Duration::from_millis(250);

@@ -388,7 +388,7 @@ Compatibility requirement:
 
 The transport may be internally arbitrated and serialized, but wire-level compatibility must remain intact for a normal compatibility client.
 
-Upstream accepts multiple clients; rejecting a second client is not an upstream requirement. Desktop accepts up to eight clients per listener, serialized through the device queue. ESP32 currently services one bridge connection at a time; broader multi-client parity remains open.
+Upstream accepts multiple clients; rejecting a second client is not an upstream requirement. Desktop accepts up to eight clients per listener, serialized through the device queue. ESP32 currently services one bridge connection at a time; broader multi-client parity remains open. It waits up to 8 s for a running device operation, such as a preset change, before answering busy.
 
 Desktop supports multiple `[[tcp_server]]` listeners mapped by `device_index` or `device_serial`; serial takes precedence. Each listener's discovery advertisement uses the same device binding. With neither selector, prefer the first local USB device. Host tests cover two mock devices and concurrent bridge/HTTP traffic; actual socket acceptance and physical multi-device operation remain release gates.
 
