@@ -306,7 +306,8 @@ fn write_image_claimed(
     }
 
     // Validate the header before touching flash.
-    let mut buf = vec![0u8; CHUNK_BYTES];
+    // esp_ota_write sends a PSRAM buffer to flash 32 bytes at a time.
+    let mut buf = crate::psram::internal(|| vec![0u8; CHUNK_BYTES]);
     let mut buffered = 0;
     while buffered < IMAGE_HEADER_BYTES {
         let n = read(&mut buf[buffered..]).map_err(OtaError::Failed)?;

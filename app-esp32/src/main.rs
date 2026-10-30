@@ -235,6 +235,10 @@ fn main() {
         ) {
             Ok(server) => {
                 info!("HTTP server running on port 5380");
+                // Handlers build large structures from small allocations.
+                if !psram::prefer_for_task(c"httpd") {
+                    warn!("HTTP handlers allocate in internal RAM: no httpd task to move to PSRAM");
+                }
                 Box::leak(Box::new(server));
                 ota::mark_http_ready();
             }

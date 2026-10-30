@@ -1,26 +1,39 @@
-//! Route one task's heap allocations to PSRAM for the length of a guard.
+//! Send chosen tasks' heap allocations to PSRAM.
 //!
 //! ESP-IDF's malloc keeps allocations under CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
 //! (16 KiB) in internal RAM, which USB host transfers, WiFi and task stacks
-//! also need. A device snapshot is about a thousand small allocations, roughly
-//! 40 KB per copy; a restore holds the request's copy and builds a verification
-//! copy, which left 16 bytes of internal RAM and stalled USB until the board
-//! hung. Handlers that build snapshots run under [`PreferPsram`].
+//! also need. HTTP handlers build large structures out of small allocations:
+//! a snapshot restore (about a thousand, held twice) left 16 bytes and hung
+//! USB, and measurement mode starved the WiFi PHY into an abort. The HTTP
+//! server task is registered at startup, so every handler allocates in PSRAM.
+//! Buffers handed to the flash driver use [`internal`]: it writes a PSRAM
+//! source 32 bytes at a time.
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use esp_idf_svc::sys;
 use std::alloc::System;
 
-/// The task whose allocations go to PSRAM; null when none.
-static PSRAM_TASK: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
+/// Tasks whose allocations go to PSRAM; null slots are free.
+static PSRAM_TASKS: [AtomicPtr<c_void>; 4] = [const { AtomicPtr::new(ptr::null_mut()) }; 4];
+/// A registered task inside [`internal`], whose allocations stay internal.
+static INTERNAL_TASK: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 pub struct Allocator;
 
+fn current_task() -> *mut c_void {
+    unsafe { sys::xTaskGetCurrentTaskHandle() }.cast()
+}
+
 fn prefer_psram() -> bool {
-    let task = PSRAM_TASK.load(Ordering::Relaxed);
-    !task.is_null() && task == unsafe { sys::xTaskGetCurrentTaskHandle() }.cast()
+    let task = current_task();
+    !task.is_null()
+        && PSRAM_TASKS
+            .iter()
+            .any(|slot| slot.load(Ordering::Relaxed) == task)
+        && INTERNAL_TASK.load(Ordering::Relaxed) != task
 }
 
 unsafe fn psram_alloc(layout: Layout) -> *mut u8 {
@@ -67,27 +80,43 @@ unsafe impl GlobalAlloc for Allocator {
     }
 }
 
-/// While alive, the current task's allocations prefer PSRAM, falling back to
-/// internal RAM when PSRAM is full. One task at a time; a second guard on
-/// another task leaves that task's allocations where they were.
-pub struct PreferPsram {
-    claimed: bool,
-}
-
-impl PreferPsram {
-    pub fn enter() -> Self {
-        let task = unsafe { sys::xTaskGetCurrentTaskHandle() }.cast();
-        let claimed = PSRAM_TASK
-            .compare_exchange(ptr::null_mut(), task, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok();
-        PreferPsram { claimed }
+/// From now on, the named task's allocations prefer PSRAM, falling back to
+/// internal RAM when PSRAM is full. False if the task doesn't exist or every
+/// slot is taken.
+pub fn prefer_for_task(name: &core::ffi::CStr) -> bool {
+    let task: *mut c_void = unsafe { sys::xTaskGetHandle(name.as_ptr()) }.cast();
+    if task.is_null() {
+        return false;
     }
+    PSRAM_TASKS.iter().any(|slot| {
+        slot.load(Ordering::Acquire) == task
+            || slot
+                .compare_exchange(ptr::null_mut(), task, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    })
 }
 
-impl Drop for PreferPsram {
-    fn drop(&mut self) {
-        if self.claimed {
-            PSRAM_TASK.store(ptr::null_mut(), Ordering::Release);
+/// Run `f` with the current task's allocations in internal RAM, for buffers
+/// the flash driver reads. One task at a time; a second caller runs `f`
+/// unchanged.
+pub fn internal<T>(f: impl FnOnce() -> T) -> T {
+    struct Release(bool);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if self.0 {
+                INTERNAL_TASK.store(ptr::null_mut(), Ordering::Release);
+            }
         }
     }
+    let _release = Release(
+        INTERNAL_TASK
+            .compare_exchange(
+                ptr::null_mut(),
+                current_task(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok(),
+    );
+    f()
 }

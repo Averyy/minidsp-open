@@ -984,7 +984,6 @@ pub fn start(
         let st = state.clone();
         let audio = audio_state.clone();
         server.fn_handler("/devices/0/snapshot", Method::Get, move |req| {
-            let _psram = crate::psram::PreferPsram::enter();
             let req = match reject_hid_during_playback(req, &audio)? {
                 Some(req) => req,
                 None => return Ok(()),
@@ -1017,7 +1016,6 @@ pub fn start(
         let st = state.clone();
         let audio = audio_state.clone();
         server.fn_handler("/devices/0/snapshot", Method::Post, move |mut req| {
-            let _psram = crate::psram::PreferPsram::enter();
             req = match reject_hid_during_playback(req, &audio)? {
                 Some(req) => req,
                 None => return Ok(()),
@@ -1067,7 +1065,6 @@ pub fn start(
         let st = state.clone();
         let audio = audio_state.clone();
         server.fn_handler("/devices/0/snapshot/learn", Method::Post, move |req| {
-            let _psram = crate::psram::PreferPsram::enter();
             let req = match reject_hid_during_playback(req, &audio)? {
                 Some(req) => req,
                 None => return Ok(()),
