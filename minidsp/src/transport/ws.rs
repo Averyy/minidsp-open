@@ -51,8 +51,15 @@ impl WsTransport {
     /// `base_url` can be "http://host:5380", "ws://host:5380", or just "host:5380".
     /// `device_id` selects which device to connect to (default 0).
     pub async fn connect(base_url: &str, device_id: usize) -> Result<Self, TransportError> {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        Self::connect_authenticated(base_url, device_id, None).await
+    }
 
+    /// Send an explicit Authorization header during the upgrade.
+    pub async fn connect_authenticated(
+        base_url: &str,
+        device_id: usize,
+        authorization: Option<&str>,
+    ) -> Result<Self, TransportError> {
         // Reject TLS schemes — we don't support wss:// yet
         if base_url.starts_with("https://") || base_url.starts_with("wss://") {
             return Err(TransportError::Io(
@@ -68,10 +75,7 @@ impl WsTransport {
             .await
             .map_err(|e| TransportError::Io(format!("TCP connect to {host_port}: {e}")))?;
 
-        let request = ws_url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| TransportError::Io(format!("WS request: {e}")))?;
+        let request = handshake_request(&ws_url, authorization)?;
 
         let boxed: Box<dyn AsyncRw> = Box::new(tcp_stream);
         let (ws_stream, _) = tokio_tungstenite::client_async(request, boxed)
@@ -113,6 +117,24 @@ impl WsTransport {
             url: format!("ws+unix:{path}/devices/{device_id}/ws"),
         })
     }
+}
+
+fn handshake_request(
+    url: &str,
+    authorization: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, TransportError> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url
+        .into_client_request()
+        .map_err(|_| TransportError::Io("invalid WebSocket URL".into()))?;
+    if let Some(value) = authorization {
+        let mut header = value
+            .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+            .map_err(|_| TransportError::Io("invalid Authorization header".into()))?;
+        header.set_sensitive(true);
+        request.headers_mut().insert("Authorization", header);
+    }
+    Ok(request)
 }
 
 /// Normalize a base URL to a WebSocket URL for the raw frame bridge.
@@ -213,5 +235,25 @@ impl Transport for WsTransport {
 
     fn url(&self) -> String {
         self.url.clone()
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    #[test]
+    fn handshake_carries_authorization_only_when_requested() {
+        let url = "ws://localhost:5380/devices/0/ws";
+        let header = minidsp_protocol::auth::basic_header("secret");
+        let request = handshake_request(url, Some(&header)).unwrap();
+        assert_eq!(request.headers()["Authorization"], header);
+        assert!(request.headers()["Authorization"].is_sensitive());
+        assert!(
+            !handshake_request(url, None)
+                .unwrap()
+                .headers()
+                .contains_key("Authorization")
+        );
+        assert!(handshake_request(url, Some("bad\r\nheader")).is_err());
     }
 }

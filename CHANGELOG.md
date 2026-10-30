@@ -23,6 +23,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - Destructive validation workflow: a full profile with hard stops, recorded manual checkpoints, verified -35 dB audio steps, reboot/reconnect identity checks, concurrent 409 assertions and a no-target `--plan` mode, with fake-device tests.
 - SECURITY.md describing the LAN trust model and how to report vulnerabilities.
 - Optional maximum master volume (off by default) on the ESP32 and the desktop daemon: `GET/POST /settings`, the `/status` page, or the `max_volume_db` config key. It clamps every volume write minidsp-open makes, including the TCP bridge and ezBEQ, and rejects rattle passes above it. The miniDSP's own knob and IR remote bypass it.
+- Optional ESP32 password (off by default), set on `/status` or during first WiFi setup. With it on, the board UI, API, OTA uploads and WebSockets need a login page session, Basic `admin` credentials or a Bearer token; the TCP bridge and UDP discovery stop until it's cleared. The CLI and `tools/ota-push.sh` read it from `--password-file` or `MINIDSP_PASSWORD`. Holding BOOT for ten seconds clears the password and WiFi.
 
 ### Changed
 
@@ -38,6 +39,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - ezBEQ state serialization and reusable service workers reduce ESP32 internal-RAM pressure during HTTP, WebSocket, and playback use.
 - Rattle plans and generators use memory proportional to tones plus volume passes, and ESP32 streams tones through the shared playback worker.
 - The default sweep fades in over at least one start-frequency cycle; timing markers remain enabled by default.
+- The ESP32 accepts request header blocks up to 1024 bytes (was 512), leaving room for a session cookie or Basic header on browser requests.
 - The advertised CLI version is 0.2.0 so ezBEQ enables Flex HTx input PEQs.
 - Protocol crate documentation states that supported builds require `std`.
 - Project history lives here; PROGRESS.md holds current status and open work.

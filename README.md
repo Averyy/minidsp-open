@@ -78,6 +78,8 @@ For driver development, use `ESP_UAC2_HOST_PATH="$HOME/code/esp-uac2-host/compon
 
 An optional maximum master volume limits HTTP, WebSocket, TCP bridge, and rattle playback levels; configure it through `/settings` (or the ESP32 `/status` page). It is off by default.
 
+ESP32 password protection is optional and off by default. Set it in `/status` → Device settings → Password (or during first WiFi setup). It protects the board UI, API, OTA and WebSockets, and disables the unauthenticated TCP bridge and UDP advertisements. CLI clients use `--daemon-url http://BOARD:5380 --password-file /path/to/password` or `MINIDSP_PASSWORD`. HTTP is unencrypted; use a trusted LAN. See [client compatibility](docs/ref-compatibility.md#optional-esp32-password).
+
 Use minidsp-open on a trusted LAN. See [SECURITY.md](SECURITY.md) for the trust model, limits, and private vulnerability reporting.
 
 ## Credits

@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-minidsp-protocol = { workspace = true }
+minidsp-protocol = { workspace = true, features = ["auth"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

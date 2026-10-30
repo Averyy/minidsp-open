@@ -13,6 +13,15 @@ pub fn load(partition: &EspDefaultNvsPartition) -> Result<(), Box<dyn std::error
         Some(255) | None => Settings::OFF,
         Some(_) => return Err("invalid stored maximum volume".into()),
     };
+    let mut bytes = [0; minidsp_protocol::auth::RECORD_BYTES];
+    let record = nvs
+        .get_blob("password", &mut bytes)?
+        .map(|bytes| {
+            minidsp_protocol::auth::PasswordRecord::decode(bytes)
+                .ok_or("invalid stored password record")
+        })
+        .transpose()?;
+    crate::auth::load(partition, record);
     *SETTINGS.lock().unwrap_or_else(|err| err.into_inner()) = settings;
     Ok(())
 }
@@ -27,5 +36,19 @@ pub fn save(
         .max_volume_db()
         .map_or(255, |db| (-2.0 * db) as u16);
     nvs.set_u16("max_vol", raw)?;
+    Ok(())
+}
+
+/// Save before publishing the new auth state, so a failed write retains protection.
+pub fn save_password(
+    partition: &EspDefaultNvsPartition,
+    record: Option<&minidsp_protocol::auth::PasswordRecord>,
+) -> Result<(), esp_idf_svc::sys::EspError> {
+    let nvs = EspNvs::<NvsDefault>::new(partition.clone(), "settings", true)?;
+    if let Some(record) = record {
+        nvs.set_blob("password", &record.encode())?;
+    } else {
+        nvs.remove("password")?;
+    }
     Ok(())
 }

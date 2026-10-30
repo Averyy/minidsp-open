@@ -31,6 +31,7 @@ and browser checks below.
 - [ ] Test the desktop rattle daemon on real audio hardware.
 - [ ] Check the maximum-volume ceiling on the board: it survives a reboot (NVS), clamps HTTP, ezBEQ and Device Console (TCP bridge) volume changes, lowers a louder current volume when set, and makes rattle refuse passes above it.
 - [ ] Check the browser-origin policy and provisioning changes on the board: hosted ezBEQ, `/status`, `/update` and their WebSockets from the board's IP and `.local` name; a foreign-origin POST gets 403; `/api/wifi/connect` is absent once on WiFi and present during provisioning; firmware upload and source override are refused in provisioning; repeated `/firmware/check` calls get the cooldown and internal RAM stays flat.
+- [ ] Check the optional password on the board: login/logout on `/status`, hosted ezBEQ and `/update` (cookie over HTTP and WebSocket, no browser credential dialog); CLI `--password-file` and `tools/ota-push.sh`; 401, 403 and 429 replies; TCP 5333 and UDP 3999 stopping while set and resuming when cleared; protected provisioning; the ten-second BOOT recovery and its LED; HA xuio URL credentials; and PBKDF2 timing at 10,000 iterations (lower it if a login takes over a second).
 - [ ] Support changing volume during a running rattle session after concurrent HID/audio is signed off. For now, volume passes use digital scaling under one master volume; HID routes return 409 while streaming.
 - [ ] Verify physical ESP32 output duration against the sample plan and the `/sync` latency target; enqueue completion isn't physical output completion.
 - [ ] Recheck non-default formats, back-to-back sample-rate changes, malformed requests, and the HID-only-device error on suitable hardware.
@@ -73,7 +74,7 @@ and default bridge/discovery services. The remaining gates are:
 
 - [ ] P0: compare beacon bytes/cadence with a physical Wi-DG; reconcile the branded SoftAP SSID/hostname and AP addressing with the planned DHCP pool/lease and AP+STA behavior; finish ESP32 TCP socket options, multi-client fan-out, and serialization. Verify desktop defaults against the zero-config discovery gate.
 - [ ] P1: reconcile ESP32/desktop mDNS hostname, HTTP service and TXT path with the fingerprint plan; add the planned HTTP-to-HTTPS redirect, certificate and Server header; reconcile STA DHCP hostname; use no-device appliance identity on ESP32 (desktop already does).
-- [ ] P3: default WPA2 provisioning with an opt-in open AP; optional management BasicAuth; certificate lifetime/subject; authenticated-only or absent log serving.
+- [ ] P3: default WPA2 provisioning with an opt-in open AP; Wi-DG-style management BasicAuth beyond the optional ESP32 password; certificate lifetime/subject; authenticated-only or absent log serving.
 - [ ] Decide whether desktop discovery should advertise a local USB bridge by default or offer an opt-out.
 
 ## Next steps and plans

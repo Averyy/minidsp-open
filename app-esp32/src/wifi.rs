@@ -798,6 +798,8 @@ button:hover,button:active{background:rgba(59,138,255,0.25);border-color:rgba(59
 <input id="ssid" name="ssid" required autofocus placeholder="Your WiFi network">
 <label for="password">Password</label>
 <input id="password" name="password" type="password" placeholder="WiFi password">
+<label for="board-password">Device password (optional, first setup)</label>
+<input id="board-password" name="board_password" type="password" autocomplete="new-password" placeholder="Leave blank for open LAN control">
 <button type="submit">Connect</button>
 </form>
 </div>

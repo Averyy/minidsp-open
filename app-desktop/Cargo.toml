@@ -11,7 +11,7 @@ name = "minidsp"
 path = "src/main.rs"
 
 [dependencies]
-minidsp-protocol = { workspace = true }
+minidsp-protocol = { workspace = true, features = ["auth"] }
 minidsp = { workspace = true }
 minidsp-daemon = { workspace = true }
 tokio = { workspace = true }

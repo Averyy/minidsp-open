@@ -69,6 +69,7 @@ pub(crate) async fn rattle(cli: &Cli, args: &RattleArgs) -> Result<(), Box<dyn s
     if base.is_none() && cli.daemon_sock.is_none() {
         return Err("rattle requires --daemon-url (or MINIDSPD_URL) pointing to a desktop daemon or ESP32 HTTP API; direct USB/TCP control transports cannot play audio".into());
     }
+    let authorization = cli.authorization.as_deref();
     let request = args.request();
     RattlePlan::build(request.clone())?;
     let id = cli
@@ -82,9 +83,16 @@ pub(crate) async fn rattle(cli: &Cli, args: &RattleArgs) -> Result<(), Box<dyn s
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
     let response = start_rattle_safely(
-        rattle_http(cli.daemon_sock.as_deref(), base, "POST", &path, &body),
+        rattle_http(
+            cli.daemon_sock.as_deref(),
+            base,
+            authorization,
+            "POST",
+            &path,
+            &body,
+        ),
         &mut interrupt,
-        || stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, &path),
+        || stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, authorization, &path),
     )
     .await?;
     let Some(response) = response else {
@@ -96,16 +104,17 @@ pub(crate) async fn rattle(cli: &Cli, args: &RattleArgs) -> Result<(), Box<dyn s
         let bytes = tokio::select! {
             signal = &mut interrupt => {
                 signal?;
-                stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, &path).await?;
+                stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, authorization, &path).await?;
                 return Ok(());
             },
-            bytes = rattle_http(cli.daemon_sock.as_deref(), base, "GET", &path, b"") => bytes,
+            bytes = rattle_http(cli.daemon_sock.as_deref(), base, authorization, "GET", &path, b"") => bytes,
         };
         let status: RattleStatus =
             match bytes.and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into)) {
                 Ok(status) => status,
                 Err(error) => {
-                    stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, &path).await?;
+                    stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, authorization, &path)
+                        .await?;
                     return Err(error);
                 }
             };
@@ -167,7 +176,7 @@ pub(crate) async fn rattle(cli: &Cli, args: &RattleArgs) -> Result<(), Box<dyn s
         tokio::select! {
             signal = &mut interrupt => {
                 signal?;
-                stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, &path).await?;
+                stop_rattle_and_confirm(cli.daemon_sock.as_deref(), base, authorization, &path).await?;
                 return Ok(());
             },
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {},
@@ -223,10 +232,11 @@ where
 async fn stop_rattle_and_confirm(
     socket: Option<&str>,
     base: Option<&str>,
+    authorization: Option<&str>,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stop_rattle_and_confirm_with(path, |method, path| async move {
-        rattle_http(socket, base, method, &path, b"").await
+        rattle_http(socket, base, authorization, method, &path, b"").await
     })
     .await
 }
@@ -284,6 +294,7 @@ where
 async fn rattle_http(
     socket: Option<&str>,
     base: Option<&str>,
+    authorization: Option<&str>,
     method: &str,
     path: &str,
     body: &[u8],
@@ -291,8 +302,12 @@ async fn rattle_http(
     let addr = base
         .map(crate::normalize_http_addr)
         .unwrap_or_else(|| "localhost".into());
+    let auth = authorization
+        .filter(|_| socket.is_none())
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut request = request.into_bytes();
@@ -577,7 +592,9 @@ pub async fn probe(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             devices_out.push(device_json_from_info(&client.device_info()));
         }
     } else if let Some(url) = cli.daemon_url.as_deref().or(env_daemon_url.as_deref()) {
-        devices_out.extend(discover_daemon_tcp(url).await?);
+        devices_out.extend(
+            crate::discover_daemon_tcp_authenticated(url, cli.authorization.as_deref()).await?,
+        );
     } else if let Some(path) = cli.usb.as_deref().or(env_usb.as_deref()) {
         let transport = crate::open_usb_selector(path, 0)?;
         let client = MiniDspClient::connect(Box::new(transport)).await?;

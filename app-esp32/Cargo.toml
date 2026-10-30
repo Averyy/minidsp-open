@@ -10,7 +10,7 @@ dev-updater-override = []
 
 [dependencies]
 # Shared protocol crate (std mode — ESP-IDF is std-on-FreeRTOS)
-minidsp-protocol = { path = "../protocol" }
+minidsp-protocol = { path = "../protocol", features = ["auth"] }
 
 # ESP-IDF Rust ecosystem with ESP-IDF 6.0 support.
 esp-idf-svc = { version = "0.53", features = ["alloc"] }

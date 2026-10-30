@@ -48,6 +48,12 @@ a{color:#6BA7FF}
 </div>
 <script>
 const $ = id => document.getElementById(id);
+const originalFetch = window.fetch.bind(window);
+async function authenticatedFetch(...args) {
+  const response = await originalFetch(...args);
+  if (response.status === 401) { location.assign('/login?next=/update'); throw new Error('Login required'); }
+  return response;
+}
 let waitingForReboot = null;
 let lastCheck = null;
 
@@ -55,7 +61,7 @@ function message(text, cls) { $('msg').textContent = text; $('msg').className = 
 
 async function refresh() {
   let s;
-  try { s = await (await fetch('/firmware', {cache: 'no-store'})).json(); }
+  try { s = await (await authenticatedFetch('/firmware', {cache: 'no-store'})).json(); }
   catch (e) { if (waitingForReboot) message('Rebooting…'); return; }
   $('version').textContent = s.version;
   $('build').textContent = s.build;
@@ -95,13 +101,13 @@ async function refresh() {
 
 $('check').onclick = async () => {
   $('check').disabled = true;
-  await fetch('/firmware/check', {method: 'POST'});
+  await authenticatedFetch('/firmware/check', {method: 'POST'});
   setTimeout(() => { $('check').disabled = false; }, 20000);
 };
 
 $('install').onclick = async () => {
   $('install').disabled = true;
-  const r = await fetch('/firmware/update', {method: 'POST'});
+  const r = await authenticatedFetch('/firmware/update', {method: 'POST'});
   if (!r.ok) message((await r.json()).error || 'Install failed', 'err');
 };
 
@@ -118,6 +124,7 @@ $('upload').onclick = () => {
     message('Uploading ' + Math.round(100 * e.loaded / e.total) + '%…');
   };
   xhr.onload = () => {
+    if (xhr.status === 401) { location.assign('/login?next=/update'); return; }
     $('bar').hidden = true;
     if (xhr.status === 200) {
       waitingForReboot = $('build').textContent; $('version').dataset.before = $('version').textContent;

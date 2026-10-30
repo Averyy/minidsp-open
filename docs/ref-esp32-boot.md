@@ -521,3 +521,9 @@ NVS has its own page-based wear leveling:
 
 ### Key design principle
 **The MiniDSP is always controllable.** WiFi down? USB HID still works locally. No internet? Stale catalogue data still works. Empty data partition? minidsp-rs API still works for direct DSP control. Every degradation mode preserves core functionality.
+
+## Password and WiFi recovery
+
+After normal boot, hold **BOOT (GPIO0) for ten seconds**. The RGB LED flashes red/blue while held; releasing early cancels. The firmware clears its optional password and saved WiFi, revokes sessions, and restarts into the open provisioning AP. DSP settings, the controller volume ceiling and catalogue data stay intact. Do not hold BOOT while pressing RESET or applying power: GPIO0 is a strapping pin and that enters the ROM downloader instead of application recovery.
+
+WiFi failure by itself never clears a configured password. The fallback AP's landing page and captive probes remain public, but saving WiFi requires logging in. A lost password requires the physical gesture. There is no USB-serial command console; the fallback is erasing NVS over USB (`tools/esptool --chip esp32s3 -p PORT erase-region 0x9000 0x6000`) and restarting. NVS erase also removes the maximum-volume ceiling; ordinary app reflashing preserves NVS/passwords.

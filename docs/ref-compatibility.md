@@ -738,3 +738,29 @@ Before phase 1 implementation is called complete, freeze these exact items here:
 - raw bridge behavior on `/devices/{id}/ws`
 - representative TCP frame transcript or packet capture
 - representative UDP discovery packet bytes
+
+## Optional ESP32 password
+
+This is additive and opt-in. Without a password the existing LAN control contract stays unchanged. Enable it on `/status` → Device settings → Password or in the optional first-provisioning field. All HTTP/WS control then requires a session cookie, Basic `admin:<password>`, or Bearer session token. WiFi fallback retains the gate. TCP 5333 and legacy UDP 3999 advertising stop while protected, and resume when cleared; mDNS remains public.
+
+| Client | Protected firmware support |
+|---|---|
+| Board-hosted ezBEQ UI, `/status`, `/update` | Browser login; same-origin session cookie covers HTTP and WS |
+| External ezBEQ | Updated minidsp-open CLI through `exe` / `options`, below; omit direct WS settings |
+| HA xuio/minidsp-rs-hass | Basic via `http://admin:ENCODED_PASSWORD@BOARD:5380`; source-inspected, unverified live for HTTP/WS; URL may appear in debug logs |
+| HA jprouty/hass-minidsp-rs | Cannot authenticate without modification |
+| HA BadLiveware/minidsp-rs-homeassistant | Cannot authenticate; rejects URL credentials |
+| HA RESTful Command | Basic username/password or Bearer Authorization header |
+| Stock minidsp-rs CLI | Cannot authenticate; URL credentials do not add Authorization |
+| Device Console / official mobile app | Cannot authenticate; TCP bridge disabled |
+
+For external ezBEQ, point `exe` at the updated minidsp-open binary and use:
+
+```yaml
+exe: /usr/local/bin/minidsp
+options: '--daemon-url http://BOARD:5380 --password-file /config/minidsp-password'
+```
+
+Omit `wsDeviceId` and `wsIp`: ezBEQ's direct WebSocket connection has no credential configuration. Its `options` splits on spaces, so use a password-file path without spaces. CLI `--password-file` overrides `MINIDSP_PASSWORD`; the UTF-8 file has one optional trailing LF/CRLF removed. Environment values are used exactly. Both accept 1–128 UTF-8 bytes. There is no plaintext password argument, because ezBEQ logs command lines. Protect the password file and service environment. `tools/ota-push.sh` accepts the same `--password-file` / `MINIDSP_PASSWORD` credentials for every curl call.
+
+`POST /login {"password":"..."}` returns a session token and `Set-Cookie: minidsp_session=...; Path=/; HttpOnly; SameSite=Strict`. Use `Authorization: Bearer <token>` for native HTTP/WS clients. `POST /logout` revokes that session. Sessions expire after 30 minutes idle or 12 hours total, and on reboot. `POST /settings/password` accepts `{"current":"...","new":"..."}` or `{"current":"...","clear":true}`; the current password is required when protected, and every session/WS connection is revoked after a change. `GET /settings/password` reports `passwordSet`. Invalid credentials yield 401 JSON. Native clients also get a `WWW-Authenticate: Basic` challenge; browser requests (with `Origin`, `Referer` or `Sec-Fetch-Mode`) don't, so the browser shows no credential dialog, and HTML GET navigation redirects to `/login`. A wrong `current` password yields 403, and backoff yields 429 with `Retry-After`. Basic WS connections stay open until the password changes. Plain HTTP exposes credentials and tokens to LAN interception; see [SECURITY.md](../SECURITY.md).

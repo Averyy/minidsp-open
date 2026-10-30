@@ -55,6 +55,13 @@ struct Cli {
     #[arg(long = "daemon-url", value_name = "URL")]
     daemon_url: Option<String>,
 
+    /// Password file for a protected board (overrides MINIDSP_PASSWORD); one trailing newline is removed
+    #[arg(long, value_name = "PATH")]
+    password_file: Option<PathBuf>,
+
+    #[arg(skip)]
+    authorization: Option<String>,
+
     /// Connect to a specific USB path or vid[:pid] selector
     #[arg(long, value_name = "PATH")]
     usb: Option<String>,
@@ -81,6 +88,33 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+fn resolve_authorization(
+    file: Option<&std::path::Path>,
+    env: Option<String>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let password = if let Some(path) = file {
+        let mut text =
+            std::fs::read_to_string(path).map_err(|_| "could not read password file as UTF-8")?;
+        if text.ends_with('\n') {
+            text.pop();
+            if text.ends_with('\r') {
+                text.pop();
+            }
+        }
+        Some(text)
+    } else {
+        env
+    };
+    password
+        .map(|password| {
+            if password.is_empty() || password.len() > minidsp_protocol::auth::MAX_PASSWORD_BYTES {
+                return Err("password must be 1–128 UTF-8 bytes".into());
+            }
+            Ok(minidsp_protocol::auth::basic_header(&password))
+        })
+        .transpose()
 }
 
 /// Map a --force-kind string to (hw_id, dsp_version).
@@ -474,7 +508,17 @@ fn make_log_writer(path: &PathBuf) -> Result<BoxMakeWriter, Box<dyn std::error::
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.authorization = match resolve_authorization(
+        cli.password_file.as_deref(),
+        std::env::var("MINIDSP_PASSWORD").ok(),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
     let log_path = cli
         .log_path
         .clone()
@@ -874,7 +918,7 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
 
     // 4. Daemon URL (or MINIDSPD_URL env var) — connects via WebSocket to /devices/{id}/ws
     if let Some(url) = cli.daemon_url.as_deref().or(env_daemon_url.as_deref()) {
-        let devices = discover_daemon_tcp(url).await?;
+        let devices = discover_daemon_tcp_authenticated(url, cli.authorization.as_deref()).await?;
         if device_idx >= devices.len() {
             return Err(format!(
                 "device index {device_idx} out of range (found {} device{})",
@@ -883,7 +927,9 @@ pub(crate) async fn connect(cli: &Cli) -> Result<MiniDspClient, Box<dyn std::err
             )
             .into());
         }
-        let transport = WsTransport::connect(url, device_idx).await?;
+        let transport =
+            WsTransport::connect_authenticated(url, device_idx, cli.authorization.as_deref())
+                .await?;
         return Ok(MiniDspClient::connect(Box::new(transport)).await?);
     }
 
@@ -1054,9 +1100,20 @@ fn normalize_http_addr(base: &str) -> String {
 pub(crate) async fn discover_daemon_tcp(
     base: &str,
 ) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
+    discover_daemon_tcp_authenticated(base, None).await
+}
+
+pub(crate) async fn discover_daemon_tcp_authenticated(
+    base: &str,
+    authorization: Option<&str>,
+) -> Result<Vec<DeviceJson>, Box<dyn std::error::Error>> {
     let addr = normalize_http_addr(base);
     let mut stream = tokio::net::TcpStream::connect(&addr).await?;
-    let request = format!("GET /devices HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let auth = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let request =
+        format!("GET /devices HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
     let buf = read_http_response(&mut stream).await?;
     parse_device_list_response(&buf)
@@ -1302,6 +1359,39 @@ mod tests {
 
     // minidsp-rs 8e987f9, protocol/src/device/probe.rs:19-49 and
     // minidsp/src/transport/hid/discover.rs:26-37, main.rs:127-133.
+    #[test]
+    fn password_file_flag_and_environment_resolution() {
+        let cli = Cli::try_parse_from([
+            "minidsp",
+            "--daemon-url",
+            "http://board:5380",
+            "--password-file",
+            "/tmp/secret",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.password_file.as_deref(),
+            Some(std::path::Path::new("/tmp/secret"))
+        );
+        assert!(Cli::try_parse_from(["minidsp", "--password", "exposed"]).is_err());
+        assert!(resolve_authorization(None, None).unwrap().is_none());
+        assert_eq!(
+            resolve_authorization(None, Some("env secret".into())).unwrap(),
+            Some(minidsp_protocol::auth::basic_header("env secret"))
+        );
+        let path =
+            std::env::temp_dir().join(format!("minidsp-password-test-{}", std::process::id()));
+        std::fs::write(&path, "file secret\r\n").unwrap();
+        let result = resolve_authorization(Some(&path), Some("env secret".into())).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            result,
+            Some(minidsp_protocol::auth::basic_header("file secret"))
+        );
+        assert!(resolve_authorization(None, Some(String::new())).is_err());
+        assert!(resolve_authorization(Some(&path), Some("fallback".into())).is_err());
+    }
+
     #[test]
     fn upstream_force_kinds_usb_urls_and_tcp_default_port() {
         for kind in [

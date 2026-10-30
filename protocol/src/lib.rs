@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "auth")]
+pub mod auth;
 pub mod biquad;
 pub mod commands;
 pub mod default_preset;

@@ -18,6 +18,7 @@ use log::{error, info, warn};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod auth;
 mod device;
 mod diagnostics;
 mod ezbeq;
@@ -119,6 +120,8 @@ fn main() {
             None
         }
     };
+
+    auth::network_ready();
 
     let wifi_is_sta = wifi_handle.as_ref().is_some_and(|h| h.is_sta);
 
@@ -287,11 +290,13 @@ fn main() {
     diagnostics::log_task_stacks();
     info!("minidsp-open ready");
 
+    auth::recovery_ready();
     // Main loop: diagnostics tick + USB device detection/reconnection
     let mut usb_backoff = Duration::from_secs(5);
     let mut next_diagnostics = Instant::now();
     let mut next_usb_scan = Instant::now();
     loop {
+        auth::maintenance();
         if Instant::now() >= next_diagnostics {
             diagnostics::tick();
             next_diagnostics = Instant::now() + Duration::from_secs(5);
@@ -378,7 +383,7 @@ fn discover_and_activate_device(
         if age < ATTACH_SETTLE {
             let wait = ATTACH_SETTLE - age;
             info!("USB state: waiting {wait:?} for device firmware warmup after attach");
-            std::thread::sleep(wait);
+            auth::responsive_sleep(wait);
         }
     }
 
@@ -400,7 +405,7 @@ fn discover_and_activate_device(
                     info!(
                         "USB state: waiting {wait:?} for device firmware warmup after root-port recycle"
                     );
-                    std::thread::sleep(wait);
+                    auth::responsive_sleep(wait);
                 }
             }
             probe_device_with_retries(bus.clone(), Duration::from_secs(20))
@@ -462,7 +467,7 @@ fn probe_device_with_retries(
         if !(bus.is_connected() || bus.has_present_device().unwrap_or(false)) {
             return Err(usb_hid::UsbHidError::Disconnected);
         }
-        std::thread::sleep(RETRY_DELAY);
+        auth::responsive_sleep(RETRY_DELAY);
     };
 
     Err(final_err)
@@ -577,97 +582,123 @@ fn tcp_bridge(state: http_server::SharedDeviceState, audio_state: usb_audio::Sha
 
     const TCP_BRIDGE_BUSY_FRAME: [u8; 1] = [minidsp_protocol::commands::RESP_ERROR];
 
-    let listener = match TcpListener::bind("0.0.0.0:5333") {
-        Ok(l) => l,
-        Err(e) => {
-            log::error!("TCP bridge: failed to bind port 5333: {e}");
-            return;
+    // The optional password has no TCP equivalent, so the bridge stops
+    // listening while one is set and the listener polls to notice changes.
+    loop {
+        while auth::protected() {
+            std::thread::sleep(Duration::from_millis(250));
         }
-    };
-    log::info!("TCP bridge listening on port 5333");
-
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
+        let listener = match TcpListener::bind("0.0.0.0:5333") {
+            Ok(l) => l,
             Err(e) => {
-                log::warn!("TCP bridge: accept error: {e}");
+                log::error!("TCP bridge: failed to bind port 5333: {e}");
+                std::thread::sleep(Duration::from_secs(5));
                 continue;
             }
         };
-        log::info!("TCP bridge: client connected from {:?}", stream.peer_addr());
+        log::info!("TCP bridge listening on port 5333");
 
-        // Set read timeout to detect disconnects
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-
-        // Persistent read buffer for TCP stream reassembly (handles zero-padding from WI-DG)
-        let mut read_buf = Vec::with_capacity(256);
-        let mut tmp = [0u8; 128];
-
+        let _ = listener.set_nonblocking(true);
         loop {
-            // Try to decode a frame from buffered data first
-            if let Some((payload, consumed)) = minidsp_protocol::packet::decode_tcp_frame(&read_buf)
-            {
-                read_buf.drain(..consumed);
+            if auth::protected() {
+                log::info!("TCP bridge: stopped while password protection is on");
+                break;
+            }
+            let mut stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("TCP bridge: accept error: {e}");
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+            use std::os::fd::AsRawFd;
+            auth::tcp_connected(stream.as_raw_fd());
+            let _ = stream.set_nonblocking(false);
+            log::info!("TCP bridge: client connected from {:?}", stream.peer_addr());
 
-                if audio_state.is_playing() {
-                    log::warn!("TCP bridge: rejecting command during playback");
-                    if stream.write_all(&TCP_BRIDGE_BUSY_FRAME).is_err() {
-                        break;
+            // Set read timeout to detect disconnects
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+
+            // Persistent read buffer for TCP stream reassembly (handles zero-padding from WI-DG)
+            let mut read_buf = Vec::with_capacity(256);
+            let mut tmp = [0u8; 128];
+
+            loop {
+                if auth::protected() {
+                    break;
+                }
+                // Try to decode a frame from buffered data first
+                if let Some((payload, consumed)) =
+                    minidsp_protocol::packet::decode_tcp_frame(&read_buf)
+                {
+                    read_buf.drain(..consumed);
+
+                    if audio_state.is_playing() {
+                        log::warn!("TCP bridge: rejecting command during playback");
+                        if stream.write_all(&TCP_BRIDGE_BUSY_FRAME).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // Forward to device
+                    let dev = match http_server::get_device(&state) {
+                        Some(d) => d,
+                        None => {
+                            log::warn!("TCP bridge: no device connected");
+                            // Don't break — keep connection alive, device may reconnect
+                            continue;
+                        }
+                    };
+                    let response = http_server::tcp_bridge_command_with_audio_coordination(
+                        &state,
+                        &audio_state,
+                        &dev,
+                        &payload,
+                    );
+
+                    match response {
+                        Ok(resp_frame) => {
+                            if stream.write_all(&resp_frame).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            if http_server::is_device_busy_error(&e) {
+                                if stream.write_all(&TCP_BRIDGE_BUSY_FRAME).is_err() {
+                                    break;
+                                }
+                            } else {
+                                log::warn!("TCP bridge: device error: {e}");
+                            }
+                            // Don't break — keep connection alive
+                        }
                     }
                     continue;
                 }
 
-                // Forward to device
-                let dev = match http_server::get_device(&state) {
-                    Some(d) => d,
-                    None => {
-                        log::warn!("TCP bridge: no device connected");
-                        // Don't break — keep connection alive, device may reconnect
-                        continue;
-                    }
-                };
-                let response = http_server::tcp_bridge_command_with_audio_coordination(
-                    &state,
-                    &audio_state,
-                    &dev,
-                    &payload,
-                );
-
-                match response {
-                    Ok(resp_frame) => {
-                        if stream.write_all(&resp_frame).is_err() {
+                // Need more data — read from socket
+                match stream.read(&mut tmp) {
+                    Ok(0) => break, // Client disconnected
+                    Ok(n) => {
+                        read_buf.extend_from_slice(&tmp[..n]);
+                        // Cap buffer to prevent OOM on malformed/malicious input
+                        if read_buf.len() > 1024 {
+                            log::warn!("TCP bridge: oversized buffer, dropping connection");
                             break;
                         }
                     }
-                    Err(e) => {
-                        if http_server::is_device_busy_error(&e) {
-                            if stream.write_all(&TCP_BRIDGE_BUSY_FRAME).is_err() {
-                                break;
-                            }
-                        } else {
-                            log::warn!("TCP bridge: device error: {e}");
-                        }
-                        // Don't break — keep connection alive
-                    }
+                    Err(_) => break,
                 }
-                continue;
             }
-
-            // Need more data — read from socket
-            match stream.read(&mut tmp) {
-                Ok(0) => break, // Client disconnected
-                Ok(n) => {
-                    read_buf.extend_from_slice(&tmp[..n]);
-                    // Cap buffer to prevent OOM on malformed/malicious input
-                    if read_buf.len() > 1024 {
-                        log::warn!("TCP bridge: oversized buffer, dropping connection");
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
+            auth::tcp_disconnected();
+            log::info!("TCP bridge: client disconnected");
         }
-        log::info!("TCP bridge: client disconnected");
     }
 }
 
@@ -693,6 +724,9 @@ fn udp_discovery(state: http_server::SharedDeviceState) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
+        if auth::protected() {
+            continue;
+        }
         let Some(packet) = discovery_packet_for_state(&state) else {
             continue;
         };

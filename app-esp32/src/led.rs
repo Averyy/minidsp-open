@@ -41,6 +41,7 @@ pub enum LedState {
     MiniDspUnavailable,
     MiniDspReady,
     BackgroundUpdate,
+    Recovery,
     Fatal,
 }
 
@@ -110,6 +111,7 @@ struct LedStatus {
     mode: LedMode,
     device_ready: bool,
     background_update: bool,
+    recovery: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +119,7 @@ enum LedCommand {
     Mode(LedMode),
     DeviceReady(bool),
     BackgroundUpdate(bool),
+    Recovery(bool),
 }
 
 pub struct BackgroundUpdateGuard;
@@ -127,12 +130,16 @@ impl Default for LedStatus {
             mode: LedMode::Booting,
             device_ready: false,
             background_update: false,
+            recovery: false,
         }
     }
 }
 
 impl LedStatus {
     fn resolve(self) -> LedState {
+        if self.recovery {
+            return LedState::Recovery;
+        }
         match self.mode {
             LedMode::Fatal => LedState::Fatal,
             LedMode::Booting => LedState::Booting,
@@ -189,6 +196,10 @@ impl LedController {
     pub fn set_background_update(&self, active: bool) {
         let _ = self.tx.send(LedCommand::BackgroundUpdate(active));
     }
+
+    pub fn set_recovery(&self, held: bool) {
+        let _ = self.tx.send(LedCommand::Recovery(held));
+    }
 }
 
 impl Drop for BackgroundUpdateGuard {
@@ -221,6 +232,13 @@ pub fn set_device_ready(ready: bool) {
 pub fn set_background_update(active: bool) {
     if let Some(controller) = GLOBAL_CONTROLLER.get() {
         controller.set_background_update(active);
+    }
+}
+
+/// Overlays the BOOT-hold recovery pattern; clearing it restores the current mode.
+pub fn set_recovery(held: bool) {
+    if let Some(controller) = GLOBAL_CONTROLLER.get() {
+        controller.set_recovery(held);
     }
 }
 
@@ -302,6 +320,13 @@ impl<'d> Led<'d> {
             LedState::MiniDspReady => Rgb::GREEN.scale(0.6),
             LedState::BackgroundUpdate => {
                 Self::breathe_color(Rgb::GREEN, elapsed, STATE_BREATHE_PERIOD, 0.0, 1.0)
+            }
+            LedState::Recovery => {
+                if elapsed.as_millis() % 400 < 200 {
+                    Rgb::RED
+                } else {
+                    Rgb::BLUE
+                }
             }
             LedState::Fatal => Rgb::RED,
         }
@@ -417,5 +442,6 @@ fn apply_command(status: &mut LedStatus, command: LedCommand) {
         }
         LedCommand::DeviceReady(ready) => status.device_ready = ready,
         LedCommand::BackgroundUpdate(active) => status.background_update = active,
+        LedCommand::Recovery(held) => status.recovery = held,
     }
 }

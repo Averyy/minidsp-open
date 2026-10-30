@@ -108,6 +108,27 @@ impl XferSync {
     }
 
     fn wait(&self, timeout: Duration) -> Result<i32, UsbHidError> {
+        if crate::auth::on_main_task() {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                crate::auth::maintenance();
+                let guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let result = self
+                    .condvar
+                    .wait_timeout_while(guard, remaining.min(Duration::from_millis(100)), |_| {
+                        !self.done.load(Ordering::SeqCst)
+                    })
+                    .map_err(|_| UsbHidError::Transfer("condvar poisoned".into()))?;
+                if self.done.load(Ordering::SeqCst) {
+                    return Ok(self.status.load(Ordering::SeqCst));
+                }
+                drop(result);
+                if std::time::Instant::now() >= deadline {
+                    return Err(UsbHidError::Timeout);
+                }
+            }
+        }
         let guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
         let result = self
             .condvar
@@ -1035,6 +1056,7 @@ fn wait_and_open_device(
 
     // Loop: wait for device events, try to open each one, skip non-MiniDSP devices
     loop {
+        crate::auth::maintenance();
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(UsbHidError::DeviceNotFound);
@@ -1124,7 +1146,7 @@ fn wait_for_attach_settle(reason: &str) {
 
     let wait = OPEN_SETTLE - age;
     info!("USB: waiting {wait:?} before opening device ({reason})");
-    std::thread::sleep(wait);
+    crate::auth::responsive_sleep(wait);
 }
 
 fn open_device_at_addr_when_settled(

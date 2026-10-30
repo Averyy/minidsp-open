@@ -55,6 +55,8 @@ pub(crate) const DEVICE_BUSY: &str = "device busy";
 pub(crate) const HID_BUSY_DURING_PLAYBACK: &str = "device busy during playback";
 static PLAYBACK_STREAM_BUF: Mutex<[u8; 2880]> = Mutex::new([0u8; 2880]);
 const EZBEQ_SHIM_JS: &str = include_str!("../static/ezbeq-shim.js");
+/// Prepended to the board UI shim while password protection is on.
+const AUTH_UI_JS: &str = include_str!("../static/auth-ui.js");
 const STATUS_PAGE_HTML: &str = include_str!("../static/status.html");
 const FIRMWARE_PAGE_HTML: &str = include_str!("../static/firmware.html");
 
@@ -102,6 +104,24 @@ pub fn start(
         ..Default::default()
     };
     let mut server = EspHttpServer::new(&config)?;
+
+    use esp_idf_svc::handle::RawHandle;
+    crate::auth::server_started(server.handle(), ap_ip.is_some());
+    server.fn_handler("/login", Method::Get, |req| {
+        send_html(req, include_str!("../static/login.html"))
+    })?;
+    // Registered so httpd dispatches these URIs through the origin wrapper,
+    // where `auth::route` answers them before this placeholder runs.
+    for (path, method) in [
+        ("/login", Method::Post),
+        ("/logout", Method::Post),
+        ("/settings/password", Method::Get),
+        ("/settings/password", Method::Post),
+    ] {
+        server.fn_handler(path, method, |req| {
+            send_json(req, 500, r#"{"error":"auth route not handled"}"#)
+        })?;
+    }
 
     // Registered normally so the global Origin guard covers POST /settings.
     server.fn_handler("/settings", Method::Get, |req| {
@@ -1121,11 +1141,18 @@ pub fn start(
     })?;
 
     server.fn_handler("/ezbeq-shim.js", Method::Get, |req| {
+        let prefix = if crate::auth::protected() {
+            AUTH_UI_JS
+        } else {
+            ""
+        };
         let path = crate::storage::full_path("ui/ezbeq-shim.js");
         if std::path::Path::new(&path).exists() {
-            send_static_file(req, &path)
-        } else {
+            send_static_file_with_prefix(req, &path, prefix.as_bytes())
+        } else if prefix.is_empty() {
             send_javascript(req, EZBEQ_SHIM_JS)
+        } else {
+            send_javascript(req, &format!("{prefix}\n{EZBEQ_SHIM_JS}"))
         }
     })?;
 
@@ -1154,7 +1181,9 @@ pub fn start(
     if ap_ip.is_some() {
         server.fn_handler("/", Method::Get, |req| {
             info!("serving provisioning page");
-            send_html(req, crate::wifi::PROVISION_HTML)
+            if crate::auth::protected() {
+                send_html(req, &crate::wifi::PROVISION_HTML.replace("<form method=", r#"<p><a href="/login?next=/">Log in before saving WiFi</a></p><form method="#))
+            } else { send_html(req, crate::wifi::PROVISION_HTML) }
         })?;
     } else {
         let nvs_root = nvs.clone();
@@ -1182,7 +1211,7 @@ pub fn start(
         // POST /api/wifi/connect — WiFi provisioning form handler
         let nvs_wifi = nvs.clone();
         server.fn_handler("/api/wifi/connect", Method::Post, move |mut req| {
-            let body_bytes = match read_request_body(&mut req, 512) {
+            let body_bytes = match read_request_body(&mut req, 1024) {
                 Ok(b) => b,
                 Err(msg) => return send_provision_error(req, msg),
             };
@@ -1191,12 +1220,14 @@ pub fn start(
             // Parse form-encoded body: ssid=...&password=...
             let mut ssid = String::new();
             let mut password = String::new();
+            let mut board_password = String::new();
             for pair in body.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
                     let decoded = urldecode(value);
                     match key {
                         "ssid" => ssid = decoded,
                         "password" => password = decoded,
+                        "board_password" => board_password = decoded,
                         _ => {}
                     }
                 }
@@ -1206,6 +1237,12 @@ pub fn start(
                 return send_provision_error(req, "SSID is required");
             }
 
+            // A protected board can only change its password through /settings/password.
+            if !crate::auth::protected() && !board_password.is_empty() {
+                if let Err(e) = crate::auth::set_password(Some(&board_password)) {
+                    return send_provision_error(req, &e);
+                }
+            }
             // Save credentials to NVS (partition passed from main — not ::take())
             if let Err(e) = crate::wifi::save_credentials(&nvs_wifi, &ssid, &password) {
                 return send_provision_error(req, &format!("Save failed: {e}"));
@@ -5173,10 +5210,14 @@ unsafe fn reject_origin(req: *mut esp_idf_svc::sys::httpd_req_t) -> esp_idf_svc:
 unsafe extern "C" fn ws_check_origin(
     req: *mut esp_idf_svc::sys::httpd_req_t,
 ) -> esp_idf_svc::sys::esp_err_t {
-    if request_origin_allowed(req) {
+    if !request_origin_allowed(req) {
+        reject_origin(req)
+    } else if crate::auth::gate(req, true).is_ok() {
         esp_idf_svc::sys::ESP_OK
     } else {
-        reject_origin(req)
+        // The gate already sent its 401/429; any non-OK result stops IDF
+        // from sending the 101 handshake after it.
+        esp_idf_svc::sys::ESP_FAIL
     }
 }
 
@@ -5190,6 +5231,10 @@ unsafe extern "C" fn origin_checked_handler(
     if httpd_ws_get_fd_info((*req).handle, httpd_req_to_sockfd(req))
         == httpd_ws_client_info_t_HTTPD_WS_CLIENT_WEBSOCKET
     {
+        if !crate::auth::websocket_allowed(httpd_req_to_sockfd(req)) {
+            httpd_sess_trigger_close((*req).handle, httpd_req_to_sockfd(req));
+            return ESP_FAIL;
+        }
         return NATIVE_HTTP_HANDLER
             .get()
             .map_or(ESP_FAIL, |handler| handler(req));
@@ -5205,6 +5250,12 @@ unsafe extern "C" fn origin_checked_handler(
     .contains(&((*req).method as u32));
     if protected && !allowed {
         return reject_origin(req);
+    }
+    if let Err(result) = crate::auth::gate(req, false) {
+        return result;
+    }
+    if let Some(result) = crate::auth::route(req) {
+        return result;
     }
     let origin = if allowed {
         request_header(req, c"Origin").ok().flatten()
@@ -6069,6 +6120,15 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
     req: esp_idf_svc::http::server::Request<C>,
     path: &str,
 ) -> Result<(), C::Error> {
+    send_static_file_with_prefix(req, path, b"")
+}
+
+/// `prefix` is written before the file, separated by a newline when present.
+fn send_static_file_with_prefix<C: esp_idf_svc::http::server::Connection>(
+    req: esp_idf_svc::http::server::Request<C>,
+    path: &str,
+    prefix: &[u8],
+) -> Result<(), C::Error> {
     // Open file BEFORE sending 200 — if it fails, return 404
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -6107,6 +6167,10 @@ fn send_static_file<C: esp_idf_svc::http::server::Connection>(
         ("Cache-Control", cache_control),
     ];
     let mut resp = req.into_response(200, None, &headers)?;
+    if !prefix.is_empty() {
+        resp.write_all(prefix)?;
+        resp.write_all(b"\n")?;
+    }
     let mut buf = [0u8; LARGE_RESPONSE_STREAM_CHUNK_BYTES];
     let mut chunks_written = 0usize;
     loop {

@@ -70,6 +70,11 @@ CONFIG_HTTPD_WS_SUPPORT=y
 # IDF >=6.0.1 uses a separate callback for connection-time WS initialization.
 CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
 CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y
+# The limit covers the whole header block. Plain-HTTP browser requests reach
+# ~450 bytes before the optional password adds a session cookie or Basic
+# header. IDF grows the per-request scratch buffer on demand, so this costs
+# nothing until a request needs it.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 
 # mDNS
 CONFIG_MDNS_MAX_SERVICES=4
