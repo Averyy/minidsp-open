@@ -65,3 +65,14 @@ opt-level = 3
 
 [profile.release.package.esp-idf-sys]
 opt-level = 3
+
+# The optional password's PBKDF2 (10,000 HMAC-SHA256 rounds) runs on every
+# login; at "s" a login took about a second on the board.
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.hmac]
+opt-level = 3
+
+[profile.release.package.pbkdf2]
+opt-level = 3
