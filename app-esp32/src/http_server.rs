@@ -2908,7 +2908,7 @@ fn openapi_rattle_path() -> serde_json::Value {
                     "toneSec": {"type": "number", "default": 4}, "gapSec": {"type": "number", "default": 1},
                     "cycles": {"type": "integer", "default": 1},
                     "volumesDb": {"type": "array", "default": [-35], "items": {"type": "number", "minimum": -127, "maximum": 0}},
-                    "sampleRate": {"type": "integer", "default": 48000}, "bitDepth": {"type": "integer", "enum": [16, 24], "default": 16}
+                    "sampleRate": {"type": "integer", "default": 48000}, "bitDepth": {"type": "string", "enum": ["16", "24"], "default": "16"}
                 }
             }}}},
             "responses": {
