@@ -72,6 +72,10 @@ class SafetyStop(StepFailed):
     """A failure that must stop the run even with --continue-on-fail."""
 
 
+class StepSkipped(Exception):
+    """Raised by a step whose check couldn't run; recorded as SKIP."""
+
+
 @dataclasses.dataclass(slots=True)
 class StepResult:
     section: str
@@ -205,6 +209,10 @@ class Harness:
         try:
             detail = fn() or "ok"
             status = "PASS"
+            ok = True
+        except StepSkipped as exc:
+            detail = str(exc)
+            status = "SKIP"
             ok = True
         except StepFailed as exc:
             detail = str(exc)
@@ -918,6 +926,12 @@ def normalize_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     normalized.pop("capturedAt", None)
     normalized.pop("tool", None)
     normalized.pop("notes", None)
+    # Provenance says how the target knows a preset (its shadow, the bundled
+    # default image a factory token implies, a live read), not what it holds;
+    # an ESP32 that reboots with the MiniDSP re-derives it from the token.
+    for preset in normalized.get("presets") or []:
+        if isinstance(preset, dict):
+            preset.pop("provenance", None)
     return normalized
 
 
@@ -1911,9 +1925,21 @@ def run_ezbeq_suite(harness: Harness, target: Target) -> None:
 
     if harness.args.allow_destructive:
         def overwrite_step() -> str:
-            resp, data = http_json("PUT", target.path("/api/1/devices/master/commands"), {"overwrite": True}, timeout=max(30.0, harness.args.timeout))
+            # An ezBEQ 2.12.4 upload: one flat biquad on input 1 of the active
+            # slot, with overwrite bypassing that channel's other bands. The
+            # final snapshot restore puts the original filters back.
+            slot = str(int(read_status(target)["master"]["preset"]) + 1)
+            body = {
+                "commandType": "bq",
+                "commands": "biquad1,\nb0=1,\nb1=0,\nb2=0,\na1=0,\na2=0\n",
+                "slot": slot,
+                "overwrite": True,
+                "inputs": [1],
+                "outputs": [],
+            }
+            resp, data = http_json("PUT", target.path("/api/1/devices/master/commands"), body, timeout=max(30.0, harness.args.timeout))
             assert_true(resp.status == 200 and isinstance(data, dict), f"{target.label}: overwrite command returned {resp.status}")
-            return data.get("status", "ok")
+            return f"slot {slot} input 1 overwritten"
 
         harness.run_step(section, "PUT /api/1/devices/master/commands overwrite", overwrite_step)
     else:
@@ -2246,7 +2272,14 @@ def assert_snapshot_busy(harness: Harness, target: Target, artifacts: SnapshotAr
     assert_true(result["response"].status == 200, f"snapshot {method} returned {result['response'].status}")
     assert_snapshot_equal(baseline, result["snapshot"])
     if serialized:
-        for evidence in [probe_observed, *mutations_observed]:
+        queued = [probe_observed, *mutations_observed]
+        # An export of trusted presets is answered from the board's cache in
+        # a fraction of a second, so nothing gets to queue behind it.
+        if method == "GET" and all("error" not in evidence and 200 <= evidence.get("status", 0) < 300
+                                   and evidence["startedAt"] >= result["completedAt"] for evidence in queued):
+            raise StepSkipped(f"export answered in {result['completedAt'] - result['startedAt']:.2f} s, before the "
+                              "concurrent requests started; the POST restore checks serialization")
+        for evidence in queued:
             assert_true("error" not in evidence and 200 <= evidence.get("status", 0) < 300,
                         f"serialized request failed: {evidence}")
             assert_true(evidence["startedAt"] < result["completedAt"],

@@ -181,6 +181,13 @@ class FakeDevice:
             return self.response(200, {"status": "rebooted"})
         if path == "/api/2/devices":
             return self.response(200, {"master": {"slots": [{"id": "1", "last": "Empty"}]}})
+        if path == "/api/1/devices/master/commands" and method == "PUT":
+            # The ezBEQ 2.12.4 upload shape the board accepts.
+            valid = (payload.get("commandType") == "bq" and isinstance(payload.get("commands"), str)
+                     and payload.get("slot") in ("1", "2", "3", "4") and isinstance(payload.get("overwrite"), bool)
+                     and isinstance(payload.get("inputs"), list) and isinstance(payload.get("outputs"), list)
+                     and bool(payload["inputs"] or payload["outputs"]))
+            return self.response(200, {"master": {}}) if valid else self.response(400, {"message": "invalid upload"})
         if path == "/api/3/devices/master" and method == "PATCH":
             self.state["master"]["volume"] = self.clamp_volume(payload["masterVolume"])
             return self.response(200, {})
@@ -448,6 +455,18 @@ class LiveValidationTests(unittest.TestCase):
                     self.assertEqual(self.device.state["master"]["volume"], -18)
                     self.assertEqual(sum(m == "GET" and p == "/settings" for m, p, _ in self.device.calls), 1)
 
+    def test_ezbeq_overwrite_uploads_bq_text_to_the_active_slot(self):
+        harness, target = self.harness("--allow-destructive", kind="esp32")
+        self.device.state["master"]["activePreset"] = 2
+        with self.only_steps(harness, "PUT /api/1/devices/master/commands overwrite"), \
+                patch.object(live, "find_catalogue_entry", return_value={"id": "fake"}):
+            live.run_ezbeq_suite(harness, target)
+        uploads = [payload for m, p, payload in self.device.calls if m == "PUT" and p == "/api/1/devices/master/commands"]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual((uploads[0]["commandType"], uploads[0]["slot"], uploads[0]["overwrite"], uploads[0]["inputs"]),
+                         ("bq", "3", True, [1]))
+        self.assertFalse(harness.failures)
+
     def test_fake_ceiling_clamps_master_ezbeq_and_snapshot_volume_writes(self):
         _, target = self.harness()
         self.device.settings = {"maxVolumeDb": -40.0}
@@ -675,6 +694,28 @@ class LiveValidationTests(unittest.TestCase):
                     self.assertEqual(request["status"], 200)
                     self.assertLess(request["startedAt"], evidence["snapshotCompletedAt"])
                     self.assertGreaterEqual(request["completedAt"], evidence["snapshotHeadersAt"])
+
+    def test_a_cached_get_snapshot_skips_but_an_unproven_post_still_fails(self):
+        harness, target = self.harness("--allow-destructive", kind="esp32")
+        artifacts = live.start_destructive_snapshot_guard(harness, target, self.root)
+        self.device.serialized = True
+        harness.run_step("esp32-snapshot", "GET snapshot concurrent mutations",
+                         lambda: live.assert_snapshot_busy(harness, target, artifacts, "GET"), hard_stop=True)
+        self.assertEqual(harness.results[-1].status, "SKIP")
+        self.assertIn("POST restore checks serialization", harness.results[-1].detail)
+        with self.assertRaisesRegex(live.StepFailed, "serialization coverage is unproven"):
+            live.assert_snapshot_busy(harness, target, artifacts, "POST")
+
+    def test_snapshot_comparison_ignores_provenance_but_not_values(self):
+        expected = snapshot()
+        relabelled = json.loads(json.dumps(expected))
+        for preset in relabelled["presets"]:
+            preset["provenance"] = ["default-preset-image"]
+        live.assert_snapshot_equal(expected, relabelled)
+        changed = json.loads(json.dumps(relabelled))
+        changed["presets"][0]["token"] = "00000000"
+        with self.assertRaisesRegex(live.StepFailed, "presets"):
+            live.assert_snapshot_equal(expected, changed)
 
     def test_snapshot_serialization_tolerates_a_slow_snapshot_client(self):
         harness, target = self.harness("--allow-destructive", kind="esp32")

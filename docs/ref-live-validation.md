@@ -92,7 +92,9 @@ target/debug/minidsp --device-index 0 snapshot export /tmp/usb-after.json
 ```
 
 Use fresh artifact paths. Compare device identity, master state, per-preset
-payloads/tokens and FIR blocks; exclude capture/tool/notes metadata. Save both
+payloads/tokens and FIR blocks; exclude capture/tool/notes metadata and
+per-preset provenance, which records how the target knows a preset (an ESP32
+re-derives it from the factory token after the MiniDSP reboots). Save both
 snapshots with the run evidence, then restart the daemon for its lane. Never
 substitute `--daemon-url` or a network transport for this direct-USB gate.
 Multiple attached USB devices and indexing require a separate physical test.
@@ -136,9 +138,12 @@ The sequence is:
    each to finish no earlier than the snapshot response headers arrived (with
    0.25 s for client scheduling), which body size and decoding can't skew.
    Each request must start
-   before that response to establish overlap. Both lanes require a strictly
-   complete snapshot equal to baseline. Unobserved overlap or boundary races fail
-   as unproven; retain artifacts and investigate on hardware.
+   before that response to establish overlap. An ESP32 export of trusted
+   presets is answered from the board's cache in about 0.3 s, before the
+   requests start; the GET case then skips with that timing, and the POST
+   restore (about 66 s on a 2x4 HD) still has to prove serialization. Both lanes
+   require a strictly complete snapshot equal to baseline. Unobserved overlap or
+   boundary races fail as unproven; retain artifacts and investigate on hardware.
 4. Run existing HTTP, transport, CLI and destructive preset-copy checks.
 5. Confirm audio, save the previous listening volume, and set/read back **-35 dB**
    before every `/play` request. Announce before playing sweep-only, marker-only,
