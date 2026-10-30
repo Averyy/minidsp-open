@@ -1,0 +1,1594 @@
+{
+  "format_version": 1,
+  "source": "Canonical Device Console 2x4 HD HID session",
+  "action_evidence": "Actions inferred from request fields and DSP100 tables; companion app log corroborates command names but is an earlier session, not timestamp-aligned.",
+  "sanitization": [
+    "All host metadata and timestamps omitted; source line ordinals retained.",
+    "Serial EEPROM bytes re-encoded as 30 39 for synthetic serial 912345 (offset 900000). Full-serial low-u16 ebd9 is not the EEPROM encoding.",
+    "Modification tokens replaced consistently with synthetic four-byte values.",
+    "Requests re-checksummed after sanitization. Unused HID tails normalized to ff.",
+    "Unframed write acknowledgements retain the echoed command; flash-block acknowledgements retain their first seven bytes (opcode, block and opaque device status), with the rest normalized."
+  ],
+  "coverage": {
+    "request_opcodes": [
+      4,
+      5,
+      6,
+      7,
+      19,
+      20,
+      25,
+      37,
+      48,
+      49,
+      52,
+      64,
+      66
+    ],
+    "unsupported_typed_variants": [
+      "ReadHardwareId selector 0/1: raw passthrough only; typed encoder emits the selector-free probe.",
+      "ReadDspVersion 0x40: encoder supported, response retained as Unknown by execute_raw; bytes 20 00 have no typed decoder."
+    ],
+    "absent_from_capture": [
+      "Reset/0xAA",
+      "CopyPreset",
+      "GetNumFirTaps/FIR upload",
+      "full-address flash",
+      "firmware/bootloader",
+      "display/DRE",
+      "Dirac",
+      "Bluetooth",
+      "DFlash",
+      "eARC/WiSA"
+    ]
+  },
+  "exchanges": [
+    {
+      "id": "capture-2",
+      "label": "ReadHardwareId",
+      "action": "Attach and probe the device",
+      "meaning": "Firmware 1.85, hardware ID 10 (2x4 HD)",
+      "support": "exact",
+      "encoder": "read_hardware_id",
+      "arguments": {},
+      "request": {
+        "direction": "tx",
+        "source_line": 2,
+        "hex": "00 02 31 33 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4,
+          "hex": "0c 31 01 55 0a 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "hardware_id",
+            "fw_major": 1,
+            "fw_minor": 85,
+            "hw_id": 10
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-5",
+      "label": "ReadFlash",
+      "action": "Attach and read device state",
+      "meaning": "DSP ID",
+      "support": "exact",
+      "encoder": "read_flash",
+      "arguments": {
+        "address": 65441,
+        "count": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 5,
+        "hex": "00 05 05 ff a1 01 ab ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 7,
+          "hex": "05 05 ff a1 64 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "flash",
+            "data_hex": "64"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-8",
+      "label": "ReadFlash",
+      "action": "Attach and read device state",
+      "meaning": "synthetic serial",
+      "support": "exact",
+      "encoder": "read_flash",
+      "arguments": {
+        "address": 65534,
+        "count": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 8,
+        "hex": "00 05 05 ff fe 02 09 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 10,
+          "hex": "06 05 ff fe 30 39 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "flash",
+            "data_hex": "30 39"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-14",
+      "label": "ReadHardwareId",
+      "action": "Attach and probe the device",
+      "meaning": "Firmware 1.85, hardware ID 10 (2x4 HD)",
+      "support": "passthrough",
+      "encoder": "read_hardware_id",
+      "arguments": {
+        "selector": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 14,
+        "hex": "00 03 31 01 35 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 16,
+          "hex": "0c 31 01 55 0a 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "hardware_id",
+            "fw_major": 1,
+            "fw_minor": 85,
+            "hw_id": 10
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-17",
+      "label": "ReadDspVersion",
+      "action": "Attach and probe DSP firmware",
+      "meaning": "Opaque DSP version bytes 20 00 (no typed response parser)",
+      "support": "raw_response",
+      "encoder": "read_dsp_version",
+      "arguments": {},
+      "request": {
+        "direction": "tx",
+        "source_line": 17,
+        "hex": "00 02 40 42 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 19,
+          "hex": "04 40 20 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "unknown",
+            "data_hex": "40 20 00"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-20",
+      "label": "ReadHardwareId",
+      "action": "Attach and probe the device",
+      "meaning": "Firmware 1.85, hardware ID 10 (2x4 HD)",
+      "support": "passthrough",
+      "encoder": "read_hardware_id",
+      "arguments": {
+        "selector": 0
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 20,
+        "hex": "00 03 31 00 34 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 22,
+          "hex": "0c 31 01 55 0a 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "hardware_id",
+            "fw_major": 1,
+            "fw_minor": 85,
+            "hw_id": 10
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-23",
+      "label": "ReadFlash",
+      "action": "Attach and read device state",
+      "meaning": "active preset",
+      "support": "exact",
+      "encoder": "read_flash",
+      "arguments": {
+        "address": 65496,
+        "count": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 23,
+        "hex": "00 05 05 ff d8 01 e2 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 25,
+          "hex": "05 05 ff d8 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "flash",
+            "data_hex": "00"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-26",
+      "label": "ReadFlash",
+      "action": "Attach and read device state",
+      "meaning": "preset-0 modification token",
+      "support": "exact",
+      "encoder": "read_flash",
+      "arguments": {
+        "address": 65480,
+        "count": 4
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 26,
+        "hex": "00 05 05 ff c8 04 d5 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 28,
+          "hex": "08 05 ff c8 12 34 56 78 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "flash",
+            "data_hex": "12 34 56 78"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-29",
+      "label": "ReadFlash",
+      "action": "Attach and read device state",
+      "meaning": "master FIR bypass",
+      "support": "exact",
+      "encoder": "read_flash",
+      "arguments": {
+        "address": 65504,
+        "count": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 29,
+        "hex": "00 05 05 ff e0 01 ea ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 31,
+          "hex": "05 05 ff e0 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "flash",
+            "data_hex": "00"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-32",
+      "label": "ReadFlash",
+      "action": "Attach and read device state",
+      "meaning": "active source",
+      "support": "exact",
+      "encoder": "read_flash",
+      "arguments": {
+        "address": 65497,
+        "count": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 32,
+        "hex": "00 05 05 ff d9 01 e3 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 34,
+          "hex": "05 05 ff d9 02 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "flash",
+            "data_hex": "02"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-38",
+      "label": "ReadFlash",
+      "action": "Attach and read device state",
+      "meaning": "master volume and mute",
+      "support": "exact",
+      "encoder": "read_flash",
+      "arguments": {
+        "address": 65498,
+        "count": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 38,
+        "hex": "00 05 05 ff da 02 e5 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 40,
+          "hex": "06 05 ff da 05 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "flash",
+            "data_hex": "05 00"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-41",
+      "label": "ReadFloats",
+      "action": "Poll levels while editing",
+      "meaning": "Input meters",
+      "support": "exact",
+      "encoder": "read_floats",
+      "arguments": {
+        "address": 68,
+        "count": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 41,
+        "hex": "00 05 14 00 44 02 5f ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 43,
+          "hex": "0c 14 00 44 4f 6e 00 c3 4f 6e 00 c3 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "floats",
+            "values": [
+              -128.43089294433594,
+              -128.43089294433594
+            ],
+            "words": [
+              3271585359,
+              3271585359
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-44",
+      "label": "ReadFloats",
+      "action": "Poll levels while editing",
+      "meaning": "Output meters",
+      "support": "exact",
+      "encoder": "read_floats",
+      "arguments": {
+        "address": 74,
+        "count": 4
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 44,
+        "hex": "00 05 14 00 4a 04 67 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 46,
+          "hex": "14 14 00 4a 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "floats",
+            "values": [
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "words": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-59",
+      "label": "SetVolume",
+      "action": "Adjust master volume",
+      "meaning": "Master volume -27 dB",
+      "support": "exact",
+      "encoder": "set_volume",
+      "arguments": {
+        "value": 54
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 59,
+        "hex": "00 03 42 36 7b ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 61,
+          "hex": "01 42 36 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-77",
+      "label": "SetVolume",
+      "action": "Adjust master volume",
+      "meaning": "Master volume -7.5 dB",
+      "support": "exact",
+      "encoder": "set_volume",
+      "arguments": {
+        "value": 15
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 77,
+        "hex": "00 03 42 0f 54 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 79,
+          "hex": "01 42 0f ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-107",
+      "label": "SetVolume",
+      "action": "Adjust master volume",
+      "meaning": "Master volume 0 dB",
+      "support": "exact",
+      "encoder": "set_volume",
+      "arguments": {
+        "value": 0
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 107,
+        "hex": "00 03 42 00 45 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 109,
+          "hex": "01 42 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-242",
+      "label": "SetSource",
+      "action": "Select the audio source",
+      "meaning": "Analog",
+      "support": "exact",
+      "encoder": "set_source",
+      "arguments": {
+        "source": 0
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 242,
+        "hex": "00 03 34 00 37 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 244,
+          "hex": "01 34 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        },
+        {
+          "direction": "rx",
+          "source_line": 245,
+          "hex": "05 05 ff a9 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "notification",
+            "address": 65449,
+            "source": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-261",
+      "label": "SetSource",
+      "action": "Select the audio source",
+      "meaning": "Toslink",
+      "support": "exact",
+      "encoder": "set_source",
+      "arguments": {
+        "source": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 261,
+        "hex": "00 03 34 01 38 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 263,
+          "hex": "01 34 01 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        },
+        {
+          "direction": "rx",
+          "source_line": 264,
+          "hex": "05 05 ff a9 01 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "notification",
+            "address": 65449,
+            "source": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-283",
+      "label": "SetSource",
+      "action": "Select the audio source",
+      "meaning": "USB",
+      "support": "exact",
+      "encoder": "set_source",
+      "arguments": {
+        "source": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 283,
+        "hex": "00 03 34 02 39 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 285,
+          "hex": "01 34 02 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        },
+        {
+          "direction": "rx",
+          "source_line": 286,
+          "hex": "05 05 ff a9 02 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "notification",
+            "address": 65449,
+            "source": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-326",
+      "label": "WriteDSP",
+      "action": "Toggle input-0 mute",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 0,
+        "value": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 326,
+        "hex": "00 09 13 80 00 00 01 00 00 00 9d ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 328,
+          "hex": "01 13 80 00 00 01 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-338",
+      "label": "WriteDSP",
+      "action": "Toggle input-0 mute",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 0,
+        "value": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 338,
+        "hex": "00 09 13 80 00 00 02 00 00 00 9e ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 340,
+          "hex": "01 13 80 00 00 02 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-401",
+      "label": "WriteDSP",
+      "action": "Edit Input-0 gain (dB)",
+      "meaning": "Input-0 gain (dB)",
+      "support": "exact",
+      "encoder": "write_dsp",
+      "arguments": {
+        "address": 26,
+        "save": true,
+        "value": -7.5
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 401,
+        "hex": "00 09 13 80 00 1a 00 00 f0 c0 66 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 403,
+          "hex": "01 13 80 00 1a 00 00 f0 c0 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-434",
+      "label": "WriteDSP",
+      "action": "Edit Input-0 gain (dB)",
+      "meaning": "Input-0 gain (dB)",
+      "support": "exact",
+      "encoder": "write_dsp",
+      "arguments": {
+        "address": 26,
+        "save": true,
+        "value": 1.2000000476837158
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 434,
+        "hex": "00 09 13 80 00 1a 9a 99 99 3f c1 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 436,
+          "hex": "01 13 80 00 1a 9a 99 99 3f ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-515",
+      "label": "WriteDSP",
+      "action": "Toggle input-0 to output-0 routing",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 6,
+        "value": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 515,
+        "hex": "00 09 13 80 00 06 01 00 00 00 a3 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 517,
+          "hex": "01 13 80 00 06 01 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-524",
+      "label": "WriteDSP",
+      "action": "Toggle input-0 to output-0 routing",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 6,
+        "value": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 524,
+        "hex": "00 09 13 80 00 06 02 00 00 00 a4 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 526,
+          "hex": "01 13 80 00 06 02 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-635",
+      "label": "WriteBiquad",
+      "action": "Edit output-0 PEQ",
+      "meaning": "Five float32-LE coefficients, auxiliary address zero",
+      "support": "exact",
+      "encoder": "write_biquad",
+      "arguments": {
+        "address": 8380,
+        "coefficients": [
+          1.0006591081619263,
+          -1.9927387237548828,
+          0.992152214050293,
+          1.9927489757537842,
+          -0.9928010106086731
+        ]
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 635,
+        "hex": "00 1b 30 80 20 bc 00 00 99 15 80 3f 10 12 ff bf b0 fd 7d 3f 66 12 ff 3f 35 28 7e bf ad ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 637,
+          "hex": "01 30 80 20 bc 00 00 99 15 80 3f 10 12 ff bf b0 fd 7d 3f 66 12 ff 3f 35 28 7e bf ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-665",
+      "label": "WriteBiquad",
+      "action": "Edit output-0 crossover",
+      "meaning": "Five float32-LE coefficients, auxiliary address zero",
+      "support": "exact",
+      "encoder": "write_biquad",
+      "arguments": {
+        "address": 8600,
+        "coefficients": [
+          0.9946387410163879,
+          -1.9892774820327759,
+          0.9946387410163879,
+          1.9892606735229492,
+          -0.9892944097518921
+        ]
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 665,
+        "hex": "00 1b 30 80 21 98 00 00 a5 a0 7e 3f a5 a0 fe bf a5 a0 7e 3f 18 a0 fe 3f 66 42 7d bf 63 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 667,
+          "hex": "01 30 80 21 98 00 00 a5 a0 7e 3f a5 a0 fe bf a5 a0 7e 3f 18 a0 fe 3f 66 42 7d bf ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-671",
+      "label": "WriteBiquad",
+      "action": "Edit output-0 crossover",
+      "meaning": "Five float32-LE coefficients, auxiliary address zero",
+      "support": "exact",
+      "encoder": "write_biquad",
+      "arguments": {
+        "address": 8580,
+        "coefficients": [
+          3.22879327541159e-06,
+          6.45758655082318e-06,
+          3.22879327541159e-06,
+          1.9933576583862305,
+          -0.9933705925941467
+        ]
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 671,
+        "hex": "00 1b 30 80 21 84 00 00 3f ae 58 36 3f ae d8 36 3f ae 58 36 58 26 ff 3f 89 4d 7e bf 30 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 673,
+          "hex": "01 30 80 21 84 00 00 3f ae 58 36 3f ae d8 36 3f ae 58 36 58 26 ff 3f 89 4d 7e bf ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-677",
+      "label": "BypassFilter",
+      "action": "Enable output-0 crossover filter",
+      "meaning": "Disable crossover bypass (control byte zero)",
+      "support": "exact",
+      "encoder": "bypass_filter",
+      "arguments": {
+        "address": 8580,
+        "bypass": false
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 677,
+        "hex": "00 07 19 00 21 84 00 00 c5 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 679,
+          "hex": "01 19 00 21 84 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-680",
+      "label": "BypassFilter",
+      "action": "Enable output-0 crossover filter",
+      "meaning": "Disable crossover bypass (control byte zero)",
+      "support": "exact",
+      "encoder": "bypass_filter",
+      "arguments": {
+        "address": 8600,
+        "bypass": false
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 680,
+        "hex": "00 07 19 00 21 98 00 00 d9 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 682,
+          "hex": "01 19 00 21 98 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-707",
+      "label": "WriteDSP",
+      "action": "Adjust output-0 delay",
+      "meaning": "Output-0 delay (samples)",
+      "support": "exact",
+      "encoder": "write_dsp_delay",
+      "arguments": {
+        "address": 64,
+        "save": true,
+        "samples": 1934
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 707,
+        "hex": "00 09 13 80 00 40 8e 07 00 00 71 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 709,
+          "hex": "01 13 80 00 40 8e 07 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-962",
+      "label": "WriteDSP",
+      "action": "Toggle output-0 polarity",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 80,
+        "value": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 962,
+        "hex": "00 09 13 80 00 50 01 00 00 00 ed ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 964,
+          "hex": "01 13 80 00 50 01 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-989",
+      "label": "WriteDSP",
+      "action": "Toggle output-0 polarity",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 80,
+        "value": 0
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 989,
+        "hex": "00 09 13 80 00 50 00 00 00 00 ec ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 991,
+          "hex": "01 13 80 00 50 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-998",
+      "label": "WriteDSP",
+      "action": "Toggle output-0 mute",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 2,
+        "value": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 998,
+        "hex": "00 09 13 80 00 02 01 00 00 00 9f ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1000,
+          "hex": "01 13 80 00 02 01 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1028",
+      "label": "ReadFloats",
+      "action": "Open output-0 compressor view",
+      "meaning": "Output-0 compressor meter",
+      "support": "exact",
+      "encoder": "read_floats",
+      "arguments": {
+        "address": 70,
+        "count": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1028,
+        "hex": "00 05 14 00 46 01 60 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1030,
+          "hex": "08 14 00 46 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "floats",
+            "values": [
+              0.0
+            ],
+            "words": [
+              0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1034",
+      "label": "WriteDSP",
+      "action": "Edit Output-0 compressor threshold (dBFS)",
+      "meaning": "Output-0 compressor threshold (dBFS)",
+      "support": "exact",
+      "encoder": "write_dsp",
+      "arguments": {
+        "address": 40,
+        "save": true,
+        "value": -35.0
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1034,
+        "hex": "00 09 13 80 00 28 00 00 0c c2 92 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1036,
+          "hex": "01 13 80 00 28 00 00 0c c2 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1043",
+      "label": "WriteDSP",
+      "action": "Edit Output-0 compressor ratio",
+      "meaning": "Output-0 compressor ratio",
+      "support": "exact",
+      "encoder": "write_dsp",
+      "arguments": {
+        "address": 42,
+        "save": true,
+        "value": 9.899999618530273
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1043,
+        "hex": "00 09 13 80 00 2a 66 66 1e 41 f1 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1045,
+          "hex": "01 13 80 00 2a 66 66 1e 41 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1052",
+      "label": "WriteDSP",
+      "action": "Edit Output-0 compressor attack (ms)",
+      "meaning": "Output-0 compressor attack (ms)",
+      "support": "exact",
+      "encoder": "write_dsp",
+      "arguments": {
+        "address": 44,
+        "save": true,
+        "value": 30.0
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1052,
+        "hex": "00 09 13 80 00 2c 00 00 f0 41 f9 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1054,
+          "hex": "01 13 80 00 2c 00 00 f0 41 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1058",
+      "label": "WriteDSP",
+      "action": "Edit Output-0 compressor release (ms)",
+      "meaning": "Output-0 compressor release (ms)",
+      "support": "exact",
+      "encoder": "write_dsp",
+      "arguments": {
+        "address": 45,
+        "save": true,
+        "value": 220.0
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1058,
+        "hex": "00 09 13 80 00 2d 00 00 5c 43 68 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1060,
+          "hex": "01 13 80 00 2d 00 00 5c 43 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1067",
+      "label": "WriteDSP",
+      "action": "Toggle output-0 compressor bypass",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 22,
+        "value": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1067,
+        "hex": "00 09 13 80 00 16 02 00 00 00 b4 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1069,
+          "hex": "01 13 80 00 16 02 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1163",
+      "label": "WriteDSP",
+      "action": "Toggle output-0 compressor bypass",
+      "meaning": "Selector word, little endian",
+      "support": "exact",
+      "encoder": "write_dsp_int",
+      "arguments": {
+        "address": 22,
+        "value": 3
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1163,
+        "hex": "00 09 13 80 00 16 03 00 00 00 b5 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1165,
+          "hex": "01 13 80 00 16 03 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1187",
+      "label": "SetConfig",
+      "action": "Switch preset",
+      "meaning": "Normal switch",
+      "support": "exact",
+      "encoder": "set_config",
+      "arguments": {
+        "preset": 1,
+        "mode": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1187,
+        "hex": "00 04 25 01 02 2c ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1189,
+          "hex": "02 ab ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "preset_complete"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1220",
+      "label": "SetConfig",
+      "action": "Switch preset",
+      "meaning": "Normal switch",
+      "support": "exact",
+      "encoder": "set_config",
+      "arguments": {
+        "preset": 0,
+        "mode": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1220,
+        "hex": "00 04 25 00 02 2b ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1222,
+          "hex": "02 ab ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "preset_complete"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1319",
+      "label": "WriteFlashBlock",
+      "action": "Initialize default settings and save to flash",
+      "meaning": "Preset values block header",
+      "support": "exact",
+      "encoder": "write_flash_block",
+      "arguments": {
+        "block": 1,
+        "begin": true,
+        "data_hex": "04 88 97 13 0f 00 00"
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1319,
+        "hex": "00 0a 06 01 04 88 97 13 0f 00 00 56 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1321,
+          "hex": "01 06 01 00 20 03 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-1322",
+      "label": "WriteFlashBlock",
+      "action": "Initialize default settings and save to flash",
+      "meaning": "Preset values continuation chunk",
+      "support": "exact",
+      "encoder": "write_flash_block",
+      "arguments": {
+        "block": 1,
+        "begin": false,
+        "data_hex": "02 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 01 00 00 00"
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 1322,
+        "hex": "00 23 06 81 02 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 01 00 00 00 b9 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 1324,
+          "hex": "01 06 81 07 20 03 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4598",
+      "label": "WriteFlashBlock",
+      "action": "Initialize default settings and save to flash",
+      "meaning": "Preset values continuation chunk",
+      "support": "exact",
+      "encoder": "write_flash_block",
+      "arguments": {
+        "block": 1,
+        "begin": false,
+        "data_hex": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4598,
+        "hex": "00 13 06 81 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9a ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4600,
+          "hex": "01 06 81 87 a8 03 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4601",
+      "label": "FinishFlashBlock",
+      "action": "Initialize default settings and finish flash save",
+      "meaning": "Complete preset values block",
+      "support": "exact",
+      "encoder": "finish_flash_block",
+      "arguments": {
+        "block": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4601,
+        "hex": "00 03 07 01 0b ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4603,
+          "hex": "02 01 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4604",
+      "label": "WriteFlashBlock",
+      "action": "Initialize default settings and save to flash",
+      "meaning": "Preset bypass records block header",
+      "support": "exact",
+      "encoder": "write_flash_block",
+      "arguments": {
+        "block": 2,
+        "begin": true,
+        "data_hex": "05 00 cf"
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4604,
+        "hex": "00 06 06 02 05 00 cf e2 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4606,
+          "hex": "01 06 02 00 4c 04 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4607",
+      "label": "WriteFlashBlock",
+      "action": "Initialize default settings and save to flash",
+      "meaning": "Preset bypass records continuation chunk",
+      "support": "exact",
+      "encoder": "write_flash_block",
+      "arguments": {
+        "block": 2,
+        "begin": false,
+        "data_hex": "01 20 58 01 20 5d 01 20 62 01 20 67 01 20 6c 01 20 71 01 20 76 01 20 7b 01 20 80 01 20 85 01 20"
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4607,
+        "hex": "00 23 06 82 01 20 58 01 20 5d 01 20 62 01 20 67 01 20 6c 01 20 71 01 20 76 01 20 7b 01 20 80 01 20 85 01 20 67 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4609,
+          "hex": "01 06 82 03 4c 04 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4625",
+      "label": "WriteFlashBlock",
+      "action": "Initialize default settings and save to flash",
+      "meaning": "Preset bypass records continuation chunk",
+      "support": "exact",
+      "encoder": "write_flash_block",
+      "arguments": {
+        "block": 2,
+        "begin": false,
+        "data_hex": "84 21 d4 84 21 e8 84 21 fc 84 22 10"
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4625,
+        "hex": "00 0f 06 82 84 21 d4 84 21 e8 84 21 fc 84 22 10 f4 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4627,
+          "hex": "01 06 82 c3 4c 04 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4628",
+      "label": "FinishFlashBlock",
+      "action": "Initialize default settings and finish flash save",
+      "meaning": "Complete preset bypass block",
+      "support": "exact",
+      "encoder": "finish_flash_block",
+      "arguments": {
+        "block": 2
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4628,
+        "hex": "00 03 07 02 0c ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4630,
+          "hex": "02 02 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4631",
+      "label": "ReadFlash",
+      "action": "Initialize default settings and verify/save the preset",
+      "meaning": "verify-program status",
+      "support": "exact",
+      "encoder": "read_flash",
+      "arguments": {
+        "address": 65443,
+        "count": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4631,
+        "hex": "00 05 05 ff a3 01 ad ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4633,
+          "hex": "05 05 ff a3 03 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "flash",
+            "data_hex": "03"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4634",
+      "label": "WriteFlash",
+      "action": "Initialize default settings and verify/save the preset",
+      "meaning": "preset-0 modification token",
+      "support": "exact",
+      "encoder": "write_flash",
+      "arguments": {
+        "address": 65480,
+        "data_hex": "12 34 56 79"
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4634,
+        "hex": "00 08 04 ff c8 12 34 56 79 e8 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4636,
+          "hex": "01 04 ff c8 12 34 56 79 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "ack"
+          }
+        }
+      ]
+    },
+    {
+      "id": "capture-4637",
+      "label": "SetConfig",
+      "action": "Initialize default settings and reload current preset",
+      "meaning": "Reload the same preset after saving",
+      "support": "exact",
+      "encoder": "set_config",
+      "arguments": {
+        "preset": 0,
+        "mode": 1
+      },
+      "request": {
+        "direction": "tx",
+        "source_line": 4637,
+        "hex": "00 04 25 00 01 2a ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff"
+      },
+      "replies": [
+        {
+          "direction": "rx",
+          "source_line": 4639,
+          "hex": "02 ab ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff",
+          "expected": {
+            "type": "preset_complete"
+          }
+        }
+      ]
+    }
+  ]
+}

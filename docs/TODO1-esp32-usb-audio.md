@@ -43,7 +43,7 @@ The six consumer fixes have their own remaining checks in
 - FFI, lifecycle, drain/format rules: [app-esp32/src/usb_audio.rs](../app-esp32/src/usb_audio.rs).
 - Playback worker, recovery and routes: [app-esp32/src/http_server.rs](../app-esp32/src/http_server.rs).
 - Build/boot integration: [Cargo.toml](../app-esp32/Cargo.toml), [build.rs](../app-esp32/build.rs), and [main.rs](../app-esp32/src/main.rs).
-- Driver API and simulator: the external esp-uac2-host checkout described in [CONTRIBUTING.md](../CONTRIBUTING.md).
+- Driver API and simulator: [esp-uac2-host](https://github.com/Averyy/esp-uac2-host). Firmware uses the registry package `averyy/usb_host_uac2`; local driver development is described in [CONTRIBUTING.md](../CONTRIBUTING.md#usb-audio-driver-development).
 - Host verification: `cargo test -p minidsp-protocol` and `cargo test`.
 - Firmware build: `tools/esp-cargo build --release`.
 - Live checks: [ref-live-validation.md](ref-live-validation.md), with audio explicitly enabled.

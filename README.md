@@ -66,11 +66,13 @@ cargo build --release
 cargo test
 ```
 
-The ESP32 firmware needs the Xtensa Rust toolchain ([espup](https://github.com/esp-rs/espup)), ESP-IDF v6.0.3 (esp-idf-sys downloads it), `ldproxy`, and a checkout of [esp-uac2-host](https://github.com/Averyy/esp-uac2-host) at `../../../code/esp-uac2-host` relative to `app-esp32/` (with this repo at `~/Code/minidsp-open`, that's `~/code/esp-uac2-host`). CONTRIBUTING.md has the full setup.
+The ESP32 firmware needs the Xtensa Rust toolchain ([espup](https://github.com/esp-rs/espup)), ESP-IDF v6.0.3 (esp-idf-sys downloads it), and `ldproxy`. The USB audio driver comes from the ESP Component Registry as `averyy/usb_host_uac2`, pinned to `0.1.3`; no sibling checkout is needed. [CONTRIBUTING.md](CONTRIBUTING.md#esp32-setup) has the full setup and local driver override details.
 
 ```bash
 tools/esp-cargo build --release
 ```
+
+For driver development, use `ESP_UAC2_HOST_PATH="$HOME/code/esp-uac2-host/components/usb_host_uac2" tools/esp-cargo build --release` to build against a local working copy without editing tracked files.
 
 ## Credits
 

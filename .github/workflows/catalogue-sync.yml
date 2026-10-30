@@ -16,6 +16,10 @@ concurrency:
 
 jobs:
   build:
+    # Scheduled runs wait until GitHub Pages is enabled for the repository and
+    # the CATALOGUE_PAGES_ENABLED repository variable is set to true; without
+    # Pages, configure-pages fails every four hours. Manual runs always go.
+    if: vars.CATALOGUE_PAGES_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       updated: ${{ steps.version_check.outputs.skip != 'true' }}
@@ -25,7 +29,7 @@ jobs:
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v10.3.3
 
       - name: Check for updates
         id: version_check

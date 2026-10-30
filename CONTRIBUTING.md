@@ -48,8 +48,7 @@ cargo run --bin minidsp -- probe
 
 1. Install Python 3.10 or newer (with venv support), CMake 3.22.1 or newer, Ninja, and libclang. These are the [ESP-IDF 6.0 tool requirements](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/migration-guides/release-6.x/6.0/tools.html). On Ubuntu, install `build-essential pkg-config libssl-dev libudev-dev cmake ninja-build python3 python3-venv libclang-dev`; check `python3 --version` and `cmake --version` on older distributions.
 2. Install the Xtensa toolchain with [espup](https://github.com/esp-rs/espup) (`espup install --targets esp32s3 --std --toolchain-version 1.93.0.0`), then `cargo install ldproxy`. Use that toolchain version: CI pins it, and Xtensa Rust 1.97.0.0 crashes LLVM while compiling this firmware. `tools/esp-cargo` sources `~/export-esp.sh` (override with `ESP_EXPORT_SCRIPT` if needed). For an existing installation, rerun the same `espup install` command; `espup update` moves to the newest toolchain. The `--std` option leaves installation of IDF's matching Xtensa GCC to esp-idf-sys.
-3. Clone [esp-uac2-host](https://github.com/Averyy/esp-uac2-host) so that `app-esp32/../../../code/esp-uac2-host` resolves. With this repo at `~/Code/minidsp-open`, that's `~/code/esp-uac2-host`. `app-esp32/Cargo.toml` points ESP-IDF at its `components/usb_host_uac2`. Check out the tag the workflows build against (`ESP_UAC2_HOST_REF`, currently `v0.1.3`), and move both workflows to a newer tag only after testing it.
-4. Build. esp-idf-sys downloads ESP-IDF v6.0.3, selected in `app-esp32/.cargo/config.toml`, and its matching build tools on the first build, which takes a while. No separate ESP-IDF checkout is needed.
+3. Build. esp-idf-sys downloads ESP-IDF v6.0.3, selected in `app-esp32/.cargo/config.toml`, and its matching build tools on the first build, which takes a while. It also downloads `averyy/usb_host_uac2` exactly `0.1.3` from the ESP Component Registry, alongside the other managed components. Their resolved versions are tracked in `app-esp32/components_esp32s3.lock`. No separate ESP-IDF or driver checkout is needed.
 
 ```bash
 tools/esp-cargo build            # size-optimised debug build, fits a 3 MB OTA slot
@@ -57,6 +56,18 @@ tools/esp-cargo build --release
 ```
 
 Do not build with an activated ESP-IDF environment (`. export.sh`): its environment variables override the pinned version. The repo wrapper clears those variables and leaves IDF installation to esp-idf-sys. `tools/esptool` uses `uvx` to run the matching esptool 5.6.0; install [uv](https://docs.astral.sh/uv/getting-started/installation/) for flashing and the Python tools.
+
+### USB audio driver development
+
+To use a working copy of [esp-uac2-host](https://github.com/Averyy/esp-uac2-host), pass its component directory to the wrapper (an absolute path is recommended):
+
+```bash
+ESP_UAC2_HOST_PATH="$HOME/code/esp-uac2-host/components/usb_host_uac2" tools/esp-cargo build --release
+```
+
+The wrapper uses esp-idf-sys 0.38.1's `ESP_IDF_SYS_EXTRA_COMPONENTS_FILE` hook to generate an ignored TOML file under `app-esp32/target/`. It preserves the other components and binding headers, replacing only the driver with `component_dirs`. In both modes, the generated filename hashes the component declarations, lockfile, and wrapper so Cargo reruns esp-idf-sys when those change. The component manager supports [`override_path`](https://docs.espressif.com/projects/idf-component-manager/en/latest/reference/manifest_file.html#override-path-registry-override), but esp-idf-sys does not expose it. The wrapper restores the registry lockfile after local builds, including failed builds. Avoid simultaneous registry and local builds, which share that lockfile.
+
+In override mode, `ESP_IDF_GLOB_UAC2_*` tracks the driver's C sources, headers, CMakeLists.txt, Kconfig, and manifest because esp-idf-sys 0.38 does not watch `component_dirs`. Keep the globs in `tools/esp-cargo` in step with the driver's build inputs. Run the command without `ESP_UAC2_HOST_PATH` to return to the registry package. Registry updates require changing the exact version in `app-esp32/Cargo.toml`, rebuilding, and committing the updated component lockfile. Keep Cargo target directories directly under `app-esp32/` (`target/` or `target-heaptrace/`): esp-idf-sys resolves project paths from their parent.
 
 ### Flashing and testing on hardware
 

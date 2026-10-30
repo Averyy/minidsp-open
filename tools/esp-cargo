@@ -9,4 +9,68 @@ source "${ESP_EXPORT_SCRIPT:-$HOME/export-esp.sh}"
 export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/esp/bin:$PATH"
 unset IDF_PATH IDF_PYTHON_ENV_PATH IDF_TOOLS_PATH ESP_IDF_VERSION
 cd "$ROOT_DIR/app-esp32"
+
+# 0.38.1 supports an extra-components file, but not override_path. Derive
+# the complete list from Cargo metadata: this hook replaces the root list.
+# Hash declarations, lockfile and wrapper into the filename because Cargo
+# tracks the env var, not those files. Absolute bindings paths are required.
+export ESP_IDF_SYS_EXTRA_COMPONENTS_FILE
+ESP_IDF_SYS_EXTRA_COMPONENTS_FILE="$(cargo metadata --no-deps --format-version 1 | python3 -c '
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+override = os.environ.get("ESP_UAC2_HOST_PATH")
+component = Path(override).expanduser().resolve(strict=True) if override else None
+if component is not None and not (component / "CMakeLists.txt").is_file():
+    sys.exit(f"Not an ESP-IDF component: {component}")
+metadata = json.load(sys.stdin)
+package = next(p for p in metadata["packages"] if p["name"] == "minidsp-esp32")
+components = package["metadata"]["esp-idf-sys"]["extra_components"]
+for entry in components:
+    if component is not None and entry.get("remote_component", {}).get("name") == "averyy/usb_host_uac2":
+        del entry["remote_component"]
+        entry["component_dirs"] = [str(component)]
+    if "bindings_header" in entry:
+        entry["bindings_header"] = str(Path(package["manifest_path"]).parent / entry["bindings_header"])
+
+def toml(value):
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{key} = {toml(item)}" for key, item in value.items()) + " }"
+    return json.dumps(value)
+
+contents = "\n".join("[[extra_components]]\n" + "\n".join(f"{key} = {toml(value)}" for key, value in entry.items()) for entry in components)
+digest = hashlib.sha256(contents.encode() + Path("components_esp32s3.lock").read_bytes() + Path("../tools/esp-cargo").read_bytes()).hexdigest()
+output = Path("target") / ("components-" + digest + ".toml")
+output.parent.mkdir(exist_ok=True)
+if not output.exists():
+    output.write_text(contents + "\n")
+print(output.resolve())
+')"
+
+if [[ -n "${ESP_UAC2_HOST_PATH:-}" ]]; then
+    # esp-idf-sys does not watch component_dirs. Globs both track and copy
+    # inputs; use the parent as BASE so CMakeLists.txt cannot replace the
+    # generated project file. Keep these in step with the driver's inputs.
+    component_dir="$(CDPATH='' cd "$ESP_UAC2_HOST_PATH" && pwd)"
+    export ESP_IDF_GLOB_UAC2_BASE="$(dirname "$component_dir")"
+    component_name="$(basename "$component_dir")"
+    export ESP_IDF_GLOB_UAC2_1="$component_name/CMakeLists.txt"
+    export ESP_IDF_GLOB_UAC2_2="$component_name/Kconfig"
+    export ESP_IDF_GLOB_UAC2_3="$component_name/idf_component.yml"
+    export ESP_IDF_GLOB_UAC2_4="$component_name/*.c"
+    export ESP_IDF_GLOB_UAC2_5="$component_name/*.h"
+    export ESP_IDF_GLOB_UAC2_6="$component_name/include/**/*.h"
+
+    # Component resolution writes this tracked lockfile even in local mode.
+    # Preserve registry pins, including when the build fails.
+    lock_backup="$(mktemp)"
+    cp components_esp32s3.lock "$lock_backup"
+    trap 'cp "$lock_backup" components_esp32s3.lock; rm -f "$lock_backup"' EXIT
+    cargo "$@"
+    exit
+fi
+
 exec cargo "$@"

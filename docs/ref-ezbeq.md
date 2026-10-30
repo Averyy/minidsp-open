@@ -203,6 +203,11 @@ automatically; adopting a new UI version is a deliberate compatibility change.
 ### Bundle and storage
 
 Build with `mkdir -p DIR && uv run tools/build-catalogue.py --output-dir DIR`.
+Boards download the published copy from GitHub Pages
+(`https://averyy.github.io/minidsp-open`), which `.github/workflows/catalogue-sync.yml`
+rebuilds every four hours when the BEQ catalogue changes. Scheduled runs only
+start once Pages is enabled for the repository and the `CATALOGUE_PAGES_ENABLED`
+repository variable is `true`; a manual run always goes.
 The builder fails if manifest files plus the manifest exceed **8,000,000 bytes**.
 This leaves filesystem/update headroom in the `0x9E0000` storage partition.
 The updater downloads only `manifest.json`'s `files` entries:

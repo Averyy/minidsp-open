@@ -17,13 +17,16 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - Desktop test and ESP32 build workflows, plus release packaging for desktop binaries and firmware.
 - ESP32 internal-heap and task-stack diagnostics, minimum-heap reset, and an optional heap-tracing build profile.
 - Public README, contributor setup, third-party notices, and bundled license texts.
+- Device Console HID capture fixtures (54 sanitized exchanges, 13 opcodes) with parser and client/queue replay tests.
+- Research notes on Device Console device identity, the `0xFFEA` source bitmap, and Dirac preset layouts.
 
 ### Changed
 
 - The workspace builds clippy-clean.
 - ESP32 builds use ESP-IDF 6.0.3 and esp-uac2-host v0.1.3; the first move from IDF 5.4 requires a USB bootloader flash.
 - Repository build and flashing wrappers select the pinned ESP-IDF and esptool versions and track external UAC2 component changes.
-- CI and release builds pin esp-uac2-host v0.1.3, espup v0.16.0 and Xtensa Rust 1.93.0.0 (1.97.0.0 crashes LLVM on this firmware), and host tests no longer read local-only device captures.
+- The UAC2 host driver comes from the ESP Component Registry (`averyy/usb_host_uac2` 0.1.3) instead of a sibling checkout; `ESP_UAC2_HOST_PATH` builds against a local driver working copy.
+- CI and release builds pin espup v0.16.0 and Xtensa Rust 1.93.0.0 (1.97.0.0 crashes LLVM on this firmware), use current Node 24 actions, and host tests no longer read local-only device captures.
 - ESP32 partitions now provide two 3 MB firmware slots and about 9.9 MB of bundle storage; existing boards need a USB flash to change layouts.
 - Hosted ezBEQ is pinned to 2.12.4 with checksum verification, slot title/author metadata, custom biquad uploads, filter-author and new-title queries, and active-slot/output controls.
 - Catalogue bundles include device-ready 96 kHz float32 coefficients with an authored-filter fallback and a sample-rate guard.
@@ -58,6 +61,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - Hosted ezBEQ handles UTF-8 and complete request bodies, resets gain/mute on clear, and supports concurrent state/Levels clients with text ping/pong.
 - Bundle updates stage and resume downloads while reclaiming stale files.
 - ESP-IDF 6.x WebSocket handshakes register the callback required by the updated HTTP server.
+- The release and catalogue-sync workflows referenced a `setup-uv` version that doesn't exist; the catalogue sync also waits for GitHub Pages to be enabled instead of failing every four hours.
 - The ESP32 no longer replays its boot log at startup, which printed every boot line twice on serial and pushed real entries out of `/debug/log`.
 
 ### Removed

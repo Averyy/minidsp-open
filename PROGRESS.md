@@ -50,11 +50,13 @@ Details: [ESP32 audio](docs/TODO1-esp32-usb-audio.md),
 - [ ] Audibly retest the compressor on loud material with a threshold that triggers it; encoding/address investigation is closed.
 - [ ] Test HT-only bass management and routing polarity on hardware that exposes them, and perform multi-device live verification.
 - [ ] Replace the conservative ESP32 attach-settle delay with earlier readiness polling and a bounded fallback.
-- [ ] Turn the canonical Device Console HID capture into labelled fixtures, compare supported request/reply families with the client/queue, and cross-check the opcode table in [the capture notes](docs/NOTES-device-console-hid-logging.md).
-- [ ] Resolve exact runtime identity, or document the intentional alias boundary, for HA-DSP, DDRC-22, DDRC-88, CDSP-8x12/DL, and Harmony DSP. Product/software families are known; exact runtime identities aren't.
+- [x] Turn the canonical Device Console HID capture into labelled fixtures: 54 sanitized exchanges cover 13 opcodes, pass client/queue replay, and cross-check the opcode table in [the capture notes](docs/NOTES-device-console-hid-logging.md); typed probe-selector/DSP-version gaps are documented.
+- [ ] Check meter reads during a preset change on hardware: the Device Console capture has one meter reply that took ~2.8 s, longer than the client's 750 ms meter timeout.
+- [ ] Prove the exact runtime identity (hw_id, DSP version, USB PID) of HA-DSP, DDRC-22, DDRC-88 and CDSP-8x12/DL with `minidsp probe` on real units. Static research settled Harmony DSP (Device Console normalizes it to PADSP) and how Device Console selects a definition: [identity and Dirac notes](docs/NOTES-device-identity-and-dirac.md).
 - [ ] Keep importer/codegen changes source-backed and regenerate coverage artifacts when device evidence changes.
-- [ ] Confirm the HT selectable-source descriptor layout at `0xFFEA` before adding a typed parser, and reverse-engineer the address table for advanced Dirac controls (`mux_bypass`, `dirac_delay`, `mixer_fir`, `fir-ctrl`, `iir-ctrl`).
-- [ ] Run the release workflow on a first `vX.Y.Z` tag; CI (host tests and the ESP32 release build) already passes on GitHub. Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
+- [ ] Add a typed parser for the HT selectable-source descriptor at `0xFFEA`: static research confirmed a little-endian source bitmap (HT/HTx encode as `0x1E`/`0x1F`). Find the live addresses and value ranges of the advanced Dirac controls (`mux_bypass`, `dirac_delay`, `mixer_fir`, `fir-ctrl`) on a Dirac-capable unit; their preset layouts are documented and there is no standalone `iir-ctrl` descriptor.
+- [ ] Run the release workflow on a first `vX.Y.Z` tag; CI passes on GitHub, and a manual dry run builds every desktop target. Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
+- [ ] Enable GitHub Pages for the repository and set the `CATALOGUE_PAGES_ENABLED` variable, so the catalogue sync publishes the ezBEQ bundle boards download (`docs/ref-ezbeq.md`). Until then its scheduled runs skip.
 - [ ] Keep PWR-ICE compatibility, later ezBEQ expansion, and custom-PCB VBUS GPIO control deferred. DevKitC boards don't need GPIO-driven VBUS.
 
 ### Wi-DG parity

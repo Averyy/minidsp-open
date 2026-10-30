@@ -20,5 +20,5 @@ On most dev boards (this one included) there's 2 solder pads on the back of the 
 ## Key Findings
 
 - **XMOS AUDIO_CLASS_FALLBACK is disabled by default** in the XMOS reference firmware. miniDSP almost certainly did not enable it (no PS4/PS5 support, Windows driver named "UAC2", no changelog mentions). The miniDSP will likely present UAC2-only descriptors at Full Speed.
-- **This means `esp-uac2-host` (`~/code/esp-uac2-host`) is likely needed** for USB audio output from ESP32 to miniDSP. The 5-minute hardware test (plug ESP32 into miniDSP, enumerate interfaces) will confirm.
+- **USB audio output uses `averyy/usb_host_uac2` from the ESP Component Registry**, pinned in `app-esp32/Cargo.toml`. A local esp-uac2-host checkout is only needed for driver or simulator development; see [CONTRIBUTING.md](../CONTRIBUTING.md#usb-audio-driver-development).
 - If by some chance UAC1 fallback IS present, Espressif's existing `usb_host_uac` v1.3.3 handles everything.
