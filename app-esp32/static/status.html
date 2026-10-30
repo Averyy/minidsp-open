@@ -134,7 +134,10 @@ async function pollDevice() {
     $('uptime').textContent = `${Math.floor(info.uptime_secs / 3600)}h ${Math.floor(info.uptime_secs / 60) % 60}m ${info.uptime_secs % 60}s`;
     $('wifi').textContent = info.wifi.connected ? `${info.wifi.ssid || 'Connected'} · ${info.wifi.rssi ?? '?'} dBm` : 'Disconnected';
     $('ip').textContent = info.wifi.ip || '—'; $('device').textContent = info.usb.device || 'Disconnected'; $('serial').textContent = info.usb.serial ?? '—';
-    try {
+    // HID is refused (409) while audio plays; skip the request rather than log
+    // a failed fetch every poll. A session starting between polls still 409s.
+    if (rattle.playing || playBusy) $('hid').textContent = 'Last known values · busy while audio plays';
+    else try {
       const status = await request('/devices/0'), m = status.master;
       $('volume').textContent = m.volume + ' dB'; $('mute').textContent = m.mute ? 'Muted' : 'Unmuted';
       $('source').textContent = displaySource(m.source); $('preset').textContent = String(m.preset + 1); $('hid').textContent = '';
