@@ -254,6 +254,17 @@ Required behavior:
   a debug build.
 - The HTTP surface matches the shared request/response contract, but ESP32 keeps
   an explicit allocation ceiling for generated playback buffers.
+- If the board resets while a stream runs and VBUS stays up (crash, watchdog,
+  restart, reset button or flashing), the 2x4 HD keeps accepting USB audio but
+  outputs nothing until it reboots. USB looks healthy throughout, so this can't
+  be detected from the host. A cable unplug doesn't cause it, because the
+  MiniDSP sees VBUS drop. The firmware sets a flag while streaming, in RTC
+  memory (which survives panics, watchdogs and software resets) and in NVS
+  (which the main task writes, and which also survives EN-pin resets). A boot
+  that finds the flag sends the MiniDSP its reboot command before opening
+  audio. `POST /devices/0/reboot` clears the state by hand. Reproduced and
+  verified with a UMIK-1 on 2026-10-30: an EN reset while idle stays audible,
+  one mid-stream goes silent, and the boot recovery restores sound.
 
 ### Desktop
 
