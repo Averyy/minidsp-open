@@ -18,6 +18,9 @@ use log::{error, info, warn};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[global_allocator]
+static ALLOCATOR: psram::Allocator = psram::Allocator;
+
 mod auth;
 mod device;
 mod diagnostics;
@@ -25,6 +28,7 @@ mod ezbeq;
 mod http_server;
 mod led;
 mod ota;
+mod psram;
 mod settings;
 mod snapshot;
 mod storage;
