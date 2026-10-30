@@ -30,9 +30,33 @@ static USB_CLEANUP_SINCE: AtomicU32 = AtomicU32::new(0);
 const MAIN_LOOP_STALL_SECS: u32 = 300;
 /// Cleanup normally finishes in under ten seconds.
 const USB_CLEANUP_STALL_SECS: u32 = 30;
+/// A healthy endpoint halt finishes within a frame or two.
+const HALT_DUMP_AFTER_MS: u32 = 2_000;
 
 fn uptime_secs() -> u32 {
     (unsafe { sys::esp_timer_get_time() } / 1_000_000) as u32
+}
+
+fn current_stall() -> Option<(&'static str, u32)> {
+    let now = uptime_secs();
+    let cleanup_since = USB_CLEANUP_SINCE.load(Ordering::Relaxed);
+    if cleanup_since != 0 && now - cleanup_since > USB_CLEANUP_STALL_SECS {
+        return Some(("USB cleanup", now - cleanup_since));
+    }
+    let alive = MAIN_LOOP_ALIVE.load(Ordering::Relaxed);
+    (now - alive > MAIN_LOOP_STALL_SECS).then_some(("the main loop", now - alive))
+}
+
+/// Log the controller registers once per endpoint halt that outlives a healthy one.
+fn dump_pending_halt(dumped: &mut u32) {
+    let Some(started) = usb_hid::halt_started_ms() else {
+        return;
+    };
+    let now_ms = (unsafe { sys::esp_timer_get_time() } / 1000) as u32;
+    if started != *dumped && now_ms.wrapping_sub(started) >= HALT_DUMP_AFTER_MS {
+        *dumped = started;
+        usb_dwc::log_controller_state("halt pending");
+    }
 }
 
 /// A USB host call that never returns (a channel halt whose interrupt never
@@ -42,21 +66,17 @@ fn uptime_secs() -> u32 {
 fn start_stall_supervisor() -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("stall_sup".into())
-        .stack_size(3 * 1024)
-        .spawn(|| loop {
-            std::thread::sleep(Duration::from_secs(5));
-            let now = uptime_secs();
-            let cleanup_since = USB_CLEANUP_SINCE.load(Ordering::Relaxed);
-            let stall = if cleanup_since != 0 && now - cleanup_since > USB_CLEANUP_STALL_SECS {
-                Some(("USB cleanup", now - cleanup_since))
-            } else {
-                let alive = MAIN_LOOP_ALIVE.load(Ordering::Relaxed);
-                (now - alive > MAIN_LOOP_STALL_SECS).then_some(("the main loop", now - alive))
-            };
-            if let Some((what, secs)) = stall {
-                error!("{what} stalled for {secs} s, likely on a USB host call that never returned; restarting");
-                std::thread::sleep(Duration::from_millis(200));
-                unsafe { sys::esp_restart() };
+        .stack_size(4 * 1024)
+        .spawn(|| {
+            let mut halt_dumped = 0;
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                dump_pending_halt(&mut halt_dumped);
+                if let Some((what, secs)) = current_stall() {
+                    error!("{what} stalled for {secs} s, likely on a USB host call that never returned; restarting");
+                    std::thread::sleep(Duration::from_millis(200));
+                    unsafe { sys::esp_restart() };
+                }
             }
         })?;
     Ok(())
@@ -76,6 +96,7 @@ mod storage;
 mod threads;
 mod updater;
 mod usb_audio;
+mod usb_dwc;
 mod usb_hid;
 mod wifi;
 

@@ -171,6 +171,17 @@ struct CallbackState {
 
 static CB_STATE: OnceLock<CallbackState> = OnceLock::new();
 static GLOBAL_BUS: OnceLock<Arc<UsbHidBus>> = OnceLock::new();
+/// esp_timer_get_time()/1000 when an endpoint halt started; 0 when none is in
+/// progress. The host library waits for the halt with no timeout.
+static HALT_STARTED_MS: AtomicU32 = AtomicU32::new(0);
+
+/// When the endpoint halt in progress started (ms since boot), if one is.
+pub fn halt_started_ms() -> Option<u32> {
+    match HALT_STARTED_MS.load(Ordering::SeqCst) {
+        0 => None,
+        started => Some(started),
+    }
+}
 
 fn cb_state() -> &'static CallbackState {
     CB_STATE.get_or_init(|| CallbackState {
@@ -388,7 +399,12 @@ impl UsbHidBus {
         );
 
         unsafe {
+            HALT_STARTED_MS.store(
+                ((esp_timer_get_time() / 1000) as u32).max(1),
+                Ordering::SeqCst,
+            );
             let halt = usb_host_endpoint_halt(dev_hdl, ep);
+            HALT_STARTED_MS.store(0, Ordering::SeqCst);
             if halt != ESP_OK && halt != ESP_ERR_INVALID_STATE && halt != ESP_ERR_NOT_FOUND {
                 warn!("USB endpoint 0x{ep:02X} halt failed during {reason}: 0x{halt:04x}");
             }
@@ -521,6 +537,7 @@ impl UsbHidBus {
                     .unwrap_or_else(|| "n/a".into())
             );
             debug!("USB OUT wait failed for {:02x?}: {}", payload, e);
+            crate::usb_dwc::log_controller_state("OUT timeout");
             if let Err(cleanup_err) = self.cleanup_device() {
                 warn!("USB cleanup after OUT timeout failed: {cleanup_err}");
             }

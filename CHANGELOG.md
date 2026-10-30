@@ -29,6 +29,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 
 ### Changed
 
+- When a HID write to the MiniDSP gets no completion within 5 s, the ESP32 logs the USB controller's global and channel registers (`USB DWC …` lines), and logs them again if the channel halt that follows is still waiting 2 s later.
 - Desktop and ESP32 share one copy of the PEQ shadow builder, raw-write shadow parsers, scalar sanitation, default PEQ frequencies and device-info assembly in the protocol crate; equivalence tests showed the two copies already behaved identically.
 - The workspace builds clippy-clean.
 - ESP32 builds use ESP-IDF 6.0.3 and esp-uac2-host v0.2.0; the first move from IDF 5.4 requires a USB bootloader flash. On a 2x4 HD with v0.2.0, 16- and 24-bit sweeps and rattle sessions were audible on a UMIK-1, with a click-free stop.
