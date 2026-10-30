@@ -255,16 +255,21 @@ Required behavior:
 - The HTTP surface matches the shared request/response contract, but ESP32 keeps
   an explicit allocation ceiling for generated playback buffers.
 - If the board resets while a stream runs and VBUS stays up (crash, watchdog,
-  restart, reset button or flashing), the 2x4 HD keeps accepting USB audio but
-  outputs nothing until it reboots. USB looks healthy throughout, so this can't
-  be detected from the host. A cable unplug doesn't cause it, because the
-  MiniDSP sees VBUS drop. The firmware sets a flag while streaming, in RTC
-  memory (which survives panics, watchdogs and software resets) and in NVS
-  (which the main task writes, and which also survives EN-pin resets). A boot
-  that finds the flag sends the MiniDSP its reboot command before opening
-  audio. `POST /devices/0/reboot` clears the state by hand. Reproduced and
-  verified with a UMIK-1 on 2026-10-30: an EN reset while idle stays audible,
-  one mid-stream goes silent, and the boot recovery restores sound.
+  restart, reset button or flashing), the 2x4 HD can keep accepting USB audio
+  but output nothing until it reboots. It's intermittent. In controlled tests
+  on 2026-10-30, measured with a UMIK-1 and with the recovery below disabled, 2
+  of 8 EN resets mid-stream went silent (cuts 15 s and 25 s into a stream);
+  cuts 2-5 s in, EN resets while idle, and resets where another host booted
+  next stayed audible. The host can't detect it: enumeration, stream start and
+  the feedback endpoint are normal, the UAC2 feature unit reads unmuted at
+  0 dB, and HID memory `0xF000`-`0xFFFF` matches a healthy unit. Switching
+  format, source, mute or preset doesn't clear it; the MiniDSP's own reboot
+  does. A cable unplug doesn't cause it, because the MiniDSP sees VBUS drop.
+  The firmware sets a flag while streaming, in RTC memory (which survives
+  panics, watchdogs and software resets) and in NVS (which the main task
+  writes, and which also survives EN-pin resets). A boot that finds the flag
+  sends the MiniDSP its reboot command before opening audio, which adds about
+  28 s. `POST /devices/0/reboot` clears the state by hand.
 
 ### Desktop
 

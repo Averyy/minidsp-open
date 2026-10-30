@@ -47,7 +47,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 
 ### Fixed
 
-- If the ESP32 reset during USB playback (crash, watchdog, restart, reset button or flashing), the 2x4 HD kept accepting audio but stayed silent until it was power-cycled. The firmware now records active streams, in RTC memory and NVS, and reboots the MiniDSP on the next boot before opening audio. A cable unplug never caused this.
+- If the ESP32 reset during USB playback (crash, watchdog, restart, reset button or flashing), the 2x4 HD could keep accepting audio but stay silent until it was power-cycled. It's intermittent: 2 of 8 controlled mid-stream resets did it. The firmware now records active streams, in RTC memory and NVS, and reboots the MiniDSP on the next boot before opening audio. A cable unplug never caused this.
 - While audio played, the ESP32 `/status` page kept requesting device state that the board refuses with 409, logging a failed request every four seconds. It now shows the last known values without asking.
 - The ESP32 OpenAPI document described the rattle `bitDepth` as a number; requests take the string `"16"` or `"24"`, as `/play` and the desktop daemon document.
 - An open hosted ezBEQ page crash-looped the ESP32 every few seconds. Its Levels worker re-read the catalogue version from flash on a PSRAM stack, which the flash driver forbids. The worker now compares a cached copy that WebSocket connects and bundle updates refresh.
