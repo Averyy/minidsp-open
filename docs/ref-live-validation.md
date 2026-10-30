@@ -44,7 +44,9 @@ control mutations and local restores; it is not a read-only smoke test.
 
 Both lanes validate `GET /settings` and cache `maxVolumeDb` for volume and audio
 checks. Master-volume and ezBEQ volume steps go down by 0.5 dB when the current
-volume is at or within 0.5 dB of the ceiling. With `--allow-destructive`, a
+volume is at or within 0.5 dB of the ceiling. A starting volume above the
+ceiling (set with the knob or IR remote) can't be restored through the API, so
+those steps skip and audio validation refuses to start. With `--allow-destructive`, a
 same-value settings POST is verified by GET and the original setting is restored
 in `finally`, including on failure. Settings are re-read for that round trip.
 With a ceiling at or below -35.5 dB and `--allow-audio`, an above-ceiling
@@ -130,8 +132,10 @@ The sequence is:
    master and config writes. On desktop, both mutations must return `409` inside
    an observed busy window. ESP32's single HTTP task queues requests behind the
    synchronous snapshot handler: launch the status probe and both mutations
-   concurrently, require successful responses, and compare completion timestamps
-   to prove they finish after the snapshot response. Each request must start
+   0.5 s after the snapshot starts, require successful responses, and require
+   each to finish no earlier than the snapshot response headers arrived (with
+   0.25 s for client scheduling), which body size and decoding can't skew.
+   Each request must start
    before that response to establish overlap. Both lanes require a strictly
    complete snapshot equal to baseline. Unobserved overlap or boundary races fail
    as unproven; retain artifacts and investigate on hardware.
@@ -229,8 +233,8 @@ The bundle also includes per-target `snapshot-before.json`, `snapshot-after.json
 record each phase. `--report PATH` additionally writes a Markdown report there.
 `snapshot-busy-get.json` / `snapshot-busy-post.json` retain the concurrency model,
 snapshot status/body, probe and mutation statuses, and timeout evidence. For
-ESP32, they include monotonic request start/completion timestamps and snapshot
-completion time for the serialization assertion.
+ESP32, they include monotonic request start/completion timestamps and the
+snapshot's header-arrival and completion times for the serialization assertion.
 
 ## Hardware validation still required
 

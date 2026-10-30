@@ -5707,34 +5707,27 @@ fn ws_poll_loop(
 
     log::info!("WebSocket poll thread started (interval={interval_ms}ms)");
 
+    // A password set, or this session revoked, since the upgrade stops pushes
+    // right before the send; auth::tick closes the socket.
+    let mut push = |json: &str| {
+        crate::auth::push_allowed(fd)
+            && sender.send(FrameType::Text(false), json.as_bytes()).is_ok()
+    };
+
     // Send initial status immediately so clients don't wait for first tick
     if audio_state.is_playing() {
-        let json = playback_busy_json();
-        if sender
-            .send(FrameType::Text(false), json.as_bytes())
-            .is_err()
-        {
+        if !push(&playback_busy_json()) {
             return;
         }
     } else if let Some(dev) = get_device(&state) {
         if let Some(_op) = dev.try_begin_operation() {
             if let Ok(status) = dev.get_status_summary() {
-                let json = status_json(&status);
-                if sender
-                    .send(FrameType::Text(false), json.as_bytes())
-                    .is_err()
-                {
+                if !push(&status_json(&status)) {
                     return;
                 }
             }
-        } else {
-            let json = device_busy_json();
-            if sender
-                .send(FrameType::Text(false), json.as_bytes())
-                .is_err()
-            {
-                return;
-            }
+        } else if !push(&device_busy_json()) {
+            return;
         }
     }
 
@@ -5747,11 +5740,6 @@ fn ws_poll_loop(
         }
 
         if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        // A password set, or this session revoked, since the upgrade stops
-        // pushes here; auth::tick closes the socket.
-        if !crate::auth::push_allowed(fd) {
             break;
         }
 
@@ -5773,11 +5761,8 @@ fn ws_poll_loop(
             }
         };
 
-        if sender
-            .send(FrameType::Text(false), json.as_bytes())
-            .is_err()
-        {
-            break; // Connection lost
+        if !push(&json) {
+            break; // Connection lost or no longer authorized
         }
     }
 
@@ -6046,15 +6031,15 @@ fn push_levels(
             let recipients: Vec<_> = clients
                 .iter()
                 .filter(|c| crate::auth::push_allowed(c.fd))
-                .map(|c| (c.token, c.sender.clone(), c.levels))
+                .map(|c| (c.token, c.sender.clone(), c.levels, c.fd))
                 .collect();
             let mut beq = beq_state.lock().unwrap_or_else(|e| e.into_inner());
             // Device reprobe replaces EzBeqState; rebuild notification senders
             // from live sessions rather than losing them across a USB reconnect.
             beq.ws_senders = recipients
                 .iter()
-                .filter(|(_, _, levels)| !levels)
-                .map(|(token, sender, _)| (*token, sender.clone()))
+                .filter(|(_, _, levels, _)| !levels)
+                .map(|(token, sender, _, _)| (*token, sender.clone()))
                 .collect();
             beq.ws_sender = beq.ws_senders.first().map(|(_, sender)| sender.clone());
             (recipients, beq.pending_state.take())
@@ -6071,7 +6056,8 @@ fn push_levels(
         } else {
             None
         };
-        let levels = if clients.iter().any(|(_, _, levels)| *levels) && !audio_state.is_playing() {
+        let levels = if clients.iter().any(|(_, _, levels, _)| *levels) && !audio_state.is_playing()
+        {
             get_device(&state).and_then(|dev| {
                 let _op = dev.try_begin_operation()?;
                 let status = dev.get_status_summary().ok()?;
@@ -6083,13 +6069,17 @@ fn push_levels(
         } else {
             None
         };
-        for (token, mut sender, subscriber) in clients {
+        for (token, mut sender, subscriber, fd) in clients {
             let messages = if subscriber {
                 [levels.as_ref(), None]
             } else {
                 [meta.as_ref(), pending.as_ref()]
             };
             for json in messages.into_iter().flatten() {
+                // Revoked since the recipients were collected.
+                if !crate::auth::push_allowed(fd) {
+                    break;
+                }
                 if sender
                     .send(FrameType::Text(false), json.as_bytes())
                     .is_err()

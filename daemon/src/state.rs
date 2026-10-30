@@ -73,11 +73,9 @@ impl DaemonState {
     pub async fn add_device(&self, id: usize, client: Arc<MiniDspClient>) {
         client.bind_volume_settings(self.settings.clone());
         let epoch = client.reconnect_epoch();
-        let enforced = match client
-            .enforce_volume_settings(*self.settings.read().await)
-            .await
-        {
-            Ok(()) => Some(epoch),
+        let current = *self.settings.read().await;
+        let enforced = match client.enforce_volume_settings(current).await {
+            Ok(()) => Some((epoch, current)),
             Err(err) => {
                 // Writes are still clamped; only lowering the current volume is pending.
                 tracing::warn!("cannot apply maximum volume to device {id} yet: {err}; retrying");
@@ -414,13 +412,15 @@ impl DaemonState {
 const VOLUME_CEILING_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Reapplies the maximum volume after the device's transport reconnects (a
-/// restarted device reports its stored volume), and retries a first attempt
-/// that failed. Ends when the client is dropped.
+/// restarted device reports its stored volume) or the settings change, and
+/// retries a first attempt that failed. The settings check also covers a
+/// `POST /settings` that ran while the device was registering, before it was
+/// listed. Ends when the client is dropped.
 fn watch_volume_ceiling(
     id: usize,
     client: std::sync::Weak<MiniDspClient>,
     settings: Arc<RwLock<minidsp_protocol::settings::Settings>>,
-    mut enforced: Option<u64>,
+    mut enforced: Option<(u64, minidsp_protocol::settings::Settings)>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -429,15 +429,16 @@ fn watch_volume_ceiling(
                 return;
             };
             let epoch = client.reconnect_epoch();
-            if enforced == Some(epoch) {
+            let current = settings.read().await;
+            if enforced == Some((epoch, *current)) {
                 continue;
             }
-            match client.enforce_volume_settings(*settings.read().await).await {
+            match client.enforce_volume_settings(*current).await {
                 Ok(()) => {
                     if enforced.is_none() {
                         tracing::info!("maximum volume applied to device {id}");
                     }
-                    enforced = Some(epoch);
+                    enforced = Some((epoch, *current));
                 }
                 Err(err) => tracing::debug!("device {id}: maximum volume not applied yet: {err}"),
             }

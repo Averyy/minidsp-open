@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import io
 import json
+import time
 import os
 import sys
 import tempfile
@@ -66,11 +67,14 @@ class FakeDevice:
         self.broken_rattle_ceiling = False
         self.firmware = {"version": "0.1.0", "build": "fake", "runningSlot": "ota_0", "slotState": "valid"}
         self.config_post_status = 200
+        self.snapshot_client_delay = 0.0
+        # A concurrent board keeps capturing after it answers other requests.
+        self.capture_after_release = 0.0
 
     def response(self, status, data):
         return live.HttpResponse(status, {"Content-Type": "application/json"}, json.dumps(data).encode())
 
-    def request(self, method, url, *, body=None, **kwargs):
+    def request(self, method, url, *, body=None, timings=None, **kwargs):
         path = live.urllib.parse.urlparse(url).path
         payload = json.loads(body) if body else None
         self.calls.append((method, path, payload))
@@ -82,7 +86,14 @@ class FakeDevice:
                 if self.queued_requests == 3:
                     self.release.set()
         with self.server_lock if self.serialized else contextlib.nullcontext():
-            return self.handle_request(method, path, payload)
+            response = self.handle_request(method, path, payload)
+            # Headers leave before a serialized server takes the next request.
+            if timings is not None:
+                timings["headersAt"] = time.monotonic()
+        if path.endswith("/snapshot"):
+            # A slow snapshot client: body read/decoding after the headers.
+            time.sleep(self.snapshot_client_delay)
+        return response
 
     def clamp_volume(self, value):
         ceiling = self.settings["maxVolumeDb"]
@@ -96,6 +107,7 @@ class FakeDevice:
                 self.busy.set()
                 if not self.release.wait(2):
                     raise AssertionError("test did not release fake snapshot operation")
+                time.sleep(self.capture_after_release)
                 self.busy.clear()
             if method == "POST":
                 if self.reject_restore:
@@ -662,7 +674,32 @@ class LiveValidationTests(unittest.TestCase):
                 for request in [evidence["probe"], *evidence["mutations"]]:
                     self.assertEqual(request["status"], 200)
                     self.assertLess(request["startedAt"], evidence["snapshotCompletedAt"])
-                    self.assertGreater(request["completedAt"], evidence["snapshotCompletedAt"])
+                    self.assertGreaterEqual(request["completedAt"], evidence["snapshotHeadersAt"])
+
+    def test_snapshot_serialization_tolerates_a_slow_snapshot_client(self):
+        harness, target = self.harness("--allow-destructive", kind="esp32")
+        artifacts = live.start_destructive_snapshot_guard(harness, target, self.root)
+        self.device.serialized = True
+        self.device.hold_snapshot = True
+        self.device.snapshot_client_delay = 0.5
+        self.device.release.clear()
+        self.device.queued_requests = 0
+        self.assertIn("after snapshot response", live.assert_snapshot_busy(harness, target, artifacts, "GET"))
+        evidence = json.loads((artifacts.root / "snapshot-busy-get.json").read_text())
+        # The queued requests finished while the snapshot client was still decoding.
+        self.assertTrue(any(r["completedAt"] < evidence["snapshotCompletedAt"]
+                            for r in [evidence["probe"], *evidence["mutations"]]))
+
+    def test_volume_above_the_ceiling_is_left_alone(self):
+        self.device.settings = {"maxVolumeDb": -30.0}
+        self.device.state["master"]["volume"] = -18.0
+        harness, target = self.harness("--allow-audio", "--yes-i-know")
+        self.assertIsNotNone(live.unrestorable_volume(target, -18.0))
+        self.assertIsNone(live.unrestorable_volume(target, -30.0))
+        with self.assertRaisesRegex(live.SafetyStop, "refusing audio"):
+            with live.safe_test_volume(harness, target):
+                self.fail("audio must not start")
+        self.assertFalse([c for c in self.device.calls if c[0] == "POST" and c[1] == "/devices/0"])
 
     def test_snapshot_serialization_rejects_early_completion_errors_and_changed_snapshot(self):
         for failure in ("early", "error", "changed", "incomplete"):
@@ -676,6 +713,7 @@ class LiveValidationTests(unittest.TestCase):
                 self.device.hold_snapshot = True
                 self.device.serialized = failure != "early"
                 self.device.broken_guard = self.device.admit_snapshot_probe = failure == "early"
+                self.device.capture_after_release = 1.0 if failure == "early" else 0.0
                 self.device.config_post_status = 500 if failure == "error" else 200
                 if failure == "changed":
                     self.device.state["master"]["volume"] = -19

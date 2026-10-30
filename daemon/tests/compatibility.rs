@@ -445,6 +445,17 @@ async fn failed_ceiling_enforcement_registers_the_device_and_retries() {
     })
     .await
     .expect("the ceiling guard lowers the volume after the failed first attempt");
+
+    // A ceiling saved while the device wasn't listed yet (as when POST
+    // /settings races registration) still reaches it.
+    *state.settings.write().await = minidsp_protocol::settings::Settings::new(Some(-30.0)).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while client.get_master_status().await.map(|m| m.volume).ok() != Some(60) {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the ceiling guard applies a settings change it didn't see enforced");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

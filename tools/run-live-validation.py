@@ -60,6 +60,10 @@ CATALOGUE_TIMEOUT = 45.0
 CATALOGUE_CACHE: dict[str, list[dict[str, Any]]] = {}
 
 
+# Client-side thread scheduling jitter allowed when comparing request times.
+SERIALIZATION_TOLERANCE_SEC = 0.25
+
+
 class StepFailed(RuntimeError):
     """Raised when a validation step fails."""
 
@@ -529,12 +533,17 @@ def http_request(
     body: bytes | None = None,
     headers: dict[str, str] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    timings: dict[str, float] | None = None,
 ) -> HttpResponse:
     req = urllib.request.Request(url=url, data=body, method=method)
     for key, value in (headers or {}).items():
         req.add_header(key, value)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # Before the body is read, for ordering evidence that body size
+            # and decoding time can't skew.
+            if timings is not None:
+                timings["headersAt"] = time.monotonic()
             raw = resp.read()
             resp_headers = {k: v for k, v in resp.headers.items()}
             return HttpResponse(
@@ -565,13 +574,14 @@ def http_json(
     payload: Any | None = None,
     *,
     timeout: float = DEFAULT_TIMEOUT,
+    timings: dict[str, float] | None = None,
 ) -> tuple[HttpResponse, Any]:
     body = None
     headers = {"Accept": "application/json"}
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    resp = http_request(method, url, body=body, headers=headers, timeout=timeout)
+    resp = http_request(method, url, body=body, headers=headers, timeout=timeout, timings=timings)
     data = None
     if resp.body:
         with contextlib.suppress(json.JSONDecodeError):
@@ -689,6 +699,16 @@ def choose_gain_delta(value: float) -> float:
     if abs(candidate - value) < 0.01:
         candidate = value + 1.0
     return round(candidate, 2)
+
+
+def unrestorable_volume(target: Target, volume: float) -> str | None:
+    """Writes clamp to the ceiling, so a louder starting volume (set with the
+    front-panel knob or IR remote) can't be restored exactly through the API."""
+    ceiling = read_settings(target)["maxVolumeDb"]
+    if ceiling is not None and volume > ceiling:
+        return (f"current volume {volume} dB is above the {ceiling} dB ceiling (knob or IR bypass), "
+                "so the API can't restore it; lower the volume or raise the ceiling")
+    return None
 
 
 def choose_volume_delta(value: float, ceiling: float | None) -> float:
@@ -1186,7 +1206,11 @@ def run_common_http_suite(harness: Harness, target: Target) -> None:
         approx_equal(float(restored), original, tolerance=0.1)
         return f"{original} -> {desired} -> {original}"
 
-    harness.run_step(section, "POST /devices/{id} volume change + restore", volume_step)
+    reason = unrestorable_volume(target, float(baseline_master["volume"]))
+    if reason:
+        harness.skip(section, "POST /devices/{id} volume change + restore", reason)
+    else:
+        harness.run_step(section, "POST /devices/{id} volume change + restore", volume_step)
 
     def mute_step() -> str:
         original = bool(baseline_master["mute"])
@@ -1426,6 +1450,9 @@ def safe_test_volume(harness: Harness, target: Target) -> Iterable[None]:
     harness.baselines.setdefault(target.label, identity)
     wait_for_idle_playback(target, harness.args.reconnect_timeout)
     original = float(read_status(target)["master"]["volume"])
+    reason = unrestorable_volume(target, original)
+    if reason:
+        raise SafetyStop(f"refusing audio: {reason}")
     try:
         resp, _ = http_json("POST", target.path(f"/devices/{target.device_id}"), {"volume": -35.0})
         assert_true(resp.status == 200, f"setting -35 dB test volume returned {resp.status}")
@@ -1876,7 +1903,11 @@ def run_ezbeq_suite(harness: Harness, target: Target) -> None:
         approx_equal(float(read_status(target)["master"]["volume"]), original, tolerance=0.1)
         return f"{original} -> {desired} -> {original}"
 
-    harness.run_step(section, "PATCH /api/3/devices/master masterVolume", patch_volume_step)
+    reason = unrestorable_volume(target, float(read_status(target)["master"]["volume"]))
+    if reason:
+        harness.skip(section, "PATCH /api/3/devices/master masterVolume", reason)
+    else:
+        harness.run_step(section, "PATCH /api/3/devices/master masterVolume", patch_volume_step)
 
     if harness.args.allow_destructive:
         def overwrite_step() -> str:
@@ -2137,14 +2168,16 @@ def assert_snapshot_busy(harness: Harness, target: Target, artifacts: SnapshotAr
     def snapshot_worker() -> None:
         result["startedAt"] = time.monotonic()
         started.set()
+        timings: dict[str, float] = {}
         try:
             result["response"], result["snapshot"] = http_json(
                 method, target.path(f"/devices/{target.device_id}/snapshot"),
-                baseline if method == "POST" else None, timeout=300.0)
+                baseline if method == "POST" else None, timeout=300.0, timings=timings)
         except Exception as exc:
             result["error"] = exc
         finally:
             result["completedAt"] = time.monotonic()
+            result["headersAt"] = timings.get("headersAt", result["completedAt"])
 
     def request_worker(method: str, path: str, payload: Any, evidence: dict[str, Any]) -> None:
         evidence.update({"method": method, "path": path, "startedAt": time.monotonic()})
@@ -2200,7 +2233,8 @@ def assert_snapshot_busy(harness: Harness, target: Target, artifacts: SnapshotAr
                   {"status": result["response"].status if "response" in result else None,
                    "snapshot": result.get("snapshot"), "error": str(result.get("error", "")),
                    "concurrencyModel": "serialized" if serialized else "busy-409",
-                   "snapshotStartedAt": result.get("startedAt"), "snapshotCompletedAt": result.get("completedAt"),
+                   "snapshotStartedAt": result.get("startedAt"), "snapshotHeadersAt": result.get("headersAt"),
+                   "snapshotCompletedAt": result.get("completedAt"),
                    "busyObserved": busy_observed, "probe": probe_observed,
                    "mutations": mutations_observed, "timedOut": timed_out})
         if timed_out:
@@ -2217,7 +2251,9 @@ def assert_snapshot_busy(harness: Harness, target: Target, artifacts: SnapshotAr
                         f"serialized request failed: {evidence}")
             assert_true(evidence["startedAt"] < result["completedAt"],
                         "snapshot completed before concurrent request started; serialization coverage is unproven")
-            assert_true(evidence["completedAt"] > result["completedAt"],
+            # A serialized board answers queued requests only after sending
+            # the snapshot response, so none can finish before its headers.
+            assert_true(evidence["completedAt"] >= result["headersAt"] - SERIALIZATION_TOLERANCE_SEC,
                         f"concurrent request {evidence['path']} completed before snapshot response")
         return "probe, master and config requests completed successfully after snapshot response; strict baseline matched"
     return "master and config mutations both returned 409 inside observed snapshot busy window"

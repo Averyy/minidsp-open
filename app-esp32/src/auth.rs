@@ -20,6 +20,10 @@ const RECOVERY_HOLD: Duration = Duration::from_secs(10);
 /// IDF marks a socket as a WebSocket only after sending 101, which follows
 /// the pre-handshake grant; `tick` keeps grants this long meanwhile.
 const UPGRADE_GRACE_SECONDS: u64 = 10;
+/// IDF queues a close against a session slot, not a connection, so a second
+/// request could close a newer connection that reused the slot. An accepted
+/// close is repeated only if its socket is still open this long after.
+const CLOSE_RETRY_SECONDS: u64 = 30;
 
 static PROTECTED: AtomicBool = AtomicBool::new(false);
 static PROVISIONING: AtomicBool = AtomicBool::new(false);
@@ -51,6 +55,8 @@ struct State {
     rate: RateLimiter,
     cache: BasicCache,
     sockets: [Option<Socket>; MAX_SOCKETS],
+    /// Accepted close requests: (fd, when).
+    closing: [Option<(i32, u64)>; MAX_SOCKETS],
 }
 
 fn state() -> &'static Mutex<State> {
@@ -180,18 +186,43 @@ fn is_websocket(handle: httpd_handle_t, fd: i32) -> bool {
     unsafe { httpd_ws_get_fd_info(handle, fd) == httpd_ws_client_info_t_HTTPD_WS_CLIENT_WEBSOCKET }
 }
 
+/// Queues one close per socket; see `CLOSE_RETRY_SECONDS`. A refused request
+/// (httpd's control queue is full) isn't recorded, so the next tick retries.
+fn request_close(s: &mut State, handle: httpd_handle_t, fd: i32, now: u64) {
+    if s.closing
+        .iter()
+        .flatten()
+        .any(|&(closing, since)| closing == fd && now.saturating_sub(since) < CLOSE_RETRY_SECONDS)
+    {
+        return;
+    }
+    if unsafe { httpd_sess_trigger_close(handle, fd) } != ESP_OK {
+        return;
+    }
+    let slot = s
+        .closing
+        .iter()
+        .position(|entry| entry.is_none_or(|(closing, _)| closing == fd))
+        .unwrap_or_else(|| {
+            (0..s.closing.len())
+                .min_by_key(|&i| s.closing[i].map_or(0, |(_, since)| since))
+                .unwrap()
+        });
+    s.closing[slot] = Some((fd, now));
+}
+
 /// Immediate best effort after a password change; `tick` retries refusals.
 fn close_websockets() {
     let handle = server();
     if handle.is_null() {
         return;
     }
+    let now = now();
+    let mut s = state().lock().unwrap();
     let (fds, len) = clients(handle);
     for &fd in &fds[..len] {
         if is_websocket(handle, fd) {
-            unsafe {
-                httpd_sess_trigger_close(handle, fd);
-            }
+            request_close(&mut s, handle, fd, now);
         }
     }
 }
@@ -204,9 +235,8 @@ fn valid_grant(s: &mut State, grant: Grant, touch: bool) -> bool {
 }
 
 /// Closes every WebSocket without a live grant: expired or revoked sessions,
-/// sockets upgraded before protection was on, and earlier closes that httpd's
-/// full control queue refused. A grant stays until its socket is gone, so a
-/// refused close is retried on the next tick.
+/// sockets upgraded before protection was on, and closes httpd's full control
+/// queue refused earlier. A grant stays until its socket is gone.
 pub fn tick() {
     if !protected() {
         return;
@@ -215,23 +245,28 @@ pub fn tick() {
     if handle.is_null() {
         return;
     }
-    let (fds, len) = clients(handle);
-    let open = &fds[..len];
     let now = now();
     let mut s = state().lock().unwrap();
+    // Listed under the lock, so every grant registered so far has its fd here.
+    let (fds, len) = clients(handle);
+    let open = &fds[..len];
     for slot in s.sockets.iter_mut() {
         if let Some(socket) = *slot {
             let upgrading = now.saturating_sub(socket.since) < UPGRADE_GRACE_SECONDS;
-            if !open.contains(&socket.fd) || !(upgrading || is_websocket(handle, socket.fd)) {
+            let live = open.contains(&socket.fd) && is_websocket(handle, socket.fd);
+            if !(upgrading || live) {
                 *slot = None;
             }
         }
     }
+    for slot in s.closing.iter_mut() {
+        if slot.is_some_and(|(fd, _)| !open.contains(&fd)) {
+            *slot = None;
+        }
+    }
     for &fd in open {
         if is_websocket(handle, fd) && !granted(&mut s, fd, false) {
-            unsafe {
-                httpd_sess_trigger_close(handle, fd);
-            }
+            request_close(&mut s, handle, fd, now);
         }
     }
 }
