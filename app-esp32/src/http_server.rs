@@ -1216,12 +1216,9 @@ pub fn start(
         send_json(req, 200, &spec)
     })?;
 
-    // GET /llms.txt
+    // GET /llms.txt: the repository's API reference for LLM clients.
     server.fn_handler("/llms.txt", Method::Get, |req| {
-        send_text(
-            req,
-            "# minidsp-open\nMiniDSP audio processor controller.\nHTTP API on port 5380.\n",
-        )
+        send_text(req, include_str!("../../llms.txt"))
     })?;
 
     server.fn_handler("/ezbeq-shim.js", Method::Get, |req| {

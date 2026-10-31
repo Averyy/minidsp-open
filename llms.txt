@@ -1,0 +1,144 @@
+# minidsp-open
+
+> Controller for MiniDSP audio processors. A `minidsp` CLI and daemon for Linux, macOS and Windows that's compatible with minidsp-rs, and ESP32-S3 firmware that puts a MiniDSP on WiFi and serves the ezBEQ web UI.
+
+This file is for LLMs writing scripts, integrations or config for minidsp-open. It covers the interfaces, defaults and the mistakes people make. The full compatibility contract is https://github.com/Averyy/minidsp-open/blob/main/docs/ref-compatibility.md, and a running daemon or board lists every route at `GET /openapi.json`.
+
+## Where things listen
+
+| | Desktop daemon (`minidsp server`) | ESP32 board |
+|---|---|---|
+| HTTP and WebSocket | `0.0.0.0:5380` | port 5380 (port 80 only during WiFi setup) |
+| TCP bridge (Device Console, WI-DG protocol) | 5333 | 5333, one client at a time |
+| UDP discovery | broadcast to 3999 every second | same |
+| mDNS | `_minidsp._tcp` | `minidsp-<serial>.local`, `_minidsp._tcp` |
+| Unix socket | `/tmp/minidsp.sock`, same HTTP API | none |
+| Devices | every USB MiniDSP, indexed in serial order | one, always device `0` |
+
+## CLI
+
+minidsp-rs syntax. Indexes are 0-based. Put `--` before negative numbers.
+
+```bash
+minidsp                          # status as text
+minidsp -o jsonline              # status as one JSON line (what ezBEQ parses)
+minidsp probe                    # list devices
+minidsp gain -- -20              # master volume in dB
+minidsp mute on                  # on | off | toggle
+minidsp source usb               # see "Sources" below
+minidsp config 1                 # select preset index 1, the second preset (0-3)
+minidsp input 0 peq 0 set -- 1.0 0.0 0.0 0.0 0.0   # b0 b1 b2 a1 a2
+minidsp input 0 peq 0 bypass on
+minidsp output 1 gain -- -3
+minidsp output 1 mute on
+minidsp -f commands.txt          # one command per line, run in file order; -f - reads stdin
+minidsp snapshot export backup.json
+minidsp snapshot import backup.json
+minidsp server --config minidspd.toml
+minidsp -V                       # prints "minidsp 0.2.0"
+```
+
+Other command groups: `input`/`output N delay|invert|crossover|compressor|fir|routing`, `dirac`, `bm` (Flex HT/HTx bass management), `rattle`, `debug`. `minidsp <command> --help` shows each one.
+
+Choosing a device:
+
+- No flags: a running daemon through `/tmp/minidsp.sock`, otherwise local USB.
+- `--tcp HOST` (port 5333 by default): an ESP32 board, a WI-DG or a daemon's TCP bridge.
+- `--daemon-url http://HOST:5380`: a daemon's or a board's HTTP API. `rattle` needs this or `MINIDSPD_URL`.
+- `-d N` / `--device-index N`: one of several devices.
+- `--password-file FILE` or `MINIDSP_PASSWORD`: a board with a password set.
+
+## HTTP API
+
+JSON in and out, the same on desktop and ESP32 unless marked. Errors are `{"error":"message"}`: 400 bad request, 404 unknown route or device, 409 another long operation is running on the device (or a token no longer matches), 501 not supported on this device, 503 device busy or missing, 504 device timeout.
+
+| Route | Does |
+|---|---|
+| `GET /devices` | `[{"url":"…","version":{"hw_id":10,"dsp_version":100,"serial":912345,"fw_major":1,"fw_minor":85},"product_name":"2x4HD"}]` |
+| `GET /devices/{id}` | `{"master":{"preset":0,"source":"Toslink","volume":-20.0,"mute":false},"input_levels":[…],"output_levels":[…]}` |
+| `POST /devices/{id}` | Set any of `preset`, `source`, `volume`, `mute` from a bare object such as `{"volume":-20}`. Returns the master status. |
+| `POST /devices/{id}/volume/{up,down,toggle_mute}` | Step the volume or toggle mute |
+| `POST /devices/{id}/source/{name}` | Lowercase name in the path, such as `toslink` |
+| `POST /devices/{id}/preset/{n}` | Select preset `n` (0-3) |
+| `GET /devices/{id}/config` | Full configuration, plus a `readback` object saying where each value came from |
+| `POST /devices/{id}/config` | Write any parameters (shape below) |
+| `GET /devices/{id}/snapshot` | Export every preset; 409 with a partial body if some can't be read |
+| `POST /devices/{id}/snapshot` | Restore an exported snapshot, then verify it and return the result |
+| `GET /settings`, `POST /settings` | `{"maxVolumeDb":null}` or a ceiling such as `-20.5` |
+| `POST /devices/{id}/play` | Measurement sweep over USB audio; `{}` plays the default bundle |
+| `POST /devices/{id}/rattle`, `GET`, `POST …/rattle/stop` | Rattle finder tones |
+| `GET /openapi.json` | Every route |
+
+`POST /devices/{id}/config` body. Include only what you're changing; indexes are physical channel and filter numbers:
+
+```json
+{
+  "master_status": {"preset": 1},
+  "inputs": [
+    {"index": 0, "peq": [
+      {"index": 0, "coeff": {"b0": 1, "b1": 0, "b2": 0, "a1": 0, "a2": 0}, "bypass": false},
+      {"index": 1, "bypass": true}
+    ]}
+  ],
+  "outputs": [{"index": 1, "mute": true, "gain": -3.0}]
+}
+```
+
+## WebSocket
+
+- `ws://HOST:5380/devices/{id}?levels=true&poll=true`: status frames shaped like `GET /devices/{id}`. `levels` adds meter levels (every 500 ms on desktop), `poll` alone sends status every second. A parameter is on whenever it's present, whatever its value.
+- `ws://HOST:5380/devices/{id}/ws`: raw binary MiniDSP frames, for clients that speak the device protocol.
+
+## ESP32 only
+
+- `/` serves the ezBEQ web UI, with its API under `/api/1`, `/api/2` and `/api/3` (`GET /api/2/devices`, `PATCH /api/3/devices/master`, `PUT /api/1/devices/master/commands`). The BEQ catalogue updates itself from GitHub Pages.
+- `/status`: board and MiniDSP status, settings, rattle finder. `/update`: firmware page.
+- `GET /firmware`: running version and slot. `POST /firmware` with the app image (`minidsp-open-esp32-X.Y.Z.bin`, not the `-full.bin`) installs it. `POST /firmware/update` installs the latest GitHub release. Firmware that can't get back on the network rolls back by itself.
+- `GET /debug/info` (heap, WiFi, uptime), `GET /debug/log` (recent log lines), `GET /debug/usb`, `GET /debug/updater`.
+- Password, off by default. Once set, every HTTP and WebSocket request needs a session cookie, `Authorization: Basic` with user `admin`, or `Authorization: Bearer <token>` from `POST /login {"password":"…"}`. The TCP bridge and UDP discovery stop while a password is set.
+
+## Desktop config file
+
+`minidsp server --config FILE` reads the minidsp-rs `minidspd` TOML format. Unknown keys are ignored.
+
+```toml
+ignore_advertisements = false   # don't add devices found by UDP discovery
+max_volume_db = -20.5           # optional volume ceiling; omit for none
+
+[http_server]
+bind_address = "0.0.0.0:5380"
+
+[[tcp_server]]
+bind_address = "0.0.0.0:5333"
+device_index = 0                # or device_serial = 912345
+
+[[static_device]]
+url = "tcp://192.168.1.50:5333" # for example an ESP32 board
+```
+
+## Sources
+
+CLI and URL paths use lowercase names; JSON uses capitalised ones. Which sources exist depends on the device.
+
+`analog` (`Analog`), `toslink` (`Toslink`), `spdif` (`Spdif`), `usb` (`Usb`), `bluetooth` (`Bluetooth`), `hdmi` (`Hdmi`), `aesebu` (`AesEbu`), `analog_se` (`AnalogSingleEnd`), `analog_bal` (`AnalogBalanced`), `lan` (`Lan`).
+
+## Common mistakes
+
+- Preset and channel indexes start at 0. `minidsp config 1` and `POST /devices/0/preset/1` both select the second preset.
+- `minidsp gain -20` fails; write `minidsp gain -- -20`.
+- `POST /devices/{id}` takes a bare object. A `{"master":{…}}` wrapper isn't accepted.
+- Volume is attenuation from 0 to -127.5 dB in 0.5 dB steps. With a ceiling set, louder writes are clamped, and the response shows the volume actually set.
+- `GET /devices/{id}` leaves out null fields; the POST routes include them (`"dirac":null`).
+- A `false` mute, a zero gain or an identity filter in `GET /config` isn't proof the device reported it. Check `readback.fields[].source`: `device` and `shadow` are known, `default` and `unavailable` aren't.
+- A preset change takes about 4 s on the ESP32, and other requests wait for it. Long operations (snapshot restore, preset reset or copy) return 409 to a second one on the same device.
+- Browser pages that change settings must come from a local origin (`localhost`, a `.local` name, a private IP) or the daemon's `cors_origin`; anything else gets 403. Native clients that send no `Origin` aren't checked.
+- `minidsp -V` has to stay above `0.1.12`. ezBEQ only uses Flex HTx input PEQs when it is.
+- There's no authentication by default. Anything on the LAN can control the device, and on the ESP32 it can also install firmware. Use a trusted network.
+
+## Docs
+
+- Compatibility contract (every command, route and config key): https://github.com/Averyy/minidsp-open/blob/main/docs/ref-compatibility.md
+- Devices and capabilities: https://github.com/Averyy/minidsp-open/blob/main/docs/ref-devices.md
+- ESP32 firmware updates: https://github.com/Averyy/minidsp-open/blob/main/docs/ref-firmware-updates.md
+- Measurement and rattle playback: https://github.com/Averyy/minidsp-open/blob/main/docs/ref-playback.md
+- Releases: https://github.com/Averyy/minidsp-open/releases

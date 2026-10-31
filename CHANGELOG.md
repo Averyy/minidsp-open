@@ -16,6 +16,7 @@ First public release.
 
 ### Added
 
+- `llms.txt`, a compact API reference for LLM clients: CLI, HTTP and WebSocket routes, config file, ESP32 extras and common mistakes. The daemon and the ESP32 serve it at `GET /llms.txt`, replacing a two-line stub.
 - `GET /devices/{id}/config` includes a `readback` object on desktop and ESP32 that records, for each field, whether the value was read from the device, comes from this controller's acknowledged writes, is a fallback default, or couldn't be read. A failed mute or routing read no longer looks like a real `false`. Existing value fields are unchanged.
 - `POST /devices/{id}/config/restore-mutes` restores output mutes only while the `readback.snapshot_token` from an earlier `GET /config` still matches. A preset change, reset, reboot, reconnect, copy or snapshot restore in between makes it answer 409 without writing.
 - Rattle finder with labelled tones, volume passes, CLI and HTTP controls, and an ESP32 status page; basic playback verified on a 2x4 HD with a UMIK-1.

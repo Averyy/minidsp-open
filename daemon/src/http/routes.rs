@@ -2433,11 +2433,9 @@ async fn openapi() -> impl IntoResponse {
     )
 }
 
+/// The repository's `llms.txt`, an API reference for LLM clients.
 async fn llms_txt() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        "# minidsp-open\n\nMiniDSP controller HTTP API.\nSee /openapi.json for endpoints.\n",
-    )
+    (StatusCode::OK, include_str!("../../../llms.txt"))
 }
 
 #[cfg(test)]
@@ -2490,6 +2488,25 @@ mod tests {
         // Avoid add_device's shadow import/persistence: only identity is needed.
         state.devices.write().await.insert(0, Arc::new(client));
         state
+    }
+
+    #[tokio::test]
+    async fn llms_txt_serves_the_repository_reference() {
+        let response = llms_txt().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(b"# minidsp-open\n\n> Controller for MiniDSP"));
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("## Common mistakes")
+        );
     }
 
     #[tokio::test]
