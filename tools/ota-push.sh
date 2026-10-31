@@ -103,11 +103,22 @@ fi
 sha256="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 size="$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN")"
 echo "==> Uploading $size bytes (sha256 $sha256)"
-board_curl -fsS --max-time 300 -H 'Content-Type: application/octet-stream' \
-  --data-binary "@$BIN" "$BOARD_URL/firmware?sha256=$sha256" || {
-  echo "upload failed; the board kept its current firmware" >&2
-  exit 1
-}
+if ! board_curl -fsS --max-time 300 -H 'Content-Type: application/octet-stream' \
+  --data-binary "@$BIN" "$BOARD_URL/firmware?sha256=$sha256"; then
+  # The reply can be lost after a complete upload: the board reboots 1.5 s
+  # after answering. Only a board still up on the same slot, and not
+  # rebooting, kept its firmware.
+  sleep 5
+  if status="$(board_curl -fsS --max-time 3 "$BOARD_URL/firmware" 2>/dev/null)"; then
+    read -r now_slot now_state < <(printf '%s' "$status" | uv run python -c \
+      'import json,sys; s=json.load(sys.stdin); print(s["runningSlot"], (s.get("progress") or {}).get("state") or "idle")')
+    if [[ "$now_slot" == "$before_slot" && "$now_state" != "rebooting" ]]; then
+      echo "upload failed; the board kept its current firmware" >&2
+      exit 1
+    fi
+  fi
+  echo "upload reply lost, but the board is installing or rebooting"
+fi
 echo
 
 echo "==> Waiting for the board to come back"
