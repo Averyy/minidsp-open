@@ -188,7 +188,10 @@ fn connect_sta(
             Ok(()) => {
                 // Wait for IP
                 match wifi.wait_netif_up() {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        enable_ipv6_link_local();
+                        return Ok(());
+                    }
                     Err(e) => warn!("WiFi: netif_up failed: {e}"),
                 }
             }
@@ -263,6 +266,27 @@ pub fn read_any_wifi_mac() -> Option<[u8; 6]> {
         }
     }
     None
+}
+
+/// Give the STA interface its IPv6 link-local address once it is up. mDNS
+/// answers AAAA queries for `minidsp-<serial>.local` only when the interface
+/// has an IPv6 address; unanswered, macOS waits 5 s on every name lookup
+/// before falling back to IPv4. The HTTP server already listens dual-stack.
+fn enable_ipv6_link_local() {
+    use esp_idf_svc::sys::{
+        esp_netif_create_ip6_linklocal, esp_netif_get_handle_from_ifkey, ESP_OK,
+    };
+    unsafe {
+        let netif = esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr());
+        if netif.is_null() {
+            return;
+        }
+        // Fails harmlessly when a reconnect finds the address already there.
+        let ret = esp_netif_create_ip6_linklocal(netif);
+        if ret != ESP_OK {
+            log::debug!("esp_netif_create_ip6_linklocal: {ret}");
+        }
+    }
 }
 
 /// Set the esp-netif hostname on the given interface key. Silently no-ops
@@ -463,6 +487,7 @@ fn monitor_loop(
                         .map(|info| format!("{}", info.ip))
                         .unwrap_or_else(|_| "unknown".into());
                     info!("WiFi reconnected: {ip}");
+                    enable_ipv6_link_local();
                     WIFI_CONNECTED.store(true, Ordering::Relaxed);
                     crate::led::set_mode(crate::led::LedMode::Operational);
                     backoff = Duration::from_secs(1);
