@@ -66,6 +66,11 @@ Details: [ESP32 audio](docs/TODO1-esp32-usb-audio.md),
 - [ ] Enable GitHub Pages for the repository and set the `CATALOGUE_PAGES_ENABLED` variable, so the catalogue sync publishes the ezBEQ bundle boards download (`docs/ref-ezbeq.md`). Until then its scheduled runs skip.
 - [ ] Keep PWR-ICE compatibility, later ezBEQ expansion, and custom-PCB VBUS GPIO control deferred. DevKitC boards don't need GPIO-driven VBUS.
 
+### ESP32 networking
+
+- [ ] Remove the ESP32's IPv6 address. It exists only so mDNS can answer IPv6 (AAAA) lookups of `minidsp-<serial>.local`: macOS asks for A and AAAA and waits about 5 s for an AAAA answer that never comes. espressif/mdns, up to 1.14.1, never sends a negative (NSEC) answer, so dropping IPv6 today brings the delay back. Patch the responder to send NSEC for AAAA when the host has no IPv6 address, or replace it; then remove `enable_ipv6_link_local` in `app-esp32/src/wifi.rs` and set `CONFIG_LWIP_IPV6=n`, which also returns about 2 KB of internal RAM. Check name lookups stay fast with curl through the macOS resolver.
+- [ ] Bump espressif/mdns from 1.4.3 (pinned as `1.4` in `app-esp32/Cargo.toml`) to 1.14.x. Later releases fix packet-parsing bugs found by fuzzing, including unbounded recursion in name decompression (1.11.2), which a crafted packet from the LAN could likely use to crash the board.
+
 ### Wi-DG parity
 
 The [parity plan](docs/plan-widg-parity.md) and
