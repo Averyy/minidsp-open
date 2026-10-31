@@ -108,20 +108,32 @@ fi
 sha256="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 size="$(stat -f%z "$BIN" 2>/dev/null || stat -c%s "$BIN")"
 echo "==> Uploading $size bytes (sha256 $sha256)"
-if ! board_curl -fsS --max-time 300 -H 'Content-Type: application/octet-stream' \
-  --data-binary "@$BIN" "$BOARD_URL/firmware?sha256=$sha256"; then
+upload_rc=0
+board_curl -fsS --max-time 300 -H 'Content-Type: application/octet-stream' \
+  --data-binary "@$BIN" "$BOARD_URL/firmware?sha256=$sha256" || upload_rc=$?
+if (( upload_rc == 22 )); then
+  # curl exit 22 is an HTTP error the board sent, and it only sends one
+  # without installing (a broken upload gets 500).
+  echo "upload failed; the board kept its current firmware" >&2
+  exit 1
+elif (( upload_rc != 0 )); then
   # The reply can be lost after a complete upload: the board reboots 1.5 s
   # after answering. Only a board still up on the same slot, and not
-  # rebooting, kept its firmware.
+  # rebooting, kept its firmware. A weak link can drop one status read, so
+  # try a few.
   sleep 5
-  if status="$(board_curl -fsS --max-time 3 "$BOARD_URL/firmware" 2>/dev/null)"; then
-    read -r now_slot now_state < <(printf '%s' "$status" | uv run python -c \
-      'import json,sys; s=json.load(sys.stdin); print(s["runningSlot"], (s.get("progress") or {}).get("state") or "idle")')
-    if [[ "$now_slot" == "$before_slot" && "$now_state" != "rebooting" ]]; then
-      echo "upload failed; the board kept its current firmware" >&2
-      exit 1
+  for _ in 1 2 3; do
+    if status="$(board_curl -fsS --max-time 5 "$BOARD_URL/firmware" 2>/dev/null)"; then
+      read -r now_slot now_state < <(printf '%s' "$status" | uv run python -c \
+        'import json,sys; s=json.load(sys.stdin); print(s["runningSlot"], (s.get("progress") or {}).get("state") or "idle")')
+      if [[ "$now_slot" == "$before_slot" && "$now_state" != "rebooting" ]]; then
+        echo "upload failed; the board kept its current firmware" >&2
+        exit 1
+      fi
+      break
     fi
-  fi
+    sleep 2
+  done
   echo "upload reply lost, but the board is installing or rebooting"
 fi
 echo

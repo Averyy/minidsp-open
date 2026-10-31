@@ -59,6 +59,7 @@ First public release.
 
 ### Fixed
 
+- `tools/ota-push.sh` reports an upload the board answered with an HTTP error as failed straight away. It had treated that like a lost reply, and on a weak WiFi link, where its one status read also timed out, waited two minutes for a reboot that never came.
 - If the ESP32 reset during USB playback (crash, watchdog, restart, reset button or flashing), the 2x4 HD could keep accepting audio but stay silent until it was power-cycled. It's intermittent: 2 of 8 controlled mid-stream resets did it. The firmware now records active streams, in RTC memory and NVS, and reboots the MiniDSP on the next boot before opening audio. A cable unplug never caused this.
 - During a preset change (about 4 s on a 2x4 HD) the ESP32 TCP bridge answered other commands with an error byte after 500 ms, failing a Device Console or CLI session. It now waits up to 8 s, as a Wi-DG would deliver the reply late; 30 of 30 CLI status reads passed across three preset changes.
 - A USB host call that never returned (a channel halt after a HID write stalled) hung the ESP32 until it was reset. A supervisor now restarts the board when device-loss cleanup or any USB endpoint halt runs past 30 s, or the main loop stops for five minutes.
