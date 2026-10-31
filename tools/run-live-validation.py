@@ -1450,7 +1450,7 @@ def wait_for_idle_playback(target: Target, timeout: float) -> dict[str, Any]:
 
 @contextlib.contextmanager
 def safe_test_volume(harness: Harness, target: Target) -> Iterable[None]:
-    harness.confirm(target, "audible playback at -35 dB")
+    """Hold the -35 dB test volume; the caller has confirmed audible playback."""
     ceiling = read_settings(target)["maxVolumeDb"]
     if ceiling is not None and ceiling < -35.0:
         raise SafetyStop(f"maximum-volume ceiling is {ceiling} dB, below the required -35 dB test level; "
@@ -1499,9 +1499,28 @@ def audio_request(harness: Harness, target: Target, path: str, payload: Any) -> 
     return http_json("POST", target.path(path), payload, timeout=max(10.0, harness.args.timeout))
 
 
+def network_device_url(target: Target) -> str | None:
+    """The desktop device's transport URL when it is reached over the network."""
+    if target.kind != "desktop":
+        return None
+    resp, devices = http_json("GET", target.path("/devices"))
+    if resp.status != 200 or not isinstance(devices, list):
+        return None
+    index = int(target.device_id)
+    url = devices[index].get("url") if 0 <= index < len(devices) and isinstance(devices[index], dict) else None
+    return url if isinstance(url, str) and url.startswith(("tcp://", "ws://", "wss://")) else None
+
+
 def run_playback_suite(harness: Harness, target: Target) -> None:
     if not harness.args.allow_audio:
         harness.skip(f"{target.label}-playback", "playback suite", "--allow-audio not set")
+        return
+    harness.confirm(target, "audible playback at -35 dB")
+    # Desktop playback needs the MiniDSP's USB audio interface on this computer.
+    bridged = network_device_url(target)
+    if bridged:
+        harness.skip(f"{target.label}-playback", "playback suite",
+                     f"the MiniDSP is reached over the network ({bridged}); desktop playback needs it on local USB")
         return
     with safe_test_volume(harness, target):
         run_audio_steps(harness, target)

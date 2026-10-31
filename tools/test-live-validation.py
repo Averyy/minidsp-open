@@ -395,6 +395,21 @@ class LiveValidationTests(unittest.TestCase):
         self.assertGreaterEqual(sum(m == "GET" and p.endswith("/play") for m, p, _ in self.device.calls), 6)
         self.assertEqual(sum(m == "GET" and p == "/settings" for m, p, _ in self.device.calls), 1)
 
+    def test_desktop_playback_skips_a_minidsp_reached_over_the_network(self):
+        harness, target = self.harness("--allow-audio", "--yes-i-know")
+        original = self.device.handle_request
+
+        def bridged(method, path, payload):
+            if path == "/devices":
+                return self.device.response(200, [{"url": "tcp://bridge.invalid:5333"}])
+            return original(method, path, payload)
+
+        self.device.handle_request = bridged
+        live.run_playback_suite(harness, target)
+        self.assertEqual(harness.failures, 0)
+        self.assertEqual([r.status for r in harness.results], ["SKIP"])
+        self.assertFalse(any(m == "POST" for m, _, _ in self.device.calls))
+
     def test_failed_playback_terminal_state_and_restore_errors_fail_audio_steps(self):
         for terminal, errors in (("failed", {"error": "stream failed"}),
                                  ("completed", {"error": "stream failed"}),

@@ -6,7 +6,7 @@
 //! `minidsp.local` is the canonical URL regardless of how many daemons live
 //! on the network; mdns-sd handles conflict resolution per RFC 6762 §9.
 
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -19,13 +19,25 @@ const HOSTNAME: &str = "minidsp";
 /// name so multiple daemons on one LAN can coexist in the service browser.
 /// Typical values are the connected device's serial or the process id.
 ///
-/// Returns the [`ServiceDaemon`] handle; it must be kept alive for the
-/// duration of the advertisement (drop-on-shutdown is fine).
+/// `bind` is the HTTP listener's address: nothing is advertised for a
+/// loopback listener, and a listener on one address advertises only that one.
+///
+/// Returns the [`ServiceDaemon`] handle, or `None` when there is nothing to
+/// advertise; it must be kept alive for the duration of the advertisement
+/// (drop-on-shutdown is fine).
 pub fn advertise(
     port: u16,
     instance_suffix: Option<String>,
-) -> Result<ServiceDaemon, Box<dyn std::error::Error>> {
+    bind: IpAddr,
+) -> Result<Option<ServiceDaemon>, Box<dyn std::error::Error>> {
+    if bind.is_loopback() {
+        tracing::info!("mDNS: not advertising, HTTP is bound to loopback {bind}");
+        return Ok(None);
+    }
     let mdns = ServiceDaemon::new()?;
+    // Only IPv4 addresses are advertised. IPv6 multicast fails on interfaces
+    // such as VPN tunnels, and the responder logs an error every second.
+    mdns.disable_interface(IfKind::IPv6)?;
 
     let instance_name = match instance_suffix {
         Some(suffix) if !suffix.is_empty() => format!("minidsp-open ({suffix})"),
@@ -46,7 +58,12 @@ pub fn advertise(
             std::net::IpAddr::V4(v4) if !v4.is_link_local() => Some(IpAddr::V4(v4)),
             _ => None,
         })
+        .filter(|ip| bind.is_unspecified() || *ip == bind)
         .collect();
+    if !bind.is_unspecified() {
+        mdns.disable_interface(IfKind::All)?;
+        mdns.enable_interface(IfKind::Addr(bind))?;
+    }
 
     let service = ServiceInfo::new(
         SERVICE_TYPE,
@@ -61,5 +78,5 @@ pub fn advertise(
     mdns.register(service)?;
     tracing::info!("mDNS: advertising {instance_name} as {HOSTNAME}.local:{port} ({SERVICE_TYPE})");
 
-    Ok(mdns)
+    Ok(Some(mdns))
 }

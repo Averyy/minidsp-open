@@ -827,20 +827,23 @@ pub async fn server(
     // Start mDNS advertisement unconditionally — `minidsp.local` should
     // resolve whether or not a DSP is attached so `http://minidsp.local/`
     // hits the daemon immediately after boot.
-    let mdns_port: u16 = http_bind
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(5380);
+    let (mdns_bind, mdns_port) = match http_bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => (addr.ip(), addr.port()),
+        Err(_) => (
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            http_bind
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5380),
+        ),
+    };
     let mdns_suffix = state
         .get_device(0)
         .await
         .map(|client| client.serial().to_string());
-    let _mdns_handle = match minidsp_daemon::mdns::advertise(mdns_port, mdns_suffix) {
-        Ok(mdns) => {
-            tracing::info!("mDNS: advertising minidsp.local on port {mdns_port}");
-            Some(mdns)
-        }
+    let _mdns_handle = match minidsp_daemon::mdns::advertise(mdns_port, mdns_suffix, mdns_bind) {
+        Ok(mdns) => mdns,
         Err(e) => {
             tracing::warn!("mDNS advertisement failed: {e}");
             None
@@ -855,7 +858,11 @@ pub async fn server(
             tcp.bind_address.as_deref().unwrap_or("0.0.0.0:5333")
         );
     }
-    println!("  mDNS: _http._tcp.local. (minidsp.local:{mdns_port})");
+    if _mdns_handle.is_some() {
+        println!("  mDNS: _http._tcp.local. (minidsp.local:{mdns_port})");
+    } else {
+        println!("  mDNS: off (HTTP is bound to {mdns_bind})");
+    }
     #[cfg(unix)]
     println!("  Unix socket: /tmp/minidsp.sock");
 

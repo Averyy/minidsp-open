@@ -99,6 +99,10 @@ const MASTER_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const SET_CONFIG_RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
 const RESET_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESET_VERIFY_TIMEOUT: Duration = Duration::from_secs(12);
+/// Behind a network bridge the MiniDSP comes back later than on local USB:
+/// an ESP32 waits 20 s after the device re-attaches before opening it, and
+/// answers about 27 s after the reboot command.
+const BRIDGED_RESET_VERIFY_TIMEOUT: Duration = Duration::from_secs(45);
 const RESET_STATUS_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const RESET_MIN_OUTAGE: Duration = Duration::from_millis(500);
 const FIR_LOAD_END_TIMEOUT: Duration = Duration::from_secs(60);
@@ -570,6 +574,14 @@ impl MiniDspClient {
         &self.transport_url
     }
 
+    fn reset_verify_timeout(&self) -> Duration {
+        if self.transport_url.starts_with("usb:") {
+            RESET_VERIFY_TIMEOUT
+        } else {
+            BRIDGED_RESET_VERIFY_TIMEOUT
+        }
+    }
+
     /// Increments each time the queue reconnects its transport.
     pub fn reconnect_epoch(&self) -> u64 {
         self.queue.reconnect_epoch()
@@ -1012,7 +1024,7 @@ impl MiniDspClient {
                     tracing::debug!(
                         "reset response dropped during device reset; verifying via master-status recovery"
                     );
-                    self.wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT, disconnect_epoch)
+                    self.wait_for_reset_recovery_until(self.reset_verify_timeout(), disconnect_epoch)
                         .await?;
                     Ok(())
                 }
@@ -1065,7 +1077,7 @@ impl MiniDspClient {
             }
 
             if let Err(err) = self
-                .wait_for_reset_recovery_until(RESET_VERIFY_TIMEOUT, disconnect_epoch)
+                .wait_for_reset_recovery_until(self.reset_verify_timeout(), disconnect_epoch)
                 .await
             {
                 tracing::warn!("reboot recovery verification failed: {err}");
