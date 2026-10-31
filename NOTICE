@@ -43,6 +43,15 @@ to that project. Our parsers, code generators, and controller implementation
 are original code. The Apache license does not establish rights to MiniDSP's
 underlying vendor data.
 
+espressif/mdns
+--------------
+app-esp32/components/mdns is a copy of espressif/mdns 1.14.1 from
+https://github.com/espressif/esp-protocols (components/mdns), Copyright
+Espressif Systems (Shanghai) CO LTD, licensed under the Apache License,
+Version 2.0 (app-esp32/components/mdns/LICENSE). mdns_send.c is modified to
+answer AAAA questions with an NSEC record when IPv6 is compiled out; the file
+header and app-esp32/components/mdns/README-minidsp-open.md describe the change.
+
 ezBEQ and beqcatalogue
 ----------------------
 The ESP32 site bundle downloads the ezBEQ hosted UI and beqcatalogue catalogue

@@ -310,8 +310,9 @@ unsafe fn path(req: *mut httpd_req_t) -> &'static str {
     uri.split('?').next().unwrap_or("")
 }
 
-/// Rate-limit key for the peer. httpd listens on an IPv6 socket
-/// (`CONFIG_LWIP_IPV6`), so IPv4 clients arrive as v4-mapped addresses.
+/// Rate-limit key for the peer. With `CONFIG_LWIP_IPV6` httpd listens on an
+/// IPv6 socket and IPv4 clients arrive as v4-mapped addresses; the board
+/// builds IPv4 only, where every peer is a plain `sockaddr_in`.
 unsafe fn ip(req: *mut httpd_req_t) -> u32 {
     let mut peer: sockaddr_storage = std::mem::zeroed();
     let mut len = std::mem::size_of_val(&peer) as socklen_t;
@@ -329,6 +330,7 @@ unsafe fn ip(req: *mut httpd_req_t) -> u32 {
                 .sin_addr
                 .s_addr
         }
+        #[cfg(esp_idf_lwip_ipv6)]
         AF_INET6 => {
             let addr = (*(&peer as *const sockaddr_storage).cast::<sockaddr_in6>())
                 .sin6_addr

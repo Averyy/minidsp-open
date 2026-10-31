@@ -31,6 +31,8 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 
 # LwIP — phones open many simultaneous connections during captive portal detection
 CONFIG_LWIP_MAX_SOCKETS=16
+# IPv4 only. mDNS answers AAAA lookups with NSEC instead (components/mdns).
+CONFIG_LWIP_IPV6=n
 
 # Stack sizes for blocking I/O. Main peaked at 6.7 KB through boot, HID
 # attach and protocol probe (task stack high-water mark).

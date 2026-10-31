@@ -155,8 +155,7 @@ POWER ON
     ▼
 [4] Got IP — start HTTP API + mDNS immediately
     │         (serve whatever is in flash, even if stale);
-    │         add an IPv6 link-local address so mDNS answers AAAA
-    │         (no autoconfigured routable IPv6 address)
+    │         IPv4 only: mDNS answers AAAA lookups with NSEC
     │
     ▼
 [5] Fetch manifest.json (3-second timeout)

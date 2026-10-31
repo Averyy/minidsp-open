@@ -9,6 +9,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(esp_idf_comp_espressif__mdns_enabled)");
     println!("cargo::rustc-check-cfg=cfg(esp_idf_httpd_ws_support)");
     println!("cargo::rustc-check-cfg=cfg(esp_idf_heap_tracing_standalone)");
+    println!("cargo::rustc-check-cfg=cfg(esp_idf_lwip_ipv6)");
 
     // Identify the exact build in GET /firmware: CI passes MINIDSP_BUILD_REV,
     // local builds fall back to `git describe`.

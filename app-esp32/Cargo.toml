@@ -37,10 +37,11 @@ embuild = "0.33.5"
 remote_component = { name = "espressif/usb", version = "^1.6.0" }
 bindings_header = "usb_host_bindings.h"
 
-# Pull espressif/mdns from IDF Component Registry (moved out of core IDF in v5.4).
-# This sets cfg(esp_idf_comp_espressif__mdns_enabled) at build time.
+# mDNS: a local copy of espressif/mdns 1.14.1 with one patch, so the board can
+# answer AAAA lookups without an IPv6 address (components/mdns/README-minidsp-open.md).
+# The component is named "mdns", which sets cfg(esp_idf_comp_mdns_enabled).
 [[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/mdns", version = "1.4" }
+component_dirs = ["components/mdns"]
 
 # LittleFS for data partition (ezBEQ catalogue, UI assets, config)
 [[package.metadata.esp-idf-sys.extra_components]]

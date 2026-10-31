@@ -35,6 +35,8 @@ for entry in components:
         entry["component_dirs"] = [str(component)]
     if "bindings_header" in entry:
         entry["bindings_header"] = str(Path(package["manifest_path"]).parent / entry["bindings_header"])
+    if "component_dirs" in entry:
+        entry["component_dirs"] = [str(Path(package["manifest_path"]).parent / d) for d in entry["component_dirs"]]
 
 def toml(value):
     if isinstance(value, dict):
@@ -49,6 +51,16 @@ if not output.exists():
     output.write_text(contents + "\n")
 print(output.resolve())
 ')"
+
+# esp-idf-sys does not watch component_dirs: track the vendored mdns sources
+# so editing them rebuilds (see the UAC2 globs below for how globs work).
+export ESP_IDF_GLOB_MDNS_BASE="$PWD/components"
+export ESP_IDF_GLOB_MDNS_1="mdns/CMakeLists.txt"
+export ESP_IDF_GLOB_MDNS_2="mdns/Kconfig"
+export ESP_IDF_GLOB_MDNS_3="mdns/idf_component.yml"
+export ESP_IDF_GLOB_MDNS_4="mdns/*.c"
+export ESP_IDF_GLOB_MDNS_5="mdns/include/*.h"
+export ESP_IDF_GLOB_MDNS_6="mdns/private_include/*.h"
 
 if [[ -n "${ESP_UAC2_HOST_PATH:-}" ]]; then
     # esp-idf-sys does not watch component_dirs. Globs both track and copy

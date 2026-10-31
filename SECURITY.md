@@ -2,7 +2,7 @@
 
 minidsp-open trusts clients on its LAN. Keep its HTTP API and bridges off the public Internet and untrusted networks.
 
-The ESP32 answers on its IPv4 address and an IPv6 link-local address, which lets mDNS answer IPv6 lookups of `minidsp-<serial>.local`. It ignores router advertisements for routable IPv6 addresses, so it never takes a global or ULA address a router could forward to.
+The ESP32 runs IPv4 only; IPv6 is compiled out, so a router advertising IPv6 prefixes can't give it an address.
 
 Browser mutations and WebSocket upgrades require a local Origin (`localhost`, single-label, `.local` or home-suffix names, private IPs, or an IP literal addressing itself) or an explicitly configured one. Pages on public DNS names are refused even when their Host matches, which also blocks DNS rebinding. Native clients without Origin keep working. CORS echoes allowed origins only. The daemon's explicit `cors_origin = "*"` disables this restriction. WiFi credentials can only be changed in provisioning mode. Firmware uploads and catalogue source overrides are unavailable in provisioning; source overrides also require a development build feature.
 
