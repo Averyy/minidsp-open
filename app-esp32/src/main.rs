@@ -43,6 +43,15 @@ fn current_stall() -> Option<(&'static str, u32)> {
     if cleanup_since != 0 && now - cleanup_since > USB_CLEANUP_STALL_SECS {
         return Some(("USB cleanup", now - cleanup_since));
     }
+    // A halt can hang on any task that holds the bus lock, not only in the
+    // main loop's cleanup: an HTTP handler stuck there takes the server down.
+    if let Some(started) = usb_hid::halt_started_ms() {
+        let now_ms = (unsafe { sys::esp_timer_get_time() } / 1000) as u32;
+        let secs = now_ms.wrapping_sub(started) / 1000;
+        if secs > USB_CLEANUP_STALL_SECS {
+            return Some(("a USB endpoint halt", secs));
+        }
+    }
     let alive = MAIN_LOOP_ALIVE.load(Ordering::Relaxed);
     (now - alive > MAIN_LOOP_STALL_SECS).then_some(("the main loop", now - alive))
 }

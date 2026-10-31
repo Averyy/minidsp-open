@@ -229,6 +229,16 @@ request shows up on its own: reset, make the request, then read
 `/debug/info`. At debug log level, the ezBEQ `/ws` handler also logs internal
 RAM at each step of a new connection.
 
+`GET /debug/usb` returns the USB OTG controller's registers as JSON: the port,
+frame number, periodic TX FIFO and request-queue space, and each configured
+channel's `hcchar`, `hcint`, `hctsiz` and `hcdma`. The same registers, plus the
+frame-list slots and current descriptor of each enabled channel, are logged as
+`USB DWC …` lines when a HID write to the MiniDSP gets no completion, and again
+if an endpoint halt is still waiting 2 s later. `POST /debug/usb/reset-bus` runs
+the recovery a stalled write uses: power the root port off, clean up the HID
+session, and power it on, so the MiniDSP re-enumerates (about 20 s on a 2x4 HD).
+It answers 409 during playback.
+
 Leaks are found with the heap-tracing profile:
 
 ```bash

@@ -1486,6 +1486,31 @@ fn register_debug_routes(
         })?;
     }
 
+    // GET /debug/usb — USB OTG controller registers (FIFO levels, channels)
+    server.fn_handler("/debug/usb", Method::Get, |req| {
+        send_json(
+            req,
+            200,
+            &crate::usb_dwc::controller_state_json().to_string(),
+        )
+    })?;
+
+    // POST /debug/usb/reset-bus — power-cycle the root port as a stalled
+    // HID write does, to check the recovery without waiting for a stall
+    {
+        let audio = audio_state.clone();
+        server.fn_handler("/debug/usb/reset-bus", Method::Post, move |req| {
+            let req = match reject_hid_during_playback(req, &audio)? {
+                Some(req) => req,
+                None => return Ok(()),
+            };
+            match crate::usb_hid::reset_bus_global("debug request") {
+                Ok(()) => send_json(req, 200, r#"{"status":"reset"}"#),
+                Err(e) => send_error(req, 500, &e.to_string()),
+            }
+        })?;
+    }
+
     // GET /debug/log — ring buffer log snapshot
     server.fn_handler("/debug/log", Method::Get, |req| {
         let snapshot = diagnostics::log_snapshot();

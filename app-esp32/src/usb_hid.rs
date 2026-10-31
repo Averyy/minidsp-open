@@ -523,7 +523,11 @@ impl UsbHidBus {
         }
         self.bump_submit_count_for_ep(ep_out);
         debug!("USB OUT submitted for payload: {:02x?}", payload);
-        let status = self.out_sync.wait(timeout).map_err(|e| {
+        let status = match self.out_sync.wait(timeout) {
+            Err(UsbHidError::Timeout) => self.wait_out_past_stall(payload, timeout),
+            result => result,
+        };
+        let status = status.map_err(|e| {
             let stats = transfer_stats_snapshot();
             warn!(
                 "USB OUT wait failed (out_cb={}, in_cb={}, last_ep=0x{:02X}, last_status={}, last_age_ms={})",
@@ -538,8 +542,8 @@ impl UsbHidBus {
             );
             debug!("USB OUT wait failed for {:02x?}: {}", payload, e);
             crate::usb_dwc::log_controller_state("OUT timeout");
-            if let Err(cleanup_err) = self.cleanup_device() {
-                warn!("USB cleanup after OUT timeout failed: {cleanup_err}");
+            if let Err(reset_err) = self.reset_bus_after_stall("OUT timeout") {
+                warn!("USB bus reset after OUT timeout failed: {reset_err}");
             }
             e
         })?;
@@ -550,6 +554,21 @@ impl UsbHidBus {
         }
         debug!("USB OUT completed for payload: {:02x?}", payload);
         Ok(())
+    }
+
+    /// The MiniDSP NAKs an OUT while it is busy. Waiting costs nothing (only
+    /// halting a NAKed channel hangs), so give it longer before resetting the
+    /// bus, and log how long it took if it came back.
+    fn wait_out_past_stall(&self, payload: &[u8], waited: Duration) -> Result<i32, UsbHidError> {
+        const STALL_GRACE: Duration = Duration::from_secs(20);
+        warn!("USB OUT not accepted after {waited:?} for {payload:02x?}; waiting up to {STALL_GRACE:?} more");
+        let started = std::time::Instant::now();
+        let status = self.out_sync.wait(STALL_GRACE)?;
+        warn!(
+            "USB OUT accepted {:?} after the {waited:?} timeout",
+            started.elapsed()
+        );
+        Ok(status)
     }
 
     /// Initialize USB host stack and background threads. Always succeeds even
@@ -708,7 +727,43 @@ impl UsbHidBus {
         if let Err(err) = self.cleanup_device() {
             warn!("USB cleanup before root-port recycle failed ({reason}): {err}");
         }
+        self.power_cycle_root_port(reason)
+    }
 
+    /// Reset the bus under a transfer the MiniDSP stopped answering. Cleanup
+    /// would halt its channel, and the host library waits forever for a
+    /// halt of a channel the device keeps NAKing. With the root port off the
+    /// port is invalid, so the same cleanup marks the channels halted without
+    /// waiting; the MiniDSP re-enumerates when power returns, as after an
+    /// unplug. Caller holds the bus lock.
+    fn reset_bus_after_stall(&self, reason: &str) -> Result<(), UsbHidError> {
+        warn!("USB: resetting the bus after {reason}");
+        self.session_ready.store(false, Ordering::SeqCst);
+        unsafe {
+            let err = usb_host_lib_set_root_port_power(false);
+            if err != ESP_OK && err != ESP_ERR_INVALID_STATE {
+                return Err(UsbHidError::Transfer(format!(
+                    "root-port power off failed during {reason}: 0x{err:04x}"
+                )));
+            }
+        }
+        // Long enough for the disconnect to mark the port invalid.
+        std::thread::sleep(ROOT_PORT_POWER_OFF_SETTLE);
+        if let Err(err) = self.cleanup_device() {
+            warn!("USB cleanup during bus reset ({reason}) failed: {err}");
+        }
+        info!("USB: powering root port on ({reason})");
+        unsafe {
+            esp_ok(usb_host_lib_set_root_port_power(true)).map_err(|e| {
+                UsbHidError::Transfer(format!("root-port power on failed during {reason}: {e}"))
+            })?;
+        }
+        std::thread::sleep(ROOT_PORT_POWER_ON_SETTLE);
+        Ok(())
+    }
+
+    /// Power the root port off and on again; the caller has cleaned up.
+    fn power_cycle_root_port(&self, reason: &str) -> Result<(), UsbHidError> {
         info!("USB: powering root port off ({reason})");
         unsafe {
             let err = usb_host_lib_set_root_port_power(false);
@@ -1071,6 +1126,15 @@ pub fn recycle_root_port_global(reason: &str) -> Result<(), UsbHidError> {
         .get()
         .ok_or_else(|| UsbHidError::Init("USB HID bus not initialized".into()))?
         .recycle_root_port(reason)
+}
+
+/// Run the stalled-transfer bus reset on demand, for `POST /debug/usb/reset-bus`.
+pub fn reset_bus_global(reason: &str) -> Result<(), UsbHidError> {
+    let bus = GLOBAL_BUS
+        .get()
+        .ok_or_else(|| UsbHidError::Init("USB HID bus not initialized".into()))?;
+    let _lock = bus.lock.lock().unwrap();
+    bus.reset_bus_after_stall(reason)
 }
 
 impl Drop for UsbHidBus {

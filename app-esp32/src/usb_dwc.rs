@@ -7,6 +7,7 @@
 //! that halted with an interrupt nobody serviced.
 
 use log::warn;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 /// `USB_DWC` in the ESP32-S3 peripheral map.
@@ -108,4 +109,31 @@ pub fn log_controller_state(context: &str) {
             reg(base + HCDMAB),
         );
     }
+}
+
+/// The same registers as JSON, for `GET /debug/usb`.
+pub fn controller_state_json() -> Value {
+    let hptxsts = reg(HPTXSTS);
+    let channels: Vec<Value> = (0..NUM_CHANNELS)
+        .map(|ch| HC_BASE + ch * HC_STRIDE)
+        .filter(|&base| reg(base + HCCHAR) != 0)
+        .map(|base| {
+            json!({
+                "hcchar": format!("{:08x}", reg(base + HCCHAR)),
+                "hcint": format!("{:08x}", reg(base + HCINT)),
+                "hctsiz": format!("{:08x}", reg(base + HCTSIZ)),
+                "hcdma": format!("{:08x}", reg(base + HCDMA)),
+            })
+        })
+        .collect();
+    json!({
+        "gintsts": format!("{:08x}", reg(GINTSTS)),
+        "hprt": format!("{:08x}", reg(HPRT)),
+        "hfnum": format!("{:08x}", reg(HFNUM)),
+        "hptxsts": format!("{hptxsts:08x}"),
+        "periodicTxFifoFreeWords": hptxsts & 0xFFFF,
+        "periodicTxQueueFree": (hptxsts >> 16) & 0xFF,
+        "gnptxsts": format!("{:08x}", reg(GNPTXSTS)),
+        "channels": channels,
+    })
 }
