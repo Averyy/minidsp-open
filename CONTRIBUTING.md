@@ -87,4 +87,4 @@ In override mode, `ESP_IDF_GLOB_UAC2_*` tracks the driver's C sources, headers, 
 
 ## Releases
 
-Maintainers tag `vX.Y.Z` after bumping the versions in the root `Cargo.toml` and `app-esp32/Cargo.toml`. CI builds the firmware and desktop binaries and publishes the GitHub release that boards update from. The steps are in `docs/ref-firmware-updates.md`.
+Maintainers tag `vX.Y.Z` after bumping the versions in the root `Cargo.toml` and `app-esp32/Cargo.toml` and renaming CHANGELOG.md's Unreleased section to `## [X.Y.Z] - YYYY-MM-DD`. CI builds the firmware and desktop binaries and publishes them on the [Releases page](https://github.com/Averyy/minidsp-open/releases), with that section as the release notes; boards update from the latest release. The steps are in `docs/ref-firmware-updates.md`.

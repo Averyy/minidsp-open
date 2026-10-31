@@ -2,12 +2,17 @@
 
 Notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-There are no git tags or tagged releases. The workspace version, `0.2.0`, is
-unreleased. Unreleased lists the current working-tree changes; the dated
-milestones below describe earlier development, not published releases.
-Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
+Releases are published on the [GitHub Releases page](https://github.com/Averyy/minidsp-open/releases),
+and each release's notes there are its section below. Unreleased lists changes
+since the latest release. The untagged milestones below 0.2.0 describe earlier
+development, not published releases. Current verification limits and open work
+live in [PROGRESS.md](PROGRESS.md).
 
 ## Unreleased
+
+## [0.2.0] - 2026-10-31
+
+First public release.
 
 ### Added
 
@@ -185,3 +190,5 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 
 - Early ESP32 USB hotplug, WiFi provisioning, level-meter, mDNS, and WebSocket compatibility failures.
 - Desktop/ESP32 config reads avoid fabricated DSP100 values where hardware readback isn't authoritative.
+
+[0.2.0]: https://github.com/Averyy/minidsp-open/releases/tag/v0.2.0

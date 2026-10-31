@@ -7,9 +7,7 @@ An open-source controller for MiniDSP audio processors, written in Rust. It runs
 
 ## Status
 
-There aren't any tagged releases yet; build from source for now. The download
-steps below describe the planned release workflow. See [CHANGELOG.md](CHANGELOG.md)
-for changes and [PROGRESS.md](PROGRESS.md) for current status and open work.
+Downloads are on the [Releases page](https://github.com/Averyy/minidsp-open/releases/latest): the `minidsp` CLI and daemon for Linux, macOS and Windows, and the ESP32 firmware. Each release lists its changes; [CHANGELOG.md](CHANGELOG.md) has them all, and [PROGRESS.md](PROGRESS.md) has current status and open work.
 
 Hardware-tested end to end on the **MiniDSP 2x4 HD**: volume, mute, source, presets, PEQ/crossover/routing writes, config read-back, snapshot backup and restore, factory reset, FIR loading, ezBEQ, the Device Console bridge, measurement sweeps over USB audio from both the desktop daemon and the ESP32, and rattle-finder tones from the ESP32.
 
@@ -43,7 +41,7 @@ After that first USB flash, firmware updates go over WiFi. Boards moving from ES
 
 ## Desktop CLI and daemon
 
-Download the archive for your platform from the [latest release](https://github.com/Averyy/minidsp-open/releases/latest), or build it (see below). It uses minidsp-rs's command syntax:
+Download the archive for your platform from the [latest release](https://github.com/Averyy/minidsp-open/releases/latest), or build it (see below). `SHA256SUMS` in the release checks the download (`shasum -a 256 -c SHA256SUMS --ignore-missing`). The macOS binaries aren't signed, so if macOS refuses to run `minidsp`, clear the download flag with `xattr -d com.apple.quarantine minidsp`. It uses minidsp-rs's command syntax:
 
 ```bash
 minidsp                      # status

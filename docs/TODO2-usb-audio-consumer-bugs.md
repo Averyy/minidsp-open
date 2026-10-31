@@ -1,7 +1,7 @@
 # USB audio consumer follow-ups
 
 All six minidsp-open fixes from the esp-uac2-host v0.1.3 audit are implemented
-and recorded under Unreleased in [CHANGELOG.md](../CHANGELOG.md). The targeted
+and recorded under 0.2.0 in [CHANGELOG.md](../CHANGELOG.md). The targeted
 hardware checks and two open-sub-optimizer tasks below remain open. The
 open-sub-optimizer fixes belong in that repo.
 

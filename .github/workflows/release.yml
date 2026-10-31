@@ -53,6 +53,17 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               print(f'version={version}', file=output)
           PY
+      # Fail before the long builds if a tag has no CHANGELOG.md section.
+      - name: Check release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$RELEASE_EVENT" = push ]; then
+            python3 tools/release-notes.py "$VERSION" > /dev/null
+          else
+            python3 tools/release-notes.py "$VERSION" --allow-unreleased > /dev/null
+          fi
 
   esp32:
     needs: version
@@ -208,14 +219,27 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            CHANGELOG.md
+            tools/release-notes.py
+          sparse-checkout-cone-mode: false
+      # The release page shows this version's CHANGELOG.md section.
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: python3 tools/release-notes.py "$VERSION" > "$RUNNER_TEMP/release-notes.md"
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: release-assets
           path: dist
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          body_path: ${{ runner.temp }}/release-notes.md
           files: dist/*
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          generate_release_notes: false
           prerelease: ${{ contains(needs.version.outputs.version, '-') }}
           make_latest: ${{ contains(needs.version.outputs.version, '-') && 'false' || 'true' }}
