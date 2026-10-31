@@ -3974,7 +3974,7 @@ mod tests {
             Box::pin(async move {
                 if payload.first() == Some(&commands::CMD_READ_FLASH) {
                     let unavailable = read_timeouts_remaining
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                             remaining.checked_sub(1)
                         })
                         .is_ok();
@@ -4131,7 +4131,7 @@ mod tests {
             Box::pin(async move {
                 if transport
                     .reopen_failures_remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()
