@@ -1,8 +1,8 @@
 # Current status
 
-History is in [CHANGELOG.md](CHANGELOG.md). There are no tagged releases;
-`0.2.0` is the current unreleased workspace version. Hardware claims below
-refer to the 2x4 HD unless another device is named.
+History is in [CHANGELOG.md](CHANGELOG.md). The latest release is
+[v0.2.0](https://github.com/Averyy/minidsp-open/releases/tag/v0.2.0). Hardware
+claims below refer to the 2x4 HD unless another device is named.
 
 ## What works
 
@@ -62,7 +62,9 @@ Details: [ESP32 audio](docs/TODO1-esp32-usb-audio.md),
 - [ ] Keep importer/codegen changes source-backed and regenerate coverage artifacts when device evidence changes.
 - [ ] Confirm the HT/HTx selectable-source bitmap at `0xFFEA` on live hardware. The typed protocol parser/encoder and tests exist from static research (HT/HTx all-enabled masks: `0x1E`/`0x1F`); no client reads or writes are enabled.
 - [ ] Find the live addresses and value ranges of the advanced Dirac controls (`mux_bypass`, `dirac_delay`, `mixer_fir`, `fir-ctrl`) on a Dirac-capable unit; their preset layouts are documented and there is no standalone `iir-ctrl` descriptor.
-- [ ] Publish the first release by pushing a `vX.Y.Z` tag. CI passes on GitHub, and a manual release dry run builds every desktop target and the ESP32 images, with matching `SHA256SUMS` and a `firmware.json` whose hash matches the OTA image; only the publish step is untried. Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
+- [ ] Publish 0.2.1 with the OTA request-buffer fix. ESP32 0.2.0 can't check for or install GitHub releases (see CHANGELOG Unreleased), so a board on 0.2.0 needs that one update uploaded through `/update` or `tools/ota-push.sh`.
+- [ ] Prove an ESP32 checks and installs a GitHub release end to end: a board running the fix, then a newer release, then `POST /firmware/update`. The fix hasn't reached the maintainer's board yet: at about -97 dBm every 2.5 MB WiFi upload broke off, while small requests and the catalogue check still worked.
+- [ ] Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
 - [ ] Keep PWR-ICE compatibility, later ezBEQ expansion, and custom-PCB VBUS GPIO control deferred. DevKitC boards don't need GPIO-driven VBUS.
 
 ### Wi-DG parity
