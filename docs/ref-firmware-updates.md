@@ -39,6 +39,8 @@ tools/ota-push.sh --board http://BOARD:5380 --debug     # debug build
 curl --data-binary @app.bin "http://BOARD:5380/firmware?sha256=$(shasum -a 256 app.bin | cut -d' ' -f1)"
 ```
 
+`ota-push.sh` waits for the board to come back on the other slot. If the upload's reply is lost, it reports a failed upload only when the board is still up on the same slot and not rebooting; otherwise it waits as usual and reports what comes up, including a rollback. A password-protected board needs `--password-file` or `MINIDSP_PASSWORD`, and the script says so.
+
 The upload must be the `elf2image` app image (`minidsp-open-esp32-X.Y.Z.bin` from a release), not the ELF and not the `-full` merged image. The board rejects anything that isn't an ESP-IDF app image for an ESP32-S3 (chip id 9), anything bigger than a slot, and anything whose SHA-256 doesn't match the optional `sha256` query parameter (or `X-Firmware-SHA256` header).
 
 Firmware upload and download SHA-256 checks use the pure-Rust `sha2` crate. ESP-IDF still validates the app image through `esp_ota_end()`.

@@ -81,6 +81,16 @@ Important behavior:
 - restore replays the saved preset/master state through our own control paths
 - restore preserves the exact preset token when the snapshot carries one
 - recovery-token presets may be exported from the bundled default preset image
+- trust in a stored preset survives preset switches, reloads, resets, reboots
+  and reconnects, which leave stored presets unchanged; a failed or
+  unacknowledged write, a preset copy, a raw flash write outside the
+  modification tokens, or a restore that fails part way revokes it
+- learn keeps a capture it can't trust (mute and routing reads on the 2x4 HD
+  and Flex) as an untrusted copy, so it no longer replaces a trusted one and the
+  default-image path still applies
+- on the ESP32, a restore that loses the MiniDSP to a stalled HID write resumes
+  once from the preset that failed, after the USB bus reset brings it back (see
+  [the stall bug](bug-usb-hid-write-stall.md))
 
 ### Surfaces
 

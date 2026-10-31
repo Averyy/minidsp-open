@@ -237,7 +237,10 @@ frame-list slots and current descriptor of each enabled channel, are logged as
 if an endpoint halt is still waiting 2 s later. `POST /debug/usb/reset-bus` runs
 the recovery a stalled write uses: power the root port off, clean up the HID
 session, and power it on, so the MiniDSP re-enumerates (about 20 s on a 2x4 HD).
-It answers 409 during playback.
+It answers 409 during playback. `POST /debug/usb/stall {"afterCommands": N}`
+makes the Nth next HID command behave as a stalled write (bus reset, then a
+timeout), to test the recovery of a snapshot restore without waiting for a real
+stall; `0` disarms it. See [the stall bug](bug-usb-hid-write-stall.md).
 
 Leaks are found with the heap-tracing profile:
 

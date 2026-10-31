@@ -298,7 +298,10 @@ It never downloads the full upstream database for overview hydration.
 One USB device is exposed as `master`, with four one-based slots. REST mutations
 return the plain upstream device object; `/api/2/devices` wraps it by name and
 `DeviceState` wraps it in a WS message. State includes `connected`, slot
-`optimise`, input/output gains/mutes, and loaded `coefficients`/`profile`.
+`optimise`, input/output gains/mutes, and loaded `coefficients`/`profile`. A
+slot's `active` flag is the MiniDSP's current preset, read with the master status,
+so a preset change from anywhere else (HTTP API, TCP bridge, snapshot restore,
+the remote) shows; slot titles are what ezBEQ last loaded.
 `optimisation` is deliberately **null**: 2.12.4's `Optimisation.jsx` then hides the
 sticky toggle and profile search/comparison while still showing a loaded slot's
 Optimised chip. The bundle always selects published optimisation when available;

@@ -78,6 +78,13 @@ environment variables. Snapshot guards use the shared HTTP routes and remain
 active with `--skip-cli`. `--desktop-cli-transport` changes CLI compatibility
 checks; it does not redirect the HTTP snapshot guard to a different device.
 
+The daemon can reach the MiniDSP through an ESP32's TCP bridge (a
+`[[static_device]] url = "tcp://BOARD:5333"` config, with the daemon bound to
+`127.0.0.1`). The suite then skips the playback suite after the audio
+confirmation, because desktop playback needs the MiniDSP's USB audio interface
+on the computer; every other check runs. Don't run the ESP32 lane against the
+same board at the same time.
+
 ### Desktop direct-USB lane (separate, required hardware gate)
 
 The daemon-backed harness does not prove direct USB. Stop the daemon and close
