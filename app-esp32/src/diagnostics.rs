@@ -9,7 +9,7 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 
-/// Ring buffer capacity in bytes (~80–100 log lines at INFO level).
+/// Ring buffer capacity in bytes (about 30–40 log lines at INFO level).
 const LOG_BUFFER_CAPACITY: usize = 4096;
 
 // ---------------------------------------------------------------------------
@@ -451,13 +451,38 @@ pub fn log_internal_heap(stage: &str) {
     );
 }
 
-/// Collect and log system diagnostics (called periodically from main loop).
+/// A heap line with no new low-water mark is logged this often.
+const HEAP_LOG_HEARTBEAT_S: i64 = 60 * 60;
+
+/// Total and internal heap minimums, and uptime, at the last heap line.
+static LAST_HEAP_LOG: Mutex<Option<(u32, usize, i64)>> = Mutex::new(None);
+
+/// Collect system diagnostics (called every few seconds from the main loop).
+/// Logs a heap line when either low-water mark moves, and otherwise hourly:
+/// a line every 5 s filled the log ring within minutes and pushed real events
+/// out. `GET /debug/info` has the live figures.
 pub fn tick() {
     let heap_free = unsafe { esp_get_free_heap_size() };
     let heap_min = unsafe { esp_get_minimum_free_heap_size() };
     let internal = internal_heap();
     let uptime_ms = unsafe { esp_timer_get_time() / 1000 };
     let uptime_s = uptime_ms / 1000;
+
+    let mut last = LAST_HEAP_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let due = match *last {
+        None => true,
+        Some((total_min, internal_min, logged_at)) => {
+            // A minimum only moves down, or up after POST /debug/heap/reset-min.
+            heap_min != total_min
+                || internal.min != internal_min
+                || uptime_s - logged_at >= HEAP_LOG_HEARTBEAT_S
+        }
+    };
+    if !due {
+        return;
+    }
+    *last = Some((heap_min, internal.min, uptime_s));
+    drop(last);
 
     log::info!(
         "heap: {heap_free} free ({heap_min} min), internal: {} free ({} min, {} largest), uptime: {}m {}s",

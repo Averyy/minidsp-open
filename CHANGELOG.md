@@ -29,6 +29,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 
 ### Changed
 
+- The ESP32 logs its heap line when a heap minimum moves and otherwise once an hour. Every 5 s, it filled the 4 KB log buffer that `GET /debug/log` serves within about two minutes and pushed out every other line, warnings included.
 - The live validation suite skips desktop playback when the MiniDSP is reached over the network, since desktop playback needs its USB audio interface on the local computer. It confirms audible playback before contacting the target.
 - A snapshot restore on the ESP32 that loses the MiniDSP to a stalled write now waits for the bus reset to bring it back and resumes from the preset that failed, instead of failing. `POST /debug/usb/stall` injects a stall to test it. The per-write `write_biquad`/`bypass_filter` log lines moved to debug level, which also takes about 2 s off a restore.
 - When a HID write to the MiniDSP gets no completion within 5 s, the ESP32 logs the USB controller's registers (`USB DWC …` lines, also at `GET /debug/usb`) and waits up to 20 s more for the MiniDSP. If it still doesn't answer, the ESP32 power-cycles the USB port instead of halting the stuck channel, whose halt never finishes; the MiniDSP re-enumerates in about 20 s and the board stays on the network. The restore or command in flight still fails. `POST /debug/usb/reset-bus` runs the same recovery on demand.

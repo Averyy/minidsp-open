@@ -229,6 +229,9 @@ request shows up on its own: reset, make the request, then read
 `/debug/info`. At debug log level, the ezBEQ `/ws` handler also logs internal
 RAM at each step of a new connection.
 
+The log gets a `heap: …` line when either minimum moves, and otherwise once
+an hour, so the 4 KB ring keeps room for real events.
+
 `GET /debug/usb` returns the USB OTG controller's registers as JSON: the port,
 frame number, periodic TX FIFO and request-queue space, and each configured
 channel's `hcchar`, `hcint`, `hctsiz` and `hcdma`. The same registers, plus the
