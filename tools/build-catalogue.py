@@ -79,11 +79,21 @@ def current_build_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def repo_build_stamp() -> str:
+def repo_build_stamp(output_dir: Path | None = None) -> str:
     repo_root = Path(__file__).resolve().parent.parent
+    # The build's own output isn't a source change. Without excluding it, the
+    # CI build into ./site always looked dirty and got a new wall-clock version.
+    pathspec = ["."]
+    if output_dir is not None:
+        try:
+            relative = output_dir.resolve().relative_to(repo_root)
+        except ValueError:
+            relative = None
+        if relative is not None and relative.parts:
+            pathspec.append(f":(exclude){relative.as_posix()}")
     try:
         dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--", *pathspec],
             cwd=repo_root,
             check=True,
             capture_output=True,
@@ -623,7 +633,7 @@ def main():
 
     # Download ezBEQ React UI from PyPI
     catalogue_stamp = catalogue_build_stamp(version)
-    repo_stamp = repo_build_stamp()
+    repo_stamp = repo_build_stamp(output_dir)
     ui_version, ui_stamp, ui_files = download_ui(output_dir)
 
     # Carry upstream notices with every stored/hosted copy, served by the

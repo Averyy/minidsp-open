@@ -22,7 +22,7 @@ Do not build with an activated ESP-IDF environment (`. export.sh`, or the person
 
 Use `tools/flash-esp32.sh` as the default local flashing workflow. It builds the current ezBEQ bundle locally, turns it into a LittleFS image for the `storage` partition, flashes that image alongside the firmware, and can optionally verify the board's `/version.txt` after boot via `--board-url http://BOARD:5380`.
 
-This is the correct dev workflow even while the published ezBEQ site is stale because the board comes up with a real stored bundle immediately after flash instead of depending on an immediate post-boot download.
+Prefer it even though the catalogue sync keeps the GitHub Pages copy current: the board comes up with a real stored bundle immediately after flash, instead of depending on a post-boot download, and the bundle matches your local builder changes.
 
 For the first move from ESP-IDF 5.4 to 6.x, use `tools/flash-esp32.sh` to update the bootloader; OTA never updates it. Once a board has the 6.x bootloader and runs OTA-capable firmware, push new builds over WiFi instead: `tools/ota-push.sh --board http://BOARD:5380` builds, uploads to `POST /firmware`, and waits for the reboot. The board verifies the image, and rolls back by itself if the new firmware never gets back on the network. USB flashing is only needed for partition-table/bootloader changes or a bricked board. Firmware updates are documented in `docs/ref-firmware-updates.md`.
 

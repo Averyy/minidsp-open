@@ -89,6 +89,7 @@ Current verification limits and open work live in [PROGRESS.md](PROGRESS.md).
 - Bundle updates stage and resume downloads while reclaiming stale files.
 - ESP-IDF 6.x WebSocket handshakes register the callback required by the updated HTTP server.
 - The release and catalogue-sync workflows referenced a `setup-uv` version that doesn't exist; the catalogue sync also waits for GitHub Pages to be enabled instead of failing every four hours.
+- The catalogue sync rebuilt and republished the GitHub Pages site every four hours even when nothing had changed, so boards and browsers saw a new site version each time. It compared the upstream catalogue revision with the site's full version string, and the builder counted its own output directory as a source change and stamped each CI build with the clock time. It now skips when the upstream catalogue and the repo commit match the deployed manifest.
 - The ESP32 no longer replays its boot log at startup, which printed every boot line twice on serial and pushed real entries out of `/debug/log`.
 - CLI, config and HTTP compatibility with minidsp-rs from an offline audit: crossover, compressor, routing and selector forms, command files, TOML arrays and device bindings, HTTP routing/crossover shapes and padded TCP replies.
 - Firmware update checks run on one persistent worker with a cooldown instead of a new thread per request, and `/debug/info` no longer reads task names from freed task memory.

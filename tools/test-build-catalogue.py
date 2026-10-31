@@ -6,7 +6,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import struct
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -110,6 +112,25 @@ class CatalogueContract(unittest.TestCase):
             self.assertEqual((output / "ui/ezbeq-shim.js").read_bytes(), catalogue.SHIM_PATH.read_bytes())
             self.assertEqual((output / "licenses/ezbeq-LICENSE.txt").read_text(), "upstream MIT license")
             self.assertEqual((output / "ui/index.html").read_text().count("ezbeq-shim.js"), 1)
+
+    def test_repo_stamp_ignores_the_build_output_but_not_other_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            env = {"GIT_AUTHOR_DATE": "2026-10-31T13:29:30Z", "GIT_COMMITTER_DATE": "2026-10-31T13:29:30Z",
+                   "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+            (repo / "tools").mkdir()
+            (repo / "tools/build-catalogue.py").write_text("")
+            for args in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "x"]):
+                subprocess.run(["git", *args], cwd=repo, check=True, env={**os.environ, **env})
+            (repo / "site").mkdir()
+            (repo / "site/catalogue.bin").write_bytes(b"built")
+            with patch.object(catalogue, "__file__", str(repo / "tools/build-catalogue.py")), \
+                    patch.object(catalogue, "current_build_stamp", return_value="WALLCLOCK"):
+                self.assertEqual(catalogue.repo_build_stamp(repo / "site"), "20261031T132930Z")
+                self.assertEqual(catalogue.repo_build_stamp(), "WALLCLOCK")
+                (repo / "tools/build-catalogue.py").write_text("# edited")
+                self.assertEqual(catalogue.repo_build_stamp(repo / "site"), "WALLCLOCK")
 
 
 if __name__ == "__main__":

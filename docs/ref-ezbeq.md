@@ -204,8 +204,10 @@ automatically; adopting a new UI version is a deliberate compatibility change.
 
 Build with `mkdir -p DIR && uv run tools/build-catalogue.py --output-dir DIR`.
 Boards download the published copy from GitHub Pages
-(`https://averyy.github.io/minidsp-open`), which `.github/workflows/catalogue-sync.yml`
-rebuilds every four hours when the BEQ catalogue changes. Scheduled runs only
+(`https://averyy.github.io/minidsp-open`). `.github/workflows/catalogue-sync.yml`
+checks every four hours and rebuilds when the upstream BEQ catalogue revision or
+the repo commit differs from the deployed manifest's `catalogue_version` and
+`repo_build_stamp`. Scheduled runs only
 start once Pages is enabled for the repository and the `CATALOGUE_PAGES_ENABLED`
 repository variable is `true`; a manual run always goes.
 The builder fails if manifest files plus the manifest exceed **8,000,000 bytes**.

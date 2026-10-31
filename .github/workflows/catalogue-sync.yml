@@ -31,19 +31,25 @@ jobs:
 
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
+      # The published site is current when it was built from the latest upstream
+      # catalogue and from this commit. Compare the deployed manifest's inputs;
+      # its version.txt also carries a build stamp and a content hash.
       - name: Check for updates
         id: version_check
         run: |
-          REMOTE_VERSION=$(curl -sf https://beqcatalogue.readthedocs.io/en/latest/version.txt | tr -dc 'A-Za-z0-9._-' | head -c 64 || echo "unknown")
-          CACHED_VERSION=$(curl -sf https://${{ github.repository_owner }}.github.io/minidsp-open/version.txt | tr -dc 'A-Za-z0-9._-' | head -c 64 || echo "none")
+          REMOTE_VERSION=$(curl -sf https://raw.githubusercontent.com/3ll3d00d/beqcatalogue/master/docs/version.txt | tr -dc 'A-Za-z0-9._-' | head -c 64)
+          REPO_STAMP=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%dT%H%M%SZ HEAD)
+          DEPLOYED=$(curl -sf https://${{ github.repository_owner }}.github.io/minidsp-open/manifest.json || echo '{}')
+          CACHED_VERSION=$(jq -r '.catalogue_version // "none"' <<<"$DEPLOYED" 2>/dev/null | tr -dc 'A-Za-z0-9._-' | head -c 64)
+          CACHED_REPO_STAMP=$(jq -r '.repo_build_stamp // "none"' <<<"$DEPLOYED" 2>/dev/null | tr -dc 'A-Za-z0-9._-' | head -c 32)
           echo "remote=$REMOTE_VERSION" >> $GITHUB_OUTPUT
           echo "cached=$CACHED_VERSION" >> $GITHUB_OUTPUT
-          if [ "$REMOTE_VERSION" = "$CACHED_VERSION" ] && [ "$REMOTE_VERSION" != "unknown" ]; then
+          if [ -n "$REMOTE_VERSION" ] && [ "$REMOTE_VERSION" = "$CACHED_VERSION" ] && [ "$REPO_STAMP" = "$CACHED_REPO_STAMP" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
-            echo "Catalogue up to date ($REMOTE_VERSION)"
+            echo "Site up to date (catalogue $REMOTE_VERSION, repo $REPO_STAMP)"
           else
             echo "skip=false" >> $GITHUB_OUTPUT
-            echo "Update available: $CACHED_VERSION -> $REMOTE_VERSION"
+            echo "Update needed: catalogue ${CACHED_VERSION:-none} -> ${REMOTE_VERSION:-unknown}, repo ${CACHED_REPO_STAMP:-none} -> $REPO_STAMP"
           fi
 
       - name: Build catalogue + UI

@@ -63,7 +63,6 @@ Details: [ESP32 audio](docs/TODO1-esp32-usb-audio.md),
 - [ ] Confirm the HT/HTx selectable-source bitmap at `0xFFEA` on live hardware. The typed protocol parser/encoder and tests exist from static research (HT/HTx all-enabled masks: `0x1E`/`0x1F`); no client reads or writes are enabled.
 - [ ] Find the live addresses and value ranges of the advanced Dirac controls (`mux_bypass`, `dirac_delay`, `mixer_fir`, `fir-ctrl`) on a Dirac-capable unit; their preset layouts are documented and there is no standalone `iir-ctrl` descriptor.
 - [ ] Publish the first release by pushing a `vX.Y.Z` tag. CI passes on GitHub, and a manual release dry run builds every desktop target and the ESP32 images, with matching `SHA256SUMS` and a `firmware.json` whose hash matches the OTA image; only the publish step is untried. Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
-- [ ] Enable GitHub Pages for the repository and set the `CATALOGUE_PAGES_ENABLED` variable, so the catalogue sync publishes the ezBEQ bundle boards download (`docs/ref-ezbeq.md`). Until then its scheduled runs skip.
 - [ ] Keep PWR-ICE compatibility, later ezBEQ expansion, and custom-PCB VBUS GPIO control deferred. DevKitC boards don't need GPIO-driven VBUS.
 
 ### Wi-DG parity
