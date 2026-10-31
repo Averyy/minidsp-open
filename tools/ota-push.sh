@@ -78,7 +78,12 @@ PYAUTH
 fi
 
 before="$(board_curl -fsS --max-time 5 "$BOARD_URL/firmware")" || {
-  echo "board at $BOARD_URL is not answering GET /firmware (is it on OTA firmware yet?)" >&2
+  code="$(board_curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BOARD_URL/firmware" || true)"
+  if [[ "$code" == "401" ]]; then
+    echo "board at $BOARD_URL needs its password: pass --password-file FILE or set MINIDSP_PASSWORD" >&2
+  else
+    echo "board at $BOARD_URL is not answering GET /firmware (is it on OTA firmware yet?)" >&2
+  fi
   exit 1
 }
 read -r before_build before_slot < <(printf '%s' "$before" | uv run python -c \
