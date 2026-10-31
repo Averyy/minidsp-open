@@ -10,6 +10,10 @@ live in [PROGRESS.md](PROGRESS.md).
 
 ## Unreleased
 
+### Fixed
+
+- The x86_64 Linux release build ran on GitHub's `ubuntu-latest`, now Ubuntu 26.04, so the binary needed glibc 2.43 and wouldn't start on Ubuntu 24.04, Debian 12 or 13, or Raspberry Pi OS. It builds on Ubuntu 24.04 again and needs glibc 2.34, like the ARM64 build, and the release workflow fails if a Linux binary needs anything newer.
+
 ## [0.2.0] - 2026-10-31
 
 First public release.

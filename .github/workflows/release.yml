@@ -126,8 +126,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux binaries need the runner's glibc or newer. Pinned images
+          # keep that at 2.34; ubuntu-latest (26.04) needed 2.43.
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
@@ -168,6 +170,14 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --package minidsp-app --bin minidsp --target "$TARGET"
+      - name: Check the Linux glibc floor
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          need=$(objdump -T "target/$TARGET/release/minidsp" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "minidsp needs $need; the README promises GLIBC_2.34"
+          [ "$(printf '%s\n' GLIBC_2.34 "$need" | sort -V | tail -1)" = GLIBC_2.34 ]
       - name: Package Unix binary
         if: runner.os != 'Windows'
         env:

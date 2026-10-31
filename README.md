@@ -27,7 +27,7 @@ Later firmware updates go over WiFi from `http://<board-ip>:5380/update`, and a 
 
 ## Desktop CLI and daemon
 
-Download the archive for your platform and check it with `shasum -a 256 -c SHA256SUMS --ignore-missing`. The macOS binaries aren't signed; if macOS blocks `minidsp`, run `xattr -d com.apple.quarantine minidsp`.
+Download the archive for your platform and check it with `shasum -a 256 -c SHA256SUMS --ignore-missing`. Linux builds need glibc 2.34 or newer (Ubuntu 22.04, Debian 12, Raspberry Pi OS Bookworm and later) and the libudev and ALSA libraries. The macOS binaries aren't signed; if macOS blocks `minidsp`, run `xattr -d com.apple.quarantine minidsp`.
 
 ```bash
 minidsp                      # status
