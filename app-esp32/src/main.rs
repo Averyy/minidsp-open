@@ -404,14 +404,19 @@ fn main() {
                 log_usb_state_transition(&mut usb_state, UsbState::Absent, "device missing");
                 info!("USB: scanning for device (timeout: {usb_backoff:?})");
                 let scan_started = Instant::now();
-                match discover_and_activate_device(bus, usb_backoff)
-                    .and_then(|state| recover_interrupted_stream(bus, state, &nvs))
-                {
+                // The device state lives as long as the connection; keep it,
+                // and the NVS shadow load's temporaries, out of internal RAM.
+                match psram::external(|| {
+                    discover_and_activate_device(bus, usb_backoff)
+                        .and_then(|state| recover_interrupted_stream(bus, state, &nvs))
+                }) {
                     Ok(state) => {
                         usb_backoff = Duration::from_secs(5);
                         next_usb_scan = Instant::now();
                         usb_state = UsbState::ProtocolReady;
-                        on_device_activated(state, &device_state, &beq_state, &nvs);
+                        psram::external(|| {
+                            on_device_activated(state, &device_state, &beq_state, &nvs)
+                        });
                         ensure_audio_driver_installed(&audio_state, &mut audio_driver_installed);
                         audio_state.resume_opening("HID protocol ready");
                         led::set_device_ready(true);

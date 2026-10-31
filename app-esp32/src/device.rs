@@ -2457,29 +2457,37 @@ impl DeviceState {
             }
         };
         let key = peq_nvs_key(self.serial);
-        let mut buf = vec![0u8; PEQ_SHADOW_MAX_BYTES];
+        // Size the buffer to the blob: a fixed 8 KiB buffer plus a decoded
+        // copy cost 12 KB of RAM at every reconnect.
+        let len = match ns.blob_len(&key) {
+            Ok(Some(len)) if len <= PEQ_SHADOW_MAX_BYTES => len,
+            Ok(Some(len)) => {
+                warn!("peq shadow NVS blob under key {key} is {len} bytes — ignoring");
+                return;
+            }
+            Ok(None) => {
+                debug!("peq shadow: no NVS blob under {key}");
+                return;
+            }
+            Err(e) => {
+                warn!("peq shadow NVS read failed: {e}");
+                return;
+            }
+        };
+        let mut buf = vec![0u8; len];
         match ns.get_blob(&key, &mut buf) {
-            Ok(Some(blob)) => match decode_peq_shadow(blob) {
-                Some(decoded) => {
-                    let mut shadow = self.peq_shadow.lock().unwrap_or_else(|e| e.into_inner());
-                    let mut merged = 0usize;
-                    for (addr, entry) in decoded {
-                        if let Some(slot) = shadow.get_mut(&addr) {
-                            *slot = entry;
-                            merged += 1;
-                        } else {
-                            // Unknown address — insert anyway so subsequent
-                            // reads see the persisted value.
-                            shadow.insert(addr, entry);
-                            merged += 1;
-                        }
+            Ok(Some(blob)) => {
+                // Unknown addresses are inserted too, so later reads see them.
+                let mut shadow = self.peq_shadow.lock().unwrap_or_else(|e| e.into_inner());
+                match decode_peq_shadow_into(blob, &mut shadow) {
+                    Some(merged) => {
+                        info!("peq shadow: restored {merged} bands from NVS (key {key})")
                     }
-                    info!("peq shadow: restored {merged} bands from NVS (key {key})");
+                    None => {
+                        warn!("peq shadow NVS blob under key {key} failed to decode — ignoring")
+                    }
                 }
-                None => {
-                    warn!("peq shadow NVS blob under key {key} failed to decode — ignoring");
-                }
-            },
+            }
             Ok(None) => {
                 debug!("peq shadow: no NVS blob under {key}");
             }
@@ -3493,7 +3501,15 @@ fn encode_peq_shadow(shadow: &HashMap<u16, PeqShadow>) -> Vec<u8> {
 /// Decode a PEQ shadow blob produced by [`encode_peq_shadow`]. Returns
 /// `None` on any structural error — the caller should log and fall back to
 /// the default shadow.
+#[cfg(test)]
 fn decode_peq_shadow(data: &[u8]) -> Option<HashMap<u16, PeqShadow>> {
+    let mut shadow = HashMap::new();
+    decode_peq_shadow_into(data, &mut shadow).map(|_| shadow)
+}
+
+/// Decode a persisted PEQ shadow into `shadow`, returning the band count.
+/// A malformed blob leaves `shadow` untouched.
+fn decode_peq_shadow_into(data: &[u8], shadow: &mut HashMap<u16, PeqShadow>) -> Option<usize> {
     if data.len() < 3 || data[0] != PEQ_SHADOW_FORMAT_V1 {
         return None;
     }
@@ -3503,7 +3519,6 @@ fn decode_peq_shadow(data: &[u8]) -> Option<HashMap<u16, PeqShadow>> {
         return None;
     }
 
-    let mut shadow = HashMap::with_capacity(count);
     let mut offset = 3;
     for _ in 0..count {
         let addr = u16::from_le_bytes([data[offset], data[offset + 1]]);
@@ -3526,7 +3541,7 @@ fn decode_peq_shadow(data: &[u8]) -> Option<HashMap<u16, PeqShadow>> {
 
         shadow.insert(addr, PeqShadow { coeffs, bypass });
     }
-    Some(shadow)
+    Some(count)
 }
 
 #[cfg(test)]

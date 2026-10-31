@@ -36,7 +36,7 @@ use minidsp_protocol::status::{
 };
 use serde_json::json;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 const REBOOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(50);
@@ -2226,7 +2226,11 @@ fn register_device_feature_routes(
                 return send_error(req, 501, "default preset reset not supported");
             }
             match dev.initialize_all_presets_to_defaults(true) {
-                Ok(()) => match wait_for_rebooted_device(&st, &dev, REBOOT_RECOVERY_TIMEOUT) {
+                Ok(()) => match wait_for_rebooted_device(
+                    &st,
+                    RebootedDevice::of(dev),
+                    REBOOT_RECOVERY_TIMEOUT,
+                ) {
                     Ok(()) => send_json(
                         req,
                         200,
@@ -2257,7 +2261,11 @@ fn register_device_feature_routes(
                 dev.reboot_device()
             };
             match reset {
-                Ok(()) => match wait_for_rebooted_device(&st, &dev, REBOOT_RECOVERY_TIMEOUT) {
+                Ok(()) => match wait_for_rebooted_device(
+                    &st,
+                    RebootedDevice::of(dev),
+                    REBOOT_RECOVERY_TIMEOUT,
+                ) {
                     Ok(()) => send_json(req, 200, r#"{"status":"rebooted"}"#),
                     Err(e) => send_error(req, 500, &e),
                 },
@@ -2566,18 +2574,40 @@ pub fn get_device(state: &SharedDeviceState) -> Option<Arc<DeviceState>> {
     state.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// What a reboot wait needs from the device it rebooted. Holding the old
+/// `DeviceState` through the wait would keep its shadow maps in internal RAM
+/// while the main loop builds the replacement; the `Weak` keeps only the
+/// allocation, so its address can't be reused by the new state.
+struct RebootedDevice {
+    hw_id: u8,
+    dsp_version: u8,
+    serial: u32,
+    previous: Weak<DeviceState>,
+}
+
+impl RebootedDevice {
+    fn of(dev: Arc<DeviceState>) -> Self {
+        Self {
+            hw_id: dev.hw_id().hw_id,
+            dsp_version: dev.dsp_version(),
+            serial: dev.serial(),
+            previous: Arc::downgrade(&dev),
+        }
+    }
+}
+
 fn wait_for_rebooted_device(
     state: &SharedDeviceState,
-    previous: &Arc<DeviceState>,
+    rebooted: RebootedDevice,
     timeout: Duration,
 ) -> Result<(), String> {
     const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     let started = Instant::now();
     let deadline = Instant::now() + timeout;
-    let expected_hw_id = previous.hw_id().hw_id;
-    let expected_dsp = previous.dsp_version();
-    let expected_serial = previous.serial();
+    let expected_hw_id = rebooted.hw_id;
+    let expected_dsp = rebooted.dsp_version;
+    let expected_serial = rebooted.serial;
 
     loop {
         if let Some(current) = get_device(state) {
@@ -2585,7 +2615,7 @@ fn wait_for_rebooted_device(
                 && current.dsp_version() == expected_dsp
                 && (expected_serial == 0 || current.serial() == expected_serial);
 
-            if same_identity && !Arc::ptr_eq(&current, previous) {
+            if same_identity && Arc::as_ptr(&current) != rebooted.previous.as_ptr() {
                 info!(
                     "HTTP reboot wait: device recovered after {:?}",
                     started.elapsed()
@@ -3773,7 +3803,11 @@ fn recycle_root_port_for_playback(
 
     let recycled = (|| {
         crate::usb_hid::recycle_root_port_global(reason).map_err(|err| err.to_string())?;
-        wait_for_rebooted_device(state, dev, REBOOT_RECOVERY_TIMEOUT)?;
+        wait_for_rebooted_device(
+            state,
+            RebootedDevice::of(dev.clone()),
+            REBOOT_RECOVERY_TIMEOUT,
+        )?;
         if !audio.wait_for_cleanup_complete(AUDIO_CLOSE_TIMEOUT) {
             return Err(format!("USB audio teardown still pending after {reason}"));
         }

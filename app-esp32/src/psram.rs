@@ -7,8 +7,9 @@
 //! USB, and measurement mode starved the WiFi PHY into an abort. The HTTP
 //! server task is registered at startup, so every handler allocates in PSRAM,
 //! and the playback worker registers itself for its per-write statistics.
+//! The main task builds each connected device's state inside [`external`].
 //! Buffers handed to the flash driver use [`internal`]: it writes a PSRAM
-//! source 32 bytes at a time.
+//! source 32 bytes at a time (reads go through its internal bounce buffer).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
@@ -119,5 +120,32 @@ pub fn internal<T>(f: impl FnOnce() -> T) -> T {
             )
             .is_ok(),
     );
+    f()
+}
+
+/// Run `f` with the current task's allocations in PSRAM, for long-lived state
+/// built by a task that isn't registered. Takes a free slot for the duration;
+/// with none free, `f` runs unchanged.
+pub fn external<T>(f: impl FnOnce() -> T) -> T {
+    struct Release(Option<&'static AtomicPtr<c_void>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(slot) = self.0 {
+                slot.store(ptr::null_mut(), Ordering::Release);
+            }
+        }
+    }
+    let task = current_task();
+    let registered = PSRAM_TASKS
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) == task);
+    let _release = Release(if registered || task.is_null() {
+        None
+    } else {
+        PSRAM_TASKS.iter().find(|slot| {
+            slot.compare_exchange(ptr::null_mut(), task, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+    });
     f()
 }
