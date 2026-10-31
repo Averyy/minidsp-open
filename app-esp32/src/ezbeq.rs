@@ -46,6 +46,16 @@ pub struct SlotState {
 /// internal RAM on every state push.
 impl serde::Serialize for SlotState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize_with_active(self.active, serializer)
+    }
+}
+
+impl SlotState {
+    fn serialize_with_active<S: serde::Serializer>(
+        &self,
+        active: bool,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         // An empty slot carries no coefficient provenance, whatever was last loaded.
         let loaded = self.last != "Empty";
@@ -54,7 +64,7 @@ impl serde::Serialize for SlotState {
         let mut slot = serializer.serialize_struct("SlotState", 14)?;
         slot.serialize_field("id", &self.id)?;
         slot.serialize_field("last", &self.last)?;
-        slot.serialize_field("active", &self.active)?;
+        slot.serialize_field("active", &active)?;
         slot.serialize_field("author", &self.author)?;
         slot.serialize_field("gains", &self.gains)?;
         slot.serialize_field("mutes", &self.mutes)?;
@@ -73,6 +83,33 @@ impl serde::Serialize for SlotState {
         slot.serialize_field("outputGains", &self.output_gains)?;
         slot.serialize_field("outputMutes", &self.output_mutes)?;
         slot.end()
+    }
+}
+
+/// The slots as sent to ezBEQ, with `active` read from the device's current
+/// preset. Presets also change through the HTTP API, the TCP bridge, a
+/// snapshot restore or the MiniDSP's remote, and none of those update the
+/// stored slot state; the stored flag is the fallback when the read fails.
+struct SlotsView<'a> {
+    slots: &'a [SlotState],
+    active_preset: Option<u8>,
+}
+
+impl serde::Serialize for SlotsView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct Slot<'a>(&'a SlotState, bool);
+        impl serde::Serialize for Slot<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.serialize_with_active(self.1, serializer)
+            }
+        }
+        serializer.collect_seq(self.slots.iter().enumerate().map(|(i, slot)| {
+            Slot(
+                slot,
+                self.active_preset
+                    .map_or(slot.active, |preset| usize::from(preset) == i),
+            )
+        }))
     }
 }
 
@@ -625,7 +662,7 @@ struct DeviceStateBody<'a> {
     // Null is understood by 2.12.4: hide the sticky toggle and profile
     // comparisons, while still rendering each loaded slot's provenance chip.
     optimisation: (),
-    slots: &'a [SlotState],
+    slots: SlotsView<'a>,
 }
 
 fn device_state_body<'a>(device: &DeviceState, beq_state: &'a EzBeqState) -> DeviceStateBody<'a> {
@@ -638,7 +675,10 @@ fn device_state_body<'a>(device: &DeviceState, beq_state: &'a EzBeqState) -> Dev
         mute: ms.as_ref().map(|m| m.is_muted()).unwrap_or(false),
         connected: ms.is_some(),
         optimisation: (),
-        slots: &beq_state.slots,
+        slots: SlotsView {
+            slots: &beq_state.slots,
+            active_preset: ms.as_ref().map(|m| m.preset),
+        },
     }
 }
 
