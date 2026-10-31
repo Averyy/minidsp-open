@@ -63,7 +63,7 @@ Details: [ESP32 audio](docs/TODO1-esp32-usb-audio.md),
 - [ ] Confirm the HT/HTx selectable-source bitmap at `0xFFEA` on live hardware. The typed protocol parser/encoder and tests exist from static research (HT/HTx all-enabled masks: `0x1E`/`0x1F`); no client reads or writes are enabled.
 - [ ] Find the live addresses and value ranges of the advanced Dirac controls (`mux_bypass`, `dirac_delay`, `mixer_fir`, `fir-ctrl`) on a Dirac-capable unit; their preset layouts are documented and there is no standalone `iir-ctrl` descriptor.
 - [ ] Publish 0.2.1 with the OTA request-buffer fix. ESP32 0.2.0 can't check for or install GitHub releases (see CHANGELOG Unreleased), so a board on 0.2.0 needs that one update uploaded through `/update` or `tools/ota-push.sh`.
-- [ ] Prove an ESP32 checks and installs a GitHub release end to end: a board running the fix, then a newer release, then `POST /firmware/update`. The fix hasn't reached the maintainer's board yet: at about -97 dBm every 2.5 MB WiFi upload broke off, while small requests and the catalogue check still worked.
+- [ ] Prove an ESP32 installs a GitHub release end to end with `POST /firmware/update`. With the fix, the 2x4 HD board's release check follows both GitHub redirects and reads v0.2.0's `firmware.json`; installing needs a release newer than the board's version. At about -97 dBm, 2.5 MB WiFi uploads broke off; at -90 dBm they work.
 - [ ] Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
 - [ ] Keep PWR-ICE compatibility, later ezBEQ expansion, and custom-PCB VBUS GPIO control deferred. DevKitC boards don't need GPIO-driven VBUS.
 
