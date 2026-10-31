@@ -27,6 +27,8 @@ const RELEASE_MANIFEST_URL: &str =
 const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/Averyy/minidsp-open/releases/download";
 const MAX_MANIFEST_BYTES: usize = 4096;
 const CHUNK_BYTES: usize = 4096;
+/// Request-line buffer: room for twice a signed GitHub release-assets URL.
+const RELEASE_REQUEST_BYTES: usize = 2048;
 /// `esp_image_header_t.chip_id` for the ESP32-S3.
 const ESP32S3_CHIP_ID: u16 = 9;
 const ESP_IMAGE_MAGIC: u8 = 0xE9;
@@ -407,9 +409,13 @@ fn uptime_sec() -> u64 {
 
 fn http_get(url: &str, timeout: Duration) -> Result<EspHttpConnection, String> {
     let config = Configuration {
-        // GitHub release downloads redirect to a CDN URL longer than the
-        // default 512-byte header buffer.
+        // GitHub release downloads redirect twice, ending at a signed
+        // release-assets URL of about 900 bytes. That URL arrives as a
+        // Location header and goes out as the next request line; both are
+        // longer than ESP-IDF's 512-byte default buffers. A short TX buffer
+        // fails the redirected request with "Out of buffer" (ESP_FAIL).
         buffer_size: Some(CHUNK_BYTES),
+        buffer_size_tx: Some(RELEASE_REQUEST_BYTES),
         timeout: Some(timeout),
         crt_bundle_attach: Some(sys::esp_crt_bundle_attach),
         ..Default::default()

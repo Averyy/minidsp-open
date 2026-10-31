@@ -12,6 +12,7 @@ live in [PROGRESS.md](PROGRESS.md).
 
 ### Fixed
 
+- The ESP32 couldn't check for or install GitHub releases. GitHub redirects release downloads to a signed `release-assets.githubusercontent.com` URL of about 900 bytes, and the HTTP client's 512-byte request buffer rejected it ("Out of buffer", `ESP_FAIL`). The request buffer is 2 KB now. Boards on 0.2.0 need one uploaded update (`/update` page or `tools/ota-push.sh`) to get the fix.
 - The x86_64 Linux release build ran on GitHub's `ubuntu-latest`, now Ubuntu 26.04, so the binary needed glibc 2.43 and wouldn't start on Ubuntu 24.04, Debian 12 or 13, or Raspberry Pi OS. It builds on Ubuntu 24.04 again and needs glibc 2.34, like the ARM64 build, and the release workflow fails if a Linux binary needs anything newer.
 
 ## [0.2.0] - 2026-10-31
