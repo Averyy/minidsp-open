@@ -2297,12 +2297,12 @@ impl DeviceState {
 
     #[allow(dead_code)]
     pub fn write_biquad(&self, addr: u16, coeffs: &[f32; 5]) -> Result<(), UsbHidError> {
-        info!("write_biquad start addr=0x{addr:04x}");
+        debug!("write_biquad start addr=0x{addr:04x}");
         self.expect_write_ok(
             &commands::write_biquad(addr, coeffs, self.dialect()),
             "write biquad",
         )?;
-        info!("write_biquad done addr=0x{addr:04x}");
+        debug!("write_biquad done addr=0x{addr:04x}");
         if let Ok(mut shadow) = self.peq_shadow.lock() {
             let entry = shadow.entry(addr).or_insert(PeqShadow {
                 coeffs: minidsp_protocol::biquad::BYPASS,
@@ -2319,12 +2319,12 @@ impl DeviceState {
 
     #[allow(dead_code)]
     pub fn bypass_filter(&self, addr: u16, bypass: bool) -> Result<(), UsbHidError> {
-        info!("bypass_filter start addr=0x{addr:04x} bypass={bypass}");
+        debug!("bypass_filter start addr=0x{addr:04x} bypass={bypass}");
         self.expect_write_ok(
             &commands::bypass_filter(addr, bypass, self.dialect()),
             "bypass filter",
         )?;
-        info!("bypass_filter done addr=0x{addr:04x} bypass={bypass}");
+        debug!("bypass_filter done addr=0x{addr:04x} bypass={bypass}");
         if let Ok(mut shadow) = self.peq_shadow.lock() {
             let entry = shadow.entry(addr).or_insert(PeqShadow {
                 coeffs: minidsp_protocol::biquad::BYPASS,
@@ -2632,7 +2632,7 @@ impl DeviceState {
         })?;
         if after != expected {
             if self.prefers_scalar_shadow_for_addr(addr) {
-                info!(
+                debug!(
                     "accepting shadow-backed scalar write at addr {addr} despite non-authoritative live readback (before=0x{before:08X}, expected=0x{expected:08X}, after=0x{after:08X})"
                 );
                 return Ok(());
@@ -2741,7 +2741,7 @@ impl DeviceState {
         })?;
         if (after - db).abs() > GAIN_VERIFY_TOLERANCE_DB {
             if self.prefers_scalar_shadow_for_addr(addr) {
-                info!(
+                debug!(
                     "accepting shadow-backed gain write at addr {addr} despite non-authoritative live readback (before={before:.6}, expected={db:.6}, after={after:.6})"
                 );
                 return Ok(());
@@ -2909,7 +2909,7 @@ impl DeviceState {
         })?;
         if after != expected {
             if self.prefers_scalar_shadow_for_addr(addr) {
-                info!(
+                debug!(
                     "accepting shadow-backed delay write at addr {addr} despite non-authoritative live readback (before={before}, expected={expected}, after={after})"
                 );
                 return Ok(());
@@ -2943,7 +2943,7 @@ impl DeviceState {
                 })?;
                 if after != expected {
                     if self.prefers_scalar_shadow_for_addr(addr) {
-                        info!(
+                        debug!(
                             "accepting shadow-backed delay write at addr {addr} despite non-authoritative live readback (before={before}, expected={expected}, after={after})"
                         );
                         return Ok(());

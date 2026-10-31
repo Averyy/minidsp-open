@@ -175,6 +175,23 @@ static GLOBAL_BUS: OnceLock<Arc<UsbHidBus>> = OnceLock::new();
 /// progress. The host library waits for the halt with no timeout.
 static HALT_STARTED_MS: AtomicU32 = AtomicU32::new(0);
 
+/// Commands left before an injected stall (`POST /debug/usb/stall`); 0 is off.
+static INJECT_STALL_AFTER: AtomicU32 = AtomicU32::new(0);
+
+/// Make the `after`th next HID command behave as a stalled write: reset the
+/// bus and fail with a timeout. 0 disarms.
+pub fn inject_stall_after(after: u32) {
+    INJECT_STALL_AFTER.store(after, Ordering::SeqCst);
+}
+
+fn take_injected_stall() -> bool {
+    INJECT_STALL_AFTER
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            (left > 0).then(|| left - 1)
+        })
+        .is_ok_and(|left| left == 1)
+}
+
 /// When the endpoint halt in progress started (ms since boot), if one is.
 pub fn halt_started_ms() -> Option<u32> {
     match HALT_STARTED_MS.load(Ordering::SeqCst) {
@@ -864,6 +881,13 @@ impl UsbHidBus {
         }
         let command_epoch = self.connection_epoch();
         debug!("USB command start: {:02x?}", payload);
+        if take_injected_stall() {
+            warn!("USB: injected stall for {payload:02x?}");
+            if let Err(err) = self.reset_bus_after_stall("injected stall") {
+                warn!("USB bus reset after injected stall failed: {err}");
+            }
+            return Err(UsbHidError::Timeout);
+        }
 
         // Check connection under lock to avoid TOCTOU race
         if !self.is_connected() {

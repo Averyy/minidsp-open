@@ -1120,12 +1120,15 @@ pub fn start(
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
                 .clamp_db(snapshot.master.volume);
-            if let Err(err) = dev.restore_device_snapshot(&snapshot) {
-                if is_device_busy_error(&err) {
+            let dev = match restore_snapshot_surviving_stall(&st, dev, &snapshot) {
+                Ok(dev) => dev,
+                Err(err) if is_device_busy_error(&err) => {
                     return send_error(req, 409, DEVICE_BUSY);
                 }
-                return send_error(req, 500, &format!("snapshot restore failed: {err}"));
-            }
+                Err(err) => {
+                    return send_error(req, 500, &format!("snapshot restore failed: {err}"));
+                }
+            };
             match dev.capture_device_snapshot() {
                 Ok(snapshot) => match serde_json::to_string_pretty(&snapshot) {
                     Ok(body) => send_json(req, 200, &body),
@@ -1510,6 +1513,27 @@ fn register_debug_routes(
             }
         })?;
     }
+
+    // POST /debug/usb/stall {"afterCommands": N} — make the Nth next HID
+    // command behave as a stalled write (bus reset, then a timeout), to test
+    // recovery without waiting for a real stall. 0 disarms.
+    server.fn_handler("/debug/usb/stall", Method::Post, |mut req| {
+        let body = match read_request_body(&mut req, 256) {
+            Ok(body) => body,
+            Err(_) => return send_error(req, 400, "failed to read request body"),
+        };
+        let after = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|json| json.get("afterCommands").and_then(|n| n.as_u64()))
+            .and_then(|n| u32::try_from(n).ok());
+        match after {
+            Some(after) => {
+                crate::usb_hid::inject_stall_after(after);
+                send_json(req, 200, &json!({ "armed": after }).to_string())
+            }
+            None => send_error(req, 400, "afterCommands must be a non-negative integer"),
+        }
+    })?;
 
     // GET /debug/log — ring buffer log snapshot
     server.fn_handler("/debug/log", Method::Get, |req| {
@@ -2256,7 +2280,7 @@ fn register_device_feature_routes(
                     RebootedDevice::of(dev),
                     REBOOT_RECOVERY_TIMEOUT,
                 ) {
-                    Ok(()) => send_json(
+                    Ok(_) => send_json(
                         req,
                         200,
                         r#"{"status":"all_presets_reset","rebooted":true}"#,
@@ -2291,7 +2315,7 @@ fn register_device_feature_routes(
                     RebootedDevice::of(dev),
                     REBOOT_RECOVERY_TIMEOUT,
                 ) {
-                    Ok(()) => send_json(req, 200, r#"{"status":"rebooted"}"#),
+                    Ok(_) => send_json(req, 200, r#"{"status":"rebooted"}"#),
                     Err(e) => send_error(req, 500, &e),
                 },
                 Err(e) => send_error(req, 500, &e.to_string()),
@@ -2599,6 +2623,48 @@ pub fn get_device(state: &SharedDeviceState) -> Option<Arc<DeviceState>> {
     state.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Restore a snapshot, continuing once if the MiniDSP stops answering part
+/// way. usb_hid recovers a stalled write by resetting the bus, which replaces
+/// the DeviceState; the restore then resumes on the replacement from the
+/// preset that failed. Its writes are absolute values, so redoing a partly
+/// written preset is safe. Returns the device the restore finished on.
+fn restore_snapshot_surviving_stall(
+    st: &SharedDeviceState,
+    dev: Arc<DeviceState>,
+    snapshot: &DeviceSnapshot,
+) -> Result<Arc<DeviceState>, UsbHidError> {
+    // Bus reset to protocol-ready takes about 22 s on a 2x4 HD.
+    const RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+    let mut dev = dev;
+    let mut start = 0;
+    let mut recovered = false;
+    loop {
+        let stopped = match dev.restore_device_snapshot_from(snapshot, start) {
+            Ok(()) => return Ok(dev),
+            Err(stopped) => stopped,
+        };
+        let lost = matches!(
+            stopped.error,
+            UsbHidError::Timeout | UsbHidError::Disconnected
+        );
+        if recovered || !lost {
+            return Err(stopped.error);
+        }
+        recovered = true;
+        warn!(
+            "snapshot restore stopped at preset {} of {} ({}); resuming when the MiniDSP answers",
+            stopped.next,
+            snapshot.presets.len(),
+            stopped.error
+        );
+        if dev.assert_connection_current().is_err() {
+            dev = wait_for_rebooted_device(st, RebootedDevice::of(dev), RECOVERY_TIMEOUT)
+                .map_err(UsbHidError::Protocol)?;
+        }
+        start = stopped.next;
+    }
+}
+
 /// What a reboot wait needs from the device it rebooted. Holding the old
 /// `DeviceState` through the wait would keep its shadow maps in internal RAM
 /// while the main loop builds the replacement; the `Weak` keeps only the
@@ -2625,7 +2691,7 @@ fn wait_for_rebooted_device(
     state: &SharedDeviceState,
     rebooted: RebootedDevice,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<Arc<DeviceState>, String> {
     const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     let started = Instant::now();
@@ -2645,7 +2711,7 @@ fn wait_for_rebooted_device(
                     "HTTP reboot wait: device recovered after {:?}",
                     started.elapsed()
                 );
-                return Ok(());
+                return Ok(current);
             }
         }
 

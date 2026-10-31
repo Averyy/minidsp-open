@@ -260,11 +260,19 @@ impl DeviceState {
         self.learn_device_snapshot_locked()
     }
 
-    pub fn restore_device_snapshot(&self, snapshot: &DeviceSnapshot) -> Result<(), UsbHidError> {
-        let _guard = self
-            .try_begin_operation()
-            .ok_or_else(|| UsbHidError::Protocol("device busy".into()))?;
-        self.restore_device_snapshot_locked(snapshot)
+    /// Restore `snapshot`, treating presets before `start` (in slot order) as
+    /// already written by an earlier connection. On failure, reports where it
+    /// stopped so a caller can continue on a replacement connection.
+    pub fn restore_device_snapshot_from(
+        &self,
+        snapshot: &DeviceSnapshot,
+        start: usize,
+    ) -> Result<(), RestoreInterrupted> {
+        let _guard = self.try_begin_operation().ok_or(RestoreInterrupted {
+            next: start,
+            error: UsbHidError::Protocol("device busy".into()),
+        })?;
+        self.restore_device_snapshot_locked(snapshot, start)
     }
 
     fn capture_device_snapshot_locked(&self) -> Result<DeviceSnapshot, UsbHidError> {
@@ -430,41 +438,52 @@ impl DeviceState {
         }
     }
 
-    fn restore_device_snapshot_locked(&self, snapshot: &DeviceSnapshot) -> Result<(), UsbHidError> {
-        validate_snapshot_target(self, snapshot)?;
+    fn restore_device_snapshot_locked(
+        &self,
+        snapshot: &DeviceSnapshot,
+        start: usize,
+    ) -> Result<(), RestoreInterrupted> {
+        let stopped = |next, error| RestoreInterrupted { next, error };
+        validate_snapshot_target(self, snapshot).map_err(|e| stopped(start, e))?;
         validation::validate_snapshot_payload(self.profile(), snapshot)
-            .map_err(UsbHidError::Protocol)?;
+            .map_err(|e| stopped(start, UsbHidError::Protocol(e)))?;
 
         let mut presets = snapshot.presets.clone();
         presets.sort_by_key(|preset| preset.slot);
-        for preset in &presets {
-            self.restore_preset_snapshot(preset)?;
+        // An earlier connection wrote these, and the MiniDSP acknowledged
+        // every write before it stopped answering; this one only records them.
+        for preset in presets.iter().take(start) {
+            let shadow = preset_shadow(preset).map_err(|e| stopped(start, e))?;
+            self.store_preset_shadow_snapshot(preset.slot, shadow);
+            self.mark_snapshot_trusted(preset.slot);
+        }
+        for (index, preset) in presets.iter().enumerate().skip(start) {
+            self.restore_preset_snapshot(preset)
+                .map_err(|e| stopped(index, e))?;
         }
 
-        self.restore_master_state(&snapshot.master)?;
+        let done = presets.len();
+        self.restore_master_state(&snapshot.master)
+            .map_err(|e| stopped(done, e))?;
 
-        let verified = self.capture_device_snapshot_locked()?;
-        match snapshot.semantically_matches(&verified) {
-            Ok(()) => Ok(()),
-            Err(mismatches) => Err(UsbHidError::Protocol(format!(
-                "post-restore verification failed: {}",
-                mismatches.join("; ")
-            ))),
-        }
+        let verified = self
+            .capture_device_snapshot_locked()
+            .map_err(|e| stopped(done, e))?;
+        snapshot
+            .semantically_matches(&verified)
+            .map_err(|mismatches| {
+                stopped(
+                    done,
+                    UsbHidError::Protocol(format!(
+                        "post-restore verification failed: {}",
+                        mismatches.join("; ")
+                    )),
+                )
+            })
     }
 
     fn restore_preset_snapshot(&self, preset: &PresetSnapshot) -> Result<(), UsbHidError> {
-        let mut shadow = preset.shadow.as_ref().cloned().ok_or_else(|| {
-            UsbHidError::Protocol(format!(
-                "preset {} has no restorable shadow payload",
-                preset.slot
-            ))
-        })?;
-        shadow.fir_blocks = preset
-            .fir_blocks
-            .iter()
-            .map(|block| (block.data_start, block.coefficients.clone()))
-            .collect();
+        let shadow = preset_shadow(preset)?;
 
         // The enclosing restore holds the operation guard. Replacing the active
         // slot can make set_config_with_verify a no-op, while the following DSP
@@ -507,6 +526,28 @@ impl DeviceState {
         }
         Ok(())
     }
+}
+
+/// Where a restore stopped: presets before `next` (in slot order) were
+/// written and acknowledged.
+pub struct RestoreInterrupted {
+    pub next: usize,
+    pub error: UsbHidError,
+}
+
+fn preset_shadow(preset: &PresetSnapshot) -> Result<PresetShadowState, UsbHidError> {
+    let mut shadow = preset.shadow.as_ref().cloned().ok_or_else(|| {
+        UsbHidError::Protocol(format!(
+            "preset {} has no restorable shadow payload",
+            preset.slot
+        ))
+    })?;
+    shadow.fir_blocks = preset
+        .fir_blocks
+        .iter()
+        .map(|block| (block.data_start, block.coefficients.clone()))
+        .collect();
+    Ok(shadow)
 }
 
 fn build_shadow_preset_source(profile: &DeviceProfile, shadow: &PresetShadowState) -> PresetSource {
