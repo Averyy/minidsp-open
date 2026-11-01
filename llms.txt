@@ -35,7 +35,7 @@ minidsp -f commands.txt          # one command per line, run in file order; -f -
 minidsp snapshot export backup.json
 minidsp snapshot import backup.json
 minidsp server --config minidspd.toml
-minidsp -V                       # prints "minidsp 0.2.0"
+minidsp -V                       # prints "minidsp X.Y.Z"
 ```
 
 Other command groups: `input`/`output N delay|invert|crossover|compressor|fir|routing`, `dirac`, `bm` (Flex HT/HTx bass management), `rattle`, `debug`. `minidsp <command> --help` shows each one.

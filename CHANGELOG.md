@@ -10,6 +10,10 @@ live in [PROGRESS.md](PROGRESS.md).
 
 ## Unreleased
 
+## [0.2.1] - 2026-11-01
+
+Fixes the ESP32's GitHub release updates, which 0.2.0 firmware can't do.
+
 ### Fixed
 
 - The ESP32 couldn't check for or install GitHub releases. GitHub redirects release downloads to a signed `release-assets.githubusercontent.com` URL of about 900 bytes, and the HTTP client's 512-byte request buffer rejected it ("Out of buffer", `ESP_FAIL`). The request buffer is 2 KB now. Boards on 0.2.0 need one uploaded update (`/update` page or `tools/ota-push.sh`) to get the fix.
@@ -198,4 +202,5 @@ First public release.
 - Early ESP32 USB hotplug, WiFi provisioning, level-meter, mDNS, and WebSocket compatibility failures.
 - Desktop/ESP32 config reads avoid fabricated DSP100 values where hardware readback isn't authoritative.
 
+[0.2.1]: https://github.com/Averyy/minidsp-open/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Averyy/minidsp-open/releases/tag/v0.2.0
