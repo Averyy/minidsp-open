@@ -1,7 +1,7 @@
 # Current status
 
 History is in [CHANGELOG.md](CHANGELOG.md). The latest release is
-[v0.2.0](https://github.com/Averyy/minidsp-open/releases/tag/v0.2.0). Hardware
+[v0.2.1](https://github.com/Averyy/minidsp-open/releases/tag/v0.2.1). Hardware
 claims below refer to the 2x4 HD unless another device is named.
 
 ## What works
@@ -16,7 +16,7 @@ claims below refer to the 2x4 HD unless another device is named.
 | ezBEQ | Hosted UI/catalogue, multi-slot load/clear, Levels, and real upstream ezBEQ through the bridge passed on the earlier bundle. The current 2.12.4 bundle loads its 15,582 entries in a browser, streams Levels at four updates a second, and passes the suite's REST, WebSocket and 2.12.4 command-upload checks. In a browser it also passed slot loads and clears, `bq` uploads with their 400 explanations (invalid coefficients, unsupported `filt`/`rs`), Levels after navigating away and back, two clients seeing each other's changes, reconnect after an ESP32 reset, and an offline reload served from the board and its IndexedDB cache. |
 | Playback | Desktop and ESP32 sweep-only, marker-only, default marker+sweep, deterministic offsets, and Toslink auto-switch/restore passed on the 2x4 HD. The current fade was listened to and recorded; markers stay on by default. GET playback status is implemented. |
 | Rattle finder | CLI, desktop/ESP32 HTTP controls, shared streamed generation, and ESP32 `/status` exist. Labelled tones, start and stop at -40 dB, busy exclusion, volume restoration, 0.5 dB step rejection, rounded log-spaced labels and the 31-row `/status` window passed with a 2x4 HD and UMIK-1. |
-| OTA and tooling | Dual-slot OTA, rollback, firmware API/page, release checks, build/release workflows, and local flash/upload wrappers are implemented. `tools/ota-push.sh` installs passed both ways between `ota_0` and `ota_1`, each confirming itself on the network. Both rollback paths passed on hardware: an image that panics before confirming boots the previous slot on the next reset, and one that never reports itself reachable marks itself invalid after 3 minutes and reboots into it. A truncated upload is rejected with 400 and the board keeps its firmware. |
+| OTA and tooling | Dual-slot OTA, rollback, firmware API/page, release checks, build/release workflows, and local flash/upload wrappers are implemented. `tools/ota-push.sh` installs passed both ways between `ota_0` and `ota_1`, each confirming itself on the network. Both rollback paths passed on hardware: an image that panics before confirming boots the previous slot on the next reset, and one that never reports itself reachable marks itself invalid after 3 minutes and reboots into it. A truncated upload is rejected with 400 and the board keeps its firmware. A board on a 0.2.0 build with the request-buffer fix found v0.2.1 on GitHub, installed it with `POST /firmware/update` (2.5 MB in about 55 s at -90 dBm) and confirmed itself; uploads also go backwards, from a newer dev build to the older v0.2.0 release image and back. |
 | Apple TV | The desktop spike pairs, reconnects with stored credentials, decodes events, and suggests catalogue matches. Real Infuse/Plex titles and durations work; Companion metadata doesn't identify a safe BEQ audio variant, and Netflix payloads are empty. |
 
 Host tests and ESP32 builds have passed. Newer changes still need the hardware
@@ -63,8 +63,6 @@ Details: [ESP32 audio](docs/TODO1-esp32-usb-audio.md),
 - [ ] Keep importer/codegen changes source-backed and regenerate coverage artifacts when device evidence changes.
 - [ ] Confirm the HT/HTx selectable-source bitmap at `0xFFEA` on live hardware. The typed protocol parser/encoder and tests exist from static research (HT/HTx all-enabled masks: `0x1E`/`0x1F`); no client reads or writes are enabled.
 - [ ] Find the live addresses and value ranges of the advanced Dirac controls (`mux_bypass`, `dirac_delay`, `mixer_fir`, `fir-ctrl`) on a Dirac-capable unit; their preset layouts are documented and there is no standalone `iir-ctrl` descriptor.
-- [ ] Publish 0.2.1 with the OTA request-buffer fix. ESP32 0.2.0 can't check for or install GitHub releases (see CHANGELOG Unreleased), so a board on 0.2.0 needs that one update uploaded through `/update` or `tools/ota-push.sh`.
-- [ ] Prove an ESP32 installs a GitHub release end to end with `POST /firmware/update`. With the fix, the 2x4 HD board's release check follows both GitHub redirects and reads v0.2.0's `firmware.json`; installing needs a release newer than the board's version. At about -97 dBm, 2.5 MB WiFi uploads broke off; at -90 dBm they work.
 - [ ] Remove the external-component Cargo tracking workaround once esp-idf-sys tracks component directories itself.
 - [ ] Keep PWR-ICE compatibility, later ezBEQ expansion, and custom-PCB VBUS GPIO control deferred. DevKitC boards don't need GPIO-driven VBUS.
 
