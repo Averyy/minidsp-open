@@ -185,6 +185,8 @@ pub fn inject_stall_after(after: u32) {
 }
 
 fn take_injected_stall() -> bool {
+    // Host Rust 1.99 deprecates fetch_update for try_update, which is still
+    // unstable on the pinned Xtensa 1.93 toolchain. Switch when it moves.
     INJECT_STALL_AFTER
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
             (left > 0).then(|| left - 1)
