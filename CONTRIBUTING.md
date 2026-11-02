@@ -80,7 +80,7 @@ In override mode, `ESP_IDF_GLOB_UAC2_*` tracks the driver's C sources, headers, 
 ## Pull requests
 
 - One topic per PR, with a description of what changed and how you tested it (host tests, which hardware, which client).
-- CI runs `cargo test` and an ESP32 release build. Run them locally first.
+- CI runs `cargo test`, an ESP32 release build, and the host tests for the tools and status page (`uv run --no-project python tools/test-build-catalogue.py`, `uv run --offline --no-project python tools/test-live-validation.py`, `node --test tools/test-status-page.cjs`). Run them locally first.
 - Run `cargo fmt` on the files you touch.
 - Note anything you couldn't verify on hardware.
 - Record user-visible changes under Unreleased in [CHANGELOG.md](CHANGELOG.md), and keep [PROGRESS.md](PROGRESS.md) limited to current status and open items.

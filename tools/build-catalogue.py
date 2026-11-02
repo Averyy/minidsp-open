@@ -27,6 +27,7 @@ import hashlib
 import gzip
 import json
 import math
+import os
 import re
 import shutil
 import struct
@@ -40,7 +41,8 @@ from pathlib import Path
 
 CATALOGUE_URL = "https://raw.githubusercontent.com/3ll3d00d/beqcatalogue/master/docs/database.json"
 VERSION_URL = "https://raw.githubusercontent.com/3ll3d00d/beqcatalogue/master/docs/version.txt"
-CATALOGUE_COMMIT_API_URL = "https://api.github.com/repos/3ll3d00d/beqcatalogue/commits/{sha}"
+GITHUB_API_PREFIX = "https://api.github.com/"
+CATALOGUE_COMMIT_API_URL = GITHUB_API_PREFIX + "repos/3ll3d00d/beqcatalogue/commits/{sha}"
 UI_VERSION = "2.12.4"
 UI_WHEEL_SHA256 = "72873c702dbdcf0b55d00b63595d3580fc750cafc8e27c9f7d89efc5e5c66873"
 PYPI_JSON_URL = f"https://pypi.org/pypi/ezbeq/{UI_VERSION}/json"
@@ -62,6 +64,12 @@ DIGEST_PREFIX_SIZE = 8  # First 8 bytes of SHA256
 
 def fetch_bytes(url: str, timeout: int = 15) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "minidsp-open build-catalogue"})
+    # Anonymous REST calls share a 60/hour limit per IP, which GitHub-hosted
+    # runners exhaust between them. Send the token to the API host only, and
+    # not on redirects.
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token and url.startswith(GITHUB_API_PREFIX):
+        req.add_unredirected_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -116,6 +124,10 @@ def repo_build_stamp(output_dir: Path | None = None) -> str:
 
 
 def catalogue_build_stamp(version: str) -> str:
+    # version.txt names an upstream commit. When it could not be fetched, the
+    # version is a content hash with no commit date to look up.
+    if not re.fullmatch(r"[0-9a-f]{40}", version):
+        return current_build_stamp()
     commit = fetch_json(CATALOGUE_COMMIT_API_URL.format(sha=version), timeout=15)
     return iso_to_build_stamp(commit["commit"]["committer"]["date"])
 

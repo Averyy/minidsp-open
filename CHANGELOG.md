@@ -10,6 +10,12 @@ live in [PROGRESS.md](PROGRESS.md).
 
 ## Unreleased
 
+### Fixed
+
+- The catalogue sync could fail with `HTTP Error 403: rate limit exceeded`, which left the GitHub Pages catalogue stale until a later run succeeded. The builder looks up the upstream catalogue commit's date through the GitHub REST API without a token, and every job on a GitHub-hosted runner's IP shares the anonymous limit of 60 requests an hour. The workflow now passes its `GITHUB_TOKEN`, and the builder sends it to `api.github.com` only. Local builds use `GITHUB_TOKEN` or `GH_TOKEN` when set.
+- If the builder couldn't fetch the upstream `version.txt`, it was meant to fall back to a content hash as the catalogue version. It then asked the API for a commit with that hash and crashed. It now stamps that case with the build time.
+- CI now runs the host tests for the catalogue builder, the live-validation harness and the ESP32 status page; they weren't run anywhere automatically. The status page test for fractional volumes had been failing since the maximum-volume ceiling made the start button reload `/settings` first. The test now answers that request and checks that nothing else is fetched and no loudness confirmation appears.
+
 ## [0.2.1] - 2026-11-01
 
 Fixes the ESP32's GitHub release updates, which 0.2.0 firmware can't do.

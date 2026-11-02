@@ -54,6 +54,10 @@ jobs:
 
       - name: Build catalogue + UI
         if: steps.version_check.outputs.skip != 'true'
+        env:
+          # The builder reads the upstream commit date from the REST API, whose
+          # anonymous limit is shared by every job on the runner's IP.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           mkdir -p site
           uv run tools/build-catalogue.py --output-dir site

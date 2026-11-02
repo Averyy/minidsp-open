@@ -132,6 +132,28 @@ class CatalogueContract(unittest.TestCase):
                 (repo / "tools/build-catalogue.py").write_text("# edited")
                 self.assertEqual(catalogue.repo_build_stamp(repo / "site"), "WALLCLOCK")
 
+    def test_github_token_goes_to_the_api_host_only(self):
+        sent = []
+
+        def urlopen(req, timeout):
+            sent.append(req.unredirected_hdrs.get("Authorization"))
+            return io.BytesIO(b"{}")
+
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}), \
+                patch.object(catalogue.urllib.request, "urlopen", urlopen):
+            catalogue.fetch_bytes(catalogue.CATALOGUE_COMMIT_API_URL.format(sha="a" * 40))
+            catalogue.fetch_bytes(catalogue.CATALOGUE_URL)
+        self.assertEqual(sent, ["Bearer tok", None])
+
+    def test_catalogue_stamp_uses_commit_date_and_skips_api_for_hash_fallback(self):
+        commit = {"commit": {"committer": {"date": "2026-11-02T20:59:01Z"}}}
+        with patch.object(catalogue, "fetch_json", return_value=commit) as fetch, \
+                patch.object(catalogue, "current_build_stamp", return_value="WALLCLOCK"):
+            self.assertEqual(catalogue.catalogue_build_stamp("8f53d46e99431f0acf4f58fc79deb3846c0804f4"),
+                             "20261102T205901Z")
+            self.assertEqual(catalogue.catalogue_build_stamp("0123456789ab"), "WALLCLOCK")
+        fetch.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

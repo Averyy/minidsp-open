@@ -51,6 +51,19 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --workspace
 
+  # Host tests for the catalogue builder, the live-validation harness and the
+  # ESP32 status page. They need no network, hardware or Python packages.
+  tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv run --no-project python tools/test-build-catalogue.py
+      - run: uv run --offline --no-project python tools/test-live-validation.py
+      - run: node --test tools/test-status-page.cjs
+
   esp32:
     runs-on: ubuntu-latest
     timeout-minutes: 90

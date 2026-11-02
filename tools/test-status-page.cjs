@@ -71,8 +71,19 @@ test('known sources use readable names and unknown names are preserved', () => {
 });
 
 test('fractional volume is rejected before submitting or confirming playback', async () => {
-  const p = page(); p.evaluate('connected = true');
-  p.element('volumes').value = '-35.2'; p.element('tones').value = '40';
-  await p.element('form').onsubmit({preventDefault() {}});
-  assert.equal(p.element('message').textContent, 'Volumes must use multiples of 0.5 dB.');
+  // Submit reloads /settings for the current ceiling; nothing else may be fetched.
+  for (const volume of ['-35.2', '-10.2']) {
+    const p = page(); p.evaluate('connected = true');
+    const paths = [], confirms = [];
+    p.context.fetch = async (path, options = {}) => {
+      paths.push(`${options.method ?? 'GET'} ${path}`);
+      return {ok:true, status:200, json:async () => ({maxVolumeDb:null})};
+    };
+    p.context.confirm = text => { confirms.push(text); return true; };
+    p.element('volumes').value = volume; p.element('tones').value = '40';
+    await p.element('form').onsubmit({preventDefault() {}});
+    assert.equal(p.element('message').textContent, 'Volumes must use multiples of 0.5 dB.');
+    assert.deepEqual(paths, ['GET /settings']);
+    assert.deepEqual(confirms, []);
+  }
 });
